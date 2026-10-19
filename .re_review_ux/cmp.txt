@@ -1,0 +1,13 @@
+206 306
+0 EN: (None) | JA(id=k+1): 毒
+1 EN: Poison | JA(id=k+1): 麻痺
+10 EN: Cold Res | JA(id=k+1): 寒冷適応
+17 EN: Bleeding | JA(id=k+1): 攻撃
+73 EN: Crit Status | JA(id=k+1): 属性会心
+100 EN: Furor | JA(id=k+1): 窮地
+150 EN: Silverwind | JA(id=k+1): 隻眼
+204 EN: Mystery | JA(id=k+1): 胴系統倍加
+205 EN: Talisman+ | JA(id=k+1): 毒耐性
+206 EN: - | JA(id=k+1): 毒倍加
+250 EN: - | JA(id=k+1): 火耐性【小】
+305 EN: - | JA(id=k+1): 装填速度-3

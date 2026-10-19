@@ -20,7 +20,10 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 # Same analysis library as the PC build. Built without std; the knife-edge
 # parts (zlib inflate/deflate) come from miniz_oxide which is pure Rust.
-mhnx-core = { path = "../crates/mhnx-core", default-features = false }
+# gamedata is required: the item picker and every item name comes from the
+# generated tables. Without it item_pick_matches() is always empty and the
+# console cannot change an item id at all.
+mhnx-core = { path = "../crates/mhnx-core", default-features = false, features = ["gamedata"] }
 
 [profile.release]
 opt-level = "s"

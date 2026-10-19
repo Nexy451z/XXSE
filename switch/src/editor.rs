@@ -349,11 +349,10 @@ fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
         SaveList => "A open   Y quest editor   X options   - rescan   + exit",
         Slots => "Up/Down slot  A character  X items  L charms  R palico  Y quest  B back",
         Char => "Up/Down field  Left/Right value  X step  A save  B back",
-        Items => "Up/Down item  Left/Right count  X step  Y filter  A save  B back",
+        Items => "Up/Down item  L/R count  R pick item  X step  Y filter  A save  B back",
         ArcList => "A open quest   X quests in save   Y save editor   + exit",
         SaveQuests => "A edit  - extract this  R extract all  B back",
         ItemPick => "A choose  Y filter  X clear  B back",
-        Items => "L/R count  R pick item  X step  Y empty  A save  B back",
         ArcEntries => "A edit  X install to save  - extract this  R extract all  L check  B back",
         Mib => "Up/Down field  Left/Right value  X step  A write .arc  B back",
         Gmd => "A edit text  X write .arc  B back",
@@ -481,8 +480,15 @@ fn service(ed: &mut Editor) -> bool {
         if !crate::swkbd::is_available() {
             ed.message = String::from("keyboard unavailable in this mode");
         } else {
-            match crate::swkbd::input_text(header, &initial, 60) {
-                Some(s) if idx == mhnx_core::hbedit::TEXT_NAME => ed.apply_name(s),
+            // 0 means "the largest length swkbd accepts". A limit of 60 used
+            // to silently cut every quest description: all 141 shipped quests
+            // have at least one string longer than that (longest 117).
+            match crate::swkbd::input_text(header, &initial, 0) {
+                Some(s) if idx == mhnx_core::hbedit::TEXT_NAME => {
+                    // The save stores 31 bytes for a name.
+                    let clipped: String = s.chars().take(31).collect();
+                    ed.apply_name(clipped)
+                }
                 Some(s) if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER => ed.apply_item_filter(s),
                 Some(s) => ed.apply_text(idx, s),
                 None => ed.message = String::from("input cancelled"),
