@@ -1,0 +1,11 @@
+mhnxeditor SD card test file
+============================
+
+If you can read this on the console, the SD card is mounted and both the libnx
+fs API and newlib stdio can reach it.
+
+Copy this folder to the root of your SD card so that the path becomes:
+
+    /switch/mhnxeditor/hello.txt
+
+Then launch dist/mhnxeditor.nro from hbmenu and press A to probe again.

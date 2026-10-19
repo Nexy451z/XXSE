@@ -1,0 +1,22 @@
+[package]
+name = "mhnx-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mhnxeditor - MHXX save & quest editor GUI"
+
+[[bin]]
+name = "mhnxeditor"
+path = "src/main.rs"
+
+[features]
+default = ["gamedata"]
+gamedata = ["mhnx-core/gamedata"]
+
+[dependencies]
+mhnx-core = { path = "../mhnx-core", features = ["std"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.32"
+egui_extras = "0.32"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }

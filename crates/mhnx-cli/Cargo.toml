@@ -1,0 +1,13 @@
+[package]
+name = "mhnx-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mhnx - command line access to the MHXX save / quest data"
+
+[[bin]]
+name = "mhnx"
+path = "src/main.rs"
+
+[dependencies]
+mhnx-core = { path = "../mhnx-core", features = ["std", "gamedata"] }

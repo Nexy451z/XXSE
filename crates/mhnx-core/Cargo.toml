@@ -1,0 +1,15 @@
+[package]
+name = "mhnx-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Monster Hunter XX (3DS/Switch) save & quest data library - no_std compatible"
+
+[features]
+default = ["std"]
+std = []
+# game data tables (item/equip/monster names) - large, can be disabled
+gamedata = []
+
+[dependencies]
+miniz_oxide = { version = "0.8", default-features = false, features = ["with-alloc"] }
