@@ -734,8 +734,15 @@ impl Editor {
         let ids = dlcats::all_ids();
         let n = ids.len();
         match key {
-            Key::Up => self.move_cursor(n, -1),
-            Key::Down => self.move_cursor(n, 1),
+            // palico_cursor is the highlighted row.
+            Key::Up => {
+                self.palico_cursor = (self.palico_cursor + n.saturating_sub(1)) % n.max(1);
+                self.cursor = self.palico_cursor;
+            }
+            Key::Down => {
+                self.palico_cursor = (self.palico_cursor + 1) % n.max(1);
+                self.cursor = self.palico_cursor;
+            }
             Key::L | Key::R => {
                 self.palico_lang = 1 - self.palico_lang;
                 self.message = if self.palico_lang == 0 {
@@ -745,7 +752,7 @@ impl Editor {
                 };
             }
             Key::A => {
-                let id = match ids.get(self.cursor) {
+                let id = match ids.get(self.palico_cursor) {
                     Some(v) => *v,
                     None => return,
                 };
@@ -817,6 +824,8 @@ impl Editor {
 
     /// Run the quest checker on the open archive.
     pub fn run_check(&mut self) {
+        // Same reason: flush the editor buffer into the archive first.
+        self.store_entry();
         self.load_entry();
         self.findings = match &self.arc {
             Some(a) => check::check_quest(a),
@@ -830,8 +839,16 @@ impl Editor {
     fn input_check(&mut self, key: Key) {
         let n = self.findings.len();
         match key {
-            Key::Up => self.move_cursor(n, -1),
-            Key::Down => self.move_cursor(n, 1),
+            // check_cursor is what the list highlights and what A acts on, so
+            // it is the one that has to move.
+            Key::Up => {
+                self.check_cursor = (self.check_cursor + n.saturating_sub(1)) % n.max(1);
+                self.cursor = self.check_cursor;
+            }
+            Key::Down => {
+                self.check_cursor = (self.check_cursor + 1) % n.max(1);
+                self.cursor = self.check_cursor;
+            }
             Key::A => {
                 let fixable = self
                     .findings
@@ -893,6 +910,16 @@ impl Editor {
 
     fn request_write_arc(&mut self) {
         self.store_entry();
+        // A quest pulled out of the save has no path; A used to do nothing at
+        // all here, which read as a broken button.
+        if self.arc_path.is_none() {
+            self.message = if self.save.is_some() {
+                String::from("press X on the entry list to write this quest back into the save")
+            } else {
+                String::from("open a save, or use Y to save this .arc to a file")
+            };
+            return;
+        }
         if let Some(p) = self.arc_path.clone() {
             if let Some(a) = &self.arc {
                 match a.to_bytes() {
@@ -932,8 +959,16 @@ impl Editor {
 
     fn input_slots(&mut self, key: Key) {
         match key {
-            Key::Up => self.slot = (self.slot + 2) % 3,
-            Key::Down => self.slot = (self.slot + 1) % 3,
+            // The list highlights self.cursor, so moving the slot has to move
+            // the cursor with it or the highlight stays on slot 1.
+            Key::Up => {
+                self.slot = (self.slot + 2) % 3;
+                self.cursor = self.slot;
+            }
+            Key::Down => {
+                self.slot = (self.slot + 1) % 3;
+                self.cursor = self.slot;
+            }
             Key::L => self.open_charms(),
             Key::R => {
                 self.screen = Screen::Palico;
@@ -1243,6 +1278,10 @@ impl Editor {
             Key::Up => self.move_cursor(n, -1),
             Key::Down => self.move_cursor(n, 1),
             Key::A => {
+                // Store the entry we are leaving first: the .mib and .gmd
+                // editors keep their edits in mib_bytes/gmd, so loading a new
+                // entry without this silently threw them away.
+                self.store_entry();
                 self.entry = self.cursor;
                 self.load_entry();
                 let kind = self
