@@ -153,10 +153,16 @@ fn a_full_replace_round_trips_through_a_file() {
     let victim = quests[quests.len() / 2].clone();
     let mask_before = dlc::bitmask(&s).unwrap();
 
-    let mut payload = victim.data.clone();
-    for b in payload.iter_mut().take(4) {
-        *b ^= 0xFF;
-    }
+    // Edit something inside a payload, not the archive header: corrupting the
+    // magic makes the payload unparseable and install_quest now refuses that.
+    let mut arc = mhnx_core::arc::Arc::parse(&victim.data).expect("the victim is an archive");
+    let gmd = arc
+        .entries
+        .iter()
+        .position(|e| mhnx_core::arc::extension_for(e.type_hash) == Some("gmd"))
+        .expect("a .gmd entry");
+    arc.entries[gmd].data[0x20] ^= 0xFF;
+    let payload = arc.to_bytes().unwrap();
     dlc::install_quest(&mut s, victim.quest_id, &payload).unwrap();
 
     let back = Save::from_bytes(&s.to_bytes()).unwrap();
