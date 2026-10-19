@@ -1066,6 +1066,9 @@ impl MhnxEditor {
         if i >= self.items.len() {
             return;
         }
+        // Everything below edits self.items; apply_to_save() pushes that into
+        // the save. Forgetting it made the edits look like they did nothing.
+        let mut touched = false;
         ui.horizontal(|ui| {
             ui.label(format!("選択中: 箱 #{} ", i + 1));
             let mut id = self.items[i].id;
@@ -1074,6 +1077,7 @@ impl MhnxEditor {
                 .changed()
             {
                 self.items[i].id = id;
+                touched = true;
             }
             let mut c = self.items[i].count;
             if ui
@@ -1081,9 +1085,11 @@ impl MhnxEditor {
                 .changed()
             {
                 self.items[i].count = c;
+                touched = true;
             }
             if ui.button("空にする").clicked() {
                 self.items[i] = ItemSlot::default();
+                touched = true;
             }
         });
 
@@ -1101,6 +1107,9 @@ impl MhnxEditor {
         });
         let needle = self.item_pick_filter.trim().to_lowercase();
         if needle.is_empty() {
+            if touched {
+                self.apply_to_save();
+            }
             return;
         }
         let mut hits: Vec<(u16, &'static str)> = Vec::new();
@@ -1117,6 +1126,9 @@ impl MhnxEditor {
         }
         if hits.is_empty() {
             ui.label(egui::RichText::new("一致するアイテムがありません").weak());
+            if touched {
+                self.apply_to_save();
+            }
             return;
         }
         egui::ScrollArea::vertical()
@@ -1133,9 +1145,14 @@ impl MhnxEditor {
                             self.items[i].count = 1;
                         }
                         self.item_pick_filter.clear();
+                        touched = true;
                     }
                 }
             });
+        if touched {
+            self.apply_to_save();
+            self.message = format!("箱 #{} を {} に変更しました", i + 1, item_name(self.items[i].id));
+        }
     }
 
     fn tab_quest(&mut self, ui: &mut egui::Ui) {
@@ -1761,52 +1778,112 @@ impl MhnxEditor {
     }
 
     fn tab_extras(&mut self, ui: &mut egui::Ui) {
-        let Some(save) = self.save.clone() else {
+        if self.save.is_none() {
             ui.label("セーブを開いてください");
             return;
-        };
+        }
+        // Everything is gathered up front and applied at the end: the buttons
+        // need &mut self.save while the widgets borrow it for reading.
+        let save = self.save.as_ref().unwrap().clone();
+        let mut set_opts: Option<mhnx_core::save::Options> = None;
+        let mut add_cat: Option<(usize, usize)> = None;
+        let mut drop_cat: Option<usize> = None;
+        let mut drop_charm: Option<usize> = None;
+        let mut write_charm = false;
+        let mut want_export = false;
+        let mut want_import = false;
+
         ui.heading("本体オプション");
-        let mut o = save.options();
-        let mut changed = false;
+        let o = save.options();
         ui.horizontal(|ui| {
             ui.label("明るさ");
             let mut b = o.brightness as i32;
             if ui.add(egui::Slider::new(&mut b, 0..=255)).changed() {
-                o.brightness = b as u8;
-                changed = true;
+                let mut n = o;
+                n.brightness = b as u8;
+                set_opts = Some(n);
             }
         });
-        changed |= ui.checkbox(&mut (o.rumble != 0), "振動").changed();
-        if changed {
-            let mut o2 = save.options();
-            o2.brightness = o.brightness;
-            if let Some(s) = &mut self.save {
-                let mut cur = s.options();
-                cur.brightness = o.brightness;
-                cur.rumble = if o.rumble != 0 { 1 } else { 0 };
-                s.set_options(&cur);
-                self.dirty = true;
-            }
+        let mut rumble = o.rumble != 0;
+        if ui.checkbox(&mut rumble, "振動").changed() {
+            let mut n = o;
+            n.rumble = if rumble { 1 } else { 0 };
+            set_opts = Some(n);
         }
 
         ui.separator();
         ui.heading("配信オトモ");
-        let cats = save.dlc_palicoes();
+        let cats: Vec<_> = save
+            .dlc_palicoes()
+            .into_iter()
+            .filter(|c| c.id != 0)
+            .collect();
         ui.label(format!("{} / 50 枠 使用中", cats.len()));
-        for c in &cats {
-            ui.horizontal(|ui| {
-                ui.label(format!("#{} id 0x{:02X} {}", c.index, c.id, c.name));
+        // Bounded: a scroll area that grows pushes everything below off screen.
+        egui::ScrollArea::vertical()
+            .id_salt("palicolist")
+            .max_height(140.0)
+            .show(ui, |ui| {
+                for c in &cats {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{:<3} id 0x{:02X} {}", c.index, c.id, c.name));
+                        if ui.small_button("外す").clicked() {
+                            drop_cat = Some(c.index);
+                        }
+                    });
+                }
             });
-        }
+        ui.horizontal(|ui| {
+            ui.label("日本語版");
+            egui::ComboBox::from_id_salt("catlang")
+                .selected_text(if self.cat_lang == 0 { "日本語版" } else { "英語版" })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.cat_lang, 0, "日本語版");
+                    ui.selectable_value(&mut self.cat_lang, 1, "英語版");
+                });
+            let lang = if self.cat_lang == 0 {
+                mhnx_core::dlcats::Lang::Jp
+            } else {
+                mhnx_core::dlcats::Lang::En
+            };
+            let ids = mhnx_core::dlcats::all_ids();
+            let shown = ids
+                .get(self.cat_id)
+                .and_then(|id| mhnx_core::dlcats::record(lang, *id))
+                .map(mhnx_core::dlcats::record_name)
+                .unwrap_or_default();
+            egui::ComboBox::from_id_salt("catid")
+                .selected_text(shown)
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    for (i, id) in ids.iter().enumerate() {
+                        let name = mhnx_core::dlcats::record(lang, *id)
+                            .map(mhnx_core::dlcats::record_name)
+                            .unwrap_or_default();
+                        let used = save.has_dlc_palico(*id);
+                        ui.selectable_value(
+                            &mut self.cat_id,
+                            i,
+                            if used {
+                                format!("{} (導入済み)", name)
+                            } else {
+                                name
+                            },
+                        );
+                    }
+                });
+            if ui.button("追加").clicked() {
+                add_cat = Some((self.cat_lang, self.cat_id));
+            }
+        });
 
         ui.separator();
         ui.heading("お守り");
         let charms = save.charms(self.slot).unwrap_or_default();
-        ui.label(format!("スロット 1: {} 個のお守り", charms.len()));
-        let mut drop_charm: Option<usize> = None;
+        ui.label(format!("スロット {}: {} 個のお守り", self.slot + 1, charms.len()));
         egui::ScrollArea::vertical()
             .id_salt("charms")
-            .max_height(200.0)
+            .max_height(150.0)
             .show(ui, |ui| {
                 for c in &charms {
                     ui.horizontal(|ui| {
@@ -1830,15 +1907,6 @@ impl MhnxEditor {
                     });
                 }
             });
-        if let Some(idx) = drop_charm {
-            if let Some(s) = &mut self.save {
-                if s.clear_charm(self.slot, idx) {
-                    self.dirty = true;
-                    self.message = format!("お守り {} を削除しました", idx);
-                }
-            }
-        }
-
         ui.horizontal(|ui| {
             ui.label("枠");
             ui.add(egui::DragValue::new(&mut self.charm_index).range(0..=1999));
@@ -1852,16 +1920,77 @@ impl MhnxEditor {
             if ui.add(egui::DragValue::new(&mut p).range(-128..=127)).changed() {
                 self.charm_points1 = p as i8;
             }
-        });
-        ui.horizontal(|ui| {
             ui.label("スキル2");
             ui.add(egui::DragValue::new(&mut self.charm_skill2).range(0..=255));
-            let mut p = self.charm_points2 as i32;
-            if ui.add(egui::DragValue::new(&mut p).range(-128..=127)).changed() {
-                self.charm_points2 = p as i8;
+            let mut p2 = self.charm_points2 as i32;
+            if ui.add(egui::DragValue::new(&mut p2).range(-128..=127)).changed() {
+                self.charm_points2 = p2 as i8;
             }
         });
         if ui.button("この内容で書き込む").clicked() {
+            write_charm = true;
+        }
+
+        ui.separator();
+        ui.heading("キャラクタをまるごと入出力");
+        ui.label(
+            egui::RichText::new("1 スロット分（キャラクタ本体 + アイテム）を .saveslot として出し入れします")
+                .weak()
+                .small(),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("このスロットを書き出す").clicked() {
+                want_export = true;
+            }
+            if ui.button("このスロットに読み込む").clicked() {
+                want_import = true;
+            }
+        });
+
+        // ---- apply ----
+        if let Some(o) = set_opts {
+            if let Some(s) = &mut self.save {
+                s.set_options(&o);
+                self.dirty = true;
+                self.message = String::from("オプションを更新しました");
+            }
+        }
+        if let Some((lang, idx)) = add_cat {
+            let ls = if lang == 0 {
+                mhnx_core::dlcats::Lang::Jp
+            } else {
+                mhnx_core::dlcats::Lang::En
+            };
+            let ids = mhnx_core::dlcats::all_ids();
+            if let Some(id) = ids.get(idx).copied() {
+                if let Some(s) = &mut self.save {
+                    match s.install_dlc_palico(ls, id) {
+                        Ok(slot) => {
+                            self.dirty = true;
+                            self.message = format!("オトモ 0x{:02X} を枠 {} に追加しました", id, slot);
+                        }
+                        Err(e) => self.message = format!("追加できません: {}", e),
+                    }
+                }
+            }
+        }
+        if let Some(i) = drop_cat {
+            if let Some(s) = &mut self.save {
+                if s.remove_dlc_palico(i) {
+                    self.dirty = true;
+                    self.message = format!("枠 {} を外しました", i);
+                }
+            }
+        }
+        if let Some(i) = drop_charm {
+            if let Some(s) = &mut self.save {
+                if s.clear_charm(self.slot, i) {
+                    self.dirty = true;
+                    self.message = format!("お守り {} を削除しました", i);
+                }
+            }
+        }
+        if write_charm {
             let c = mhnx_core::charm::Charm {
                 index: self.charm_index,
                 slots: self.charm_slots,
@@ -1875,56 +2004,50 @@ impl MhnxEditor {
                     self.dirty = true;
                     self.message = format!("お守り {} を更新しました", c.index);
                 } else {
-                    self.message = "書き込めませんでした（武器・防具の枠は保護されています）".to_owned();
+                    self.message =
+                        String::from("書き込めません（武器・防具の枠は保護されています）");
                 }
             }
         }
-
-        ui.separator();
-        ui.heading("キャラクタをまるごと入出力");
-        ui.horizontal(|ui| {
-            if ui.button("このスロットを書き出す").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
-                    .set_file_name(format!("slot{}.saveslot", self.slot + 1))
-                    .save_file()
-                {
-                    if let Some(s) = &self.save {
-                        if let Some(bytes) = s.export_slot(self.slot) {
-                            match std::fs::write(&p, &bytes) {
-                                Ok(()) => self.message = format!("書き出しました: {}", p.display()),
-                                Err(e) => self.message = format!("書き出せません: {}", e),
-                            }
-                        }
+        if want_export {
+            if let Some(p) = rfd::FileDialog::new()
+                .set_file_name(format!("slot{}.saveslot", self.slot + 1))
+                .save_file()
+            {
+                if let Some(bytes) = save.export_slot(self.slot) {
+                    match std::fs::write(&p, &bytes) {
+                        Ok(()) => self.message = format!("書き出しました: {}", p.display()),
+                        Err(e) => self.message = format!("書き出せません: {}", e),
                     }
                 }
             }
-            if ui.button("このスロットに読み込む").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("save slot", &["saveslot"])
-                    .pick_file()
-                {
-                    match std::fs::read(&p) {
-                        Ok(bytes) => {
-                            let mut err = None;
-                            if let Some(s) = &mut self.save {
-                                if let Err(e) = s.import_slot(self.slot, &bytes) {
-                                    err = Some(format!("{}", e));
-                                }
-                            }
-                            match err {
-                                Some(e) => self.message = e,
-                                None => {
-                                    self.dirty = true;
-                                    self.reload_from_save();
-                                    self.message = format!("読み込みました: {}", p.display());
-                                }
+        }
+        if want_import {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("save slot", &["saveslot"])
+                .pick_file()
+            {
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        let mut err = None;
+                        if let Some(s) = &mut self.save {
+                            if let Err(e) = s.import_slot(self.slot, &bytes) {
+                                err = Some(format!("{}", e));
                             }
                         }
-                        Err(e) => self.message = format!("読めません: {}", e),
+                        match err {
+                            Some(e) => self.message = e,
+                            None => {
+                                self.dirty = true;
+                                self.reload_from_save();
+                                self.message = format!("読み込みました: {}", p.display());
+                            }
+                        }
                     }
+                    Err(e) => self.message = format!("読めません: {}", e),
                 }
             }
-        });
+        }
     }
 
     fn tab_about(&mut self, ui: &mut egui::Ui) {
