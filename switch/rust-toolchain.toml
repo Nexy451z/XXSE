@@ -1,0 +1,6 @@
+# Building for a tier-3 target requires -Z build-std, i.e. a nightly cargo plus
+# the rust-src component. build.ps1 installs both automatically when missing.
+[toolchain]
+channel = "nightly"
+components = ["rust-src"]
+profile = "minimal"

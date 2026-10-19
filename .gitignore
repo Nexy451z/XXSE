@@ -1,0 +1,22 @@
+# Rust build output
+/target
+/switch/target
+
+# Scratch space and generated data
+/.work
+/dist/quests_all
+/dist/quests_out
+/dist/shots
+/dist/_*
+
+# Built binaries (rebuild with cargo / switch\build.ps1)
+/dist/*.exe
+/dist/*.nro
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
+Thumbs.db
+# Scratch files used while reverse engineering
+/tools/_*

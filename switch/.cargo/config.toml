@@ -1,0 +1,16 @@
+# Configuration for the Switch (.nro) build.
+# A plain `cargo build --release` inside this directory is enough as long as
+# devkitPro is installed at DEVKITPRO (or C:/devkitPro).
+
+[build]
+target = "targets/aarch64-nintendo-switch-libnx.json"
+
+# Custom target -> core/alloc must be compiled from source (nightly + rust-src).
+[unstable]
+build-std = ["core", "alloc"]
+json-target-spec = true
+
+# Default value only: an already exported DEVKITPRO wins.  Forward slashes keep
+# gcc's %:getenv(DEVKITPRO ...) spec expansion happy on Windows.
+[env]
+DEVKITPRO = { value = "C:/devkitPro", force = false }
