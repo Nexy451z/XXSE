@@ -267,21 +267,30 @@ pub fn install_quest(save: &mut Save, quest_id: i32, arc_bytes: &[u8]) -> Result
             value: quest_id as u32,
         });
     }
+    // The payload has to be a real archive. This used to be an "if let Ok",
+    // so anything at all was accepted: 777 bytes of 0xAB returned Ok, replaced
+    // an installed quest and left a slot that no longer parses. The game would
+    // then drop or crash on that entry.
+    let arc = crate::arc::Arc::parse(arc_bytes).map_err(|_| {
+        Error::Parse("the payload is not a quest archive, so it was not installed")
+    })?;
     // The .arc carries its own quest id in the .mib. Installing a payload whose
     // id disagrees with the slot would leave the save claiming one quest and
     // holding another, which the game indexes by id, so refuse it.
-    if let Ok(arc) = crate::arc::Arc::parse(arc_bytes) {
-        if let Some(mib) = arc
-            .by_ext("mib")
-            .and_then(|e| crate::quest::Mib::from_bytes(&e.data).ok())
-        {
-            let payload_id = mib.quest_id();
-            if payload_id != 0 && payload_id != quest_id as u32 {
-                return Err(Error::Parse(
-                    "the archive's own quest id does not match the id being installed",
-                ));
-            }
+    if let Some(mib) = arc
+        .by_ext("mib")
+        .and_then(|e| crate::quest::Mib::from_bytes(&e.data).ok())
+    {
+        let payload_id = mib.quest_id();
+        if payload_id != 0 && payload_id != quest_id as u32 {
+            return Err(Error::Parse(
+                "the archive's own quest id does not match the id being installed",
+            ));
         }
+    } else {
+        return Err(Error::Parse(
+            "the archive has no readable .mib, so its quest id cannot be checked",
+        ));
     }
     if arc_bytes.len() > QUEST_MAX_PAYLOAD {
         return Err(Error::OutOfRange {
@@ -382,19 +391,52 @@ mod tests {
         );
     }
 
+    /// A payload that really is a quest archive: one .mib with the given id.
+    /// install_quest now refuses anything else, so the tests need a real one.
+    fn arc_for(id: u32) -> alloc::vec::Vec<u8> {
+        let mut mib = alloc::vec![0u8; 249];
+        mib[0x0C..0x10].copy_from_slice(&id.to_le_bytes());
+        let a = crate::arc::Arc {
+            version: crate::arc::ARC_VERSION,
+            entries: alloc::vec![crate::arc::ArcEntry {
+                name: alloc::string::String::from("questData\\questData_x"),
+                type_hash: 0x1BBF_D18E,
+                data: mib,
+                original: None,
+                original_offset: None,
+            }],
+        };
+        a.to_bytes().unwrap()
+    }
+
+    #[test]
+    fn a_payload_that_is_not_an_archive_is_refused() {
+        let mut s = empty_switch_save();
+        seed(&mut s, 3, 1010165, &arc_for(1010165));
+        let before = s.body().to_vec();
+        // 777 bytes of 0xAB used to return Ok and destroy the installed quest.
+        assert!(install_quest(&mut s, 1010165, &alloc::vec![0xABu8; 777]).is_err());
+        assert!(install_quest(&mut s, 1010165, &[1u8; 64]).is_err());
+        // A truncated archive must be refused too.
+        let mut cut = arc_for(1010165);
+        cut.truncate(cut.len() / 2);
+        assert!(install_quest(&mut s, 1010165, &cut).is_err());
+        assert_eq!(s.body(), &before[..], "a refused install must not write");
+    }
+
     #[test]
     fn replacing_keeps_the_slot_the_id_and_the_mask() {
         let mut s = empty_switch_save();
-        seed(&mut s, 3, 1010165, &[1u8; 64]);
+        seed(&mut s, 3, 1010165, &arc_for(1010165));
         let mask_before = bitmask(&s).unwrap();
 
-        let slot = install_quest(&mut s, 1010165, &[2u8; 128]).unwrap();
+        let slot = install_quest(&mut s, 1010165, &arc_for(1010165)).unwrap();
         assert_eq!(slot, 3, "must reuse the slot that holds the quest");
 
         let list = list_quests(&s);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].quest_id, 1010165);
-        assert_eq!(list[0].data, alloc::vec![2u8; 128]);
+        assert_eq!(list[0].data, arc_for(1010165), "the payload must round trip");
 
         // The installed set is catalogue indexed, so a slot number cannot
         // address it: a replace must leave it byte for byte alone.
@@ -484,12 +526,12 @@ mod tests {
         assert_eq!(equipment_catalogue_index(&s, 1010165), None, "event quests are not there");
         // Entry 3's bit is clear in a blank save, so the write is refused.
         assert_eq!(installed_flag(&s, 1020004), Some(false));
-        seed(&mut s, 0, 1020004, &[1u8; 16]);
-        assert!(install_quest(&mut s, 1020004, &[2u8; 32]).is_err());
+        seed(&mut s, 0, 1020004, &arc_for(1020004));
+        assert!(install_quest(&mut s, 1020004, &arc_for(1020004)).is_err());
         // Set bit 3 and the same write goes through.
         set_test_bit(&mut s, 3, true);
         assert_eq!(installed_flag(&s, 1020004), Some(true));
-        assert!(install_quest(&mut s, 1020004, &[2u8; 32]).is_ok());
+        assert!(install_quest(&mut s, 1020004, &arc_for(1020004)).is_ok());
     }
 
     /// Test-only bit poke: the library itself deliberately never writes the set.

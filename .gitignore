@@ -20,3 +20,4 @@
 Thumbs.db
 # Scratch files used while reverse engineering
 /tools/_*
+/.re_review*/

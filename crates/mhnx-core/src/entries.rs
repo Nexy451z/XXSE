@@ -75,6 +75,12 @@ pub struct ItemTable {
     pub capacity: usize,
     /// The records.
     pub records: Vec<ItemRecord>,
+    /// Where each record sits inside the record array.
+    ///
+    /// A .sup is a fixed array of 40 where an empty entry does not mean the
+    /// list has ended: 119 of the 316 real files hold items after a gap.
+    /// Storing the original index keeps the edit aimed at the right bytes.
+    pub positions: Vec<usize>,
     /// Did the file end its list with 00 00 00 FF?
     ///
     /// .rem does, .sup does not (it is a fixed array of 40 where zero means
@@ -96,7 +102,11 @@ impl ItemTable {
         }
         let capacity = (raw.len() - first) / 4;
         let mut records = Vec::new();
+        let mut positions = Vec::new();
         let mut terminated = false;
+        // .rem is a list that ends; .sup is a fixed array, so an empty record
+        // is just a free slot and the scan continues past it.
+        let fixed = raw.len() != 184;
         for i in 0..capacity {
             let o = first + i * 4;
             let r = ItemRecord::read(&raw[o..o + 4]);
@@ -106,15 +116,20 @@ impl ItemTable {
                 break;
             }
             if r.item == 0 && r.count == 0 && r.slot == 0 {
+                if fixed {
+                    continue;
+                }
                 break;
             }
             records.push(r);
+            positions.push(i);
         }
         Ok(ItemTable {
             raw: raw.to_vec(),
             first,
             capacity,
             records,
+            positions,
             terminated,
         })
     }
@@ -126,7 +141,8 @@ impl ItemTable {
         // defaulting the missing ones to zero wiped real records that sit after
         // a gap - a .sup can hold two blocks separated by an empty run.
         for (i, r) in self.records.iter().enumerate() {
-            let o = self.first + i * 4;
+            let at = self.positions.get(i).copied().unwrap_or(i);
+            let o = self.first + at * 4;
             if o + 4 > out.len() {
                 break;
             }

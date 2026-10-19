@@ -150,7 +150,11 @@ impl Gmd {
         }
         let key = String::from_utf8_lossy(&b[GMD_HEADER_SIZE..key_end]).into_owned();
         let text = &b[key_end + 1..];
-        let mut strings = Vec::with_capacity(count);
+        // count comes straight out of the file. Reserving it unfiltered asked
+        // for ~96 GiB from a 64 byte payload; it only survived here because
+        // Windows overcommits, and a 32-bit or console build would abort.
+        // No string can be longer than the text that is actually present.
+        let mut strings = Vec::with_capacity(count.min(text.len() + 1));
         let mut cur: Vec<u8> = Vec::new();
         for &c in text {
             if c == 0 {
