@@ -107,6 +107,17 @@ pub enum Request {
     },
 }
 
+/// Everything up to and including the last path separator.
+///
+/// The console paths use '/', the PC ones can use '\', and this code runs on
+/// both, so both are accepted. Returns "" when there is no separator.
+fn split_dir(path: &str) -> String {
+    match path.rfind(['/', '\\']) {
+        Some(i) => path[..=i].to_string(),
+        None => String::new(),
+    }
+}
+
 /// Data the I/O layer must write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Write {
@@ -172,6 +183,8 @@ pub const TEXT_ITEM_FILTER: usize = usize::MAX - 1;
 pub const TEXT_SKILL_FILTER: usize = usize::MAX - 2;
 /// Sentinel id for "ask for a quest id or title to filter the list by".
 pub const TEXT_QUEST_FILTER: usize = usize::MAX - 3;
+/// Sentinel id for "ask what to call the converted save".
+pub const TEXT_SAVE_NAME: usize = usize::MAX - 4;
 
 /// The editable character fields, in menu order.
 pub const CHAR_FIELDS: &[(&str, &str)] = &[
@@ -242,6 +255,8 @@ pub struct Editor {
     pub entry_item_row: usize,
     /// Cursor over the records of the open reward table.
     pub entry_row_cursor: usize,
+    /// File name chosen for the converted save, without path or extension.
+    pub convert_name: String,
     /// Quest id / title filter for the save's quest list.
     pub quest_filter: String,
     /// Skill name filter used by the picker.
@@ -316,6 +331,7 @@ impl Editor {
             quest_titles: Vec::new(),
             item_undo: Vec::new(),
             skill_pick_field: 1,
+            convert_name: String::new(),
             item_pick_mode: 0,
             entry_item_row: 0,
             entry_row_cursor: 0,
@@ -1314,6 +1330,13 @@ impl Editor {
             self.message = String::from("this save has no path");
             return;
         };
+        let dir = split_dir(&base);
+        let stem = if self.convert_name.trim().is_empty() {
+            alloc::string::String::from("system")
+        } else {
+            // Keep it to one path segment: a stray slash would write elsewhere.
+            self.convert_name.trim().replace('/', "_").replace('\\', "_")
+        };
         let (path, bytes, what) = match save.kind() {
             crate::save::SaveKind::ThreeDs => {
                 let name = if save.header().iter().any(|b| *b != 0) {
@@ -1323,7 +1346,7 @@ impl Editor {
                 };
                 match crate::save::Save::from_3ds_body(save.body(), name) {
                     Ok(sw) => (
-                        alloc::format!("{}.switch", base),
+                        alloc::format!("{}{}.switch", dir, stem),
                         sw.to_bytes(),
                         "Switch (36 byte header synthesised)",
                     ),
@@ -1334,7 +1357,7 @@ impl Editor {
                 }
             }
             _ => (
-                alloc::format!("{}.3ds", base),
+                alloc::format!("{}{}.3ds", dir, stem),
                 save.to_3ds_bytes(),
                 "3DS (header stripped)",
             ),
@@ -1349,6 +1372,10 @@ impl Editor {
     fn input_convert(&mut self, key: Key) {
         match key {
             Key::A => self.convert_now(),
+            // Name the output instead of taking the default.
+            Key::Y => {
+                self.pending_text = Some((TEXT_SAVE_NAME, self.convert_name.clone()));
+            }
             Key::B => {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
@@ -1527,6 +1554,11 @@ impl Editor {
                     || self.quest_title(q.quest_id).to_lowercase().contains(&needle)
             })
             .collect()
+    }
+
+    /// The io layer answers a save-name request with this.
+    pub fn apply_convert_name(&mut self, text: String) {
+        self.convert_name = text;
     }
 
     /// The io layer answers a quest filter request with this.
@@ -2365,15 +2397,32 @@ impl Editor {
                             "3DS MHXX (header stripped)"
                         };
                         push(&mut out, alloc::format!("  target : {}", target), false, false);
-                        let path = p.clone().map(|v| alloc::format!("{}.{}", v,
-                            if s.kind() == crate::save::SaveKind::ThreeDs { "switch" } else { "3ds" }))
+                        let ext = if s.kind() == crate::save::SaveKind::ThreeDs {
+                            "switch"
+                        } else {
+                            "3ds"
+                        };
+                        let stem = if self.convert_name.trim().is_empty() {
+                            alloc::string::String::from("system")
+                        } else {
+                            self.convert_name.trim().to_string()
+                        };
+                        let path = p
+                            .clone()
+                            .map(|v| alloc::format!("{}{}.{}", split_dir(&v), stem, ext))
                             .unwrap_or_else(|| String::from("(no path)"));
                         push(&mut out, alloc::format!("  writes : {}", path), false, false);
+                        push(
+                            &mut out,
+                            alloc::format!("  name   : {}  (Y changes it)", stem),
+                            false,
+                            false,
+                        );
                     }
                 }
                 push(
                     &mut out,
-                    String::from("  A convert and write   B back"),
+                    String::from("  A convert and write   Y name   B back"),
                     false,
                     false,
                 );
