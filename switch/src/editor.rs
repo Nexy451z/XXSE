@@ -348,7 +348,8 @@ fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
     match screen {
         SaveList => "A open  Y quest editor  L convert  X options  - rescan  + exit",
         Convert => "A convert and write   Y name   B back",
-        Slots => "Up/Down slot  A character  X items  L charms  R palico  Y quest  B back",
+        Slots => "Up/Down slot  A char  X items  - equip  L charms  R palico  Y quest  B back",
+        Equip => "Up/Down row  Y filter  X clear  B back",
         Char => "Up/Down field  Left/Right value  X step  A save  B back",
         ArcList => "A open quest   X quests in save   Y save editor   + exit",
         SaveQuests => "A edit  - extract  R all  Y filter  X clear  B back",
@@ -494,6 +495,8 @@ fn service(ed: &mut Editor) -> bool {
             "クエストIDかタイトルで絞り込み"
         } else if idx == mhnx_core::hbedit::TEXT_SAVE_NAME {
             "書き出すファイル名（拡張子は自動）"
+        } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
+            "装備名か種類で絞り込み"
         } else {
             "クエストテキスト"
         };
@@ -513,6 +516,10 @@ fn service(ed: &mut Editor) -> bool {
                 Some(s) if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER => ed.apply_skill_filter(s),
                 Some(s) if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER => ed.apply_quest_filter(s),
                 Some(s) if idx == mhnx_core::hbedit::TEXT_SAVE_NAME => ed.apply_convert_name(s),
+                Some(s) if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER => {
+                    ed.equip_filter = s;
+                    ed.equip_cursor = 0;
+                }
                 Some(s) => ed.apply_text(idx, s),
                 None => ed.message = String::from("input cancelled"),
             }

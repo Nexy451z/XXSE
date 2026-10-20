@@ -2128,3 +2128,69 @@ fn armour_names_index_by_series_and_part() {
     let eq = mhnx_core::equip::Equipment { kind: 5, ..eq };
     assert_eq!(mhnx_core::equip::name(&eq), "レザーパンツ");
 }
+
+#[test]
+fn the_console_equipment_screen_lists_real_names() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    assert_eq!(ed.screen, Screen::Slots, "open_save lands on the slot list");
+    ed.input(Key::Minus);
+    assert_eq!(ed.screen, Screen::Equip);
+    let all = ed.equipment();
+    assert!(all.len() > 300, "expected a used box, got {}", all.len());
+    // Every row must carry a real name, not the "-" fallback.
+    for e in &all {
+        let n = mhnx_core::equip::name(e);
+        assert_ne!(n, "-", "slot {} ({:?}) has no name", e.index, e.kind);
+    }
+    // And the screen must render the names.
+    let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = lines.join("\n");
+    assert!(joined.contains("EQUIPMENT"), "{}", joined);
+    assert!(joined.contains("ボーンブレイド") || joined.contains("大剣"), "{}", joined);
+    // Navigation stays inside the list.
+    for _ in 0..5 {
+        ed.input(Key::Down);
+    }
+    assert!(ed.equip_cursor <= all.len());
+    assert_eq!(ed.equip_cursor, 5, "five downs should land on row 5");
+    ed.input(Key::Up);
+    assert_eq!(ed.equip_cursor, 4, "up should step back one");
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+}
+
+#[test]
+fn the_console_equipment_filter_narrows_and_clears() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus);
+    let all = ed.equipment().len();
+    ed.input(Key::Y);
+    let (idx, _) = ed.take_text_request().expect("a filter request");
+    assert_eq!(idx, mhnx_core::hbedit::TEXT_EQUIP_FILTER);
+    assert_eq!(idx, usize::MAX - 5, "must not collide");
+    ed.equip_filter = String::from("大剣");
+    ed.equip_cursor = 0;
+    let filtered = ed.equipment();
+    assert!(!filtered.is_empty());
+    assert!(filtered.len() < all, "the filter did not narrow anything");
+    assert!(filtered
+        .iter()
+        .all(|e| mhnx_core::equip::type_name(e.kind).contains("大剣")));
+    ed.input(Key::X);
+    assert_eq!(ed.equipment().len(), all, "X must clear the filter");
+    // Nothing matching must not panic.
+    ed.equip_filter = String::from("zzzz");
+    assert!(ed.equipment().is_empty());
+    ed.input(Key::Down);
+    ed.input(Key::Up);
+    let lines = ed.lines();
+    assert!(lines[0].text.contains("EQUIPMENT"));
+}

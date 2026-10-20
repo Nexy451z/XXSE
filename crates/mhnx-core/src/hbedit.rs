@@ -64,6 +64,8 @@ pub enum Screen {
     SkillPick,
     /// 3DS <-> Switch conversion for the open save.
     Convert,
+    /// The equipment box of the current character.
+    Equip,
     /// Item name search, opened from the item box with R.
     ItemPick,
     /// Download Palicoes (配信オトモ).
@@ -185,6 +187,8 @@ pub const TEXT_SKILL_FILTER: usize = usize::MAX - 2;
 pub const TEXT_QUEST_FILTER: usize = usize::MAX - 3;
 /// Sentinel id for "ask what to call the converted save".
 pub const TEXT_SAVE_NAME: usize = usize::MAX - 4;
+/// Sentinel id for "ask which equipment to show".
+pub const TEXT_EQUIP_FILTER: usize = usize::MAX - 5;
 
 /// The editable character fields, in menu order.
 pub const CHAR_FIELDS: &[(&str, &str)] = &[
@@ -257,6 +261,10 @@ pub struct Editor {
     pub entry_row_cursor: usize,
     /// File name chosen for the converted save, without path or extension.
     pub convert_name: String,
+    /// Equipment list filter and cursor.
+    pub equip_filter: String,
+    /// Cursor over the filtered equipment list.
+    pub equip_cursor: usize,
     /// Quest id / title filter for the save's quest list.
     pub quest_filter: String,
     /// Skill name filter used by the picker.
@@ -332,6 +340,8 @@ impl Editor {
             item_undo: Vec::new(),
             skill_pick_field: 1,
             convert_name: String::new(),
+            equip_filter: String::new(),
+            equip_cursor: 0,
             item_pick_mode: 0,
             entry_item_row: 0,
             entry_row_cursor: 0,
@@ -607,6 +617,7 @@ impl Editor {
             Screen::ItemPick => self.input_item_pick(key),
             Screen::SkillPick => self.input_skill_pick(key),
             Screen::Convert => self.input_convert(key),
+            Screen::Equip => self.input_equip(key),
             Screen::EntryView => match key {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
@@ -1095,6 +1106,12 @@ impl Editor {
                 self.cursor = 0;
                 self.field = 0;
             }
+            // - opens the equipment box: this screen had every other key
+            // spoken for.
+            Key::Minus => {
+                self.screen = Screen::Equip;
+                self.equip_cursor = 0;
+            }
             Key::X => {
                 self.screen = Screen::Items;
                 self.cursor = 0;
@@ -1367,6 +1384,55 @@ impl Editor {
             bytes,
         });
         self.message = alloc::format!("writing {} -> {}", what, path);
+    }
+
+    /// Equipment of the current slot, after the filter.
+    pub fn equipment(&self) -> Vec<crate::equip::Equipment> {
+        let Some(save) = &self.save else {
+            return Vec::new();
+        };
+        let Some(box_) = save.equipment_box(self.slot) else {
+            return Vec::new();
+        };
+        let needle = self.equip_filter.trim().to_lowercase();
+        crate::equip::decode_box(&box_)
+            .into_iter()
+            .filter(|e| !e.is_empty())
+            .filter(|e| {
+                if needle.is_empty() {
+                    return true;
+                }
+                crate::equip::name(e).to_lowercase().contains(&needle)
+                    || crate::equip::type_name(e.kind)
+                        .to_lowercase()
+                        .contains(&needle)
+            })
+            .collect()
+    }
+
+    fn input_equip(&mut self, key: Key) {
+        let n = self.equipment().len();
+        match key {
+            Key::Up => self.equip_cursor = self.equip_cursor.saturating_sub(1),
+            Key::Down => {
+                if n > 0 {
+                    self.equip_cursor = (self.equip_cursor + 1).min(n - 1);
+                }
+            }
+            Key::Y => {
+                self.pending_text = Some((TEXT_EQUIP_FILTER, self.equip_filter.clone()));
+            }
+            Key::X => {
+                self.equip_filter.clear();
+                self.equip_cursor = 0;
+            }
+            Key::B => {
+                self.screen = Screen::Slots;
+                self.cursor = self.slot;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
     }
 
     fn input_convert(&mut self, key: Key) {
@@ -2376,6 +2442,51 @@ impl Editor {
                 push(
                     &mut out,
                     String::from("  A delete  Y edit  L new  X write save  B back"),
+                    false,
+                    false,
+                );
+            }
+            Screen::Equip => {
+                let all = self.equipment();
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "EQUIPMENT   slot {}   {} shown{}",
+                        self.slot + 1,
+                        all.len(),
+                        if self.equip_filter.trim().is_empty() {
+                            alloc::string::String::new()
+                        } else {
+                            alloc::format!("   filter: {}", self.equip_filter)
+                        }
+                    ),
+                    false,
+                    false,
+                );
+                if all.is_empty() {
+                    push(&mut out, String::from("  (nothing matches)"), false, false);
+                }
+                let mut start = self.equip_cursor.saturating_sub(8);
+                if start + 16 > all.len() {
+                    start = all.len().saturating_sub(16);
+                }
+                for (i, e) in all.iter().enumerate().skip(start).take(16) {
+                    push(
+                        &mut out,
+                        alloc::format!(
+                            "  {:>4}  {:<12} Lv{:<3} {}",
+                            e.index,
+                            crate::equip::type_name(e.kind),
+                            e.level,
+                            crate::equip::name(e)
+                        ),
+                        true,
+                        i == self.equip_cursor,
+                    );
+                }
+                push(
+                    &mut out,
+                    String::from("  Up/Down row  Y filter  X clear  B back"),
                     false,
                     false,
                 );
