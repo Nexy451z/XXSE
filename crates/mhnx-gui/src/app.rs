@@ -440,6 +440,44 @@ impl MhnxEditor {
         }
     }
 
+    /// Install the archive that is open into a free quest slot.
+    ///
+    /// Unlike write_arc_to_save this does not need the quest to be in the
+    /// save already: add_quest writes the payload and sets the catalogue bit
+    /// together, which is what makes a brand new quest appear in game.
+    pub fn add_open_arc_to_save(&mut self) {
+        let Some(arc) = &self.arc else {
+            self.message = "先に .arc を開いてください".to_owned();
+            return;
+        };
+        let bytes = match arc.to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = format!("再構築失敗: {}", e);
+                return;
+            }
+        };
+        let Some(id) = mhnx_core::hbedit::quest_id_of_arc(&bytes) else {
+            self.message = "クエストIDが読めません（.mib がない）".to_owned();
+            return;
+        };
+        let Some(save) = &mut self.save else {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        };
+        match dlc::add_quest(save, id, &bytes) {
+            Ok(slot) => {
+                self.dirty = true;
+                self.message = format!(
+                    "クエスト {} を枠 {} に追加しました（{} バイト）",
+                    id,
+                    slot,
+                    bytes.len()
+                );
+            }
+            Err(e) => self.message = format!("追加できません: {}", e),
+        }
+    }
     /// Rebuild the open archive and write it back into the save.
     ///
     /// Only works for an archive that came out of the save, and only for a
@@ -2252,37 +2290,92 @@ impl MhnxEditor {
 
     fn tab_guild(&mut self, ui: &mut egui::Ui) {
         ui.heading("ギルドカード");
-        let Some(save) = &self.save else {
-            ui.label("セーブを開くと、ギルドカードと闘技大会の記録を表示します");
-            return;
+        // Everything below is copied out first: the edit controls need a
+        // mutable borrow of the save, which cannot coexist with reading it.
+        let (hr, time, id, comment, log) = {
+            let Some(save) = &self.save else {
+                ui.label("セーブを開くと、ギルドカードと闘技大会の記録を表示します");
+                return;
+            };
+            let slot = self.slot;
+            (
+                mhnx_core::guildcard::hunter_rank(save, slot).unwrap_or(0),
+                mhnx_core::guildcard::play_time(save, slot).unwrap_or(0),
+                mhnx_core::guildcard::card_id(save, slot).unwrap_or([0; 8]),
+                mhnx_core::guildcard::comment(save, slot).unwrap_or_default(),
+                mhnx_core::guildcard::arena(save, slot),
+            )
         };
         let slot = self.slot;
-        let hr = mhnx_core::guildcard::hunter_rank(save, slot).unwrap_or(0);
-        let time = mhnx_core::guildcard::play_time(save, slot).unwrap_or(0);
-        let id = mhnx_core::guildcard::card_id(save, slot).unwrap_or([0; 8]);
-        let comment = mhnx_core::guildcard::comment(save, slot).unwrap_or_default();
+        // The card is editable: rank, its own clock and the comment are all
+        // plain fields, so they can be nudged here like any other number.
+        let mut new_hr = hr;
+        let mut new_time = time;
+        let mut new_comment = comment.clone();
+        let mut changed = false;
         egui::Grid::new("gcinfo").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
             ui.label("ハンターランク");
-            ui.label(format!("{}", hr));
+            if ui
+                .add(egui::DragValue::new(&mut new_hr).range(0..=999))
+                .changed()
+            {
+                changed = true;
+            }
             ui.end_row();
-            ui.label("カード側プレイ時間");
-            ui.label(format!(
-                "{}:{:02}:{:02}",
-                time / 3600,
-                (time % 3600) / 60,
-                time % 60
-            ));
+            ui.label("カード側プレイ時間(秒)");
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut new_time)
+                            .speed(60)
+                            .range(0..=100_000_000u32),
+                    )
+                    .changed()
+                {
+                    changed = true;
+                }
+                ui.label(format!(
+                    "= {}:{:02}:{:02}",
+                    new_time / 3600,
+                    (new_time % 3600) / 60,
+                    new_time % 60
+                ));
+            });
             ui.end_row();
             ui.label("カードID");
             ui.label(id.iter().map(|b| format!("{:02X}", b)).collect::<String>());
             ui.end_row();
             ui.label("コメント");
-            ui.label(comment);
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut new_comment)
+                        .desired_width(360.0)
+                        .char_limit(mhnx_core::guildcard::GC_COMMENT_CHARS),
+                )
+                .changed()
+            {
+                changed = true;
+            }
             ui.end_row();
         });
+        if changed {
+            if let Some(save) = &mut self.save {
+                if new_hr != hr {
+                    mhnx_core::guildcard::set_hunter_rank(save, slot, new_hr);
+                }
+                if new_time != time {
+                    mhnx_core::guildcard::set_play_time(save, slot, new_time);
+                }
+                if new_comment != comment {
+                    mhnx_core::guildcard::set_comment(save, slot, &new_comment);
+                }
+            }
+            self.dirty = true;
+            self.message = "ギルドカードを更新しました（まだファイルには書いていません）".to_owned();
+        }
+        ui.separator();
         ui.separator();
         ui.label(egui::RichText::new("闘技大会の記録（タイムは 1/100 秒）").strong());
-        let log = mhnx_core::guildcard::arena(save, slot);
         if log.iter().all(|e| e.is_empty()) {
             ui.label("記録はありません");
             return;
@@ -2392,6 +2485,16 @@ impl MhnxEditor {
             ui.label(format!("導入済み {} 件", quests.len()));
             ui.label("絞り込み");
             ui.text_edit_singleline(&mut self.dlc_filter);
+            // Adding a quest needs an archive, so the button only appears when
+            // one is open; the id is read from its .mib rather than its name.
+            let can_add = self.arc.is_some();
+            if ui
+                .add_enabled(can_add, egui::Button::new("開いている .arc を追加"))
+                .on_hover_text("いま開いているクエストを、空き枠へ新規に導入します")
+                .clicked()
+            {
+                self.add_open_arc_to_save();
+            }
         });
         // The 45 quest-equipment entries were only readable once the low mask
         // bits were proven to index this array directly.

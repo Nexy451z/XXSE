@@ -334,7 +334,11 @@ fn quest_flow_installs_a_download_quest_into_the_save() {
     let had_it = dlc::find_quest(ed.save.as_ref().unwrap(), 1010165).is_some();
     let before_n = dlc::list_quests(ed.save.as_ref().unwrap()).len();
     ed.input(Key::X);
-    assert!(ed.message.contains("installed"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("上書き") || ed.message.contains("追加"),
+        "message was {}",
+        ed.message
+    );
     let list = dlc::list_quests(ed.save.as_ref().unwrap());
     // Installing a quest that is already there replaces it in place, which is
     // the safe edit: the slot and the id never move.
@@ -784,7 +788,11 @@ fn editing_a_quest_from_the_save_writes_back_to_the_same_slot() {
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::ArcEntries);
     ed.input(Key::X);
-    assert!(ed.message.contains("installed"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("上書き") || ed.message.contains("追加"),
+        "message was {}",
+        ed.message
+    );
     let after = ed.save.as_ref().unwrap().to_bytes();
     assert_eq!(after.len(), before.len());
     let diff = (0..before.len()).filter(|i| before[*i] != after[*i]).count();
@@ -3093,4 +3101,1135 @@ fn the_console_shows_the_sets() {
     assert!(joined.contains("剣士"), "{}", joined);
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::Slots);
+}
+
+// ---------------------------------------------------------------------------
+// The console save entry.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_save_list_offers_the_console_save_first() {
+    // The pseudo path is not a real file: the console layer mounts the NAND
+    // when it sees it, so it must never be handed to the file reader.
+    assert_eq!(mhnx_core::hbedit::CONSOLE_SAVE, "nand:/system");
+    assert!(mhnx_core::hbedit::CONSOLE_SAVE.starts_with("nand:"));
+}
+
+#[test]
+fn the_console_entry_is_labelled_in_the_list() {
+    let mut ed = Editor::new();
+    ed.set_save_files(vec![String::from(mhnx_core::hbedit::CONSOLE_SAVE)]);
+    let joined = ed
+        .lines()
+        .iter()
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("SAVE FILES"), "{}", joined);
+    assert!(joined.contains("NAND"), "the console entry should be labelled: {}", joined);
+    // Selecting it asks the platform layer to mount, not to read a file.
+    ed.input(Key::A);
+    assert_eq!(ed.take_request(), Some(Request::ReadSave(0)));
+}
+
+
+// ===========================================================================
+// Console UI audit - docs/review_console_audit.md
+//
+// The questions a player asked about the console build: which screens can be
+// reached and with which button, can the item / talisman / quest editors really
+// change anything, can a quest be added, and does the button guide on screen
+// agree with the keys the state machine handles?
+//
+// audit_*  behaviour that works today (stays green)
+// gap_*    today's missing or wrong behaviour; it fails the moment the gap is
+//          closed, which is the reminder to turn it into an audit_* test
+// spec_*   what the UI should do; ignored until the gap is closed
+//          (cargo test -- --ignored lists what is still missing)
+// ===========================================================================
+
+/// Every Screen variant, so the reachability test cannot miss a new one.
+const AUDIT_SCREENS: [Screen; 24] = [
+    Screen::SaveList,
+    Screen::Slots,
+    Screen::Char,
+    Screen::Items,
+    Screen::ItemPick,
+    Screen::Charms,
+    Screen::CharmEdit,
+    Screen::SkillPick,
+    Screen::Equip,
+    Screen::QuestEquip,
+    Screen::Hunts,
+    Screen::Guild,
+    Screen::Roster,
+    Screen::Sets,
+    Screen::Palico,
+    Screen::Convert,
+    Screen::Options,
+    Screen::SaveQuests,
+    Screen::ArcList,
+    Screen::ArcEntries,
+    Screen::EntryView,
+    Screen::Mib,
+    Screen::Gmd,
+    Screen::Check,
+];
+
+/// Keys that could plausibly start an edit on a record screen.
+const AUDIT_EDIT_KEYS: [Key; 7] = [
+    Key::A,
+    Key::X,
+    Key::Y,
+    Key::L,
+    Key::R,
+    Key::Left,
+    Key::Right,
+];
+
+fn audit_screen_name(s: Screen) -> &'static str {
+    match s {
+        Screen::SaveList => "SaveList",
+        Screen::Slots => "Slots",
+        Screen::Char => "Char",
+        Screen::Items => "Items",
+        Screen::ItemPick => "ItemPick",
+        Screen::Charms => "Charms",
+        Screen::CharmEdit => "CharmEdit",
+        Screen::SkillPick => "SkillPick",
+        Screen::Equip => "Equip",
+        Screen::QuestEquip => "QuestEquip",
+        Screen::Hunts => "Hunts",
+        Screen::Guild => "Guild",
+        Screen::Roster => "Roster",
+        Screen::Sets => "Sets",
+        Screen::Palico => "Palico",
+        Screen::Convert => "Convert",
+        Screen::Options => "Options",
+        Screen::SaveQuests => "SaveQuests",
+        Screen::ArcList => "ArcList",
+        Screen::ArcEntries => "ArcEntries",
+        Screen::EntryView => "EntryView",
+        Screen::Mib => "Mib",
+        Screen::Gmd => "Gmd",
+        Screen::Check => "Check",
+    }
+}
+
+fn audit_note(ed: &Editor, seen: &mut Vec<&'static str>) {
+    let name = audit_screen_name(ed.screen);
+    if !seen.contains(&name) {
+        seen.push(name);
+    }
+}
+
+fn audit_walk(ed: &mut Editor, key: Key, seen: &mut Vec<&'static str>) {
+    ed.input(key);
+    audit_note(ed, seen);
+}
+
+/// The sample quest used by the entry tests, falling back to the one next to
+/// the save editor on this machine.
+fn audit_arc() -> Option<PathBuf> {
+    if let Some(p) = sample_arc() {
+        return Some(p);
+    }
+    let p = real_arc();
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+/// Press every edit candidate on a screen and prove that none of them moves the
+/// save. That is the difference between "this screen is an editor" and "this
+/// screen is a viewer".
+fn audit_assert_read_only(what: &str, setup: fn(&mut Editor), keys: &[Key]) {
+    for key in keys {
+        let mut ed = Editor::new();
+        open_save(&mut ed);
+        setup(&mut ed);
+        let before = ed.save.as_ref().expect("a save").body().to_vec();
+        ed.input(*key);
+        assert!(
+            !ed.dirty,
+            "{}: {:?} marked the save dirty - it has no writer for this record",
+            what,
+            key
+        );
+        assert!(
+            ed.take_write().is_none(),
+            "{}: {:?} queued a save write",
+            what,
+            key
+        );
+        assert!(
+            ed.take_text_request().is_none(),
+            "{}: {:?} opened a text editor",
+            what,
+            key
+        );
+        assert_eq!(
+            ed.save.as_ref().expect("a save").body(),
+            before.as_slice(),
+            "{}: {:?} changed the save",
+            what,
+            key
+        );
+    }
+}
+
+/// The Switch build's actions() table, read straight out of its source.
+///
+/// That crate needs the Nintendo SDK, so it is not part of this workspace and
+/// the test cannot call the function. Reading the text keeps the comparison
+/// honest: this is the table the console really compiles.
+const SWITCH_EDITOR_SRC: &str = include_str!("../../../switch/src/editor.rs");
+
+/// (screen name, [(key, label)]) for every arm of actions().
+fn switch_hint_arms() -> Vec<(String, Vec<(String, String)>)> {
+    let start = SWITCH_EDITOR_SRC
+        .find("fn actions(screen: mhnx_core::hbedit::Screen)")
+        .expect("actions() is gone - the audit must be updated");
+    let body = &SWITCH_EDITOR_SRC[start..];
+    let body = &body[..body.find("\n}").expect("actions() has no closing brace")];
+    let mut arms = Vec::new();
+    let mut rest = body;
+    loop {
+        let Some(pos) = rest.find("=>") else { break };
+        let name: String = rest[..pos]
+            .trim_end()
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        let after = rest[pos + 2..].trim_start();
+        if name.is_empty() || !after.starts_with("&[") {
+            rest = &rest[pos + 2..];
+            continue;
+        }
+        let arr = &after[1..];
+        let close = arr.find(']').expect("an arm must end with ]");
+        let mut entries = Vec::new();
+        let mut tail = &arr[..close];
+        while let Some(k) = tail.find("(\"") {
+            let t1 = &tail[k + 2..];
+            let Some(e1) = t1.find('"') else { break };
+            let key = &t1[..e1];
+            let t2 = &t1[e1 + 1..];
+            let Some(q2) = t2.find('"') else { break };
+            let t3 = &t2[q2 + 1..];
+            let Some(e2) = t3.find('"') else { break };
+            entries.push((key.to_string(), t3[..e2].to_string()));
+            tail = &t3[e2..];
+        }
+        arms.push((name, entries));
+        rest = &after[close + 2..];
+    }
+    arms
+}
+
+fn hint_keys(arms: &[(String, Vec<(String, String)>)], screen: &str) -> Vec<String> {
+    arms.iter()
+        .find(|(n, _)| n == screen)
+        .map(|(_, e)| e.iter().map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// The sample quest repacked with another id in its .mib.
+fn quest_payload_with_id(arc: &PathBuf, id: i32) -> Option<Vec<u8>> {
+    let raw = std::fs::read(arc).ok()?;
+    let mut a = Arc::parse(&raw).ok()?;
+    let i = a
+        .entries
+        .iter()
+        .position(|e| extension_for(e.type_hash) == Some("mib"))?;
+    if a.entries.get(i)?.data.len() < 0x10 {
+        return None;
+    }
+    a.entries[i].data[0x0C..0x10].copy_from_slice(&id.to_le_bytes());
+    a.to_bytes().ok()
+}
+
+/// A quest id that the embedded catalogue knows but this save does not hold.
+fn quest_id_the_save_does_not_have(save: &Save) -> Option<i32> {
+    (1_010_000..1_020_000)
+        .find(|id| !dlc::is_installed(save, *id) && dlc::bit_for_quest(*id).is_some())
+}
+
+#[test]
+fn audit_every_screen_is_reachable_by_keys() {
+    if !real_save().exists() {
+        return;
+    }
+    let Some(arc) = audit_arc() else { return };
+    let mut ed = Editor::new();
+    ed.set_arc_files(vec![arc.to_string_lossy().to_string()]);
+    let mut seen: Vec<&'static str> = Vec::new();
+    audit_note(&ed, &mut seen);
+
+    macro_rules! press {
+        ($($k:expr),+ $(,)?) => {{
+            $( audit_walk(&mut ed, $k, &mut seen); )+
+        }};
+    }
+
+    // SaveList -> Slots: A asks the I/O layer for the bytes.
+    open_save(&mut ed);
+    audit_note(&ed, &mut seen);
+    assert_eq!(ed.screen, Screen::Slots);
+
+    // Slot screen: X items, R download palicoes, L charms, - equipment,
+    // Y quest files, A character.
+    press!(Key::X);
+    assert_eq!(ed.screen, Screen::Items);
+    press!(Key::R);
+    assert_eq!(ed.screen, Screen::ItemPick);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Items);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+
+    press!(Key::Minus);
+    assert_eq!(ed.screen, Screen::Equip);
+    press!(Key::L);
+    assert_eq!(ed.screen, Screen::Guild);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+    press!(Key::Minus, Key::R);
+    assert_eq!(ed.screen, Screen::Roster);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+
+    press!(Key::R);
+    assert_eq!(ed.screen, Screen::Palico);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+
+    // Charms -> CharmEdit -> SkillPick.
+    press!(Key::L);
+    assert_eq!(ed.screen, Screen::Charms);
+    press!(Key::L);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    press!(Key::Y);
+    assert_eq!(ed.screen, Screen::SkillPick);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Charms);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+
+    // Quest files: Y on the slot screen, A opens the .arc.
+    press!(Key::Y);
+    assert_eq!(ed.screen, Screen::ArcList);
+    ed.input(Key::A);
+    service(&mut ed);
+    audit_note(&ed, &mut seen);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+
+    press!(Key::Y);
+    assert_eq!(ed.screen, Screen::EntryView);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    assert!(!ed.mib_bytes().is_empty(), "the .arc must open on its .mib");
+    press!(Key::A);
+    assert_eq!(ed.screen, Screen::Mib);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    // Walk the entry cursor to the .gmd and open it.
+    let gmd = ed
+        .arc
+        .as_ref()
+        .expect("an arc")
+        .entries
+        .iter()
+        .position(|e| extension_for(e.type_hash) == Some("gmd"))
+        .expect("a .gmd entry");
+    while ed.cursor != gmd {
+        press!(Key::Down);
+    }
+    press!(Key::A);
+    assert_eq!(ed.screen, Screen::Gmd);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    press!(Key::L);
+    assert_eq!(ed.screen, Screen::Check);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::ArcList);
+
+    press!(Key::X);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    press!(Key::L);
+    assert_eq!(ed.screen, Screen::QuestEquip);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::ArcList);
+    press!(Key::Y);
+    assert_eq!(ed.screen, Screen::SaveList);
+
+    // The rest hang off the save list and the character screen.
+    press!(Key::L);
+    assert_eq!(ed.screen, Screen::Convert);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::SaveList);
+    press!(Key::X);
+    assert_eq!(ed.screen, Screen::Options);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::SaveList);
+    ed.input(Key::A);
+    service(&mut ed);
+    assert_eq!(ed.screen, Screen::Slots);
+    press!(Key::A);
+    assert_eq!(ed.screen, Screen::Char);
+    press!(Key::Minus);
+    assert_eq!(ed.screen, Screen::Hunts);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+    press!(Key::A, Key::Y);
+    assert_eq!(ed.screen, Screen::Sets);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+
+    let missing: Vec<&str> = AUDIT_SCREENS
+        .iter()
+        .map(|s| audit_screen_name(*s))
+        .filter(|n| !seen.contains(n))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "screens no key press reaches: {:?} (reached {:?})",
+        missing,
+        seen
+    );
+    assert_eq!(seen.len(), AUDIT_SCREENS.len(), "reached {:?}", seen);
+}
+
+#[test]
+fn audit_the_item_type_can_be_changed_through_the_picker() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::X);
+    assert_eq!(ed.screen, Screen::Items);
+    let vis = ed.visible_items();
+    assert!(!vis.is_empty(), "the dump has item slots");
+    let target = vis[0];
+    let old = ed
+        .save
+        .as_ref()
+        .expect("a save")
+        .read_item_box(ed.slot)
+        .expect("a box")[target]
+        .id;
+
+    ed.input(Key::R);
+    assert_eq!(ed.screen, Screen::ItemPick, "R must open the type picker");
+    assert_eq!(ed.item_pick_target, target, "the picker must aim at the cursor");
+    assert!(ed.item_pick_matches().len() > 3, "the name table must be loaded");
+
+    // Move until the highlighted id is a different one.
+    ed.input(Key::Down);
+    let mut want = ed.item_pick_matches()[ed.item_pick_cursor];
+    let mut guard = 0;
+    while want == old && guard < 8 {
+        ed.input(Key::Down);
+        want = ed.item_pick_matches()[ed.item_pick_cursor];
+        guard += 1;
+    }
+    assert_ne!(want, old, "the test must pick another item");
+
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Items);
+    let after = ed
+        .save
+        .as_ref()
+        .expect("a save")
+        .read_item_box(ed.slot)
+        .expect("a box")[target];
+    assert_eq!(after.id, want, "the chosen id must land in the box");
+    assert!(after.count >= 1, "a new item must have a count");
+    assert!(ed.dirty);
+    assert!(!ed.item_undo.is_empty(), "the replacement must be undoable");
+
+    // On the item box A writes the save and X changes the step, unlike the
+    // record screens where X is the write key.
+    assert_eq!(ed.step, 0);
+    ed.input(Key::X);
+    assert_eq!(ed.step, 1, "X is the step key on this screen");
+    ed.input(Key::A);
+    match ed.take_write() {
+        Some(Write::File { bytes, .. }) => {
+            let s = Save::from_bytes(&bytes).expect("a valid container");
+            assert_eq!(
+                s.read_item_box(ed.slot).expect("a box")[target].id,
+                want,
+                "the new type must survive the write"
+            );
+        }
+        other => panic!("expected a save write, got {:?}", other),
+    }
+}
+
+#[test]
+fn audit_a_charm_can_be_edited_through_the_skill_picker() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Charms);
+    assert!(!ed.charms().is_empty(), "the sample has talismans");
+
+    ed.input(Key::Y);
+    assert_eq!(
+        ed.screen,
+        Screen::CharmEdit,
+        "Y must edit the charm under the cursor"
+    );
+    let seed = ed.charm_edit.expect("the form is open");
+    let points0 = seed.points1;
+
+    // The form navigates with Up/Down and edits with Left/Right.
+    ed.input(Key::Down);
+    assert_eq!(ed.charm_edit.expect("open").field, 3);
+    ed.input(Key::Right);
+    assert_eq!(
+        ed.charm_edit.expect("open").points1,
+        points0 + 1,
+        "the points row must move"
+    );
+    ed.input(Key::Up);
+    assert_eq!(ed.charm_edit.expect("open").field, 2);
+
+    // Y on a skill row opens the name picker.
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::SkillPick);
+    assert!(ed.skill_pick_matches().len() > 3);
+    ed.input(Key::Down);
+    ed.input(Key::Down);
+    let chosen = ed.skill_pick_matches()[ed.skill_pick_cursor];
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    assert_eq!(ed.charm_edit.expect("open").skill1, chosen);
+
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Charms);
+    assert!(ed.dirty);
+    let idx = ed.charm_edit.expect("kept").index;
+
+    ed.input(Key::X);
+    match ed.take_write() {
+        Some(Write::File { bytes, .. }) => {
+            let s = Save::from_bytes(&bytes).expect("a valid container");
+            let list = s.charms(ed.slot).expect("charms");
+            let c = list
+                .iter()
+                .find(|c| c.index == idx)
+                .expect("the edited charm must be in the box");
+            assert_eq!(c.skill1, chosen, "the skill must survive the write");
+            assert_eq!(c.points1, points0 + 1, "the points must survive the write");
+        }
+        other => panic!("expected a save write, got {:?}", other),
+    }
+}
+
+#[test]
+fn audit_a_quest_inside_the_save_can_be_edited_and_written_back() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    let before = ed.save.as_ref().expect("a save").to_bytes();
+
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::ArcList);
+    ed.input(Key::X);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    let target = ed.save_quests()[0].clone();
+    assert!(
+        !target.data.is_empty(),
+        "quest {} has no payload",
+        target.quest_id
+    );
+
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Mib);
+    goto_mib_field(&mut ed, "quest_level");
+    let lv = questfields::MIB_FIELDS
+        .iter()
+        .find(|f| f.key == "quest_level")
+        .expect("a quest_level field");
+    let before_val = questfields::read_u32(ed.mib_bytes(), lv.offset, lv.kind).unwrap();
+    ed.input(Key::Right);
+    assert_eq!(
+        questfields::read_u32(ed.mib_bytes(), lv.offset, lv.kind).unwrap(),
+        before_val + 1
+    );
+
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    ed.input(Key::X);
+    assert!(
+        ed.message.contains("上書き") || ed.message.contains("追加"),
+        "message was {}",
+        ed.message
+    );
+
+    let written = ed
+        .save_quests()
+        .into_iter()
+        .find(|q| q.slot == target.slot)
+        .expect("the quest must still be there");
+    assert_eq!(written.quest_id, target.quest_id, "the id must not move");
+    let repacked = ed.arc.as_ref().expect("an arc").to_bytes().expect("repack");
+    assert_eq!(
+        written.data, repacked,
+        "the edited payload must be what landed in the slot"
+    );
+    assert_ne!(
+        ed.save.as_ref().expect("a save").to_bytes(),
+        before,
+        "the edit must reach the save"
+    );
+}
+
+#[test]
+fn audit_a_quest_the_save_does_not_have_can_be_added() {
+    if !real_save().exists() {
+        return;
+    }
+    let Some(arc) = audit_arc() else { return };
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    let Some(id) = quest_id_the_save_does_not_have(ed.save.as_ref().expect("a save")) else {
+        return;
+    };
+    let Some(payload) = quest_payload_with_id(&arc, id) else {
+        return;
+    };
+    let before = dlc::list_quests(ed.save.as_ref().expect("a save")).len();
+
+    // Open the .arc with its .mib id rewritten to a quest this save lacks.
+    ed.open_arc_bytes("patched.arc", &payload);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    ed.input(Key::X);
+    assert!(
+        ed.message.contains("追加"),
+        "the console must say it added the quest; message was {}",
+        ed.message
+    );
+    assert_eq!(
+        dlc::list_quests(ed.save.as_ref().expect("a save")).len(),
+        before + 1,
+        "the quest must take a slot"
+    );
+    assert!(dlc::is_installed(ed.save.as_ref().expect("a save"), id));
+}
+
+#[test]
+fn gap_the_guild_card_is_display_only() {
+    if !real_save().exists() {
+        return;
+    }
+    audit_assert_read_only(
+        "Guild",
+        |ed| {
+            ed.input(Key::Minus);
+            ed.input(Key::L);
+            assert_eq!(ed.screen, Screen::Guild);
+        },
+        &AUDIT_EDIT_KEYS,
+    );
+
+    // It renders rank, comment and arena times, which is why it reads as an
+    // editor; nothing on it writes a byte.
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus);
+    ed.input(Key::L);
+    let joined = ed
+        .lines()
+        .iter()
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("GUILD CARD"), "{}", joined);
+    assert!(joined.contains("comment"), "{}", joined);
+}
+
+#[test]
+fn gap_the_palico_roster_is_display_only() {
+    if !real_save().exists() {
+        return;
+    }
+    audit_assert_read_only(
+        "Roster",
+        |ed| {
+            ed.input(Key::Minus);
+            ed.input(Key::R);
+            assert_eq!(ed.screen, Screen::Roster);
+        },
+        &AUDIT_EDIT_KEYS,
+    );
+
+    // Up/Down move the cursor, so the screen looks interactive.
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus);
+    ed.input(Key::R);
+    assert!(!ed.palicos().is_empty());
+    let before = ed.roster_cursor;
+    ed.input(Key::Down);
+    assert_ne!(ed.roster_cursor, before);
+    // palico::set_name / set_exp / set_level / set_enthusiasm exist; no screen
+    // calls them.
+}
+
+#[test]
+fn gap_the_hunt_records_are_display_only() {
+    if !real_save().exists() {
+        return;
+    }
+    audit_assert_read_only(
+        "Hunts",
+        |ed| {
+            ed.input(Key::A);
+            ed.input(Key::Minus);
+            assert_eq!(ed.screen, Screen::Hunts);
+        },
+        &AUDIT_EDIT_KEYS,
+    );
+
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::A);
+    ed.input(Key::Minus);
+    assert!(ed.hunt_rows().len() > 100);
+    // Save::set_hunt_count / set_capture_count / set_monster_size exist and are
+    // exercised by the library tests, but no screen calls them.
+    assert!(ed.hunt_rows().iter().any(|(_, slay, _, _, _)| *slay > 0));
+}
+
+#[test]
+fn gap_the_quest_equipment_list_is_display_only() {
+    if !real_save().exists() {
+        return;
+    }
+    audit_assert_read_only(
+        "QuestEquip",
+        |ed| {
+            ed.input(Key::Y);
+            ed.input(Key::X);
+            ed.input(Key::L);
+            assert_eq!(ed.screen, Screen::QuestEquip);
+        },
+        &AUDIT_EDIT_KEYS,
+    );
+
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Y);
+    ed.input(Key::X);
+    ed.input(Key::L);
+    let list = ed.quest_equipment();
+    assert!(!list.is_empty(), "the DLC section has the 45 entries");
+}
+
+#[test]
+fn gap_the_my_sets_screen_is_display_only() {
+    if !real_save().exists() {
+        return;
+    }
+    audit_assert_read_only(
+        "Sets",
+        |ed| {
+            ed.input(Key::A);
+            ed.input(Key::Y);
+            assert_eq!(ed.screen, Screen::Sets);
+        },
+        &AUDIT_EDIT_KEYS,
+    );
+    // myset::set_item_set_name / set_equip_set_name / set_item_set_entry exist
+    // and are tested, but this screen only lists the sets.
+}
+
+#[test]
+fn gap_the_equipment_box_is_display_only() {
+    if !real_save().exists() {
+        return;
+    }
+    // Y opens the filter prompt and X clears it, so only the keys that would
+    // have to start an edit are probed here.
+    audit_assert_read_only(
+        "Equip",
+        |ed| {
+            ed.input(Key::Minus);
+            assert_eq!(ed.screen, Screen::Equip);
+        },
+        &[Key::A, Key::Left, Key::Right, Key::Up, Key::Down],
+    );
+
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus);
+    assert!(!ed.equipment().is_empty(), "the box decodes to named items");
+    // Save::equipment_box_mut has no editor in front of it.
+}
+
+/// The entry view used to advertise X and have no arm for it, so the key did
+/// nothing. This is the guard that it still writes.
+#[test]
+fn audit_the_entry_view_x_writes_the_archive() {
+    let Some(arc) = audit_arc() else { return };
+    let bytes = std::fs::read(&arc).expect("the sample arc");
+    let mut ed = Editor::new();
+    ed.open_arc_bytes(&arc.to_string_lossy(), &bytes);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    let rem = ed
+        .arc
+        .as_ref()
+        .expect("an arc")
+        .entries
+        .iter()
+        .position(|e| extension_for(e.type_hash) == Some("rem"))
+        .expect("a .rem entry");
+    while ed.cursor != rem {
+        ed.input(Key::Down);
+    }
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::EntryView);
+    let footer = ed.lines().last().map(|l| l.text.clone()).unwrap_or_default();
+    assert!(
+        footer.contains("X write .arc"),
+        "the footer advertises the key: {}",
+        footer
+    );
+
+    ed.input(Key::X);
+    assert_eq!(ed.screen, Screen::EntryView, "X must not navigate");
+    assert!(
+        ed.take_write().is_some(),
+        "X on the entry view must ask for the archive to be written"
+    );
+}
+
+#[test]
+fn gap_the_arc_list_has_no_back_key() {
+    if !real_save().exists() {
+        return;
+    }
+    let arms = switch_hint_arms();
+    assert!(
+        !hint_keys(&arms, "ArcList").iter().any(|k| k == "B"),
+        "the chips do not mention B either"
+    );
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::ArcList);
+    let message = ed.message.clone();
+    ed.input(Key::B);
+    assert_eq!(
+        ed.screen,
+        Screen::ArcList,
+        "B is the back button on every other screen"
+    );
+    assert_eq!(ed.message, message);
+    // The only way back is Y, which is labelled as the save editor.
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::SaveList);
+}
+
+#[test]
+fn gap_the_slots_screen_calls_the_download_palico_list_the_roster() {
+    let arms = switch_hint_arms();
+    let slots = arms
+        .iter()
+        .find(|(n, _)| n == "Slots")
+        .map(|(_, e)| e.clone())
+        .expect("an arm for the slot screen");
+    let label = slots
+        .iter()
+        .find(|(k, _)| k == "R")
+        .map(|(_, l)| l.clone())
+        .expect("R on the slot screen");
+    assert_eq!(label, "オトモ", "the chip promises the roster");
+
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::R);
+    assert_eq!(
+        ed.screen,
+        Screen::Palico,
+        "R opens the download catalogue, not the palico roster"
+    );
+    // The real roster is two screens away and the slot screen never says so.
+    ed.input(Key::B);
+    ed.input(Key::Minus);
+    ed.input(Key::R);
+    assert_eq!(ed.screen, Screen::Roster);
+}
+
+/// The hint table used to spell the charm screen "Charm", which is not a
+/// variant: it was a binding that matched every screen and made the seventeen
+/// arms below it unreachable, so those screens all showed charm chips.
+#[test]
+fn audit_the_hint_table_has_no_catch_all_arm() {
+    let arms = switch_hint_arms();
+    let names: Vec<&str> = AUDIT_SCREENS
+        .iter()
+        .map(|s| audit_screen_name(*s))
+        .collect();
+    assert_eq!(
+        arms.len(),
+        24,
+        "arms: {:?}",
+        arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+    );
+    assert!(
+        !arms.iter().any(|(n, _)| n == "Charm"),
+        "Charm is not a variant, so it would match every screen"
+    );
+    // Every arm must name a real screen: a binding would swallow the rest.
+    assert!(
+        arms.iter().all(|(n, _)| names.contains(&n.as_str())),
+        "an arm names something that is not a screen: {:?}",
+        arms.iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| !names.contains(n))
+            .collect::<Vec<_>>()
+    );
+    // And the charm screen itself still has its own arm with its own keys.
+    assert!(
+        !hint_keys(&arms, "Charms").is_empty(),
+        "the charm screen lost its chips"
+    );
+}
+
+#[test]
+fn audit_the_hint_table_names_the_keys_that_work() {
+    let arms = switch_hint_arms();
+
+    // Every chip must name a key the screen actually handles, and the charm
+    // screen has to advertise the L that creates a talisman.
+    assert!(
+        hint_keys(&arms, "Charms").iter().any(|k| k == "L"),
+        "the charm screen creates with L, so it must say so"
+    );
+    // ArcEntries: - and R write quests out.
+    let arc = hint_keys(&arms, "ArcEntries");
+    for k in ["-", "R"] {
+        assert!(
+            arc.iter().any(|h| h == k),
+            "ArcEntries handles {} but does not say so: {:?}",
+            k,
+            arc
+        );
+    }
+    // SkillPick and Mib both change the step with X.
+    assert!(hint_keys(&arms, "SkillPick").iter().any(|k| k == "X"));
+    assert!(hint_keys(&arms, "Mib").iter().any(|k| k == "X"));
+    // Palico: L / R switch the name language.
+    let palico = hint_keys(&arms, "Palico");
+    for k in ["L", "R"] {
+        assert!(
+            palico.iter().any(|h| h == k),
+            "Palico handles {} but does not say so",
+            k
+        );
+    }
+
+    if !real_save().exists() {
+        return;
+    }
+    // Charms: L really creates a new talisman.
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Charms);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::CharmEdit, "L must create a charm");
+
+    // Palico: L really switches the language.
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::R);
+    assert_eq!(ed.screen, Screen::Palico);
+    assert_eq!(ed.palico_lang, 0);
+    ed.input(Key::L);
+    assert_eq!(ed.palico_lang, 1, "L must switch the language");
+
+    // SkillPick: X really clears the filter.
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    ed.input(Key::L);
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::SkillPick);
+    ed.apply_skill_filter(String::from("zzz"));
+    assert!(!ed.skill_pick_filter.is_empty());
+    ed.input(Key::X);
+    assert!(ed.skill_pick_filter.is_empty(), "X clears the filter");
+
+    // The core footer of the slot screen names three keys out of six.
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    let footer = ed.lines().last().map(|l| l.text.clone()).unwrap_or_default();
+    assert!(footer.contains("A char edit"), "{}", footer);
+    for k in ["L", "R", "-", "Y"] {
+        assert!(
+            !footer.contains(k),
+            "the slot footer now names {}: {}",
+            k,
+            footer
+        );
+    }
+
+    let Some(arc) = audit_arc() else { return };
+    let bytes = std::fs::read(&arc).expect("the sample arc");
+
+    // ArcEntries: - really asks the I/O layer for that quest.
+    let mut ed = Editor::new();
+    ed.open_arc_bytes(&arc.to_string_lossy(), &bytes);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+    assert_eq!(ed.take_request(), None);
+    ed.input(Key::Minus);
+    match ed.take_request() {
+        Some(Request::ExtractQuests { ids }) => assert_eq!(ids.len(), 1),
+        other => panic!("expected one quest, got {:?}", other),
+    }
+
+    // Mib: X really cycles the adjustment step.
+    let mut ed = Editor::new();
+    ed.open_arc_bytes(&arc.to_string_lossy(), &bytes);
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Mib);
+    assert_eq!(ed.step, 0);
+    ed.input(Key::X);
+    assert_eq!(ed.step, 1, "X cycles the step on the .mib screen");
+}
+
+#[test]
+fn gap_the_quest_list_cannot_add_or_remove_a_quest() {
+    if !real_save().exists() {
+        return;
+    }
+    for key in [
+        Key::A,
+        Key::B,
+        Key::L,
+        Key::R,
+        Key::X,
+        Key::Y,
+        Key::Minus,
+        Key::Up,
+        Key::Down,
+        Key::Left,
+        Key::Right,
+    ] {
+        let mut ed = Editor::new();
+        open_save(&mut ed);
+        ed.input(Key::Y);
+        ed.input(Key::X);
+        assert_eq!(ed.screen, Screen::SaveQuests);
+        let before_n = ed.save_quests().len();
+        let before = ed.save.as_ref().expect("a save").to_bytes();
+        ed.input(key);
+        assert_eq!(
+            ed.save_quests().len(),
+            before_n,
+            "{:?} must not add or drop a quest slot",
+            key
+        );
+        assert_eq!(
+            ed.save.as_ref().expect("a save").to_bytes(),
+            before,
+            "{:?} must not touch the save",
+            key
+        );
+    }
+    // dlc::add_quest and dlc::uninstall_quest exist; no screen calls either.
+}
+
+#[test]
+#[ignore = "missing: install_into_save only overwrites an installed quest"]
+fn spec_a_quest_can_be_added_from_an_arc() {
+    if !real_save().exists() {
+        return;
+    }
+    let Some(arc) = audit_arc() else { return };
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    let Some(id) = quest_id_the_save_does_not_have(ed.save.as_ref().expect("a save")) else {
+        return;
+    };
+    let Some(payload) = quest_payload_with_id(&arc, id) else {
+        return;
+    };
+    ed.open_arc_bytes("patched.arc", &payload);
+    ed.input(Key::X);
+    assert!(
+        dlc::is_installed(ed.save.as_ref().expect("a save"), id),
+        "X on an .arc must add a quest the save does not have yet"
+    );
+}
+
+#[test]
+#[ignore = "missing: the guild card screen has no editor"]
+fn spec_the_guild_card_can_be_edited() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Guild);
+    ed.input(Key::A);
+    assert!(
+        ed.dirty,
+        "A on the guild card must open an editor (comment / rank / arena log)"
+    );
+}
+
+#[test]
+#[ignore = "missing: actions() has a catch-all Charm arm"]
+fn spec_every_screen_has_its_own_hint_chips() {
+    let arms = switch_hint_arms();
+    let names: Vec<&str> = AUDIT_SCREENS
+        .iter()
+        .map(|s| audit_screen_name(*s))
+        .collect();
+    for (name, keys) in &arms {
+        assert!(
+            names.contains(&name.as_str()),
+            "actions() has an arm that is not a Screen variant: {} (a bare identifier is a catch-all)",
+            name
+        );
+        assert!(!keys.is_empty(), "{} has no hints", name);
+    }
+    for n in names {
+        assert!(
+            arms.iter().any(|(a, _)| a == n),
+            "no hint arm for {}",
+            n
+        );
+    }
 }
