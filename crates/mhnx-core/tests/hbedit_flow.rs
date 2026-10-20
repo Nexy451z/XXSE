@@ -1346,3 +1346,43 @@ fn a_3ds_save_converts_to_a_switch_container() {
         other => panic!("expected a write, got {:?}", other),
     }
 }
+#[test]
+fn the_quest_list_shows_a_title_on_every_row() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Y); // quest list
+    ed.input(Key::X); // quests inside the save
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    // Titles are decoded once when the screen opens.
+    assert!(
+        ed.quest_titles.len() > 150,
+        "expected the cache to be filled, got {}",
+        ed.quest_titles.len()
+    );
+    let first = ed.save_quests()[0].quest_id;
+    assert!(
+        !ed.quest_title(first).is_empty(),
+        "quest {} has no cached title",
+        first
+    );
+    // Every visible row must carry its title, not just the cursor row.
+    let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let rows: Vec<&String> = lines.iter().filter(|l| l.contains("slot ")).collect();
+    assert!(rows.len() >= 10, "expected a page of rows, got {}", rows.len());
+    let with_title = rows
+        .iter()
+        .filter(|l| {
+            // "slot NNN  id XXXX  NNNN B  <title>"
+            l.split(" B  ").nth(1).map(|t| !t.trim().is_empty()).unwrap_or(false)
+        })
+        .count();
+    assert!(
+        with_title >= rows.len() - 1,
+        "only {} of {} rows carried a title",
+        with_title,
+        rows.len()
+    );
+}

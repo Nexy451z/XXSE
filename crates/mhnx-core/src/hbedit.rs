@@ -223,6 +223,10 @@ pub struct Editor {
     pub charm_cursor: usize,
     /// The charm being edited, if the editor form is open.
     pub charm_edit: Option<CharmEdit>,
+    /// Cached quest titles: (quest id, title). Decoded once when the list
+    /// opens, because inflating a .gmd for every visible row each frame is
+    /// far too slow on the console.
+    pub quest_titles: Vec<(i32, alloc::string::String)>,
     /// Raw item boxes for undo, newest last.
     ///
     /// 5463 bytes each, so the stack is deliberately shallow.
@@ -298,6 +302,7 @@ impl Editor {
             findings: Vec::new(),
             charm_cursor: 0,
             charm_edit: None,
+            quest_titles: Vec::new(),
             item_undo: Vec::new(),
             skill_pick_field: 1,
             skill_pick_filter: String::new(),
@@ -1390,6 +1395,8 @@ impl Editor {
                     return;
                 }
                 let n = self.save_quests().len();
+                // Decode the titles once here rather than per frame.
+                self.refresh_quest_titles();
                 self.screen = Screen::SaveQuests;
                 self.save_quest_cursor = self.save_quest_cursor.min(n.saturating_sub(1));
                 self.cursor = 0;
@@ -1403,6 +1410,34 @@ impl Editor {
             Key::Plus => self.quit = true,
             _ => {}
         }
+    }
+
+    /// Decode every installed quest's title into the cache.
+    pub fn refresh_quest_titles(&mut self) {
+        self.quest_titles.clear();
+        for q in self.save_quests() {
+            if q.data.is_empty() {
+                continue;
+            }
+            let title = crate::arc::Arc::parse(&q.data)
+                .ok()
+                .and_then(|a| {
+                    a.by_ext("gmd")
+                        .and_then(|e| crate::quest::Gmd::from_bytes(&e.data).ok())
+                })
+                .and_then(|g| g.title().map(alloc::string::ToString::to_string))
+                .unwrap_or_default();
+            self.quest_titles.push((q.quest_id, title));
+        }
+    }
+
+    /// Cached title for a quest id.
+    pub fn quest_title(&self, id: i32) -> &str {
+        self.quest_titles
+            .iter()
+            .find(|(q, _)| *q == id)
+            .map(|(_, t)| t.as_str())
+            .unwrap_or("")
     }
 
     /// The download quests stored in the open save, in slot order.
@@ -2004,21 +2039,16 @@ impl Editor {
                     start = list.len().saturating_sub(16);
                 }
                 for (i, q) in list.iter().enumerate().skip(start).take(16) {
-                    // Decode the title for the row under the cursor only: one
-                    // gmd parse per frame instead of sixteen.
-                    let mut line = format!("  slot {:>3}  id {:<8} {:>5} B", q.slot, q.quest_id, q.size);
-                    if i == self.save_quest_cursor {
-                        if let Ok(a) = Arc::parse(&q.data) {
-                            if let Some(g) = a
-                                .by_ext("gmd")
-                                .and_then(|e| Gmd::from_bytes(&e.data).ok())
-                            {
-                                if let Some(t) = g.title() {
-                                    line.push_str("  ");
-                                    line.push_str(t);
-                                }
-                            }
-                        }
+                    // Titles come from the cache filled when the screen opens,
+                    // so showing sixteen of them costs nothing per frame.
+                    let mut line = format!(
+                        "  slot {:>3}  id {:<8} {:>5} B",
+                        q.slot, q.quest_id, q.size
+                    );
+                    let title = self.quest_title(q.quest_id);
+                    if !title.is_empty() {
+                        line.push_str("  ");
+                        line.push_str(title);
                     }
                     push(&mut out, line, true, i == self.save_quest_cursor);
                 }
