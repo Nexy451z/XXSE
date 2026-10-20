@@ -46,6 +46,146 @@ use alloc::vec::Vec;
 use crate::save::Save;
 use crate::Error;
 
+/// One item entry inside a quest-equipment loadout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestEquipItem {
+    /// Which of the five loadouts (0..4). Entry 4 is the ranged one.
+    pub record: usize,
+    /// Which of the two lists: the 24 slot supply box, or the 8 slot ammo list.
+    pub list: QuestEquipList,
+    /// Index inside that list.
+    pub index: usize,
+    /// Item id, 0 when the slot is unused.
+    pub item: u16,
+    /// Stack count.
+    pub count: u8,
+}
+
+/// The two item lists a loadout carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestEquipList {
+    /// The 24 slot supply box at body + 0x53.
+    Supply,
+    /// The 8 slot ammo or bottle list at body + 0x9B.
+    Ammo,
+}
+
+impl QuestEquipList {
+    /// Byte offset of the list inside a loadout body.
+    fn offset(self) -> usize {
+        match self {
+            QuestEquipList::Supply => 0x53,
+            QuestEquipList::Ammo => 0x9B,
+        }
+    }
+    /// Entries in the list.
+    pub fn len(self) -> usize {
+        match self {
+            QuestEquipList::Supply => 24,
+            QuestEquipList::Ammo => 8,
+        }
+    }
+}
+
+/// Loadout header: the id and size come first, then 0x1D bytes, then five
+/// blocks of a 3 byte header and a 179 byte body.
+const LOADOUT_HEADER: usize = 0x1D;
+const LOADOUT_BLOCK: usize = 182;
+const LOADOUT_BLOCK_HEADER: usize = 3;
+
+fn loadout_block(data: &[u8], record: usize) -> Option<usize> {
+    if record >= 5 {
+        return None;
+    }
+    let at = LOADOUT_HEADER + LOADOUT_BLOCK * record + LOADOUT_BLOCK_HEADER;
+    if at + 0xA3 > data.len() {
+        return None;
+    }
+    Some(at)
+}
+
+/// Every item entry of one quest-equipment slot.
+pub fn quest_equipment_items(save: &Save, slot: usize) -> Vec<QuestEquipItem> {
+    let mut out = Vec::new();
+    let Some(bytes) = quest_equipment_bytes(save, slot) else {
+        return out;
+    };
+    let data = &bytes[8..];
+    for record in 0..5 {
+        let Some(body) = loadout_block(data, record) else {
+            continue;
+        };
+        for list in [QuestEquipList::Supply, QuestEquipList::Ammo] {
+            for index in 0..list.len() {
+                let at = body + list.offset() + index * 3;
+                let Some(b) = data.get(at..at + 3) else {
+                    continue;
+                };
+                out.push(QuestEquipItem {
+                    record,
+                    list,
+                    index,
+                    item: u16::from_le_bytes([b[0], b[1]]),
+                    count: b[2],
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Rewrite one item entry of a quest-equipment slot.
+///
+/// Only the three bytes of that entry change: the loadout length, the block
+/// headers, the trailer and the equipment mask are all left alone, which is
+/// what makes this safe to do without understanding the rest of the record.
+pub fn set_quest_equipment_item(
+    save: &mut Save,
+    slot: usize,
+    record: usize,
+    list: QuestEquipList,
+    index: usize,
+    item: u16,
+    count: u8,
+) -> Result<(), Error> {
+    if index >= list.len() {
+        return Err(Error::OutOfRange {
+            context: "item index",
+            value: index as u32,
+        });
+    }
+    if item as usize > crate::gamedata::LAST_ITEM_ID {
+        return Err(Error::OutOfRange {
+            context: "item id past the item table",
+            value: item as u32,
+        });
+    }
+    let sec = section_start(save).ok_or(Error::OutOfRange {
+        context: "save has no DLC section",
+        value: 0,
+    })?;
+    let base = sec + EQUIP_ARRAY_OFFSET + slot * EQUIP_SLOT_SIZE;
+    let at = {
+        let body = save.body().get(base + 8..base + EQUIP_SLOT_SIZE).ok_or(
+            Error::OutOfRange {
+                context: "quest equipment slot",
+                value: base as u32,
+            },
+        )?;
+        let off = loadout_block(body, record).ok_or(Error::OutOfRange {
+            context: "loadout record",
+            value: record as u32,
+        })?;
+        base + 8 + off + list.offset() + index * 3
+    };
+    let dst = save.body_mut().get_mut(at..at + 3).ok_or(Error::OutOfRange {
+        context: "item entry",
+        value: at as u32,
+    })?;
+    dst[0..2].copy_from_slice(&item.to_le_bytes());
+    dst[2] = count;
+    Ok(())
+}
 /// One of the 45 quest-equipment entries the DLC section carries.
 ///
 /// Every non-empty entry starts with the quest id it belongs to, which is what

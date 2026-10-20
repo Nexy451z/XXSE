@@ -2320,3 +2320,151 @@ fn an_oversized_payload_is_refused() {
     let r = mhnx_core::dlc::add_quest(&mut s, 1010002, &big);
     assert!(r.is_err(), "a payload that cannot fit must be refused");
 }
+
+#[test]
+fn the_item_id_bound_matches_the_item_table() {
+    // itemData holds 2991 entries and the game compares against 2991, so the
+    // last usable id is 2990.
+    assert_eq!(mhnx_core::gamedata::LAST_ITEM_ID, 2990);
+    assert_eq!(
+        mhnx_core::gamedata::ITEM_NAME_LIST.len(),
+        mhnx_core::gamedata::LAST_ITEM_ID + 1,
+        "the name table and the id bound must agree"
+    );
+}
+
+#[test]
+fn every_item_id_in_the_sample_save_is_within_the_bound() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    for slot in 0..3 {
+        let Some(box_) = s.equipment_box(slot) else { continue };
+        let _ = box_;
+    }
+    let items = s.read_item_box(0).expect("an item box");
+    let mut checked = 0;
+    for it in items.iter().filter(|i| i.id != 0) {
+        assert!(
+            (it.id as usize) <= mhnx_core::gamedata::LAST_ITEM_ID,
+            "item id {} is past the end of the table",
+            it.id
+        );
+        checked += 1;
+    }
+    assert!(checked > 100, "expected a used item box, got {}", checked);
+}
+
+// ---------------------------------------------------------------------------
+// The supply items inside a quest-equipment loadout.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_quest_equipment_items_read_back_exactly() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let items = mhnx_core::dlc::quest_equipment_items(&s, 0);
+    // Five loadouts of 24 supplies and 8 ammo entries each.
+    assert_eq!(items.len(), 5 * (24 + 8));
+    // The first supply of every loadout is the same in this save: 1724 potion x2.
+    for it in items.iter().filter(|i| i.list == mhnx_core::dlc::QuestEquipList::Supply && i.index == 0) {
+        assert_eq!(it.item, 1724, "record {} supply 0", it.record);
+        assert_eq!(it.count, 2);
+    }
+    // Only the fifth loadout carries ammo in slot 0, and it is a light bowgun.
+    let ammo: Vec<_> = items
+        .iter()
+        .filter(|i| i.list == mhnx_core::dlc::QuestEquipList::Ammo && i.item != 0)
+        .collect();
+    assert!(!ammo.is_empty(), "expected ammo somewhere");
+    for it in &ammo {
+        assert_eq!(it.record, 4, "only the fifth loadout should carry ammo");
+    }
+    // Every id must be inside the item table.
+    for it in items.iter().filter(|i| i.item != 0) {
+        assert!((it.item as usize) <= mhnx_core::gamedata::LAST_ITEM_ID);
+    }
+}
+
+#[test]
+fn writing_one_supply_entry_changes_only_those_bytes() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let before = s.to_bytes();
+    mhnx_core::dlc::set_quest_equipment_item(
+        &mut s,
+        0,
+        0,
+        mhnx_core::dlc::QuestEquipList::Supply,
+        0,
+        1718,
+        5,
+    )
+    .expect("write");
+    let after = s.to_bytes();
+    let diff: Vec<usize> = (0..after.len()).filter(|i| after[*i] != before[*i]).collect();
+    // Up to three bytes: the low half of the id and the count changed here, so
+    // only two actually differ. Every difference must fall inside the entry.
+    let entry = 36 + 0xB280 + 0x1049F4 + 0 + 8 + 0x1D + 3 + 0x53;
+    assert!(!diff.is_empty(), "the write did nothing");
+    for at in &diff {
+        assert!(
+            (*at >= entry && *at < entry + 3),
+            "byte 0x{:X} changed outside the entry at 0x{:X}",
+            at,
+            entry
+        );
+    }
+    // And the entry now reads back what was written.
+    let items = mhnx_core::dlc::quest_equipment_items(&s, 0);
+    let it = items
+        .iter()
+        .find(|i| {
+            i.record == 0
+                && i.list == mhnx_core::dlc::QuestEquipList::Supply
+                && i.index == 0
+        })
+        .unwrap();
+    assert_eq!((it.item, it.count), (1718, 5));
+    // The mask was not touched, which is what keeps the entry listed.
+    let base = 0xB280usize;
+    assert_eq!(
+        &s.body()[base + 0x4C..base + 0x4C + 28],
+        &before[36 + base + 0x4C..36 + base + 0x4C + 28]
+    );
+}
+
+#[test]
+fn an_out_of_range_supply_write_is_refused() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    // Index past the end of the supply list.
+    assert!(mhnx_core::dlc::set_quest_equipment_item(
+        &mut s,
+        0,
+        0,
+        mhnx_core::dlc::QuestEquipList::Supply,
+        24,
+        1718,
+        1,
+    )
+    .is_err());
+    // Item id past the item table.
+    assert!(mhnx_core::dlc::set_quest_equipment_item(
+        &mut s,
+        0,
+        0,
+        mhnx_core::dlc::QuestEquipList::Supply,
+        0,
+        2991,
+        1,
+    )
+    .is_err());
+}
