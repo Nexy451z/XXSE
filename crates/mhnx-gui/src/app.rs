@@ -25,6 +25,7 @@ pub enum Tab {
     Equip,
     Hunts,
     Guild,
+    Palico,
     Extras,
     About,
 }
@@ -671,6 +672,7 @@ impl eframe::App for MhnxEditor {
             Tab::Equip => self.tab_equip(ui),
             Tab::Hunts => self.tab_hunts(ui),
             Tab::Guild => self.tab_guild(ui),
+            Tab::Palico => self.tab_palico_detail(ui),
             Tab::Extras => self.tab_extras(ui),
             Tab::About => self.tab_about(ui),
         });
@@ -832,6 +834,7 @@ impl MhnxEditor {
         ui.selectable_value(&mut self.tab, Tab::Equip, "装備");
         ui.selectable_value(&mut self.tab, Tab::Hunts, "狩猟記録");
         ui.selectable_value(&mut self.tab, Tab::Guild, "ギルド");
+        ui.selectable_value(&mut self.tab, Tab::Palico, "オトモ");
                 ui.selectable_value(&mut self.tab, Tab::Extras, "設定/オトモ");
         ui.selectable_value(&mut self.tab, Tab::About, "情報");
                     });
@@ -2001,6 +2004,85 @@ impl MhnxEditor {
             .unwrap_or_default()
     }
 
+    fn tab_palico_detail(&mut self, ui: &mut egui::Ui) {
+        ui.heading("オトモ")
+            ;
+        let Some(save) = &self.save else {
+            ui.label("セーブを開くと、オトモの一覧を表示します");
+            return;
+        };
+        let list = mhnx_core::palico::used(save, self.slot);
+        ui.label(format!("{} 匹", list.len()));
+        if list.is_empty() {
+            ui.label("このスロットにはオトモがいません");
+            return;
+        }
+        let mut changed = false;
+        egui::ScrollArea::vertical()
+            .id_salt("palicolist")
+            .show(ui, |ui| {
+                egui::Grid::new("palicogrid")
+                    .num_columns(4)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for h in ["枠", "名前", "レベル", "なつき"] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        for p in &list {
+                            ui.label(format!("{}", p.index));
+                            let mut name = p.name.clone();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut name)
+                                        .desired_width(140.0),
+                                )
+                                .changed()
+                            {
+                                if let Some(s) = &mut self.save {
+                                    mhnx_core::palico::set_name(s, self.slot, p.index, &name);
+                                }
+                                changed = true;
+                            }
+                            let mut lvl = p.level as i32;
+                            if ui
+                                .add(egui::DragValue::new(&mut lvl).range(1..=99))
+                                .changed()
+                            {
+                                if let Some(s) = &mut self.save {
+                                    mhnx_core::palico::set_level(
+                                        s,
+                                        self.slot,
+                                        p.index,
+                                        lvl as u16,
+                                    );
+                                }
+                                changed = true;
+                            }
+                            let mut ent = p.enthusiasm as i32;
+                            if ui
+                                .add(egui::DragValue::new(&mut ent).range(0..=100))
+                                .changed()
+                            {
+                                if let Some(s) = &mut self.save {
+                                    mhnx_core::palico::set_enthusiasm(
+                                        s,
+                                        self.slot,
+                                        p.index,
+                                        ent as u8,
+                                    );
+                                }
+                                changed = true;
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if changed {
+            self.dirty = true;
+            self.message = "オトモを更新しました（まだファイルには書いていません）".to_owned();
+        }
+    }
     fn tab_hunts(&mut self, ui: &mut egui::Ui) {
         ui.heading("狩猟記録");
         if self.save.is_none() {

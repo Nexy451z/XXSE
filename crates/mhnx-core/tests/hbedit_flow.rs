@@ -2750,3 +2750,82 @@ fn the_arena_clock_converts_hundredths() {
     };
     assert!(t.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// The palico roster.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_palico_roster_reads_real_records() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let all = mhnx_core::palico::roster(&s, 0);
+    assert_eq!(all.len(), mhnx_core::palico::SLOTS);
+    let used = mhnx_core::palico::used(&s, 0);
+    assert_eq!(used.len(), 17, "the sample character has seventeen palicos");
+    for p in &used {
+        assert!(!p.name.is_empty());
+        assert!(
+            (1..=99).contains(&p.level),
+            "palico {} has level {}, which is not a level",
+            p.index,
+            p.level
+        );
+        assert!(p.exp < 2_000_000, "experience {} looks wrong", p.exp);
+        assert!(p.enthusiasm <= 100, "enthusiasm {} is out of range", p.enthusiasm);
+    }
+    // Names must be valid text, not mojibake.
+    assert!(
+        used.iter().all(|p| !p.name.contains('\u{FFFD}')),
+        "a name failed to decode: {:?}",
+        used.iter().map(|p| &p.name).collect::<Vec<_>>()
+    );
+    // Levels rise with experience across the roster; a swap would show up here.
+    let mut pairs: Vec<(u32, u16)> = used.iter().map(|p| (p.exp, p.level)).collect();
+    pairs.sort();
+    let mut inversions = 0;
+    for w in pairs.windows(2) {
+        if w[1].1 + 2 < w[0].1 {
+            inversions += 1;
+        }
+    }
+    assert!(
+        inversions <= 2,
+        "level and experience disagree on {} of {} palicos",
+        inversions,
+        pairs.len()
+    );
+}
+
+#[test]
+fn palico_fields_can_be_written() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let before = s.to_bytes();
+    assert!(mhnx_core::palico::set_name(&mut s, 0, 0, "テスト猫"));
+    assert!(mhnx_core::palico::set_level(&mut s, 0, 0, 50));
+    assert!(mhnx_core::palico::set_exp(&mut s, 0, 0, 123_456));
+    assert!(mhnx_core::palico::set_enthusiasm(&mut s, 0, 0, 42));
+    let p = &mhnx_core::palico::roster(&s, 0)[0];
+    assert_eq!(p.name, "テスト猫");
+    assert_eq!(p.level, 50);
+    assert_eq!(p.exp, 123_456);
+    assert_eq!(p.enthusiasm, 42);
+    // Only record 0 may have moved.
+    let after = s.to_bytes();
+    let base = 36 + 0x126474 + mhnx_core::palico::OFF_ROSTER;
+    let end = base + mhnx_core::palico::RECORD;
+    let outside: Vec<usize> = (0..after.len())
+        .filter(|i| after[*i] != before[*i])
+        .filter(|i| *i < base || *i >= end)
+        .collect();
+    assert!(outside.is_empty(), "bytes outside record 0 changed: {:?}", outside);
+    // Out of range is refused.
+    assert!(!mhnx_core::palico::set_name(&mut s, 0, mhnx_core::palico::SLOTS, "x"));
+    assert!(!mhnx_core::palico::set_level(&mut s, 0, 0, 100));
+    assert!(!mhnx_core::palico::set_level(&mut s, 0, 0, 0));
+}
