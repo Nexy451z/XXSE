@@ -598,7 +598,8 @@ impl Editor {
         }
     }
 
-    fn charms(&self) -> Vec<Charm> {
+    /// The talismans of the current slot.
+    pub fn charms(&self) -> Vec<Charm> {
         self.save.as_ref().and_then(|s| s.charms(self.slot)).unwrap_or_default()
     }
 
@@ -2202,9 +2203,58 @@ impl Editor {
                         i == e.field,
                     );
                 }
+                // The published per-rarity range, same check the PC build
+                // shows: it is the difference between a talisman the game
+                // accepts and one it quietly rejects.
+                #[cfg(feature = "gamedata")]
+                {
+                    let ty = self
+                        .save
+                        .as_ref()
+                        .and_then(|s| s.equipment_box(self.slot))
+                        .and_then(|b| {
+                            let o = e.index * crate::charm::CHARM_RECORD + 2;
+                            b.get(o).copied()
+                        })
+                        .unwrap_or(0);
+                    if let Some(r) = crate::charm::rarity_of(ty) {
+                        push(
+                            &mut out,
+                            format!("  type 0x{:02X}  rarity {}", ty, r),
+                            false,
+                            false,
+                        );
+                    }
+                    for (label, sid, pts, second) in [
+                        ("skill 1", e.skill1, e.points1, false),
+                        ("skill 2", e.skill2, e.points2, true),
+                    ] {
+                        if sid == 0 {
+                            continue;
+                        }
+                        let Some(r) = crate::charm::allowed_points(ty, sid, second) else {
+                            continue;
+                        };
+                        let name = crate::skills::skill_name(sid).unwrap_or("?");
+                        let line = if r.min == 0 && r.max == 0 {
+                            format!("  !! {} {} cannot go on this type", label, name)
+                        } else if pts < r.min || pts > r.max {
+                            format!(
+                                "  !! {} {} is {:+}, allowed {:+}..{:+}",
+                                label, name, pts, r.min, r.max
+                            )
+                        } else {
+                            format!(
+                                "     {} {} allowed {:+}..{:+}",
+                                label, name, r.min, r.max
+                            )
+                        };
+                        push(&mut out, line, false, false);
+                    }
+                }
                 push(
                     &mut out,
-                    String::from("  Up/Down row  Left/Right value  X step  A write  B back"),
+                    String::from("  Up/Down row  Left/Right value  Y pick skill  X step  A write"),
                     false,
                     false,
                 );
