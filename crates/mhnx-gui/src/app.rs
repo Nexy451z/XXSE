@@ -23,6 +23,8 @@ pub enum Tab {
     Dlc,
     Charm,
     Equip,
+    Hunts,
+    Guild,
     Extras,
     About,
 }
@@ -75,6 +77,12 @@ pub struct MhnxEditor {
     pub item_undo: Vec<Vec<ItemSlot>>,
     /// Keep the picker filter after choosing, so several slots can be filled
     /// from one search.
+    /// Hunt record working copies for the current slot.
+    pub hunt_slay: Vec<u16>,
+    pub hunt_capture: Vec<u16>,
+    pub hunt_size: Vec<(u16, u16)>,
+    /// Filter for the hunt tab.
+    pub hunt_filter: String,
     /// Filter for the equipment tab.
     pub equip_filter: String,
     pub item_pick_keep_filter: bool,
@@ -134,6 +142,10 @@ impl Default for MhnxEditor {
             dlc_filter: String::new(),
             dlc_outdir: String::new(),
             item_undo: Vec::new(),
+            hunt_slay: Vec::new(),
+            hunt_capture: Vec::new(),
+            hunt_size: Vec::new(),
+            hunt_filter: String::new(),
             equip_filter: String::new(),
             item_pick_keep_filter: true,
             entry_item_sel: None,
@@ -188,6 +200,31 @@ impl MhnxEditor {
         if let Some(items) = s.read_item_box(self.slot) {
             self.items = items;
         }
+        self.hunt_slay = s.hunt_counts(self.slot).unwrap_or_default();
+        self.hunt_capture = s.capture_counts(self.slot).unwrap_or_default();
+        self.hunt_size = s.monster_sizes(self.slot).unwrap_or_default();
+    }
+
+    /// Write the hunt tables back, one monster at a time.
+    fn apply_hunts(&mut self) {
+        let Some(s) = &mut self.save else { return };
+        let slot = self.slot;
+        for i in 0..self.hunt_slay.len() {
+            s.set_hunt_count(slot, i, self.hunt_slay[i]);
+            if i < self.hunt_capture.len() {
+                s.set_capture_count(slot, i, self.hunt_capture[i]);
+            }
+            if i < self.hunt_size.len() {
+                let (a, b) = self.hunt_size[i];
+                // The game keeps the pair ordered; writing it the other way
+                // round would be a value it never produces.
+                let (a, b) = if a > b { (b, a) } else { (a, b) };
+                self.hunt_size[i] = (a, b);
+                s.set_monster_size(slot, i, a, b);
+            }
+        }
+        self.dirty = true;
+        self.message = "狩猟記録を適用しました（まだファイルには書いていません）".to_owned();
     }
 
     /// Push the working copies back into the save.
@@ -632,6 +669,8 @@ impl eframe::App for MhnxEditor {
             Tab::Dlc => self.tab_dlc(ui),
             Tab::Charm => self.tab_charm(ui),
             Tab::Equip => self.tab_equip(ui),
+            Tab::Hunts => self.tab_hunts(ui),
+            Tab::Guild => self.tab_guild(ui),
             Tab::Extras => self.tab_extras(ui),
             Tab::About => self.tab_about(ui),
         });
@@ -791,6 +830,8 @@ impl MhnxEditor {
                         ui.selectable_value(&mut self.tab, Tab::Dlc, "DLC");
                         ui.selectable_value(&mut self.tab, Tab::Charm, "お守り");
         ui.selectable_value(&mut self.tab, Tab::Equip, "装備");
+        ui.selectable_value(&mut self.tab, Tab::Hunts, "狩猟記録");
+        ui.selectable_value(&mut self.tab, Tab::Guild, "ギルド");
                 ui.selectable_value(&mut self.tab, Tab::Extras, "設定/オトモ");
         ui.selectable_value(&mut self.tab, Tab::About, "情報");
                     });
@@ -1960,6 +2001,161 @@ impl MhnxEditor {
             .unwrap_or_default()
     }
 
+    fn tab_hunts(&mut self, ui: &mut egui::Ui) {
+        ui.heading("狩猟記録");
+        if self.save.is_none() {
+            ui.label("セーブを開くと、モンスターごとの討伐数と狩猟サイズを一覧できます");
+            return;
+        }
+        if self.hunt_slay.is_empty() {
+            ui.label("このスロットには狩猟記録がありません");
+            return;
+        }
+        let names = mhnx_core::gamedata::MONSTER_HUNT_NAMES;
+        ui.horizontal(|ui| {
+            let recorded = self.hunt_slay.iter().filter(|v| **v > 0).count();
+            ui.label(format!("{} 体 / {} 体中記録あり", recorded, self.hunt_slay.len()));
+            ui.label("絞り込み");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.hunt_filter)
+                    .hint_text("モンスター名")
+                    .desired_width(160.0),
+            );
+            if ui.small_button("クリア").clicked() {
+                self.hunt_filter.clear();
+            }
+            if ui.button("変更を反映").clicked() {
+                self.apply_hunts();
+            }
+        });
+        let needle = self.hunt_filter.trim().to_lowercase();
+        egui::ScrollArea::vertical()
+            .id_salt("huntlist")
+            .show(ui, |ui| {
+                egui::Grid::new("huntgrid")
+                    .num_columns(5)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for h in ["id", "モンスター", "討伐", "捕獲", "サイズ"] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        let mut changed = false;
+                        for i in 0..self.hunt_slay.len() {
+                            let name = names.get(i).copied().unwrap_or("?");
+                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                                continue;
+                            }
+                            ui.label(format!("{}", i));
+                            ui.label(name);
+                            let mut slay = self.hunt_slay[i] as i32;
+                            if ui
+                                .add(egui::DragValue::new(&mut slay).range(0..=9999))
+                                .changed()
+                            {
+                                self.hunt_slay[i] = slay as u16;
+                                changed = true;
+                            }
+                            if i < self.hunt_capture.len() {
+                                let mut cap = self.hunt_capture[i] as i32;
+                                if ui
+                                    .add(egui::DragValue::new(&mut cap).range(0..=9999))
+                                    .changed()
+                                {
+                                    self.hunt_capture[i] = cap as u16;
+                                    changed = true;
+                                }
+                            } else {
+                                ui.label("-");
+                            }
+                            if i < self.hunt_size.len() {
+                                let (a, b) = self.hunt_size[i];
+                                let (mut lo, mut hi) = (a as i32, b as i32);
+                                ui.horizontal(|ui| {
+                                    let c1 = ui
+                                        .add(egui::DragValue::new(&mut lo).range(0..=300))
+                                        .changed();
+                                    ui.label("..");
+                                    let c2 = ui
+                                        .add(egui::DragValue::new(&mut hi).range(0..=300))
+                                        .changed();
+                                    if c1 || c2 {
+                                        self.hunt_size[i] = (lo as u16, hi as u16);
+                                        changed = true;
+                                    }
+                                });
+                            } else {
+                                ui.label("-");
+                            }
+                            ui.end_row();
+                        }
+                        if changed {
+                            self.dirty = true;
+                        }
+                    });
+            });
+    }
+
+    fn tab_guild(&mut self, ui: &mut egui::Ui) {
+        ui.heading("ギルドカード");
+        let Some(save) = &self.save else {
+            ui.label("セーブを開くと、ギルドカードと闘技大会の記録を表示します");
+            return;
+        };
+        let slot = self.slot;
+        let hr = mhnx_core::guildcard::hunter_rank(save, slot).unwrap_or(0);
+        let time = mhnx_core::guildcard::play_time(save, slot).unwrap_or(0);
+        let id = mhnx_core::guildcard::card_id(save, slot).unwrap_or([0; 8]);
+        let comment = mhnx_core::guildcard::comment(save, slot).unwrap_or_default();
+        egui::Grid::new("gcinfo").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+            ui.label("ハンターランク");
+            ui.label(format!("{}", hr));
+            ui.end_row();
+            ui.label("カード側プレイ時間");
+            ui.label(format!(
+                "{}:{:02}:{:02}",
+                time / 3600,
+                (time % 3600) / 60,
+                time % 60
+            ));
+            ui.end_row();
+            ui.label("カードID");
+            ui.label(id.iter().map(|b| format!("{:02X}", b)).collect::<String>());
+            ui.end_row();
+            ui.label("コメント");
+            ui.label(comment);
+            ui.end_row();
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("闘技大会の記録（タイムは 1/100 秒）").strong());
+        let log = mhnx_core::guildcard::arena(save, slot);
+        if log.iter().all(|e| e.is_empty()) {
+            ui.label("記録はありません");
+            return;
+        }
+        egui::Grid::new("arenagrid").num_columns(2).striped(true).show(ui, |ui| {
+            ui.strong("アリーナ");
+            ui.strong("ベストタイム");
+            ui.end_row();
+            for a in 0..mhnx_core::guildcard::ARENA_COUNT {
+                let rows: Vec<_> = log.iter().filter(|e| e.arena == a && !e.is_empty()).collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                ui.label(format!("{}", a));
+                let text = rows
+                    .iter()
+                    .map(|e| {
+                        let (m, s, cs) = e.as_clock();
+                        format!("{}:{:02}.{:02}", m, s, cs)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("   ");
+                ui.label(text);
+                ui.end_row();
+            }
+        });
+    }
     fn tab_equip(&mut self, ui: &mut egui::Ui) {
         ui.heading("装備ボックス");
         let Some(save) = &self.save else {
