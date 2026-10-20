@@ -1608,3 +1608,63 @@ fn random_keys_on_an_arc_never_produce_a_broken_archive() {
         }
     }
 }
+
+#[test]
+fn the_converted_save_can_be_given_a_name() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::B);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Convert);
+    // Default name is "system".
+    let has_default = ed.lines().iter().any(|l| l.text.contains("system.3ds"));
+    assert!(has_default, "the default output name must be shown");
+    ed.input(Key::Y);
+    let (idx, _) = ed.take_text_request().expect("a name request");
+    assert_eq!(idx, mhnx_core::hbedit::TEXT_SAVE_NAME);
+    assert_eq!(idx, usize::MAX - 4, "must not collide");
+    ed.apply_convert_name(String::from("before-edit"));
+    let shown = ed.lines().iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n");
+    assert!(shown.contains("before-edit.3ds"), "{}", shown);
+    ed.input(Key::A);
+    match ed.take_write() {
+        Some(mhnx_core::hbedit::Write::File { path, .. }) => {
+            assert!(path.ends_with("before-edit.3ds"), "wrote {}", path);
+            assert!(
+                path.contains('/') || path.contains('\\'),
+                "the directory must be kept: {}",
+                path
+            );
+        }
+        other => panic!("expected a write, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_slash_in_the_name_cannot_escape_the_directory() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::B);
+    ed.input(Key::L);
+    ed.apply_convert_name(String::from("../escape"));
+    ed.input(Key::A);
+    match ed.take_write() {
+        Some(mhnx_core::hbedit::Write::File { path, .. }) => {
+            assert!(!path.contains("../"), "path escaped: {}", path);
+            let seps = |s: &str| s.matches(['/', '\\']).count();
+            assert_eq!(
+                seps(&path),
+                seps(ed.save_path.as_ref().unwrap()),
+                "the file must stay in the same directory: {}",
+                path
+            );
+        }
+        other => panic!("expected a write, got {:?}", other),
+    }
+}
