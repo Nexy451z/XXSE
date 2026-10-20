@@ -1912,3 +1912,100 @@ fn an_empty_equipment_entry_returns_zeros() {
     assert!(b.iter().all(|x| *x == 0), "entry 25 should be blank");
     assert!(mhnx_core::dlc::quest_equipment_bytes(&s, 45).is_none(), "45 is out of range");
 }
+
+// ---------------------------------------------------------------------------
+// The DLC catalogue. This is what made the installed mask readable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_catalogue_reproduces_the_installed_mask_exactly() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    let installed: Vec<i32> = mhnx_core::dlc::list_quests(&s)
+        .iter()
+        .map(|q| q.quest_id)
+        .collect();
+    let base = 0xB280usize;
+    let mask = &s.body()[base + 0x4C..base + 0x4C + 28];
+    let actual: std::collections::BTreeSet<usize> = (0..224)
+        .filter(|i| (mask[i >> 3] >> (i & 7)) & 1 == 1)
+        .collect();
+
+    let mut predicted = std::collections::BTreeSet::new();
+    for id in &installed {
+        if let Some(bit) = mhnx_core::dlc::bit_for_quest(*id) {
+            predicted.insert(bit);
+        }
+    }
+    assert_eq!(
+        predicted.len(),
+        actual.len(),
+        "the catalogue must account for every set bit"
+    );
+    assert_eq!(predicted, actual, "predicted and stored masks disagree");
+}
+
+#[test]
+fn every_installed_quest_has_a_mask_bit() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    for q in mhnx_core::dlc::list_quests(&s) {
+        assert!(
+            mhnx_core::dlc::bit_for_quest(q.quest_id).is_some(),
+            "quest {} is installed but not in the catalogue",
+            q.quest_id
+        );
+        assert!(
+            mhnx_core::dlc::is_installed(&s, q.quest_id),
+            "quest {} is installed but its bit is clear",
+            q.quest_id
+        );
+    }
+}
+
+#[test]
+fn the_placeholder_positions_have_no_bit() {
+    for pos in 41..=44 {
+        assert_eq!(
+            mhnx_core::dlc::bit_for_position(pos),
+            None,
+            "position {} is a placeholder",
+            pos
+        );
+    }
+    // The two fields meet at bit 64, not 45.
+    assert_eq!(mhnx_core::dlc::bit_for_position(40), Some(40));
+    assert_eq!(mhnx_core::dlc::bit_for_position(45), Some(64));
+    assert_eq!(mhnx_core::dlc::bit_for_position(204), Some(223));
+    assert_eq!(mhnx_core::dlc::bit_for_position(205), None);
+}
+
+#[test]
+fn setting_a_bit_is_reversible_and_hits_the_right_byte() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let mut s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    let before = s.to_bytes();
+    // 1010002 is in the catalogue and is not installed in the sample save.
+    let id = 1010002;
+    assert!(!mhnx_core::dlc::is_installed(&s, id), "fixture changed");
+    let bit = mhnx_core::dlc::bit_for_quest(id).unwrap();
+    assert_eq!(bit, 65);
+    mhnx_core::dlc::set_installed(&mut s, id, true).unwrap();
+    assert!(mhnx_core::dlc::is_installed(&s, id));
+    // Only one bit changed.
+    let after = s.to_bytes();
+    let diff: Vec<usize> = (0..after.len()).filter(|i| after[*i] != before[*i]).collect();
+    assert_eq!(diff.len(), 1, "more than one byte changed: {:?}", diff);
+    assert_eq!(after[diff[0]] & !before[diff[0]], 1 << (bit & 7));
+    mhnx_core::dlc::set_installed(&mut s, id, false).unwrap();
+    assert_eq!(s.to_bytes(), before, "clearing must restore the original");
+}

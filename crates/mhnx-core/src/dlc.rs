@@ -61,6 +61,79 @@ pub struct QuestEquipment {
     pub occupied: bool,
 }
 
+/// Mask bit for a catalogue position.
+///
+/// The mask is two fields side by side: the 45 equipment entries sit at bits
+/// 0..44, and the 160 event entries start at bit 64 because the game rounds the
+/// equipment array up to two 32 bit words. Positions 41..44 are placeholders in
+/// the catalogue and never carry a bit.
+pub fn bit_for_position(pos: usize) -> Option<usize> {
+    if pos > 204 {
+        return None;
+    }
+    if (41..=44).contains(&pos) {
+        return None;
+    }
+    Some(if pos < 45 { pos } else { 64 + (pos - 45) })
+}
+
+/// Catalogue position for a quest id, if the catalogue lists it.
+#[cfg(feature = "gamedata")]
+pub fn position_for_quest(quest_id: i32) -> Option<usize> {
+    crate::gamedata::DLC_CATALOG
+        .iter()
+        .position(|q| *q == quest_id)
+}
+
+/// Mask bit for a quest id, if the catalogue lists it.
+#[cfg(feature = "gamedata")]
+pub fn bit_for_quest(quest_id: i32) -> Option<usize> {
+    bit_for_position(position_for_quest(quest_id)?)
+}
+
+/// Is the installed mask bit set for this quest?
+pub fn is_installed(save: &Save, quest_id: i32) -> bool {
+    let Some(bit) = bit_for_quest(quest_id) else {
+        return false;
+    };
+    let Some(sec) = section_start(save) else {
+        return false;
+    };
+    save.body()
+        .get(sec + BITMASK_OFFSET + (bit >> 3))
+        .map(|b| (b >> (bit & 7)) & 1 == 1)
+        .unwrap_or(false)
+}
+
+/// Set or clear one installed-mask bit.
+///
+/// This is the operation the tool has always refused to do, because a wrong bit
+/// means a quest the game lists but cannot load, or one it will not list at all.
+/// The catalogue makes the bit computable. Whether the game accepts a quest
+/// placed in a slot the catalogue never filled is still unverified, so the
+/// callers keep this behind an explicit opt in.
+pub fn set_installed(save: &mut Save, quest_id: i32, on: bool) -> Result<(), Error> {
+    let bit = bit_for_quest(quest_id).ok_or(Error::OutOfRange {
+        context: "quest id is not in the DLC catalogue",
+        value: quest_id as u32,
+    })?;
+    let sec = section_start(save).ok_or(Error::OutOfRange {
+        context: "save has no DLC section",
+        value: 0,
+    })?;
+    let off = sec + BITMASK_OFFSET + (bit >> 3);
+    let byte = save.body_mut().get_mut(off).ok_or(Error::OutOfRange {
+        context: "mask byte",
+        value: off as u32,
+    })?;
+    if on {
+        *byte |= 1 << (bit & 7);
+    } else {
+        *byte &= !(1 << (bit & 7));
+    }
+    Ok(())
+}
+
 /// Read the quest-equipment array.
 pub fn quest_equipment(save: &Save) -> Vec<QuestEquipment> {
     let mut out = Vec::with_capacity(EQUIP_SLOTS);
