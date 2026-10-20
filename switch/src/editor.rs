@@ -353,6 +353,7 @@ fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
         ArcList => "A open quest   X quests in save   Y save editor   + exit",
         SaveQuests => "A edit  - extract this  R extract all  B back",
         ItemPick => "A choose  Y filter  X clear  B back",
+        Items => "Up/Down  L/R count  R pick  L undo  X step  Y empty  A save  B back",
         ArcEntries => "A edit  Y view  X save  - extract  R all  L check  B back",
         EntryView => "B back",
         Mib => "Up/Down field  Left/Right value  X step  A write .arc  B back",

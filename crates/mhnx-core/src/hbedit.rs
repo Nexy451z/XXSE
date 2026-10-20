@@ -221,6 +221,10 @@ pub struct Editor {
     pub charm_cursor: usize,
     /// The charm being edited, if the editor form is open.
     pub charm_edit: Option<CharmEdit>,
+    /// Raw item boxes for undo, newest last.
+    ///
+    /// 5463 bytes each, so the stack is deliberately shallow.
+    pub item_undo: Vec<Vec<u8>>,
     /// Which talisman skill the picker writes: 1 or 2.
     pub skill_pick_field: u8,
     /// Skill name filter used by the picker.
@@ -292,6 +296,7 @@ impl Editor {
             findings: Vec::new(),
             charm_cursor: 0,
             charm_edit: None,
+            item_undo: Vec::new(),
             skill_pick_field: 1,
             skill_pick_filter: String::new(),
             skill_pick_cursor: 0,
@@ -1100,6 +1105,9 @@ impl Editor {
             }
             // R opens the item picker for the slot under the cursor, so the
             // type can be changed by name instead of only the count.
+            // Replacing an item is the destructive step here, so it can be
+            // taken back with L.
+            Key::L => self.undo_item(),
             Key::R => {
                 if let Some(&idx) = vis.get(self.cursor) {
                     self.item_pick_target = idx;
@@ -1146,6 +1154,37 @@ impl Editor {
     pub fn apply_item_filter(&mut self, text: String) {
         self.item_pick_filter = text;
         self.item_pick_cursor = 0;
+    }
+
+    /// Remember the item box before replacing an entry.
+    fn push_item_undo(&mut self) {
+        let snapshot = self
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(self.slot))
+            .map(|b| crate::itembox::encode(&b));
+        if let Some(raw) = snapshot {
+            self.item_undo.push(raw);
+            if self.item_undo.len() > 16 {
+                self.item_undo.remove(0);
+            }
+        }
+    }
+
+    /// Put the item box back the way it was.
+    fn undo_item(&mut self) {
+        let Some(raw) = self.item_undo.pop() else {
+            self.message = String::from("nothing to undo");
+            return;
+        };
+        let slots = crate::itembox::decode(&raw);
+        let slot = self.slot;
+        if let Some(s) = &mut self.save {
+            if s.write_item_box(slot, &slots).is_ok() {
+                self.dirty = true;
+                self.message = String::from("item box restored");
+            }
+        }
     }
 
     /// Skill ids whose name matches the current filter, in id order.
@@ -1242,6 +1281,7 @@ impl Editor {
                     let box_i = self.item_pick_target;
                     if let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(slot)) {
                         if box_i < items.len() {
+                            self.push_item_undo();
                             items[box_i].id = id;
                             if items[box_i].count == 0 {
                                 items[box_i].count = 1;

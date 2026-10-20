@@ -1132,3 +1132,72 @@ fn the_skill_picker_does_not_panic_on_an_empty_match() {
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit);
 }
+// ---------------------------------------------------------------------------
+// Undo for the console item box.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn replacing_an_item_can_be_taken_back() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::X); // items
+    assert_eq!(ed.screen, Screen::Items);
+
+    let before = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
+    let target = ed.visible_items()[ed.cursor];
+
+    // Change the type through the picker.
+    ed.input(Key::R);
+    assert_eq!(ed.screen, Screen::ItemPick);
+    ed.apply_item_filter(String::from("解毒薬"));
+    let want = ed.item_pick_matches()[0];
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Items);
+    let changed = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
+    assert_eq!(changed[target].id, want, "the picker must write");
+    assert_ne!(changed[target].id, before[target].id);
+
+    // L puts it back.
+    ed.input(Key::L);
+    let restored = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
+    assert_eq!(
+        restored[target].id, before[target].id,
+        "undo must restore the old item"
+    );
+    assert!(ed.message.contains("restored"), "message was {}", ed.message);
+}
+
+#[test]
+fn undo_with_nothing_to_take_back_says_so() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::X);
+    ed.input(Key::L);
+    assert!(ed.message.contains("nothing to undo"), "message was {}", ed.message);
+}
+
+#[test]
+fn undo_restores_the_whole_box_not_just_the_item() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::X);
+    let before = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
+
+    ed.input(Key::R);
+    ed.apply_item_filter(String::from("回復薬"));
+    let want = ed.item_pick_matches()[0];
+    ed.input(Key::A);
+    ed.input(Key::L);
+
+    let after = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
+    assert_eq!(before, after, "every slot must come back");
+}
