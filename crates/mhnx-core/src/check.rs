@@ -172,9 +172,21 @@ pub fn check_quest(arc: &Arc) -> Vec<Finding> {
         })
         .collect();
 
-    if real_rems.is_empty() && !rems.is_empty() {
+    // Only download quests carry their rewards in .rem. Village and hub quests
+    // have fixed rewards and ship a lone dummy, which is normal: flagging it as
+    // an error made the checker cry wolf on 359 of the 1855 shipped quests.
+    let quest_id = arc
+        .by_ext("mib")
+        .and_then(|e| Mib::from_bytes(&e.data).ok())
+        .map(|m| m.quest_id())
+        .unwrap_or(0);
+    let is_download = (1_000_000..10_000_000).contains(&quest_id);
+    // Warn, not Error: 31 shipped download quests really do carry only the
+    // dummy, and the game plays them. It is worth saying, but it is not proof
+    // that an edit went wrong.
+    if is_download && real_rems.is_empty() && !rems.is_empty() {
         out.push(Finding::new(
-            Severity::Error,
+            Severity::Warn,
             "reward-dummy-only",
             String::from(
                 "報酬ファイルが rem_000000 (ダミー) しかありません。rem_000000 はゲームに読み込まれないため、\
