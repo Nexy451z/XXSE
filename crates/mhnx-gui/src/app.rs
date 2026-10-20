@@ -8,6 +8,7 @@ use egui_extras::{Column, TableBuilder};
 use mhnx_core::arc::{extension_for, Arc};
 use mhnx_core::check::{self, Finding, Severity};
 use mhnx_core::dlc;
+use mhnx_core::gamedata::LAST_ITEM_ID;
 use mhnx_core::itembox::ItemSlot;
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::questfields::FieldKind;
@@ -1187,7 +1188,7 @@ impl MhnxEditor {
             ui.label(format!("選択中: 箱 #{} ", i + 1));
             let mut id = self.items[i].id;
             if ui
-                .add(egui::DragValue::new(&mut id).range(0..=4095).prefix("ID "))
+                .add(egui::DragValue::new(&mut id).range(0..=(LAST_ITEM_ID as i32)).prefix("ID "))
                 .changed()
             {
                 self.items[i].id = id;
@@ -1231,7 +1232,7 @@ impl MhnxEditor {
         }
         let mut hits: Vec<(u16, &'static str)> = Vec::new();
         for (id, name) in mhnx_core::gamedata::ITEM_NAME_LIST.iter().enumerate() {
-            if id == 0 || id > 4095 {
+            if id == 0 || id > LAST_ITEM_ID {
                 continue;
             }
             if name.to_lowercase().contains(&needle) {
@@ -1748,7 +1749,7 @@ impl MhnxEditor {
                             for (id, name) in
                                 mhnx_core::gamedata::ITEM_NAME_LIST.iter().enumerate()
                             {
-                                if id == 0 || id > 4095 {
+                                if id == 0 || id > LAST_ITEM_ID {
                                     continue;
                                 }
                                 if name.to_lowercase().contains(&needle) {

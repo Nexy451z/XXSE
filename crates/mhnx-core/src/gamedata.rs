@@ -3,6 +3,12 @@
 #![allow(clippy::all)]
 
 /// C# ItemNameList (2991 entries)
+/// Highest valid item id.
+///
+/// The item table holds 2991 entries and the game compares against 2991 in
+/// code (movw #0xBAF), so ids run 0..=2990. Anything above that is not an item.
+pub const LAST_ITEM_ID: usize = 2990;
+
 pub static ITEM_NAME_LIST: &[&str] = &[
     "-----", "調合書①入門編", "調合書②初級編", "調合書③中級編", "調合書④上級編", "調合書⑤達人編", "収納上手・技の書", "収納上手・力の書",
     "双眼鏡", "回復薬", "回復薬グレート", "栄養剤", "栄養剤グレート", "解毒薬", "活力剤", "強走薬",

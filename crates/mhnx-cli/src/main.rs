@@ -227,6 +227,63 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// List the supply and ammo items inside a quest-equipment slot.
+fn cmd_equip_items(save_path: &str, slot: usize) -> Result<(), String> {
+    let s = Save::from_bytes(&read(save_path)?).map_err(|e| e.to_string())?;
+    let entries = dlc::quest_equipment(&s);
+    let Some(e) = entries.get(slot) else {
+        return Err(format!("slot {} does not exist", slot));
+    };
+    if !e.occupied {
+        return Err(format!("slot {} is empty", slot));
+    }
+    println!("slot {} -> quest {}", slot, e.quest_id);
+    for it in dlc::quest_equipment_items(&s, slot) {
+        if it.item == 0 {
+            continue;
+        }
+        println!(
+            "  rec {} {}[{:>2}]  item {:>5} x{}",
+            it.record,
+            match it.list {
+                dlc::QuestEquipList::Supply => "supply",
+                dlc::QuestEquipList::Ammo => "ammo  ",
+            },
+            it.index,
+            it.item,
+            it.count
+        );
+    }
+    Ok(())
+}
+
+/// Rewrite one supply or ammo entry of a quest-equipment slot.
+fn cmd_equip_set(
+    save_path: &str,
+    slot: usize,
+    record: usize,
+    list: &str,
+    index: usize,
+    item: u16,
+    count: u8,
+    out: &str,
+) -> Result<(), String> {
+    let mut s = Save::from_bytes(&read(save_path)?).map_err(|e| e.to_string())?;
+    let which = match list {
+        "supply" => dlc::QuestEquipList::Supply,
+        "ammo" => dlc::QuestEquipList::Ammo,
+        other => return Err(format!("unknown list {}", other)),
+    };
+    dlc::set_quest_equipment_item(&mut s, slot, record, which, index, item, count)
+        .map_err(|e| e.to_string())?;
+    std::fs::write(out, s.to_bytes()).map_err(|e| e.to_string())?;
+    println!(
+        "slot {} rec {} {}[{}] = item {} x{}, wrote {}",
+        slot, record, list, index, item, count, out
+    );
+    Ok(())
+}
+
 /// Add a quest the save does not list into a free slot.
 fn cmd_add_quest(save_path: &str, arc_path: &str, out: &str) -> Result<(), String> {
     let mut s = Save::from_bytes(&read(save_path)?).map_err(|e| e.to_string())?;
@@ -752,6 +809,19 @@ fn main() -> ExitCode {
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
         "add-quest" if args.len() == 4 => cmd_add_quest(&args[1], &args[2], &args[3]),
+        "equip-items" if args.len() == 3 => {
+            cmd_equip_items(&args[1], args[2].parse().unwrap_or(0))
+        }
+        "equip-set" if args.len() == 9 => cmd_equip_set(
+            &args[1],
+            args[2].parse().unwrap_or(0),
+            args[3].parse().unwrap_or(0),
+            &args[4],
+            args[5].parse().unwrap_or(0),
+            args[6].parse().unwrap_or(0),
+            args[7].parse().unwrap_or(1),
+            &args[8],
+        ),
         "gmd-dump" if args.len() == 2 => cmd_gmd_dump(&args[1], 40),
         "gmd-dump" if args.len() == 3 => {
             cmd_gmd_dump(&args[1], args[2].parse().unwrap_or(40))

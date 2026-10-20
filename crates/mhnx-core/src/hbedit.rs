@@ -1227,7 +1227,7 @@ impl Editor {
         {
             let mut out = Vec::new();
             for (id, name) in crate::gamedata::ITEM_NAME_LIST.iter().enumerate() {
-                if id == 0 || id > 4095 {
+                if id == 0 || id as usize > crate::gamedata::LAST_ITEM_ID {
                     continue;
                 }
                 if needle.is_empty() || name.to_lowercase().contains(&needle) {
