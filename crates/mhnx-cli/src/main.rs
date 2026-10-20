@@ -227,6 +227,63 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// Show the item sets and equipment sets of one character.
+fn cmd_mysets(path: &str, slot: Option<usize>) -> Result<(), String> {
+    let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    let slot = match slot {
+        Some(n) if (1..=3).contains(&n) => n - 1,
+        Some(_) => return Err(String::from("slot must be 1, 2 or 3")),
+        None => 0,
+    };
+    println!("slot {} item sets", slot + 1);
+    for set in mhnx_core::myset::item_sets(&s, slot) {
+        if set.is_empty() {
+            continue;
+        }
+        let items: Vec<String> = set
+            .used_items()
+            .iter()
+            .map(|i| format!("{} x{}", mhnx_core::hbedit::item_name_of(i.id), i.count))
+            .collect();
+        println!("  [{}] {}", set.index, set.name);
+        println!("      {}", items.join(", "));
+    }
+    println!("slot {} equipment sets", slot + 1);
+    for set in mhnx_core::myset::equip_sets(&s, slot) {
+        if set.is_empty() {
+            continue;
+        }
+        let parts: Vec<String> = set
+            .parts
+            .iter()
+            .map(|p| {
+                if *p == mhnx_core::myset::NONE {
+                    String::from("-")
+                } else {
+                    format!("{}", p)
+                }
+            })
+            .collect();
+        println!("  [{}] {:<16} {}", set.index, set.name, parts.join(" "));
+    }
+    println!("slot {} palicos", slot + 1);
+    for p in mhnx_core::palico::used(&s, slot) {
+        println!(
+            "  {:>3} {:<14} Lv{:<3} {:<12} bond {:<3} skills: {}",
+            p.index,
+            p.name,
+            p.level,
+            p.system_name(),
+            p.enthusiasm,
+            p.learned_skills()
+                .iter()
+                .map(|id| mhnx_core::palico::skill_name(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
 /// Show the guild card and the arena records of one character.
 fn cmd_guild_card(path: &str, slot: Option<usize>) -> Result<(), String> {
     let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
@@ -898,6 +955,8 @@ fn main() -> ExitCode {
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
         "add-quest" if args.len() == 4 => cmd_add_quest(&args[1], &args[2], &args[3]),
+        "mysets" if args.len() == 2 => cmd_mysets(&args[1], None),
+        "mysets" if args.len() == 3 => cmd_mysets(&args[1], args[2].parse().ok()),
         "guild-card" if args.len() == 2 => cmd_guild_card(&args[1], None),
         "guild-card" if args.len() == 3 => cmd_guild_card(&args[1], args[2].parse().ok()),
         "hunts" if args.len() == 2 => cmd_hunts(&args[1], None),

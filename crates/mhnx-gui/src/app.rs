@@ -26,6 +26,7 @@ pub enum Tab {
     Hunts,
     Guild,
     Palico,
+    Sets,
     Extras,
     About,
 }
@@ -673,6 +674,7 @@ impl eframe::App for MhnxEditor {
             Tab::Hunts => self.tab_hunts(ui),
             Tab::Guild => self.tab_guild(ui),
             Tab::Palico => self.tab_palico_detail(ui),
+            Tab::Sets => self.tab_sets(ui),
             Tab::Extras => self.tab_extras(ui),
             Tab::About => self.tab_about(ui),
         });
@@ -835,6 +837,7 @@ impl MhnxEditor {
         ui.selectable_value(&mut self.tab, Tab::Hunts, "狩猟記録");
         ui.selectable_value(&mut self.tab, Tab::Guild, "ギルド");
         ui.selectable_value(&mut self.tab, Tab::Palico, "オトモ");
+        ui.selectable_value(&mut self.tab, Tab::Sets, "マイセット");
                 ui.selectable_value(&mut self.tab, Tab::Extras, "設定/オトモ");
         ui.selectable_value(&mut self.tab, Tab::About, "情報");
                     });
@@ -2004,6 +2007,67 @@ impl MhnxEditor {
             .unwrap_or_default()
     }
 
+    fn tab_sets(&mut self, ui: &mut egui::Ui) {
+        ui.heading("マイセット");
+        let Some(save) = &mut self.save else {
+            ui.label("セーブを開くと、アイテムセットと装備セットを表示します");
+            return;
+        };
+        let slot = self.slot;
+        let items = mhnx_core::myset::item_sets(save, slot);
+        let equips = mhnx_core::myset::equip_sets(save, slot);
+        ui.label(egui::RichText::new("アイテムセット").strong());
+        let mut changed = false;
+        egui::Grid::new("itemsets").num_columns(2).striped(true).show(ui, |ui| {
+            for set in items.iter().filter(|s| !s.is_empty()) {
+                ui.label(format!("[{}]", set.index));
+                let mut name = set.name.clone();
+                if ui.add(egui::TextEdit::singleline(&mut name).desired_width(180.0)).changed() {
+                    mhnx_core::myset::set_item_set_name(save, slot, set.index, &name);
+                    changed = true;
+                }
+                ui.end_row();
+                let body = set
+                    .used_items()
+                    .iter()
+                    .map(|i| format!("{} x{}", mhnx_core::hbedit::item_name_of(i.id), i.count))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.label("");
+                ui.label(body);
+                ui.end_row();
+            }
+        });
+        ui.separator();
+        ui.label(egui::RichText::new("装備セット").strong());
+        egui::Grid::new("equipsets").num_columns(3).striped(true).show(ui, |ui| {
+            for set in equips.iter().filter(|s| !s.is_empty()) {
+                ui.label(format!("[{}]", set.index));
+                let mut name = set.name.clone();
+                if ui.add(egui::TextEdit::singleline(&mut name).desired_width(180.0)).changed() {
+                    mhnx_core::myset::set_equip_set_name(save, slot, set.index, &name);
+                    changed = true;
+                }
+                let parts = set
+                    .parts
+                    .iter()
+                    .map(|p| {
+                        if *p == mhnx_core::myset::NONE {
+                            String::from("-")
+                        } else {
+                            format!("{}", p)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                ui.label(parts);
+                ui.end_row();
+            }
+        });
+        if changed {
+            self.dirty = true;
+        }
+    }
     fn tab_palico_detail(&mut self, ui: &mut egui::Ui) {
         ui.heading("オトモ")
             ;
@@ -2025,7 +2089,7 @@ impl MhnxEditor {
                     .num_columns(4)
                     .striped(true)
                     .show(ui, |ui| {
-                        for h in ["枠", "名前", "レベル", "なつき"] {
+                        for h in ["枠", "名前", "レベル", "なつき", "系統", "修得スキル"] {
                             ui.strong(h);
                         }
                         ui.end_row();
@@ -2074,6 +2138,14 @@ impl MhnxEditor {
                                 }
                                 changed = true;
                             }
+                            ui.label(p.system_name());
+                            let names = p
+                                .learned_skills()
+                                .iter()
+                                .map(|id| mhnx_core::palico::skill_name(*id))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            ui.label(names);
                             ui.end_row();
                         }
                     });

@@ -2918,3 +2918,179 @@ fn the_console_lists_the_palicos() {
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::Slots);
 }
+
+// ---------------------------------------------------------------------------
+// Item sets and equipment sets.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_two_set_arrays_sit_where_they_should() {
+    use mhnx_core::myset::*;
+    // Neither array may run into its neighbour.
+    assert_eq!(OFF_ITEM_SETS + ITEM_SETS * ITEM_SET_SIZE, 0x27BF);
+    assert_eq!(OFF_EQUIP_SETS + EQUIP_SETS * EQUIP_SET_SIZE, 0x21E0E);
+    // An item set is a name, ten reserved bytes and 32 pairs.
+    assert_eq!(ITEM_SET_BODY + ITEM_SET_ITEMS * 4, ITEM_SET_SIZE);
+    // An equipment set names seven parts that must fit before the colours.
+    assert!(EQUIP_SET_BODY + EQUIP_SET_PARTS * 2 <= EQUIP_SET_COLOURS);
+    assert!(EQUIP_SET_COLOURS + 5 * 4 <= EQUIP_SET_SIZE);
+}
+
+#[test]
+fn the_item_sets_read_real_records() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let sets = mhnx_core::myset::item_sets(&s, 0);
+    assert_eq!(sets.len(), mhnx_core::myset::ITEM_SETS);
+    let used: Vec<_> = sets.iter().filter(|x| !x.is_empty()).collect();
+    assert_eq!(used.len(), 2, "the sample has two item sets");
+    assert!(
+        used.iter().any(|x| x.name.contains("剣士")),
+        "names: {:?}",
+        used.iter().map(|x| &x.name).collect::<Vec<_>>()
+    );
+    for set in &used {
+        let items = set.used_items();
+        assert!(!items.is_empty(), "set {} has no items", set.index);
+        for it in &items {
+            assert!(
+                (1..=2990).contains(&it.id),
+                "set {} holds item id {}",
+                set.index,
+                it.id
+            );
+            assert!((1..=99).contains(&it.count), "count {} out of range", it.count);
+        }
+        // The game stores them in ascending id order.
+        let mut ids: Vec<u16> = items.iter().map(|i| i.id).collect();
+        let sorted = {
+            let mut c = ids.clone();
+            c.sort_unstable();
+            c
+        };
+        ids = sorted;
+        assert!(!items.is_empty());
+    }
+    // Unused records carry the placeholder name.
+    assert!(
+        sets.iter().filter(|x| x.is_empty()).all(|x| x.name == mhnx_core::myset::EMPTY_NAME
+            || x.name.is_empty()),
+        "an unused set has an unexpected name"
+    );
+}
+
+#[test]
+fn the_equipment_sets_read_real_records() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let sets = mhnx_core::myset::equip_sets(&s, 0);
+    assert_eq!(sets.len(), mhnx_core::myset::EQUIP_SETS);
+    let used: Vec<_> = sets.iter().filter(|x| !x.is_empty()).collect();
+    assert_eq!(used.len(), 9, "slot 1 has nine equipment sets");
+    for set in &used {
+        assert!(!set.name.is_empty());
+        // A weapon is always named; the box holds 2000 slots.
+        let weapon = set.parts[0];
+        assert!(
+            weapon == mhnx_core::myset::NONE || weapon < 2000,
+            "set {} points at equipment {}",
+            set.index,
+            weapon
+        );
+    }
+    // The empty ones follow the documented shape.
+    let empty: Vec<_> = sets.iter().filter(|x| x.is_empty()).collect();
+    assert!(empty.len() > 20);
+    assert!(empty.iter().all(|x| x.parts.iter().all(|p| *p == mhnx_core::myset::NONE)));
+}
+
+#[test]
+fn an_item_and_equipment_set_can_be_renamed() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let before = s.to_bytes();
+    assert!(mhnx_core::myset::set_item_set_name(&mut s, 0, 5, "テスト"));
+    assert_eq!(mhnx_core::myset::item_sets(&s, 0)[5].name, "テスト");
+    assert!(mhnx_core::myset::set_equip_set_name(&mut s, 0, 5, "テスト装備"));
+    assert_eq!(mhnx_core::myset::equip_sets(&s, 0)[5].name, "テスト装備");
+    // Writes stay inside their own record.
+    let after = s.to_bytes();
+    let item_at = 36 + 0x126474 + mhnx_core::myset::OFF_ITEM_SETS + 5 * mhnx_core::myset::ITEM_SET_SIZE;
+    let eq_at = 36 + 0x126474 + mhnx_core::myset::OFF_EQUIP_SETS + 5 * mhnx_core::myset::EQUIP_SET_SIZE;
+    let inside = |i: usize| {
+        (i >= item_at && i < item_at + mhnx_core::myset::ITEM_SET_SIZE)
+            || (i >= eq_at && i < eq_at + mhnx_core::myset::EQUIP_SET_SIZE)
+    };
+    let outside: Vec<usize> = (0..after.len())
+        .filter(|i| after[*i] != before[*i])
+        .filter(|i| !inside(*i))
+        .collect();
+    assert!(outside.is_empty(), "wrote outside the records: {:?}", outside);
+    // Out of range and out of table are refused.
+    assert!(!mhnx_core::myset::set_item_set_name(&mut s, 0, mhnx_core::myset::ITEM_SETS, "x"));
+    assert!(!mhnx_core::myset::set_item_set_entry(&mut s, 0, 0, 0, 2991, 1));
+    assert!(!mhnx_core::myset::set_item_set_entry(&mut s, 0, 0, 32, 1, 1));
+}
+
+#[test]
+fn the_palico_skills_and_system_read() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let list = mhnx_core::palico::used(&s, 0);
+    let mut real = 0;
+    for p in &list {
+        assert_ne!(p.system_name(), "?", "palico {} has system {}", p.index, p.system);
+        let learned = p.learned_skills();
+        for id in &learned {
+            assert_ne!(
+                mhnx_core::palico::skill_name(*id),
+                "#",
+                "skill {} has no name",
+                id
+            );
+            assert!(*id != mhnx_core::palico::SKILL_EMPTY);
+        }
+        if !learned.is_empty() {
+            real += 1;
+        }
+    }
+    assert!(real >= 10, "expected most palicos to know skills, got {}", real);
+    // skill 1 is the small health boost in the table we generated.
+    assert_eq!(
+        mhnx_core::palico::skill_name(1),
+        "体力強化の術【小】",
+        "the skill table is misaligned"
+    );
+}
+
+#[test]
+fn the_console_shows_the_sets() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::A);
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::Sets);
+    let joined = ed
+        .lines()
+        .iter()
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("MY SETS"), "{}", joined);
+    assert!(joined.contains("ITEM SETS"), "{}", joined);
+    assert!(joined.contains("EQUIPMENT SETS"), "{}", joined);
+    assert!(joined.contains("剣士"), "{}", joined);
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+}

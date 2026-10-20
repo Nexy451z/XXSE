@@ -30,6 +30,7 @@ pub mod dlc;
 pub mod dlcats;
 pub mod equip;
 pub mod guildcard;
+pub mod myset;
 pub mod palico;
 pub mod equipnames;
 pub mod entries;

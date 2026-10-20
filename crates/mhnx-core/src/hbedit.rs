@@ -74,6 +74,8 @@ pub enum Screen {
     Guild,
     /// The palico roster.
     Roster,
+    /// Item sets and equipment sets.
+    Sets,
     /// Item name search, opened from the item box with R.
     ItemPick,
     /// Download Palicoes (配信オトモ).
@@ -652,6 +654,14 @@ impl Editor {
             Screen::Hunts => self.input_hunts(key),
             Screen::Guild => self.input_guild(key),
             Screen::Roster => self.input_roster(key),
+            Screen::Sets => {
+                if key == Key::B {
+                    self.screen = Screen::Slots;
+                    self.cursor = self.slot;
+                } else if key == Key::Plus {
+                    self.quit = true;
+                }
+            }
             Screen::EntryView => match key {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
@@ -1183,6 +1193,7 @@ impl Editor {
                 self.screen = Screen::Hunts;
                 self.hunt_cursor = 0;
             }
+            Key::Y => self.screen = Screen::Sets,
             Key::X => self.step = (self.step + 1) % STEPS.len(),
             Key::Left | Key::Right => {
                 if self.field == 0 {
@@ -2675,6 +2686,43 @@ impl Editor {
                     push(
                         &mut out,
                         alloc::format!("  {:>2} : {}", a, times.join("  ")),
+                        false,
+                        false,
+                    );
+                }
+                push(&mut out, String::from("  B back"), false, false);
+            }
+            Screen::Sets => {
+                push(
+                    &mut out,
+                    alloc::format!("MY SETS   slot {}", self.slot + 1),
+                    false,
+                    false,
+                );
+                let Some(save) = &self.save else {
+                    return out;
+                };
+                push(&mut out, String::from(" ITEM SETS"), false, false);
+                for set in crate::myset::item_sets(save, self.slot) {
+                    if set.is_empty() {
+                        continue;
+                    }
+                    let n = set.used_items().len();
+                    push(
+                        &mut out,
+                        alloc::format!("  [{:>2}] {:<16} {} items", set.index, set.name, n),
+                        false,
+                        false,
+                    );
+                }
+                push(&mut out, String::from(" EQUIPMENT SETS"), false, false);
+                for set in crate::myset::equip_sets(save, self.slot) {
+                    if set.is_empty() {
+                        continue;
+                    }
+                    push(
+                        &mut out,
+                        alloc::format!("  [{:>2}] {}", set.index, set.name),
                         false,
                         false,
                     );
