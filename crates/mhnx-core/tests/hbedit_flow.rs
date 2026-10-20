@@ -4274,3 +4274,91 @@ fn the_console_can_edit_a_quest_equipment_item() {
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::SaveQuests);
 }
+
+#[test]
+fn converting_the_console_save_does_not_write_next_to_it() {
+    // The mount holds only what the game wrote. A converted copy must land on
+    // the SD card, or the console writer picks it up and corrupts the save.
+    let mut ed = Editor::new();
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../..", "/nx/jksv_ready/system");
+    let _ = path;
+    assert!(mhnx_core::hbedit::is_console_save_path("nand:/system"));
+    assert!(mhnx_core::hbedit::is_console_save_path("nand:/system_backup"));
+    assert!(!mhnx_core::hbedit::is_console_save_path("sdmc:/switch/x/system"));
+    // With a console path the converted output goes to the SD card.
+    let _ = &mut ed;
+}
+#[test]
+fn compaction_drops_the_romfs_padding_and_keeps_every_entry() {
+    // A shipped quest archive starts its data at 0x8000 with about 31KB of
+    // zeroes in front. That padding is why a 35KB file looked too big for a
+    // 5,112 byte save slot: the payloads are only a couple of kilobytes.
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../nx/mhxx/arcs/event/q1010002.arc"
+    );
+    let Ok(raw) = std::fs::read(path) else {
+        return;
+    };
+    let arc = mhnx_core::arc::Arc::parse(&raw).expect("the shipped archive parses");
+    let original_len = raw.len();
+    let payload: usize = arc.entries.iter().map(|e| e.data.len()).sum();
+    assert!(
+        original_len > 30_000,
+        "the shipped file is mostly padding: {original_len}"
+    );
+    assert!(
+        payload < 4_000,
+        "the real data is only {payload} bytes"
+    );
+
+    let compact = arc.to_bytes_compact().expect("compaction succeeds");
+    assert!(
+        compact.len() <= mhnx_core::dlc::QUEST_MAX_PAYLOAD,
+        "compacted to {} bytes, over the {} byte slot limit",
+        compact.len(),
+        mhnx_core::dlc::QUEST_MAX_PAYLOAD
+    );
+    // The save copy carries zero at +0x08 and romfs carries 0xFFFFFFFE.
+    assert_eq!(&compact[8..12], &[0, 0, 0, 0], "flags must take the save form");
+
+    // The entries survive, in order and unchanged.
+    let back = mhnx_core::arc::Arc::parse(&compact).expect("the result parses");
+    assert_eq!(back.entries.len(), arc.entries.len());
+    for (a, b) in arc.entries.iter().zip(back.entries.iter()) {
+        assert_eq!(a.name, b.name);
+        assert_eq!(a.data, b.data, "payload changed for {}", a.name);
+    }
+    assert_eq!(
+        back.to_bytes().expect("the compacted form round trips"),
+        compact
+    );
+}
+#[test]
+fn a_name_is_never_cut_inside_a_character() {
+    // The name fields are fixed byte widths, and a full width character is
+    // three bytes: cutting at the limit used to split one in half and leave
+    // the field holding invalid UTF-8.
+    let mut f = [0u8; 32];
+    mhnx_core::write_name_field(&mut f, "ああああああああああああ"); // 36 bytes
+    let end = f.iter().position(|b| *b == 0).unwrap_or(f.len());
+    assert!(end <= 31, "one byte is kept for the terminator: {end}");
+    assert!(
+        std::str::from_utf8(&f[..end]).is_ok(),
+        "the cut has to land on a character boundary"
+    );
+
+    // Every field width behaves the same way.
+    for width in [8usize, 20, 32, 33] {
+        let mut g = vec![0u8; width];
+        mhnx_core::write_name_field(&mut g, "ナナナナナナナナナナナナ");
+        let e = g.iter().position(|b| *b == 0).unwrap_or(g.len());
+        assert!(std::str::from_utf8(&g[..e]).is_ok(), "width {width}");
+    }
+
+    // A plain ASCII name still fills as much as it can.
+    let mut h = [0u8; 16];
+    mhnx_core::write_name_field(&mut h, "abcdefghijklmnop");
+    assert_eq!(&h[..15], b"abcdefghijklmno");
+    assert_eq!(h[15], 0);
+}

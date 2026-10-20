@@ -125,6 +125,11 @@ pub enum Request {
 ///
 /// The console paths use '/', the PC ones can use '\', and this code runs on
 /// both, so both are accepted. Returns "" when there is no separator.
+/// Is this path one of the two files inside the console's save area?
+pub fn is_console_save_path(path: &str) -> bool {
+    path == CONSOLE_SAVE || path == "nand:/system_backup" || path.starts_with("nand:")
+}
+
 fn split_dir(path: &str) -> String {
     match path.rfind(['/', '\\']) {
         Some(i) => path[..=i].to_string(),
@@ -1013,12 +1018,46 @@ impl Editor {
                 }
             }
             Key::X => self.request_write_save(),
+            Key::Y => self.install_all_dlc_palicoes(),
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = 0;
             }
             Key::Plus => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// Install all downloadable Palicoes of the current language (`palico_lang`)
+    /// into free slots in the open save.
+    pub fn install_all_dlc_palicoes(&mut self) {
+        let lang = if self.palico_lang == 0 {
+            Lang::Jp
+        } else {
+            Lang::En
+        };
+        let ids: &[u8] = match lang {
+            Lang::Jp => dlcats::JP_IDS,
+            Lang::En => dlcats::EN_IDS,
+        };
+        let Some(s) = &mut self.save else {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        };
+        let mut added = 0usize;
+        for &id in ids {
+            if !s.has_dlc_palico(id) && s.install_dlc_palico(lang, id).is_ok() {
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.dirty = true;
+            self.message = format!(
+                "公式配信オトモを {} 匹一括導入しました！([X] またはヘッダーでセーブ保存)",
+                added
+            );
+        } else {
+            self.message = String::from("選択言語の配信オトモはすべて導入済み（または枠満杯）です");
         }
     }
 
@@ -1250,7 +1289,8 @@ impl Editor {
                 self.field = (self.field + 1) % n;
                 self.cursor = self.field;
             }
-            Key::L | Key::R => self.slot = (self.slot + 1) % 3,
+            Key::L => self.slot = (self.slot + 2) % 3,
+            Key::R => self.slot = (self.slot + 1) % 3,
             // The slot screen has no spare key, so the record screens hang off
             // this one: - for hunt records and the guild card, plus palicos
             // from the equipment screen.
@@ -1464,7 +1504,16 @@ impl Editor {
             self.message = String::from("this save has no path");
             return;
         };
-        let dir = split_dir(&base);
+        // The console save lives on a mounted save area, and that area holds
+        // exactly the files the game made. A converted copy does not belong
+        // next to it: "nand:/system" used to produce "nand:/system.3ds", which
+        // then went straight back through the console writer and left the save
+        // as a hybrid of a 3DS body and the old tail.
+        let dir = if crate::hbedit::is_console_save_path(&base) {
+            alloc::string::String::from("/switch/mhnxeditor/")
+        } else {
+            split_dir(&base)
+        };
         let stem = if self.convert_name.trim().is_empty() {
             alloc::string::String::from("system")
         } else {
@@ -1563,7 +1612,9 @@ impl Editor {
                 }
             }
             // X walks the four numbers of the highlighted monster.
-            Key::X => self.hunt_field = (self.hunt_field + 1) % 4,
+            Key::X | Key::R => self.hunt_field = (self.hunt_field + 1) % 4,
+            Key::L => self.hunt_field = (self.hunt_field + 3) % 4,
+            Key::Y => self.step = (self.step + 1) % STEPS.len(),
             // Left/Right change the highlighted number.
             Key::Left | Key::Right => {
                 let Some(&(monster, slay, cap, lo, hi)) = rows.get(self.hunt_cursor) else {
@@ -1623,7 +1674,8 @@ impl Editor {
     fn input_guild(&mut self, key: Key) {
         // Field 0 is the rank, 1 is the card's own clock, 2 the comment.
         match key {
-            Key::X => self.guild_field = (self.guild_field + 1) % 3,
+            Key::Up => self.guild_field = (self.guild_field + 2) % 3,
+            Key::Down | Key::X => self.guild_field = (self.guild_field + 1) % 3,
             Key::Left | Key::Right => {
                 let up = key == Key::Right;
                 let slot = self.slot;
@@ -1683,7 +1735,8 @@ impl Editor {
                 }
             }
             // X walks the editable fields of the highlighted palico.
-            Key::X => self.roster_field = (self.roster_field + 1) % 3,
+            Key::X | Key::R => self.roster_field = (self.roster_field + 1) % 3,
+            Key::L => self.roster_field = (self.roster_field + 2) % 3,
             Key::Left | Key::Right => {
                 let Some(p) = list.get(self.roster_cursor).cloned() else {
                     return;
@@ -1743,10 +1796,6 @@ impl Editor {
             Some(s) => crate::palico::used(s, self.slot),
             None => Vec::new(),
         }
-    }
-
-    fn rounds_roster(&self) -> usize {
-        self.palicos().len()
     }
     fn input_quest_equip(&mut self, key: Key) {
         let n = self.quest_equipment().len();
@@ -2132,11 +2181,143 @@ impl Editor {
 
     /// Cached title for a quest id.
     pub fn quest_title(&self, id: i32) -> &str {
-        self.quest_titles
+        if let Some((_, t)) = self
+            .quest_titles
             .iter()
-            .find(|(q, _)| *q == id)
-            .map(|(_, t)| t.as_str())
-            .unwrap_or("")
+            .find(|(q, t)| *q == id && !t.is_empty())
+        {
+            return t.as_str();
+        }
+        crate::dlc_bundle::official_quest_title(id).unwrap_or("")
+    }
+
+    /// Install all 189 bundled official event & challenge quests (plus the 40
+    /// challenge quest equipment loadouts and DLC section header flags) into
+    /// the open save.
+    #[cfg(feature = "gamedata")]
+    pub fn install_official_dlc(&mut self) {
+        self.install_dlc_category(true, false, "公式イベント(189件)");
+    }
+
+    /// Install bundled quests matching the specified categories into the open save.
+    #[cfg(feature = "gamedata")]
+    pub fn install_dlc_category(&mut self, official: bool, dead: bool, label: &str) {
+        let Some(save) = &mut self.save else {
+            self.message = String::from("先にセーブデータを開いてください");
+            return;
+        };
+        match crate::dlc::install_dlc_quests_by_category(save, official, dead) {
+            Ok((added, total)) => {
+                self.dirty = true;
+                self.refresh_quest_titles();
+                let n = self.filtered_quests().len();
+                self.save_quest_cursor = self.save_quest_cursor.min(n.saturating_sub(1));
+                self.cursor = self.save_quest_cursor;
+                if added > 0 {
+                    self.message = format!("{} を {} 件追加しました（計 {} 件）", label, added, total);
+                } else {
+                    self.message = format!("{} はすべて導入済みです（計 {} 件）", label, total);
+                }
+            }
+            Err(e) => {
+                self.message = format!("{} の追加に失敗: {}", label, e);
+            }
+        }
+    }
+
+    /// Toggle one bundled quest (install into free slot or remove from save).
+    #[cfg(feature = "gamedata")]
+    pub fn toggle_bundled_quest(&mut self, quest_id: i32) {
+        let Some(save) = &mut self.save else {
+            self.message = String::from("先にセーブデータを開いてください");
+            return;
+        };
+        let title = crate::dlc_bundle::official_quest_title(quest_id).unwrap_or("");
+        match crate::dlc::toggle_bundled_quest(save, quest_id) {
+            Ok((slot, true)) => {
+                self.dirty = true;
+                self.refresh_quest_titles();
+                self.message = format!(
+                    "クエスト {} 「{}」を枠 {:03} に導入しました！",
+                    quest_id, title, slot
+                );
+            }
+            Ok((slot, false)) => {
+                self.dirty = true;
+                self.refresh_quest_titles();
+                self.message = format!(
+                    "クエスト {} 「{}」（枠 {:03}）をセーブから削除しました",
+                    quest_id, title, slot
+                );
+            }
+            Err(e) => {
+                self.message = format!("クエスト {} の切替に失敗しました: {}", quest_id, e);
+            }
+        }
+    }
+
+    /// Remove a quest from the open save by its quest ID.
+    #[cfg(feature = "gamedata")]
+    pub fn remove_save_quest(&mut self, quest_id: i32) {
+        let title = self.quest_title(quest_id).to_string();
+        let Some(save) = &mut self.save else {
+            self.message = String::from("先にセーブデータを開いてください");
+            return;
+        };
+        match crate::dlc::remove_quest_by_id(save, quest_id) {
+            Ok(slot) => {
+                self.dirty = true;
+                self.refresh_quest_titles();
+                let n = self.filtered_quests().len();
+                self.save_quest_cursor = self.save_quest_cursor.min(n.saturating_sub(1));
+                self.cursor = self.save_quest_cursor;
+                self.message = format!(
+                    "クエスト {} 「{}」（枠 {:03}）をセーブから削除しました",
+                    quest_id, title, slot
+                );
+            }
+            Err(e) => {
+                self.message = format!("削除失敗: {}", e);
+            }
+        }
+    }
+
+    /// Open a quest either from the save (if installed) or directly from the bundled `.arc` catalogue.
+    pub fn open_bundled_quest(&mut self, quest_id: i32) {
+        if self.save_quests().iter().any(|q| q.quest_id == quest_id) {
+            self.open_quest_from_save(quest_id);
+            return;
+        }
+        let Some(meta) = crate::dlc_bundle::find_official_quest(quest_id) else {
+            self.message = format!("クエスト {} が見つかりません", quest_id);
+            return;
+        };
+        let data = crate::dlc_bundle::arc_bytes(meta);
+        match Arc::parse(data) {
+            Ok(a) => {
+                let idx = a
+                    .entries
+                    .iter()
+                    .position(|e| extension_for(e.type_hash) == Some("mib"))
+                    .or_else(|| {
+                        a.entries
+                            .iter()
+                            .position(|e| extension_for(e.type_hash) == Some("gmd"))
+                    })
+                    .unwrap_or(0);
+                self.arc = Some(a);
+                self.arc_path = None;
+                self.entry = idx;
+                self.cursor = idx;
+                self.load_entry();
+                self.screen = Screen::ArcEntries;
+                self.message = format!(
+                    "内蔵クエスト {} 「{}」を開きました（[X]でセーブへ導入できます）",
+                    quest_id, meta.title
+                );
+            }
+            Err(e) => self.message = format!("クエスト {} を開けません: {}", quest_id, e),
+        }
     }
 
     /// The download quests stored in the open save, in slot order.
@@ -2223,6 +2404,10 @@ impl Editor {
             Key::L => {
                 self.screen = Screen::QuestEquip;
                 self.cursor = 0;
+            }
+            #[cfg(feature = "gamedata")]
+            Key::Z => {
+                self.install_official_dlc();
             }
             Key::B => {
                 self.screen = Screen::ArcList;
@@ -2316,6 +2501,48 @@ impl Editor {
             Key::Left | Key::Right => {
                 let f = fields[self.mib_cursor];
                 if f.kind == FieldKind::Bytes {
+                    if f.key.starts_with("mob_slot[") && f.offset + 13 <= self.mib_bytes.len() {
+                        let cur_id = u16::from_le_bytes([
+                            self.mib_bytes[f.offset],
+                            self.mib_bytes[f.offset + 1],
+                        ]);
+                        let mint = questfields::ENUM_MINT_;
+                        let cur_idx = mint
+                            .iter()
+                            .position(|s| s.parse::<u16>().ok() == Some(cur_id))
+                            .unwrap_or(0);
+                        let len = (mint.len().saturating_sub(1)).max(1);
+                        let next_idx = if key == Key::Right {
+                            (cur_idx + 1) % len
+                        } else {
+                            (cur_idx + len - 1) % len
+                        };
+                        let next_id = mint
+                            .get(next_idx)
+                            .and_then(|s| s.parse::<u16>().ok())
+                            .unwrap_or(0);
+                        self.mib_bytes[f.offset..f.offset + 2]
+                            .copy_from_slice(&next_id.to_le_bytes());
+                        if next_id > 0 && self.mib_bytes[f.offset + 4] == 0 {
+                            // Initialize default spawn count=1, hp=50, atk=50, def=50, size=100%, stamina=1
+                            self.mib_bytes[f.offset + 4] = 1;
+                            self.mib_bytes[f.offset + 5] = 50;
+                            self.mib_bytes[f.offset + 6] = 50;
+                            self.mib_bytes[f.offset + 7] = 50;
+                            self.mib_bytes[f.offset + 9..f.offset + 11]
+                                .copy_from_slice(&100u16.to_le_bytes());
+                            self.mib_bytes[f.offset + 12] = 1;
+                        } else if next_id == 0 {
+                            self.mib_bytes[f.offset..f.offset + 13].fill(0);
+                        }
+                        self.dirty = true;
+                        let mname = questfields::ENUM_MONS_
+                            .get(next_idx)
+                            .copied()
+                            .unwrap_or("?");
+                        self.message = format!("{} -> {} (ID: {})", f.ja, mname, next_id);
+                        return;
+                    }
                     self.message = String::from("raw byte field - not editable here");
                     return;
                 }

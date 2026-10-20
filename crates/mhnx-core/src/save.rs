@@ -418,9 +418,7 @@ impl Save {
             .ok_or(Error::Parse("character slot has no base offset"))? as usize;
 
         let mut nb = [0u8; 32];
-        let raw = c.name.as_bytes();
-        let n = raw.len().min(31);
-        nb[..n].copy_from_slice(&raw[..n]);
+        crate::write_name_field(&mut nb, &c.name);
         self.body[base + OFF_NAME..base + OFF_NAME + 32].copy_from_slice(&nb);
         self.body[base + OFF_NAME_PREVIEW..base + OFF_NAME_PREVIEW + 32].copy_from_slice(&nb);
 

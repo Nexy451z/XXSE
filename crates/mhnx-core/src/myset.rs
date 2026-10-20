@@ -105,10 +105,7 @@ fn read_name(b: &[u8]) -> String {
 }
 
 fn write_name(dst: &mut [u8], name: &str) {
-    dst.fill(0);
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(dst.len().saturating_sub(1));
-    dst[..n].copy_from_slice(&bytes[..n]);
+    crate::write_name_field(dst, name);
 }
 
 fn u16_at(b: &[u8], off: usize) -> u16 {
