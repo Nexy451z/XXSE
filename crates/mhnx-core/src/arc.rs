@@ -106,6 +106,12 @@ impl ArcEntry {
 pub struct Arc {
     /// Format version.
     pub version: u16,
+    /// The word at +0x08, which the header documentation used to call zero.
+    ///
+    /// Every shipped archive carries 0xFFFFFFFE there. The writer used to
+    /// leave the slot zeroed, so a repack differed from the original in those
+    /// four bytes alone: harmless in testing, but not a faithful copy.
+    pub header8: u32,
     /// Entries, in file order.
     pub entries: Vec<ArcEntry>,
 }
@@ -137,6 +143,7 @@ impl Arc {
             return Err(Error::BadMagic { context: "arc" });
         }
         let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+        let header8 = read_u32(bytes, 8).unwrap_or(0xFFFF_FFFE);
         let count = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
         let dir_end = HEADER_SIZE + ENTRY_SIZE * count;
         if bytes.len() < dir_end {
@@ -176,7 +183,11 @@ impl Arc {
                 data,
             });
         }
-        Ok(Arc { version, entries })
+        Ok(Arc {
+            version,
+            header8,
+            entries,
+        })
     }
 
     /// Serialise back to raw bytes.
@@ -228,6 +239,7 @@ impl Arc {
         out[0..4].copy_from_slice(&ARC_MAGIC);
         out[4..6].copy_from_slice(&self.version.to_le_bytes());
         out[6..8].copy_from_slice(&(count as u16).to_le_bytes());
+        out[8..12].copy_from_slice(&self.header8.to_le_bytes());
         for (i, e) in self.entries.iter().enumerate() {
             let base = HEADER_SIZE + ENTRY_SIZE * i;
             let nb = e.name.as_bytes();
