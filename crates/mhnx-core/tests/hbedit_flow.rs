@@ -2468,3 +2468,38 @@ fn an_out_of_range_supply_write_is_refused() {
     )
     .is_err());
 }
+
+#[test]
+fn a_repacked_archive_is_byte_identical_to_the_original() {
+    // The writer used to leave the word at +0x08 as zero while every shipped
+    // archive carries 0xFFFFFFFE there, so a repack differed in four bytes.
+    let q = std::path::PathBuf::from(
+        "C:/anyWorkspace/nx/mhxx/extract/base_romfs/nativeNX/arc/quest",
+    );
+    if !q.exists() {
+        return;
+    }
+    let mut checked = 0;
+    for e in std::fs::read_dir(&q).unwrap().flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("arc") {
+            continue;
+        }
+        let raw = std::fs::read(&p).unwrap();
+        let Ok(a) = mhnx_core::arc::Arc::parse(&raw) else {
+            continue;
+        };
+        let out = a.to_bytes().unwrap();
+        assert_eq!(
+            out,
+            raw,
+            "{} did not round trip",
+            p.file_name().unwrap().to_string_lossy()
+        );
+        checked += 1;
+        if checked >= 12 {
+            break;
+        }
+    }
+    assert!(checked > 0, "no archives were checked");
+}
