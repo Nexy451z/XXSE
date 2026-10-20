@@ -1011,3 +1011,124 @@ fn the_entry_view_never_panics_on_a_junk_payload() {
         ed.input(Key::B);
     }
 }
+// ---------------------------------------------------------------------------
+// The console skill picker: 306 skills cannot be reached by +/- on a number.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn y_on_a_skill_row_opens_the_name_picker() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L); // charms
+    ed.input(Key::L); // new charm form
+    assert_eq!(ed.screen, Screen::CharmEdit);
+
+    // The form opens on the skill 1 row, so Y works straight away.
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::SkillPick);
+    assert_eq!(ed.skill_pick_field, 1);
+    assert_eq!(
+        ed.skill_pick_matches().len(),
+        306,
+        "the whole table is reachable"
+    );
+    let lines = ed.lines();
+    assert!(lines[0].text.contains("PICK SKILL 1"), "{}", lines[0].text);
+    // The first rows carry real Japanese names.
+    assert!(
+        lines.iter().any(|l| l.text.contains("毒")),
+        "skill names must be rendered"
+    );
+}
+
+#[test]
+fn filtering_by_name_and_choosing_writes_the_skill() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    ed.input(Key::L);
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::SkillPick);
+
+    ed.apply_skill_filter(String::from("攻撃"));
+    let matches = ed.skill_pick_matches();
+    assert!(!matches.is_empty(), "the filter must find 攻撃");
+    let want = matches[0];
+
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::CharmEdit, "choosing returns to the form");
+    assert_eq!(
+        ed.charm_edit.map(|e| e.skill1),
+        Some(want),
+        "the chosen id must land in skill 1"
+    );
+    assert!(ed.message.contains("攻撃"), "message was {}", ed.message);
+}
+
+#[test]
+fn the_second_skill_row_targets_skill_2() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    ed.input(Key::L);
+    // A new charm is seeded from a real talisman, so remember skill 1.
+    let skill1_before = ed.charm_edit.map(|e| e.skill1);
+    // skill 1 -> points 1 -> skill 2
+    ed.input(Key::Down);
+    ed.input(Key::Down);
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::SkillPick);
+    assert_eq!(ed.skill_pick_field, 2);
+    ed.apply_skill_filter(String::from("匠"));
+    let want = ed.skill_pick_matches()[0];
+    ed.input(Key::A);
+    assert_eq!(ed.charm_edit.map(|e| e.skill2), Some(want));
+    assert_eq!(
+        ed.charm_edit.map(|e| e.skill1),
+        skill1_before,
+        "skill 1 untouched"
+    );
+}
+
+#[test]
+fn y_off_a_skill_row_says_so_instead_of_opening() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    ed.input(Key::L);
+    ed.input(Key::Up); // skill 1 -> deco slots
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    assert!(ed.message.contains("skill row"), "message was {}", ed.message);
+}
+
+#[test]
+fn the_skill_picker_does_not_panic_on_an_empty_match() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    ed.input(Key::L);
+    ed.input(Key::Y);
+    ed.apply_skill_filter(String::from("zzzznothing"));
+    assert!(ed.skill_pick_matches().is_empty());
+    ed.input(Key::Down);
+    ed.input(Key::Up);
+    ed.input(Key::Right);
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+}
