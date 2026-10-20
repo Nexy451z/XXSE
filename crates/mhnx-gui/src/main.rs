@@ -133,10 +133,10 @@ fn main() -> eframe::Result<()> {
             // ... and write the resulting save somewhere so the whole loop can
             // be verified byte for byte without a human clicking.
             if let Ok(p) = std::env::var("MHNXEDITOR_SAVE_OUT") {
-                if let Some(save) = &app.save {
-                    let _ = std::fs::write(&p, save.to_bytes());
-                    app.status = format!("save written to {}", p);
-                }
+                // Go through the same path the 上書き保存 button uses, so the
+                // hook exercises the real write including its backup.
+                app.write_current(std::path::PathBuf::from(&p));
+                app.status = app.message.clone();
             }
             Ok(Box::new(app))
         }),

@@ -452,8 +452,19 @@ fn service(ed: &mut Editor) -> bool {
         match w {
             Write::File { path, bytes } => {
                 let n = bytes.len();
+                // Keep the file we are about to replace. Nothing used to hold
+                // the previous contents, so one bad write lost the save.
+                let mut kept = false;
+                if let Some(old) = read_file(&path) {
+                    let bak = format!("{}.bak", path);
+                    kept = write_file(&bak, &old);
+                }
                 if write_file(&path, &bytes) {
-                    ed.message = format!("wrote {} bytes to {}", n, path);
+                    ed.message = if kept {
+                        format!("wrote {} bytes to {} (previous kept as .bak)", n, path)
+                    } else {
+                        format!("wrote {} bytes to {}", n, path)
+                    };
                     // Keep the Switch save pair consistent.
                     if path.ends_with("/system") {
                         let backup = format!("{}_backup", path);
