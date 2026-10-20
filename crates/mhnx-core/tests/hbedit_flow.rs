@@ -1452,3 +1452,70 @@ fn the_quest_filter_survives_an_empty_result() {
     let lines = ed.lines();
     assert!(lines[0].text.contains("QUESTS INSIDE THIS SAVE"));
 }
+#[test]
+fn a_reward_item_can_be_changed_from_the_console() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    ed.cursor = 5; // rem_620114
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::EntryView);
+    let before = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].item
+    };
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::ItemPick, "A must open the picker");
+    assert_eq!(ed.item_pick_mode, 1);
+    ed.apply_item_filter(String::from("回復薬"));
+    let want = ed.item_pick_matches()[0];
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::EntryView, "choosing returns to the view");
+    let after = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].item
+    };
+    assert_eq!(after, want, "the record must hold the chosen item");
+    assert_ne!(after, before, "the test must actually change something");
+    assert!(ed.dirty, "the archive must be marked changed");
+    assert!(ed.message.contains("X writes"), "message was {}", ed.message);
+}
+
+#[test]
+fn the_row_cursor_picks_which_record_changes() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    ed.cursor = 5;
+    ed.input(Key::Y);
+    ed.input(Key::Down);
+    ed.input(Key::Down);
+    assert_eq!(ed.entry_row_cursor, 2);
+    ed.input(Key::A);
+    ed.apply_item_filter(String::from("回復薬"));
+    let want = ed.item_pick_matches()[0];
+    ed.input(Key::A);
+    let t = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap()
+    };
+    assert_eq!(t.records[2].item, want, "row 2 must hold the new item");
+    assert_ne!(t.records[0].item, want, "row 0 must be untouched");
+}
+
+#[test]
+fn b_leaves_the_picker_without_writing() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    ed.cursor = 5;
+    ed.input(Key::Y);
+    let before = ed.arc.as_ref().unwrap().entries[5].data.clone();
+    ed.input(Key::A);
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::EntryView, "B returns to the view");
+    assert_eq!(ed.arc.as_ref().unwrap().entries[5].data, before, "nothing written");
+}
