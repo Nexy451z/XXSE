@@ -68,6 +68,12 @@ pub enum Screen {
     Equip,
     /// The 45 quest-equipment entries the DLC section carries.
     QuestEquip,
+    /// Monster hunt, capture and size records.
+    Hunts,
+    /// The guild card and the arena log.
+    Guild,
+    /// The palico roster.
+    Roster,
     /// Item name search, opened from the item box with R.
     ItemPick,
     /// Download Palicoes (配信オトモ).
@@ -167,6 +173,22 @@ pub type TextRequest = (usize, String);
 /// Sentinel id for "ask the player's name".
 pub const TEXT_NAME: usize = usize::MAX;
 
+/// Monster name for a hunt-record index, or a placeholder when unavailable.
+pub fn monster_name(index: usize) -> &'static str {
+    #[cfg(feature = "gamedata")]
+    {
+        crate::gamedata::MONSTER_HUNT_NAMES
+            .get(index)
+            .copied()
+            .unwrap_or("?")
+    }
+    #[cfg(not(feature = "gamedata"))]
+    {
+        let _ = index;
+        "?"
+    }
+}
+
 /// Display name for an item id, or a placeholder when the table is absent.
 #[cfg(feature = "gamedata")]
 pub fn item_name_of(id: u16) -> alloc::string::String {
@@ -263,6 +285,10 @@ pub struct Editor {
     pub entry_row_cursor: usize,
     /// File name chosen for the converted save, without path or extension.
     pub convert_name: String,
+    /// Hunt record cursor and the working copies.
+    pub hunt_cursor: usize,
+    /// Palico roster cursor.
+    pub roster_cursor: usize,
     /// Equipment list filter and cursor.
     pub equip_filter: String,
     /// Cursor over the filtered equipment list.
@@ -342,6 +368,8 @@ impl Editor {
             item_undo: Vec::new(),
             skill_pick_field: 1,
             convert_name: String::new(),
+            hunt_cursor: 0,
+            roster_cursor: 0,
             equip_filter: String::new(),
             equip_cursor: 0,
             item_pick_mode: 0,
@@ -621,6 +649,9 @@ impl Editor {
             Screen::Convert => self.input_convert(key),
             Screen::Equip => self.input_equip(key),
             Screen::QuestEquip => self.input_quest_equip(key),
+            Screen::Hunts => self.input_hunts(key),
+            Screen::Guild => self.input_guild(key),
+            Screen::Roster => self.input_roster(key),
             Screen::EntryView => match key {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
@@ -1145,6 +1176,13 @@ impl Editor {
                 self.cursor = self.field;
             }
             Key::L | Key::R => self.slot = (self.slot + 1) % 3,
+            // The slot screen has no spare key, so the record screens hang off
+            // this one: - for hunt records and the guild card, plus palicos
+            // from the equipment screen.
+            Key::Minus => {
+                self.screen = Screen::Hunts;
+                self.hunt_cursor = 0;
+            }
             Key::X => self.step = (self.step + 1) % STEPS.len(),
             Key::Left | Key::Right => {
                 if self.field == 0 {
@@ -1421,6 +1459,81 @@ impl Editor {
         }
     }
 
+    /// The hunt tables as a flat list of monsters that have records.
+    pub fn hunt_rows(&self) -> Vec<(usize, u16, u16, u16, u16)> {
+        let Some(save) = &self.save else {
+            return Vec::new();
+        };
+        let slay = save.hunt_counts(self.slot).unwrap_or_default();
+        let cap = save.capture_counts(self.slot).unwrap_or_default();
+        let size = save.monster_sizes(self.slot).unwrap_or_default();
+        (0..slay.len())
+            .map(|i| {
+                let (a, b) = size.get(i).copied().unwrap_or((0, 0));
+                (i, slay[i], cap.get(i).copied().unwrap_or(0), a, b)
+            })
+            .filter(|(_, s, c, _, _)| *s > 0 || *c > 0)
+            .collect()
+    }
+
+    fn input_hunts(&mut self, key: Key) {
+        let n = self.hunt_rows().len();
+        match key {
+            Key::Up => self.hunt_cursor = self.hunt_cursor.saturating_sub(1),
+            Key::Down => {
+                if n > 0 {
+                    self.hunt_cursor = (self.hunt_cursor + 1).min(n - 1);
+                }
+            }
+            Key::B => {
+                self.screen = Screen::Slots;
+                self.cursor = self.slot;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn input_guild(&mut self, key: Key) {
+        match key {
+            Key::B => {
+                self.screen = Screen::Slots;
+                self.cursor = self.slot;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn input_roster(&mut self, key: Key) {
+        let n = self.rounds_roster();
+        match key {
+            Key::Up => self.roster_cursor = self.roster_cursor.saturating_sub(1),
+            Key::Down => {
+                if n > 0 {
+                    self.roster_cursor = (self.roster_cursor + 1).min(n - 1);
+                }
+            }
+            Key::B => {
+                self.screen = Screen::Slots;
+                self.cursor = self.slot;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    /// Palicos the current character owns.
+    pub fn palicos(&self) -> Vec<crate::palico::Palico> {
+        match &self.save {
+            Some(s) => crate::palico::used(s, self.slot),
+            None => Vec::new(),
+        }
+    }
+
+    fn rounds_roster(&self) -> usize {
+        self.palicos().len()
+    }
     fn input_quest_equip(&mut self, key: Key) {
         let n = self.quest_equipment().len();
         match key {
@@ -1454,6 +1567,13 @@ impl Editor {
             Key::X => {
                 self.equip_filter.clear();
                 self.equip_cursor = 0;
+            }
+            Key::L => {
+                self.screen = Screen::Guild;
+            }
+            Key::R => {
+                self.screen = Screen::Roster;
+                self.roster_cursor = 0;
             }
             Key::B => {
                 self.screen = Screen::Slots;
@@ -2480,7 +2600,109 @@ impl Editor {
                     false,
                 );
             }
-            Screen::QuestEquip => {
+            Screen::Hunts => {
+                let rows = self.hunt_rows();
+                push(
+                    &mut out,
+                    alloc::format!("HUNT RECORDS   slot {}", self.slot + 1),
+                    false,
+                    false,
+                );
+                if rows.is_empty() {
+                    push(&mut out, String::from("  (no records)"), false, false);
+                }
+                let mut start = self.hunt_cursor.saturating_sub(8);
+                if start + 18 > rows.len() {
+                    start = rows.len().saturating_sub(18);
+                }
+                for (i, (id, slay, cap, lo, hi)) in rows.iter().enumerate().skip(start).take(18) {
+                    push(
+                        &mut out,
+                        alloc::format!(
+                            "  {:>3}  {:<22} {:>4} {:>4}  {}",
+                            id,
+                            monster_name(*id),
+                            slay,
+                            cap,
+                            if *lo == 0 && *hi == 0 {
+                                alloc::string::String::from("-")
+                            } else {
+                                alloc::format!("{}..{}", lo, hi)
+                            }
+                        ),
+                        true,
+                        i == self.hunt_cursor,
+                    );
+                }
+                push(&mut out, String::from("  Up/Down row   B back"), false, false);
+            }
+            Screen::Guild => {
+                push(
+                    &mut out,
+                    alloc::format!("GUILD CARD   slot {}", self.slot + 1),
+                    false,
+                    false,
+                );
+                let Some(save) = &self.save else {
+                    push(&mut out, String::from("  no save"), false, false);
+                    return out;
+                };
+                let hr = crate::guildcard::hunter_rank(save, self.slot).unwrap_or(0);
+                let time = crate::guildcard::play_time(save, self.slot).unwrap_or(0);
+                let comment = crate::guildcard::comment(save, self.slot).unwrap_or_default();
+                push(&mut out, alloc::format!("  rank    : {}", hr), false, false);
+                push(
+                    &mut out,
+                    alloc::format!("  time    : {}:{:02}:{:02}", time / 3600, (time % 3600) / 60, time % 60),
+                    false,
+                    false,
+                );
+                push(&mut out, alloc::format!("  comment : {}", comment), false, false);
+                push(&mut out, String::from("  ARENA"), false, false);
+                let log = crate::guildcard::arena(save, self.slot);
+                for a in 0..crate::guildcard::ARENA_COUNT {
+                    let times: Vec<alloc::string::String> = log
+                        .iter()
+                        .filter(|e| e.arena == a && !e.is_empty())
+                        .map(|e| {
+                            let (m, s, cs) = e.as_clock();
+                            alloc::format!("{}:{:02}.{:02}", m, s, cs)
+                        })
+                        .collect();
+                    if times.is_empty() {
+                        continue;
+                    }
+                    push(
+                        &mut out,
+                        alloc::format!("  {:>2} : {}", a, times.join("  ")),
+                        false,
+                        false,
+                    );
+                }
+                push(&mut out, String::from("  B back"), false, false);
+            }
+            Screen::Roster => {
+                let list = self.palicos();
+                push(
+                    &mut out,
+                    alloc::format!("PALICOS   slot {}   {} owned", self.slot + 1, list.len()),
+                    false,
+                    false,
+                );
+                let mut start = self.roster_cursor.saturating_sub(8);
+                if start + 18 > list.len() {
+                    start = list.len().saturating_sub(18);
+                }
+                for (i, p) in list.iter().enumerate().skip(start).take(18) {
+                    push(
+                        &mut out,
+                        alloc::format!("  {:>3}  {:<16} Lv{:<3} bond {}", p.index, p.name, p.level, p.enthusiasm),
+                        true,
+                        i == self.roster_cursor,
+                    );
+                }
+                push(&mut out, String::from("  Up/Down row   B back"), false, false);
+            }            Screen::QuestEquip => {
                 let list = self.quest_equipment();
                 let used = list.iter().filter(|e| e.occupied).count();
                 push(
