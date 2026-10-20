@@ -58,6 +58,8 @@ pub enum Screen {
     Charms,
     /// Charm editor form.
     CharmEdit,
+    /// Decoded view of one .rem / .sup / .sem / .esl / .qdp / .qdl entry.
+    EntryView,
     /// Item name search, opened from the item box with R.
     ItemPick,
     /// Download Palicoes (配信オトモ).
@@ -547,6 +549,14 @@ impl Editor {
             Screen::ArcList => self.input_arc_list(key),
             Screen::SaveQuests => self.input_save_quests(key),
             Screen::ItemPick => self.input_item_pick(key),
+            Screen::EntryView => match key {
+                Key::B => {
+                    self.screen = Screen::ArcEntries;
+                    self.cursor = self.entry;
+                }
+                Key::Plus => self.quit = true,
+                _ => {}
+            },
             Screen::ArcEntries => self.input_arc_entries(key),
             Screen::Mib => self.input_mib(key),
             Screen::Gmd => self.input_gmd(key),
@@ -1301,6 +1311,15 @@ impl Editor {
                     _ => self.message = String::from("this entry type cannot be edited"),
                 }
             }
+            // Y shows the entry decoded, whatever its type. The six container
+            // formats used to be unreadable on the console.
+            Key::Y => {
+                // The view renders self.entry, so the cursor has to be copied
+                // across or every entry shows whichever one was opened last.
+                self.entry = self.cursor;
+                self.screen = Screen::EntryView;
+                self.message = String::from("B goes back");
+            }
             Key::X => self.install_into_save(),
             Key::L => self.run_check(),
             // Pull the quest arc back out of the save as a file.
@@ -1568,6 +1587,142 @@ impl Editor {
                         false,
                         false,
                     );
+                }
+            }
+            Screen::EntryView => {
+                use crate::entries::{Esl, ItemTable, Qdp, QuestLink, SemEntry};
+                let entry = self
+                    .arc
+                    .as_ref()
+                    .and_then(|a| a.entries.get(self.entry));
+                match entry {
+                    None => push(&mut out, String::from("no entry"), false, false),
+                    Some(e) => {
+                        let ext = extension_for(e.type_hash).unwrap_or("?");
+                        push(
+                            &mut out,
+                            format!("{} ({} B)  .{}", e.file_name(), e.data.len(), ext),
+                            false,
+                            false,
+                        );
+                        match ext {
+                            "rem" | "sup" => match ItemTable::parse(&e.data) {
+                                Ok(t) => {
+                                    push(
+                                        &mut out,
+                                        format!(
+                                            "{} records of {} slots",
+                                            t.records.len(),
+                                            t.capacity
+                                        ),
+                                        false,
+                                        false,
+                                    );
+                                    for (i, r) in t.records.iter().take(18).enumerate() {
+                                        push(
+                                            &mut out,
+                                            format!(
+                                                "  {:>2}  {:<6} x{:<3} slot {}  {}",
+                                                i,
+                                                r.item,
+                                                r.count,
+                                                r.slot,
+                                                item_name_of(r.item)
+                                            ),
+                                            false,
+                                            false,
+                                        );
+                                    }
+                                }
+                                Err(_) => push(
+                                    &mut out,
+                                    String::from("  cannot parse"),
+                                    false,
+                                    false,
+                                ),
+                            },
+                            "sem" => {
+                                for (i, c) in e.data.chunks_exact(32).take(8).enumerate() {
+                                    let s = SemEntry { raw: c.to_vec() };
+                                    let (x, y, z, _) = s.position();
+                                    push(
+                                        &mut out,
+                                        format!(
+                                            "  {:>2}  x {:>8.1}  y {:>8.1}  z {:>8.1}  {}",
+                                            i,
+                                            x,
+                                            y,
+                                            z,
+                                            if s.is_dummy() { "dummy" } else { "real" }
+                                        ),
+                                        false,
+                                        false,
+                                    );
+                                }
+                            }
+                            "esl" => match Esl::parse(&e.data) {
+                                Ok(l) => push(
+                                    &mut out,
+                                    format!("  waves {}", l.waves),
+                                    false,
+                                    false,
+                                ),
+                                Err(_) => push(
+                                    &mut out,
+                                    String::from("  cannot parse"),
+                                    false,
+                                    false,
+                                ),
+                            },
+                            "qdp" => match Qdp::parse(&e.data) {
+                                Ok(q) => {
+                                    let hex: alloc::string::String =
+                                        q.flags().iter().map(|b| alloc::format!("{:02X}", b)).collect();
+                                    push(&mut out, format!("  flags {}", hex), false, false);
+                                }
+                                Err(_) => push(
+                                    &mut out,
+                                    String::from("  cannot parse"),
+                                    false,
+                                    false,
+                                ),
+                            },
+                            "qdl" => match QuestLink::parse(&e.data) {
+                                Ok(q) => {
+                                    for r in q.refs.iter().take(18) {
+                                        push(
+                                            &mut out,
+                                            format!(
+                                                "  {:<4} {}",
+                                                extension_for(r.type_hash).unwrap_or("?"),
+                                                r.name
+                                            ),
+                                            false,
+                                            false,
+                                        );
+                                    }
+                                }
+                                Err(_) => push(
+                                    &mut out,
+                                    String::from("  cannot parse"),
+                                    false,
+                                    false,
+                                ),
+                            },
+                            "mib" | "gmd" => push(
+                                &mut out,
+                                String::from("  B, then A, to edit this one"),
+                                false,
+                                false,
+                            ),
+                            other => push(
+                                &mut out,
+                                format!("  .{} has no viewer yet", other),
+                                false,
+                                false,
+                            ),
+                        }
+                    }
                 }
             }
             Screen::ItemPick => {
