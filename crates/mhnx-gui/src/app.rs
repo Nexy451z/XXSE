@@ -71,6 +71,9 @@ pub struct MhnxEditor {
     /// Snapshots for 元に戻す, newest last. Bounded so a long session cannot
     /// grow without limit; one item box is 2242 entries.
     pub item_undo: Vec<Vec<ItemSlot>>,
+    /// Keep the picker filter after choosing, so several slots can be filled
+    /// from one search.
+    pub item_pick_keep_filter: bool,
     /// Free-text filter for the talisman list.
     pub charm_filter: String,
     /// Search text inside the two skill pickers.
@@ -125,6 +128,7 @@ impl Default for MhnxEditor {
             dlc_filter: String::new(),
             dlc_outdir: String::new(),
             item_undo: Vec::new(),
+            item_pick_keep_filter: true,
             charm_filter: String::new(),
             skill_search1: String::new(),
             skill_search2: String::new(),
@@ -1172,6 +1176,8 @@ impl MhnxEditor {
             if ui.small_button("クリア").clicked() {
                 self.item_pick_filter.clear();
             }
+            ui.checkbox(&mut self.item_pick_keep_filter, "選んだあとも絞り込みを残す")
+                .on_hover_text("同じ名前のアイテムを続けて複数の枠へ入れやすくなります");
         });
         let needle = self.item_pick_filter.trim().to_lowercase();
         if needle.is_empty() {
@@ -1199,9 +1205,12 @@ impl MhnxEditor {
             }
             return;
         }
+        // Fixed height: a block that grows with the hit count moved the table
+        // under the pointer while typing.
         egui::ScrollArea::vertical()
             .id_salt("itempick")
-            .max_height(140.0)
+            .max_height(160.0)
+            .min_scrolled_height(160.0)
             .show(ui, |ui| {
                 for (id, name) in &hits {
                     if ui
@@ -1213,7 +1222,9 @@ impl MhnxEditor {
                         if self.items[i].count == 0 {
                             self.items[i].count = 1;
                         }
-                        self.item_pick_filter.clear();
+                        if !self.item_pick_keep_filter {
+                            self.item_pick_filter.clear();
+                        }
                         touched = true;
                     }
                 }
