@@ -2009,3 +2009,122 @@ fn setting_a_bit_is_reversible_and_hits_the_right_byte() {
     mhnx_core::dlc::set_installed(&mut s, id, false).unwrap();
     assert_eq!(s.to_bytes(), before, "clearing must restore the original");
 }
+
+// ---------------------------------------------------------------------------
+// Equipment box decoding and the Japanese names.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_equipment_box_decodes_into_named_items() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    let box_ = s.equipment_box(0).expect("a box");
+    let items: Vec<_> = mhnx_core::equip::decode_box(&box_)
+        .into_iter()
+        .filter(|e| !e.is_empty())
+        .collect();
+    assert!(items.len() > 100, "expected a used box, got {}", items.len());
+
+    let mut types = std::collections::BTreeSet::new();
+    let mut unnamed = Vec::new();
+    for e in &items {
+        types.insert(e.kind);
+        let n = mhnx_core::equip::name(e);
+        assert!(!n.is_empty(), "slot {} decoded to an empty name", e.index);
+        if n == "-" {
+            unnamed.push((e.index, e.kind, e.id));
+        }
+    }
+    assert!(
+        unnamed.is_empty(),
+        "{} slots have no name, first: {:?}",
+        unnamed.len(),
+        unnamed.first()
+    );
+    // The sample box holds weapons, armour and talismans.
+    assert!(types.iter().any(|k| (1..=5).contains(k)), "no armour");
+    assert!(types.iter().any(|k| *k == 6), "no talismans");
+    assert!(types.iter().any(|k| (7..=21).contains(k)), "no weapons");
+    // Type 12 is the deliberately unused slot.
+    assert!(!types.contains(&12), "type 12 should never appear");
+}
+
+#[test]
+fn the_weapon_type_numbering_matches_the_japanese_tables() {
+    // The JP tables skip type 5; EQUIPMENT_TYPES skips 12. The offset is 7.
+    for jp in 0..15usize {
+        if jp == 5 {
+            assert!(mhnx_core::equipnames::WEAPON_NAMES[5].is_empty());
+            continue;
+        }
+        let game = jp + 7;
+        assert!(game != 12, "jp {} would map onto the unused type", jp);
+        assert_eq!(
+            mhnx_core::equip::type_name(game as u8),
+            mhnx_core::equipnames::WEAPON_NAMES[jp]
+                .first()
+                .map(|_| mhnx_core::equip::type_name(game as u8))
+                .unwrap(),
+            "mapping check for jp type {}",
+            jp
+        );
+        assert!(!mhnx_core::equipnames::WEAPON_NAMES[jp].is_empty());
+    }
+}
+
+#[test]
+fn a_known_weapon_decodes_to_its_japanese_name() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    let box_ = s.equipment_box(0).unwrap();
+    let items = mhnx_core::equip::decode_box(&box_);
+    // Every weapon id must fall inside its table.
+    let mut checked = 0;
+    for e in items.iter().filter(|e| (7..=21).contains(&e.kind)) {
+        let t = e.kind as usize - 7;
+        if t == 5 {
+            continue;
+        }
+        let tbl = mhnx_core::equipnames::WEAPON_NAMES[t];
+        assert!(
+            (e.id as usize) < tbl.len(),
+            "weapon id {} is outside the {} table ({} entries)",
+            e.id,
+            mhnx_core::equip::type_name(e.kind),
+            tbl.len()
+        );
+        assert_eq!(mhnx_core::equip::name(e), tbl[e.id as usize]);
+        checked += 1;
+    }
+    assert!(checked > 5, "expected weapons in the sample box");
+}
+
+#[test]
+fn armour_names_index_by_series_and_part() {
+    let names = mhnx_core::equipnames::ARMOR_NAMES;
+    assert_eq!(names.len() % 5, 0, "the table must be a whole number of sets");
+    // Series 0 is the empty set, series 1 is Leather.
+    assert_eq!(names[0], "装備なし");
+    assert_eq!(names[5 + 0], "レザーヘッド");
+    assert_eq!(names[5 + 1], "レザーベスト");
+    assert_eq!(names[5 + 2], "レザーグラブ");
+    assert_eq!(names[5 + 3], "レザーベルト");
+    assert_eq!(names[5 + 4], "レザーパンツ");
+    // And the decoder reaches them the same way.
+    let eq = mhnx_core::equip::Equipment {
+        index: 0,
+        kind: 1,
+        level: 1,
+        id: 1,
+        transmog: 0,
+    };
+    assert_eq!(mhnx_core::equip::name(&eq), "レザーヘッド");
+    let eq = mhnx_core::equip::Equipment { kind: 5, ..eq };
+    assert_eq!(mhnx_core::equip::name(&eq), "レザーパンツ");
+}

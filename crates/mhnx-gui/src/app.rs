@@ -21,6 +21,7 @@ pub enum Tab {
     Quest,
     Dlc,
     Charm,
+    Equip,
     Extras,
     About,
 }
@@ -73,6 +74,8 @@ pub struct MhnxEditor {
     pub item_undo: Vec<Vec<ItemSlot>>,
     /// Keep the picker filter after choosing, so several slots can be filled
     /// from one search.
+    /// Filter for the equipment tab.
+    pub equip_filter: String,
     pub item_pick_keep_filter: bool,
     /// Row selected inside the .rem / .sup reward table.
     pub entry_item_sel: Option<usize>,
@@ -130,6 +133,7 @@ impl Default for MhnxEditor {
             dlc_filter: String::new(),
             dlc_outdir: String::new(),
             item_undo: Vec::new(),
+            equip_filter: String::new(),
             item_pick_keep_filter: true,
             entry_item_sel: None,
             charm_filter: String::new(),
@@ -626,6 +630,7 @@ impl eframe::App for MhnxEditor {
             Tab::Quest => self.tab_quest(ui),
             Tab::Dlc => self.tab_dlc(ui),
             Tab::Charm => self.tab_charm(ui),
+            Tab::Equip => self.tab_equip(ui),
             Tab::Extras => self.tab_extras(ui),
             Tab::About => self.tab_about(ui),
         });
@@ -784,6 +789,7 @@ impl MhnxEditor {
                         ui.selectable_value(&mut self.tab, Tab::Quest, "クエスト");
                         ui.selectable_value(&mut self.tab, Tab::Dlc, "DLC");
                         ui.selectable_value(&mut self.tab, Tab::Charm, "お守り");
+        ui.selectable_value(&mut self.tab, Tab::Equip, "装備");
                 ui.selectable_value(&mut self.tab, Tab::Extras, "設定/オトモ");
         ui.selectable_value(&mut self.tab, Tab::About, "情報");
                     });
@@ -1951,6 +1957,68 @@ impl MhnxEditor {
             })
             .and_then(|g| g.title().map(|t| t.to_string()))
             .unwrap_or_default()
+    }
+
+    fn tab_equip(&mut self, ui: &mut egui::Ui) {
+        ui.heading("装備ボックス");
+        let Some(save) = &self.save else {
+            ui.label("セーブを開くと、装備 2000 枠を一覧できます");
+            return;
+        };
+        let Some(box_) = save.equipment_box(self.slot) else {
+            ui.label("このスロットには装備ボックスがありません");
+            return;
+        };
+        let all = mhnx_core::equip::decode_box(&box_);
+        let used: Vec<_> = all.iter().filter(|e| !e.is_empty()).collect();
+        ui.horizontal(|ui| {
+            ui.label(format!("使用中 {} / {} 枠", used.len(), all.len()));
+            ui.label("絞り込み");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.equip_filter)
+                    .hint_text("名前・種類")
+                    .desired_width(180.0),
+            );
+            if ui.small_button("クリア").clicked() {
+                self.equip_filter.clear();
+            }
+        });
+        let needle = self.equip_filter.trim().to_lowercase();
+        let rows: Vec<_> = used
+            .iter()
+            .filter(|e| {
+                needle.is_empty()
+                    || mhnx_core::equip::name(e).to_lowercase().contains(&needle)
+                    || mhnx_core::equip::type_name(e.kind)
+                        .to_lowercase()
+                        .contains(&needle)
+            })
+            .collect();
+        ui.label(
+            egui::RichText::new(format!("{} 件を表示", rows.len()))
+                .weak()
+                .small(),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("equiplist")
+            .show(ui, |ui| {
+                egui::Grid::new("equipgrid")
+                    .num_columns(4)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for h in ["枠", "種類", "名前", "Lv"] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        for e in &rows {
+                            ui.label(format!("{}", e.index));
+                            ui.label(mhnx_core::equip::type_name(e.kind));
+                            ui.label(mhnx_core::equip::name(e));
+                            ui.label(format!("{}", e.level));
+                            ui.end_row();
+                        }
+                    });
+            });
     }
 
     fn tab_dlc(&mut self, ui: &mut egui::Ui) {
