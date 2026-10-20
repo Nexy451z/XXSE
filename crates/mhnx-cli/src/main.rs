@@ -227,6 +227,24 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// Add a quest the save does not list into a free slot.
+fn cmd_add_quest(save_path: &str, arc_path: &str, out: &str) -> Result<(), String> {
+    let mut s = Save::from_bytes(&read(save_path)?).map_err(|e| e.to_string())?;
+    let raw = read(arc_path)?;
+    let a = Arc::parse(&raw).map_err(|e| e.to_string())?;
+    let id = a
+        .by_ext("mib")
+        .and_then(|e| e.data.get(0x0C..0x10))
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .ok_or("archive has no .mib")? as i32;
+    let slot = dlc::add_quest(&mut s, id, &raw).map_err(|e| e.to_string())?;
+    let bit = dlc::bit_for_quest(id).unwrap_or(0);
+    std::fs::write(out, s.to_bytes()).map_err(|e| e.to_string())?;
+    println!("added quest {} to slot {} (mask bit {}), wrote {}", id, slot, bit, out);
+    println!("the input save was not modified");
+    Ok(())
+}
+
 /// Dump the strings of a standalone .gmd file.
 fn cmd_gmd_dump(path: &str, limit: usize) -> Result<(), String> {
     let g = mhnx_core::quest::Gmd::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
@@ -733,6 +751,7 @@ fn main() -> ExitCode {
         "options" if args.len() == 2 => cmd_options(&args[1]),
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
+        "add-quest" if args.len() == 4 => cmd_add_quest(&args[1], &args[2], &args[3]),
         "gmd-dump" if args.len() == 2 => cmd_gmd_dump(&args[1], 40),
         "gmd-dump" if args.len() == 3 => {
             cmd_gmd_dump(&args[1], args[2].parse().unwrap_or(40))
