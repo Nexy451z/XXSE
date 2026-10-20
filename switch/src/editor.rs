@@ -351,7 +351,7 @@ fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Slots => "Up/Down slot  A character  X items  L charms  R palico  Y quest  B back",
         Char => "Up/Down field  Left/Right value  X step  A save  B back",
         ArcList => "A open quest   X quests in save   Y save editor   + exit",
-        SaveQuests => "A edit  - extract this  R extract all  B back",
+        SaveQuests => "A edit  - extract  R all  Y filter  X clear  B back",
         ItemPick => "A choose  Y filter  X clear  B back",
         Items => "Up/Down  L/R count  R pick  L undo  X step  Y empty  A save  B back",
         ArcEntries => "A edit  Y view  X save  - extract  R all  L check  B back",
@@ -490,6 +490,8 @@ fn service(ed: &mut Editor) -> bool {
             "アイテム名で絞り込み"
         } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
             "スキル名で絞り込み"
+        } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {
+            "クエストIDかタイトルで絞り込み"
         } else {
             "クエストテキスト"
         };
@@ -507,6 +509,7 @@ fn service(ed: &mut Editor) -> bool {
                 }
                 Some(s) if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER => ed.apply_item_filter(s),
                 Some(s) if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER => ed.apply_skill_filter(s),
+                Some(s) if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER => ed.apply_quest_filter(s),
                 Some(s) => ed.apply_text(idx, s),
                 None => ed.message = String::from("input cancelled"),
             }

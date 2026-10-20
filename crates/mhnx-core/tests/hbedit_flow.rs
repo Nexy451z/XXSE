@@ -1386,3 +1386,69 @@ fn the_quest_list_shows_a_title_on_every_row() {
         rows.len()
     );
 }
+#[test]
+fn the_quest_list_can_be_filtered_by_id_or_title() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Y);
+    ed.input(Key::X);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    let all = ed.filtered_quests().len();
+    assert!(all > 150, "expected the whole set, got {}", all);
+
+    // By id.
+    ed.apply_quest_filter(String::from("1010165"));
+    let by_id = ed.filtered_quests();
+    assert!(!by_id.is_empty(), "the id filter found nothing");
+    assert!(
+        by_id.iter().all(|q| format!("{}", q.quest_id).contains("1010165")),
+        "the id filter let something through"
+    );
+
+    // By title, using a string that really is in the cache.
+    let sample = ed
+        .quest_titles
+        .iter()
+        .find(|(_, t)| t.chars().count() > 4)
+        .map(|(_, t)| t.chars().take(3).collect::<String>())
+        .expect("a title to search for");
+    ed.apply_quest_filter(sample.clone());
+    let by_title = ed.filtered_quests();
+    assert!(
+        !by_title.is_empty(),
+        "the title filter {:?} found nothing",
+        sample
+    );
+    assert!(by_title.len() < all, "the filter did not narrow anything");
+
+    // X clears it and Y asks the keyboard.
+    ed.input(Key::X);
+    assert_eq!(ed.filtered_quests().len(), all);
+    ed.input(Key::Y);
+    let (idx, _) = ed.take_text_request().expect("a filter request");
+    assert_eq!(idx, mhnx_core::hbedit::TEXT_QUEST_FILTER);
+    assert_eq!(idx, usize::MAX - 3, "must not collide with the others");
+}
+
+#[test]
+fn the_quest_filter_survives_an_empty_result() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Y);
+    ed.input(Key::X);
+    ed.apply_quest_filter(String::from("zzzznothing"));
+    assert!(ed.filtered_quests().is_empty());
+    // Navigation and A must be harmless with nothing to show.
+    ed.input(Key::Down);
+    ed.input(Key::Up);
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    let lines = ed.lines();
+    assert!(lines[0].text.contains("QUESTS INSIDE THIS SAVE"));
+}
