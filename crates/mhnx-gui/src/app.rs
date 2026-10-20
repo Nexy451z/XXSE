@@ -68,6 +68,9 @@ pub struct MhnxEditor {
     pub dlc_filter: String,
     /// Output folder for the quest extractor.
     pub dlc_outdir: String,
+    /// Snapshots for 元に戻す, newest last. Bounded so a long session cannot
+    /// grow without limit; one item box is 2242 entries.
+    pub item_undo: Vec<Vec<ItemSlot>>,
     /// Free-text filter for the talisman list.
     pub charm_filter: String,
     /// Search text inside the two skill pickers.
@@ -121,6 +124,7 @@ impl Default for MhnxEditor {
             item_pick_filter: String::new(),
             dlc_filter: String::new(),
             dlc_outdir: String::new(),
+            item_undo: Vec::new(),
             charm_filter: String::new(),
             skill_search1: String::new(),
             skill_search2: String::new(),
@@ -972,7 +976,12 @@ impl MhnxEditor {
             ui.label("絞り込み");
             ui.text_edit_singleline(&mut self.item_filter);
             ui.checkbox(&mut self.item_show_empty, "空きスロットも表示");
-            if ui.button("全アイテムを 99 個にする").clicked() {
+            if ui
+                .button("全アイテムを 99 個にする")
+                .on_hover_text("1 回で戻せます")
+                .clicked()
+            {
+                self.push_item_undo();
                 for s in self.items.iter_mut() {
                     if s.id != 0 {
                         s.count = 99;
@@ -980,18 +989,34 @@ impl MhnxEditor {
                 }
                 self.apply_to_save();
             }
-            if ui.button("重複を除去").clicked() {
-                let mut seen = std::collections::HashSet::new();
-                for s in self.items.iter_mut() {
-                    if s.id == 0 {
-                        continue;
+            // Dedupe throws stacks away, so it asks first.
+            ui.menu_button("重複を除去", |ui| {
+                ui.label(egui::RichText::new("同じアイテムの 2 個目以降を空にします").small());
+                if ui.button("実行").clicked() {
+                    self.push_item_undo();
+                    let mut seen = std::collections::HashSet::new();
+                    let mut removed = 0;
+                    for s in self.items.iter_mut() {
+                        if s.id == 0 {
+                            continue;
+                        }
+                        if !seen.insert(s.id) {
+                            s.id = 0;
+                            s.count = 0;
+                            removed += 1;
+                        }
                     }
-                    if !seen.insert(s.id) {
-                        s.id = 0;
-                        s.count = 0;
-                    }
+                    self.apply_to_save();
+                    self.message = format!("重複を {} 件消しました（元に戻せます）", removed);
+                    ui.close();
                 }
-                self.apply_to_save();
+            });
+            if ui
+                .add_enabled(!self.item_undo.is_empty(), egui::Button::new("元に戻す"))
+                .on_hover_text("直前のアイテム変更を取り消します")
+                .clicked()
+            {
+                self.undo_item();
             }
         });
 
@@ -1020,6 +1045,9 @@ impl MhnxEditor {
         let mut selected = self.item_selected;
         TableBuilder::new(ui)
             .striped(true)
+            // Without this only the 20px box-number cell is clickable, which
+            // nobody discovers.
+            .sense(egui::Sense::click())
             .column(Column::exact(70.0))
             .column(Column::exact(80.0))
             .column(Column::remainder())
@@ -1058,10 +1086,19 @@ impl MhnxEditor {
                     });
                     row.col(|ui| {
                         let mut c = count;
-                        if ui.add(egui::DragValue::new(&mut c).range(0..=127)).changed() {
+                        let r = ui.add(egui::DragValue::new(&mut c).range(0..=127));
+                        // One snapshot per drag, not per pixel.
+                        if r.drag_started() || (r.changed() && !r.dragged()) {
+                            self.push_item_undo();
+                        }
+                        if r.changed() {
                             self.items[idx].count = c;
+                            self.apply_to_save();
                         }
                     });
+                    if row.response().clicked() {
+                        selected = Some(idx);
+                    }
                 });
             });
         self.item_selected = selected;
@@ -1069,6 +1106,25 @@ impl MhnxEditor {
 
     /// The selected slot's editor, drawn above the table so the list can never
     /// push it off the screen.
+    /// Remember the box before a change so it can be undone.
+    fn push_item_undo(&mut self) {
+        self.item_undo.push(self.items.clone());
+        if self.item_undo.len() > 32 {
+            self.item_undo.remove(0);
+        }
+    }
+
+    /// Put the box back the way it was.
+    fn undo_item(&mut self) {
+        if let Some(prev) = self.item_undo.pop() {
+            self.items = prev;
+            self.apply_to_save();
+            self.message = String::from("アイテムボックスを元に戻しました");
+        } else {
+            self.message = String::from("戻せる変更がありません");
+        }
+    }
+
     fn item_detail_panel(&mut self, ui: &mut egui::Ui) {
         let Some(i) = self.item_selected else {
             ui.label(egui::RichText::new("行をクリックすると、ここで種類と個数を変更できます").weak());
@@ -1099,6 +1155,7 @@ impl MhnxEditor {
                 touched = true;
             }
             if ui.button("空にする").clicked() {
+                self.push_item_undo();
                 self.items[i] = ItemSlot::default();
                 touched = true;
             }
@@ -1151,6 +1208,7 @@ impl MhnxEditor {
                         .selectable_label(self.items[i].id == *id, format!("{:<6} {}", id, name))
                         .clicked()
                     {
+                        self.push_item_undo();
                         self.items[i].id = *id;
                         if self.items[i].count == 0 {
                             self.items[i].count = 1;
