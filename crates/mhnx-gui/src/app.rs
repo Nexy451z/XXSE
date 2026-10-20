@@ -818,8 +818,15 @@ impl MhnxEditor {
                         }
                     }
                     if let Some(i) = pending_slot {
+                        // Commit the edits first: reload_from_save() rebuilds
+                        // the character, item box and talisman buffers from the
+                        // save, so anything not applied yet was silently lost.
+                        if self.dirty {
+                            self.apply_to_save();
+                        }
                         self.slot = i;
                         self.reload_from_save();
+                        self.message = format!("スロット {} に切り替えました", i + 1);
                     }
 
                     ui.separator();
@@ -1236,6 +1243,14 @@ impl MhnxEditor {
     }
 
     fn tab_quest(&mut self, ui: &mut egui::Ui) {
+        // The 249-byte hex grid and both 反映 buttons sit below the field
+        // list; without a scroll they were off the bottom of the window.
+        egui::ScrollArea::vertical()
+            .id_salt("questtab")
+            .show(ui, |ui| self.quest_tab_body(ui));
+    }
+
+    fn quest_tab_body(&mut self, ui: &mut egui::Ui) {
         if self.arc.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.label("「.arc を開く」か、DLC タブのクエスト一覧で「編集」を押してください")
@@ -1485,6 +1500,13 @@ impl MhnxEditor {
                 }
             }
 
+            // The button belongs next to the fields it commits: it used to sit
+            // under the hex grid, which put it off the bottom of the window.
+            if ui.button(".mib の変更を .arc に反映").clicked() {
+                self.store_arc_entry(self.arc_selected);
+                self.message = "反映しました".to_owned();
+            }
+
             ui.add_space(6.0);
             ui.label(egui::RichText::new("全 249 バイト (16 進)").strong());
             ui.label(
@@ -1544,10 +1566,6 @@ impl MhnxEditor {
                             }
                         });
                 });
-            if ui.button(".mib の変更を .arc に反映").clicked() {
-                self.store_arc_entry(self.arc_selected);
-                self.message = "反映しました".to_owned();
-            }
         } else if self.gmd.is_some() {
             ui.label(egui::RichText::new("クエストテキスト (.gmd)").strong());
             let key = self.gmd.as_ref().map(|g| g.key.clone()).unwrap_or_default();
