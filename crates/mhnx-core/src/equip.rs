@@ -11,6 +11,8 @@
 //! weapon tables have their own numbering where 5 is the gap, and
 //! type_id + 7 maps one to the other exactly.
 
+use alloc::vec::Vec;
+
 use crate::charm::CHARM_RECORD;
 
 /// Bytes per equipment record.
