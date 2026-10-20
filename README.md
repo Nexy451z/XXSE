@@ -314,7 +314,11 @@ $env:MHNXEDITOR_OPEN_TAB   = "quest"
 ## 6. 解析の根拠
 
 このエディタが前提としている事実は、すべて実データで検証済み。
-詳細は [docs/](../save_editor/analysis/MHXX_SAVE_ANALYSIS.md) と [docs/quest_format_spec.md](docs/quest_format_spec.md) を参照。
+詳細は [docs/](../save_editor/analysis/MHXX_SAVE_ANALYSIS.md)、[docs/quest_format_spec.md](docs/quest_format_spec.md)、
+[docs/talisman_format.md](docs/talisman_format.md) を参照。
+
+お守りのレコード構造と、レア度ごとのスキル許容ポイント表の引き方は
+[docs/talisman_format.md](docs/talisman_format.md) に検証結果つきでまとめてあります。
 
 | 事実 | 検証方法 |
 |---|---|
