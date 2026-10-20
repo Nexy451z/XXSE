@@ -76,6 +76,7 @@ fn main() -> eframe::Result<()> {
                     "hunts" => app::Tab::Hunts,
                     "guild" => app::Tab::Guild,
                     "palico" => app::Tab::Palico,
+                    "sets" => app::Tab::Sets,
                 "extras" => app::Tab::Extras,
             "about" => app::Tab::About,
                     _ => app::Tab::Save,
