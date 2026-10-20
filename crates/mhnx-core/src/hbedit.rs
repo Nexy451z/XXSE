@@ -215,9 +215,23 @@ pub const TEXT_SKILL_FILTER: usize = usize::MAX - 2;
 pub const TEXT_QUEST_FILTER: usize = usize::MAX - 3;
 /// Sentinel id for "ask what to call the converted save".
 pub const TEXT_SAVE_NAME: usize = usize::MAX - 4;
+/// Sentinel base for "ask for the name of palico N": N is added to this.
+pub const TEXT_PALICO_NAME: usize = usize::MAX - 1_000;
+/// Sentinel id for "ask for the guild card comment".
+pub const TEXT_GUILD_COMMENT: usize = usize::MAX - 999;
 /// Sentinel id for "ask which equipment to show".
 pub const TEXT_EQUIP_FILTER: usize = usize::MAX - 5;
 
+/// Add `step` to a value, staying in the u16 range and never going below zero.
+fn clamp_u16(value: u16, step: i64) -> u16 {
+    let v = value as i64 + step;
+    v.clamp(0, u16::MAX as i64) as u16
+}
+
+/// Label for the monster under the hunt cursor, for the status line.
+fn monster_label(rows: &[(usize, u16, u16, u16, u16)], cursor: usize) -> usize {
+    rows.get(cursor).map(|r| r.0).unwrap_or(0)
+}
 /// Quest id taken from an archive's .mib.
 ///
 /// The id is the first field of the .mib, so an archive can be placed in the
@@ -258,6 +272,9 @@ pub const CHAR_FIELDS: &[(&str, &str)] = &[
 
 /// Adjustment steps cycled with X.
 pub const STEPS: [i64; 5] = [1, 10, 100, 1_000, 10_000];
+
+/// Steps the hunt screen cycles through: counts are small, so 10000 is useless.
+const HUNT_STEPS: [i64; 5] = [1, 10, 100, 1000, -1];
 
 /// The editor.
 pub struct Editor {
@@ -308,8 +325,15 @@ pub struct Editor {
     pub convert_name: String,
     /// Hunt record cursor and the working copies.
     pub hunt_cursor: usize,
+    /// Which of the four numbers (slay, capture, smallest, largest) is being
+    /// changed on the hunt screen.
+    pub hunt_field: usize,
     /// Palico roster cursor.
     pub roster_cursor: usize,
+    /// Which palico field (level, bond, experience) Left/Right changes.
+    pub roster_field: usize,
+    /// Which guild card field (rank, clock, comment) is being changed.
+    pub guild_field: usize,
     /// Equipment list filter and cursor.
     pub equip_filter: String,
     /// Cursor over the filtered equipment list.
@@ -390,7 +414,10 @@ impl Editor {
             skill_pick_field: 1,
             convert_name: String::new(),
             hunt_cursor: 0,
+            hunt_field: 0,
             roster_cursor: 0,
+            roster_field: 0,
+            guild_field: 0,
             equip_filter: String::new(),
             equip_cursor: 0,
             item_pick_mode: 0,
@@ -1510,12 +1537,62 @@ impl Editor {
     }
 
     fn input_hunts(&mut self, key: Key) {
-        let n = self.hunt_rows().len();
+        let rows = self.hunt_rows();
+        let n = rows.len();
         match key {
             Key::Up => self.hunt_cursor = self.hunt_cursor.saturating_sub(1),
             Key::Down => {
                 if n > 0 {
                     self.hunt_cursor = (self.hunt_cursor + 1).min(n - 1);
+                }
+            }
+            // X walks the four numbers of the highlighted monster.
+            Key::X => self.hunt_field = (self.hunt_field + 1) % 4,
+            // Left/Right change the highlighted number.
+            Key::Left | Key::Right => {
+                let Some(&(monster, slay, cap, lo, hi)) = rows.get(self.hunt_cursor) else {
+                    return;
+                };
+                let up = key == Key::Right;
+                let step = if up {
+                    HUNT_STEPS[self.step]
+                } else {
+                    -HUNT_STEPS[self.step]
+                };
+                let Some(save) = &mut self.save else { return };
+                let slot = self.slot;
+                let ok = match self.hunt_field {
+                    // Slay and capture are counts, so they clamp at zero.
+                    0 => save.set_hunt_count(slot, monster, clamp_u16(slay, step)),
+                    1 => save.set_capture_count(slot, monster, clamp_u16(cap, step)),
+                    // The size pair keeps its order: the game never stores a
+                    // smallest above a largest.
+                    _ => {
+                        let (mut a, mut b) = (lo, hi);
+                        if self.hunt_field == 2 {
+                            a = clamp_u16(a, step);
+                        } else {
+                            b = clamp_u16(b, step);
+                        }
+                        if a > b {
+                            core::mem::swap(&mut a, &mut b);
+                        }
+                        save.set_monster_size(slot, monster, a, b)
+                    }
+                };
+                if ok {
+                    self.dirty = true;
+                }
+            }
+            Key::A => {
+                if self.save.is_some() {
+                    self.dirty = true;
+                    self.message = alloc::format!(
+                        "狩猟記録 {} 番の値を変更しました",
+                        monster_label(&rows, self.hunt_cursor)
+                    );
+                } else {
+                    self.message = String::from("先にセーブを開いてください");
                 }
             }
             Key::B => {
@@ -1528,7 +1605,48 @@ impl Editor {
     }
 
     fn input_guild(&mut self, key: Key) {
+        // Field 0 is the rank, 1 is the card's own clock, 2 the comment.
         match key {
+            Key::X => self.guild_field = (self.guild_field + 1) % 3,
+            Key::Left | Key::Right => {
+                let up = key == Key::Right;
+                let slot = self.slot;
+                let Some(save) = &mut self.save else { return };
+                let ok = match self.guild_field {
+                    0 => {
+                        let cur = crate::guildcard::hunter_rank(save, slot).unwrap_or(0);
+                        let v = if up {
+                            (cur + 1).min(999)
+                        } else {
+                            cur.saturating_sub(1)
+                        };
+                        crate::guildcard::set_hunter_rank(save, slot, v)
+                    }
+                    1 => {
+                        let cur = crate::guildcard::play_time(save, slot).unwrap_or(0);
+                        let step = STEPS[self.step].max(1) as u32;
+                        let v = if up {
+                            cur.saturating_add(step)
+                        } else {
+                            cur.saturating_sub(step)
+                        };
+                        crate::guildcard::set_play_time(save, slot, v)
+                    }
+                    _ => false,
+                };
+                if ok {
+                    self.dirty = true;
+                }
+            }
+            // The comment is text, so it needs the keyboard.
+            Key::A => {
+                if self.guild_field == 2 {
+                    if let Some(save) = &self.save {
+                        let cur = crate::guildcard::comment(save, self.slot).unwrap_or_default();
+                        self.pending_text = Some((TEXT_GUILD_COMMENT, cur));
+                    }
+                }
+            }
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
@@ -1539,13 +1657,60 @@ impl Editor {
     }
 
     fn input_roster(&mut self, key: Key) {
-        let n = self.rounds_roster();
+        let list = self.palicos();
+        let n = list.len();
         match key {
             Key::Up => self.roster_cursor = self.roster_cursor.saturating_sub(1),
             Key::Down => {
                 if n > 0 {
                     self.roster_cursor = (self.roster_cursor + 1).min(n - 1);
                 }
+            }
+            // X walks the editable fields of the highlighted palico.
+            Key::X => self.roster_field = (self.roster_field + 1) % 3,
+            Key::Left | Key::Right => {
+                let Some(p) = list.get(self.roster_cursor).cloned() else {
+                    return;
+                };
+                let up = key == Key::Right;
+                let slot = self.slot;
+                let Some(save) = &mut self.save else { return };
+                let ok = match self.roster_field {
+                    0 => {
+                        let lvl = if up {
+                            (p.level + 1).min(99)
+                        } else {
+                            p.level.saturating_sub(1).max(1)
+                        };
+                        crate::palico::set_level(save, slot, p.index, lvl)
+                    }
+                    1 => {
+                        let v = if up {
+                            (p.enthusiasm as u16 + 1).min(100) as u8
+                        } else {
+                            p.enthusiasm.saturating_sub(1)
+                        };
+                        crate::palico::set_enthusiasm(save, slot, p.index, v)
+                    }
+                    _ => {
+                        if up {
+                            crate::palico::set_exp(save, slot, p.index, p.exp.saturating_add(1_000))
+                        } else {
+                            crate::palico::set_exp(save, slot, p.index, p.exp.saturating_sub(1_000))
+                        }
+                    }
+                };
+                if ok {
+                    self.dirty = true;
+                }
+            }
+            // A renames: the console has no text entry of its own, so this
+            // asks the platform layer for the software keyboard.
+            Key::A => {
+                let Some(p) = list.get(self.roster_cursor) else {
+                    return;
+                };
+                self.pending_text = Some((TEXT_PALICO_NAME + p.index, p.name.clone()));
             }
             Key::B => {
                 self.screen = Screen::Slots;
@@ -2722,26 +2887,50 @@ impl Editor {
                 if start + 18 > rows.len() {
                     start = rows.len().saturating_sub(18);
                 }
+                // The four numbers are drawn as fields so it is obvious which
+                // one Left/Right is about to change.
+                let arrow = |f: usize| if self.hunt_field == f { "[" } else { " " };
+                let arrow_end = |f: usize| if self.hunt_field == f { "]" } else { " " };
                 for (i, (id, slay, cap, lo, hi)) in rows.iter().enumerate().skip(start).take(18) {
+                    let size = if *lo == 0 && *hi == 0 {
+                        alloc::format!("{}  -{}", arrow(2), arrow_end(3))
+                    } else {
+                        alloc::format!(
+                            "{}{:>3}..{:>3}{}",
+                            arrow(2),
+                            lo,
+                            hi,
+                            arrow_end(3)
+                        )
+                    };
                     push(
                         &mut out,
                         alloc::format!(
-                            "  {:>3}  {:<22} {:>4} {:>4}  {}",
+                            "  {:>3}  {:<22} {}{:>4}{} {}{:>4}{}  {}",
                             id,
                             monster_name(*id),
+                            arrow(0),
                             slay,
+                            arrow_end(0),
+                            arrow(1),
                             cap,
-                            if *lo == 0 && *hi == 0 {
-                                alloc::string::String::from("-")
-                            } else {
-                                alloc::format!("{}..{}", lo, hi)
-                            }
+                            arrow_end(1),
+                            size
                         ),
                         true,
                         i == self.hunt_cursor,
                     );
                 }
-                push(&mut out, String::from("  Up/Down row   B back"), false, false);
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "  変更中: {}   刻み {}",
+                        ["討伐数", "捕獲数", "最小サイズ", "最大サイズ"][self.hunt_field.min(3)],
+                        HUNT_STEPS[self.step]
+                    ),
+                    false,
+                    false,
+                );
             }
             Screen::Guild => {
                 push(
@@ -2757,14 +2946,36 @@ impl Editor {
                 let hr = crate::guildcard::hunter_rank(save, self.slot).unwrap_or(0);
                 let time = crate::guildcard::play_time(save, self.slot).unwrap_or(0);
                 let comment = crate::guildcard::comment(save, self.slot).unwrap_or_default();
-                push(&mut out, alloc::format!("  rank    : {}", hr), false, false);
+                // The field being edited is bracketed, so Left/Right is
+                // never a guess.
+                let mk = |f: usize| if self.guild_field == f { "[" } else { " " };
+                let cl = |f: usize| if self.guild_field == f { "]" } else { " " };
                 push(
                     &mut out,
-                    alloc::format!("  time    : {}:{:02}:{:02}", time / 3600, (time % 3600) / 60, time % 60),
+                    alloc::format!("  rank    : {}{:>3}{}", mk(0), hr, cl(0)),
                     false,
                     false,
                 );
-                push(&mut out, alloc::format!("  comment : {}", comment), false, false);
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "  time    : {}{}:{:02}:{:02}{}  刻み {}",
+                        mk(1),
+                        time / 3600,
+                        (time % 3600) / 60,
+                        time % 60,
+                        cl(1),
+                        STEPS[self.step]
+                    ),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    alloc::format!("  comment : {}{}{}", mk(2), comment, cl(2)),
+                    false,
+                    false,
+                );
                 push(&mut out, String::from("  ARENA"), false, false);
                 let log = crate::guildcard::arena(save, self.slot);
                 for a in 0..crate::guildcard::ARENA_COUNT {
@@ -2837,15 +3048,35 @@ impl Editor {
                 if start + 18 > list.len() {
                     start = list.len().saturating_sub(18);
                 }
+                let mark = |f: usize| if self.roster_field == f { "[" } else { " " };
+                let close = |f: usize| if self.roster_field == f { "]" } else { " " };
                 for (i, p) in list.iter().enumerate().skip(start).take(18) {
                     push(
                         &mut out,
-                        alloc::format!("  {:>3}  {:<16} Lv{:<3} bond {}", p.index, p.name, p.level, p.enthusiasm),
+                        alloc::format!(
+                            "  {:>3}  {:<14} {}{:>3}{} {}exp {:>7}{}",
+                            p.index,
+                            p.name,
+                            mark(0),
+                            p.level,
+                            close(0),
+                            mark(1),
+                            p.exp,
+                            close(1)
+                        ),
                         true,
                         i == self.roster_cursor,
                     );
                 }
-                push(&mut out, String::from("  Up/Down row   B back"), false, false);
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "  変更中: {}   A で名前変更",
+                        ["レベル", "なつき度", "経験値"][self.roster_field.min(2)]
+                    ),
+                    false,
+                    false,
+                );
             }            Screen::QuestEquip => {
                 let list = self.quest_equipment();
                 let used = list.iter().filter(|e| e.occupied).count();

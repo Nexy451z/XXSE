@@ -271,6 +271,10 @@ impl MhnxEditor {
 
     pub fn write_current(&mut self, path: PathBuf) {
         self.apply_to_save();
+        // The hunt tables are edited in their own buffers, which used to reach
+        // the save only if the user pressed the apply button first: writing
+        // straight from the table silently dropped the changes.
+        self.apply_hunts();
         let Some(s) = &self.save else { return };
         let backup = Self::backup_before_write(&path);
         match std::fs::write(&path, s.to_bytes()) {
@@ -446,6 +450,11 @@ impl MhnxEditor {
     /// save already: add_quest writes the payload and sets the catalogue bit
     /// together, which is what makes a brand new quest appear in game.
     pub fn add_open_arc_to_save(&mut self) {
+        // The .mib and .gmd editors keep their edits in separate buffers, so
+        // they have to be flushed into the archive before it is rebuilt, or
+        // the quest is added with the values it had on disk.
+        let selected = self.arc_selected;
+        self.store_arc_entry(selected);
         let Some(arc) = &self.arc else {
             self.message = "先に .arc を開いてください".to_owned();
             return;
@@ -699,6 +708,10 @@ impl MhnxEditor {
 impl eframe::App for MhnxEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.top_bar(ctx);
+        // Tabs live in their own bar: laying them out inside the side panel
+        // made the panel grow to fit the row, so it covered more than half the
+        // window and pushed controls off the bottom of every tab.
+        self.tab_bar(ctx);
         self.side_panel(ctx);
         self.bottom_bar(ctx);
 
@@ -858,28 +871,38 @@ impl MhnxEditor {
         });
     }
 
+    /// The tab bar, across the top of the window.
+    fn tab_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (tab, label) in [
+                    (Tab::Save, "キャラ"),
+                    (Tab::Items, "アイテム"),
+                    (Tab::Quest, "クエスト"),
+                    (Tab::Dlc, "DLC"),
+                    (Tab::Charm, "お守り"),
+                    (Tab::Equip, "装備"),
+                    (Tab::Hunts, "狩猟記録"),
+                    (Tab::Guild, "ギルド"),
+                    (Tab::Palico, "オトモ"),
+                    (Tab::Sets, "マイセット"),
+                    (Tab::Extras, "設定/オトモ"),
+                    (Tab::About, "情報"),
+                ] {
+                    ui.selectable_value(&mut self.tab, tab, label);
+                }
+            });
+        });
+    }
+
     fn side_panel(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("side")
             .resizable(true)
-            .default_width(340.0)
+            .default_width(320.0)
+            .max_width(420.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.tab, Tab::Save, "キャラ");
-                        ui.selectable_value(&mut self.tab, Tab::Items, "アイテム");
-                        ui.selectable_value(&mut self.tab, Tab::Quest, "クエスト");
-                        ui.selectable_value(&mut self.tab, Tab::Dlc, "DLC");
-                        ui.selectable_value(&mut self.tab, Tab::Charm, "お守り");
-        ui.selectable_value(&mut self.tab, Tab::Equip, "装備");
-        ui.selectable_value(&mut self.tab, Tab::Hunts, "狩猟記録");
-        ui.selectable_value(&mut self.tab, Tab::Guild, "ギルド");
-        ui.selectable_value(&mut self.tab, Tab::Palico, "オトモ");
-        ui.selectable_value(&mut self.tab, Tab::Sets, "マイセット");
-                ui.selectable_value(&mut self.tab, Tab::Extras, "設定/オトモ");
-        ui.selectable_value(&mut self.tab, Tab::About, "情報");
-                    });
-                    ui.separator();
 
                     ui.label(egui::RichText::new("セーブ情報").strong());
                     let mut pending_slot: Option<usize> = None;
