@@ -1668,3 +1668,51 @@ fn a_slash_in_the_name_cannot_escape_the_directory() {
         other => panic!("expected a write, got {:?}", other),
     }
 }
+
+#[test]
+fn the_name_hash_matches_the_files_ryujinx_wrote() {
+    // Taken from the two real files: their bodies are byte identical and only
+    // the 4 bytes at header +0x14 differ, which is the name hash.
+    let system = mhnx_core::save::switch_header("system", mhnx_core::save::BODY_SIZE);
+    let backup =
+        mhnx_core::save::switch_header("system_backup", mhnx_core::save::BODY_SIZE);
+    let u = |h: &[u8; mhnx_core::save::SWITCH_HEADER_SIZE]| {
+        u32::from_le_bytes([h[0x14], h[0x15], h[0x16], h[0x17]])
+    };
+    assert_eq!(
+        u(&system),
+        0x36B2_EE74,
+        "name_hash(\"system\") no longer matches the real file"
+    );
+    assert_eq!(
+        u(&backup),
+        0xD081_9B92,
+        "name_hash(\"system_backup\") no longer matches the real file"
+    );
+    // Everything else in the two headers must be the same.
+    for i in 0..mhnx_core::save::SWITCH_HEADER_SIZE {
+        if (0x14..0x18).contains(&i) {
+            continue;
+        }
+        assert_eq!(system[i], backup[i], "header byte 0x{:X} differs", i);
+    }
+}
+
+#[test]
+fn the_two_real_headers_differ_only_in_the_name_hash() {
+    let dir = std::path::PathBuf::from("C:/Users/haruk/AppData/Roaming/Ryujinx/bis/user/save/0000000000000001/0");
+    let (a, b) = (dir.join("system"), dir.join("system_backup"));
+    if !a.exists() || !b.exists() {
+        return;
+    }
+    let (a, b) = (std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
+    assert_eq!(a.len(), b.len());
+    let diffs: Vec<usize> = (0..a.len()).filter(|i| a[*i] != b[*i]).collect();
+    assert!(
+        diffs.iter().all(|i| (0x14..0x18).contains(i)),
+        "the files differ outside the name hash: {:?}",
+        diffs
+    );
+    // And the bodies really are identical, which is what makes the pair safe.
+    assert_eq!(a[36..], b[36..], "the bodies must be identical");
+}
