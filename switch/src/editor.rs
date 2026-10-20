@@ -349,7 +349,6 @@ fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
         SaveList => "A open   Y quest editor   X options   - rescan   + exit",
         Slots => "Up/Down slot  A character  X items  L charms  R palico  Y quest  B back",
         Char => "Up/Down field  Left/Right value  X step  A save  B back",
-        Items => "Up/Down item  L/R count  R pick item  X step  Y filter  A save  B back",
         ArcList => "A open quest   X quests in save   Y save editor   + exit",
         SaveQuests => "A edit  - extract this  R extract all  B back",
         ItemPick => "A choose  Y filter  X clear  B back",
