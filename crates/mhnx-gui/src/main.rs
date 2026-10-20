@@ -71,7 +71,8 @@ fn main() -> eframe::Result<()> {
                     "items" => app::Tab::Items,
                     "quest" => app::Tab::Quest,
                     "dlc" => app::Tab::Dlc,
-                    "extras" => app::Tab::Extras,
+                    "charm" => app::Tab::Charm,
+                "extras" => app::Tab::Extras,
             "about" => app::Tab::About,
                     _ => app::Tab::Save,
                 };
