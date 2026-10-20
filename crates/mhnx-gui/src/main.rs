@@ -45,7 +45,8 @@ fn install_japanese_font(ctx: &egui::Context) -> Option<String> {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 820.0])
+            // Fits a 1536x864 display: 820 plus the title bar and taskbar did not.
+        .with_inner_size([1180.0, 740.0])
             .with_min_inner_size([900.0, 600.0])
             .with_title("mhnxeditor - Monster Hunter XX save & quest editor"),
         ..Default::default()

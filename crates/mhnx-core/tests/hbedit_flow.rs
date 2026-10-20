@@ -4228,3 +4228,49 @@ fn spec_every_screen_has_its_own_hint_chips() {
         );
     }
 }
+
+#[test]
+fn the_console_can_edit_a_quest_equipment_item() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    // Slots -> quest list -> the save's own quests -> quest equipment.
+    ed.input(Key::Y);
+    ed.input(Key::X);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::QuestEquip);
+    assert!(ed.quest_equipment().len() > 0);
+
+    // Open the first slot that holds something, then walk to a filled entry.
+    let mut guard = 0;
+    while !ed.qe_open && guard < 50 {
+        ed.input(Key::A);
+        guard += 1;
+        if !ed.qe_open {
+            ed.input(Key::Down);
+        }
+    }
+    assert!(ed.qe_open, "the slot did not open");
+    let mut guard = 0;
+    while ed.quest_equip_items().get(ed.qe_item_cursor).map(|i| i.item) == Some(0)
+        && guard < 200
+    {
+        ed.input(Key::Down);
+        guard += 1;
+    }
+    let target = ed.quest_equip_items()[ed.qe_item_cursor];
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::ItemPick, "the picker did not open");
+    assert_eq!(ed.item_pick_mode, 2);
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::QuestEquip);
+    assert!(ed.dirty, "choosing an item must mark the save dirty");
+    // B closes the slot, B again leaves the screen.
+    ed.input(Key::B);
+    assert!(!ed.qe_open);
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+}

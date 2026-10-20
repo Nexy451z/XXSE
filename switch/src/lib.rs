@@ -19,6 +19,7 @@ pub mod savedata;
 pub mod swkbd;
 pub mod sys;
 pub mod text;
+pub mod ui;
 
 /// Backed by devkitA64's newlib heap, which is what libnx itself uses.
 struct LibcAlloc;
