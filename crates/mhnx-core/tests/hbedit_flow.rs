@@ -931,3 +931,83 @@ fn the_item_picker_does_not_panic_on_an_empty_match() {
     let after = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
     assert_eq!(before, after);
 }
+// ---------------------------------------------------------------------------
+// The console entry viewer: the six container formats used to be unreadable.
+// ---------------------------------------------------------------------------
+
+fn sample_arc() -> Option<std::path::PathBuf> {
+    let mut p = std::path::PathBuf::from("C:/");
+    for part in ["anyWorkspace", "nx", "mhxx", "mhnxeditor", "dist", "quests_all"] {
+        p.push(part);
+    }
+    p.push("q1010165.arc");
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn y_on_an_entry_shows_it_decoded() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    assert_eq!(ed.screen, Screen::ArcEntries);
+
+    // Walk every entry and check that Y always produces a readable screen,
+    // and that the four container types show their contents.
+    let n = ed.arc.as_ref().map(|a| a.entries.len()).unwrap_or(0);
+    assert_eq!(n, 15, "the sample quest has 15 entries");
+    let mut seen: Vec<String> = Vec::new();
+    for i in 0..n {
+        ed.cursor = i;
+        ed.input(Key::Y);
+        assert_eq!(ed.screen, Screen::EntryView, "entry {} did not open", i);
+        let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+        assert!(lines.len() > 1, "entry {} rendered nothing", i);
+        assert!(
+            lines[0].len() > 3,
+            "entry {} has no header: {:?}",
+            i,
+            lines[0]
+        );
+        seen.push(lines.join(" | "));
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::ArcEntries);
+    }
+    let joined = seen.join("\n");
+    // .rem shows reward records with the Japanese item names.
+    assert!(
+        joined.contains("古びたお守り"),
+        ".rem reward names missing; got:
+{}",
+        &joined[..joined.len().min(1500)]
+    );
+    // .qdl lists the referenced files.
+    assert!(joined.contains("questData_1010165"), ".qdl file list missing");
+    // .sem shows a position.
+    assert!(joined.contains("x "), ".sem position missing");
+}
+
+#[test]
+fn the_entry_view_never_panics_on_a_junk_payload() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    // Replace the payload under every entry with noise and view them all.
+    if let Some(a) = &mut ed.arc {
+        for e in a.entries.iter_mut() {
+            e.data = vec![0x5A; 40];
+        }
+    }
+    let n = ed.arc.as_ref().map(|a| a.entries.len()).unwrap_or(0);
+    for i in 0..n {
+        ed.cursor = i;
+        ed.input(Key::Y);
+        let _ = ed.lines();
+        ed.input(Key::B);
+    }
+}
