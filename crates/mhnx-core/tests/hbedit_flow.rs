@@ -1268,3 +1268,81 @@ fn an_illegal_skill_is_flagged_on_the_console() {
         joined
     );
 }
+// ---------------------------------------------------------------------------
+// 3DS <-> Switch conversion on the console.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn l_on_the_save_list_opens_the_convert_screen() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::B); // back to the save list
+    assert_eq!(ed.screen, Screen::SaveList);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Convert);
+    let joined: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = joined.join("\n");
+    assert!(joined.contains("CONVERT SAVE"), "{}", joined);
+    assert!(joined.contains("source"), "{}", joined);
+    assert!(joined.contains("3DS"), "the target must be named:\n{}", joined);
+}
+
+#[test]
+fn a_switch_save_converts_to_a_3ds_body() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::B);
+    ed.input(Key::L);
+    ed.input(Key::A);
+    match ed.take_write() {
+        Some(mhnx_core::hbedit::Write::File { path, bytes }) => {
+            assert!(path.ends_with(".3ds"), "wrote {}", path);
+            // The 3DS container is the body alone, with no 36 byte header.
+            assert_eq!(bytes.len(), 4_726_152, "3DS save is the bare body");
+            let before = ed.save.as_ref().unwrap().body().to_vec();
+            assert_eq!(bytes, before, "the body must be carried over unchanged");
+        }
+        other => panic!("expected a write, got {:?}", other),
+    }
+}
+
+#[test]
+fn a_3ds_save_converts_to_a_switch_container() {
+    if !real_save().exists() {
+        return;
+    }
+    let src = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    // A bare body is what a 3DS save is.
+    let body = src.to_3ds_bytes();
+    let mut ed = Editor::new();
+    ed.open_save_bytes("C:/fake/system", &body);
+    assert_eq!(
+        ed.save.as_ref().unwrap().kind(),
+        mhnx_core::save::SaveKind::ThreeDs,
+        "a bare body must be recognised as 3DS"
+    );
+    ed.input(Key::B); // slots -> save list
+    ed.input(Key::L); // convert
+    assert_eq!(ed.screen, Screen::Convert);
+    ed.input(Key::A);
+    match ed.take_write() {
+        Some(mhnx_core::hbedit::Write::File { path, bytes }) => {
+            assert!(path.ends_with(".switch"), "wrote {}", path);
+            assert_eq!(bytes.len(), 4_726_188, "Switch save carries the header");
+            let back = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+            assert_eq!(
+                back.kind(),
+                mhnx_core::save::SaveKind::Switch,
+                "the container must be a Switch one"
+            );
+            assert_eq!(back.body(), &body[..], "the body must survive");
+        }
+        other => panic!("expected a write, got {:?}", other),
+    }
+}

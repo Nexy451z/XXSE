@@ -346,7 +346,8 @@ impl Painter {
 fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
     use mhnx_core::hbedit::Screen::*;
     match screen {
-        SaveList => "A open   Y quest editor   X options   - rescan   + exit",
+        SaveList => "A open  Y quest editor  L convert  X options  - rescan  + exit",
+        Convert => "A convert and write   B back",
         Slots => "Up/Down slot  A character  X items  L charms  R palico  Y quest  B back",
         Char => "Up/Down field  Left/Right value  X step  A save  B back",
         ArcList => "A open quest   X quests in save   Y save editor   + exit",

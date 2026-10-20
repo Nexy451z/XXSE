@@ -62,6 +62,8 @@ pub enum Screen {
     EntryView,
     /// Skill name picker for the talisman editor.
     SkillPick,
+    /// 3DS <-> Switch conversion for the open save.
+    Convert,
     /// Item name search, opened from the item box with R.
     ItemPick,
     /// Download Palicoes (配信オトモ).
@@ -568,6 +570,7 @@ impl Editor {
             Screen::SaveQuests => self.input_save_quests(key),
             Screen::ItemPick => self.input_item_pick(key),
             Screen::SkillPick => self.input_skill_pick(key),
+            Screen::Convert => self.input_convert(key),
             Screen::EntryView => match key {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
@@ -996,6 +999,11 @@ impl Editor {
                 self.cursor = 0;
                 self.message = String::from("options");
             }
+            // L converts between the 3DS and Switch containers.
+            Key::L => {
+                self.screen = Screen::Convert;
+                self.message = String::from("3DS <-> Switch");
+            }
             Key::Plus => self.quit = true,
             _ => {}
         }
@@ -1213,6 +1221,64 @@ impl Editor {
     pub fn apply_skill_filter(&mut self, text: String) {
         self.skill_pick_filter = text;
         self.skill_pick_cursor = 0;
+    }
+
+    /// Build the converted save and hand the bytes to the io layer.
+    fn convert_now(&mut self) {
+        let Some(save) = &self.save else {
+            self.message = String::from("open a save first");
+            return;
+        };
+        if save.kind() == crate::save::SaveKind::Mhgu {
+            self.message = String::from("MHGU is not converted here");
+            return;
+        }
+        let Some(base) = self.save_path.clone() else {
+            self.message = String::from("this save has no path");
+            return;
+        };
+        let (path, bytes, what) = match save.kind() {
+            crate::save::SaveKind::ThreeDs => {
+                let name = if save.header().iter().any(|b| *b != 0) {
+                    "system"
+                } else {
+                    "system"
+                };
+                match crate::save::Save::from_3ds_body(save.body(), name) {
+                    Ok(sw) => (
+                        alloc::format!("{}.switch", base),
+                        sw.to_bytes(),
+                        "Switch (36 byte header synthesised)",
+                    ),
+                    Err(_) => {
+                        self.message = String::from("cannot build a Switch container");
+                        return;
+                    }
+                }
+            }
+            _ => (
+                alloc::format!("{}.3ds", base),
+                save.to_3ds_bytes(),
+                "3DS (header stripped)",
+            ),
+        };
+        self.pending_write = Some(Write::File {
+            path: path.clone(),
+            bytes,
+        });
+        self.message = alloc::format!("writing {} -> {}", what, path);
+    }
+
+    fn input_convert(&mut self, key: Key) {
+        match key {
+            Key::A => self.convert_now(),
+            Key::B => {
+                self.screen = Screen::SaveList;
+                self.cursor = 0;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
     }
 
     fn input_skill_pick(&mut self, key: Key) {
@@ -2126,6 +2192,36 @@ impl Editor {
                 push(
                     &mut out,
                     String::from("  A delete  Y edit  L new  X write save  B back"),
+                    false,
+                    false,
+                );
+            }
+            Screen::Convert => {
+                push(&mut out, String::from("CONVERT SAVE"), false, false);
+                match (&self.save, &self.save_path) {
+                    (None, _) => push(&mut out, String::from("  no save open"), false, false),
+                    (Some(s), p) => {
+                        let kind = match s.kind() {
+                            crate::save::SaveKind::ThreeDs => "3DS MHXX (no header)",
+                            crate::save::SaveKind::Switch => "Switch MHXX (36 byte header)",
+                            crate::save::SaveKind::Mhgu => "Switch MHGU",
+                        };
+                        push(&mut out, alloc::format!("  source : {}", kind), false, false);
+                        let target = if s.kind() == crate::save::SaveKind::ThreeDs {
+                            "Switch MHXX (header synthesised)"
+                        } else {
+                            "3DS MHXX (header stripped)"
+                        };
+                        push(&mut out, alloc::format!("  target : {}", target), false, false);
+                        let path = p.clone().map(|v| alloc::format!("{}.{}", v,
+                            if s.kind() == crate::save::SaveKind::ThreeDs { "switch" } else { "3ds" }))
+                            .unwrap_or_else(|| String::from("(no path)"));
+                        push(&mut out, alloc::format!("  writes : {}", path), false, false);
+                    }
+                }
+                push(
+                    &mut out,
+                    String::from("  A convert and write   B back"),
                     false,
                     false,
                 );
