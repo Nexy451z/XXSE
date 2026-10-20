@@ -2829,3 +2829,92 @@ fn palico_fields_can_be_written() {
     assert!(!mhnx_core::palico::set_level(&mut s, 0, 0, 100));
     assert!(!mhnx_core::palico::set_level(&mut s, 0, 0, 0));
 }
+
+// ---------------------------------------------------------------------------
+// The three record screens on the console.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_console_shows_the_hunt_records() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::A); // character
+    assert_eq!(ed.screen, Screen::Char);
+    ed.input(Key::Minus);
+    assert_eq!(ed.screen, Screen::Hunts);
+    let rows = ed.hunt_rows();
+    assert!(rows.len() > 100, "expected the recorded monsters, got {}", rows.len());
+    // Every row must carry a real monster name, not the "?" fallback.
+    for (i, ..) in &rows {
+        assert_ne!(mhnx_core::hbedit::monster_name(*i), "?", "index {} unnamed", i);
+    }
+    let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = lines.join("\n");
+    assert!(joined.contains("HUNT RECORDS"), "{}", joined);
+    assert!(
+        joined.contains("Rathian") || joined.contains("Rathalos"),
+        "{}",
+        joined
+    );
+    // Navigation is bounded and B returns to the slot list.
+    for _ in 0..200 {
+        ed.input(Key::Down);
+    }
+    assert!(ed.hunt_cursor < rows.len());
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+}
+
+#[test]
+fn the_console_shows_the_guild_card_and_arena() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus); // equipment
+    assert_eq!(ed.screen, Screen::Equip);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Guild);
+    let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = lines.join("\n");
+    assert!(joined.contains("GUILD CARD"), "{}", joined);
+    assert!(joined.contains("rank"), "{}", joined);
+    assert!(joined.contains("comment"), "{}", joined);
+    // A recorded arena time must be rendered as a clock, not raw hundredths.
+    assert!(joined.contains("ARENA"), "{}", joined);
+    assert!(
+        joined.contains(":") && !joined.contains("57544"),
+        "arena times should be formatted: {}",
+        joined
+    );
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+}
+
+#[test]
+fn the_console_lists_the_palicos() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus); // equipment
+    ed.input(Key::R);
+    assert_eq!(ed.screen, Screen::Roster);
+    let list = ed.palicos();
+    assert_eq!(list.len(), 17, "the sample character has seventeen palicos");
+    let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = lines.join("\n");
+    assert!(joined.contains("PALICOS"), "{}", joined);
+    assert!(joined.contains("Lv"), "{}", joined);
+    // Every name must have survived decoding.
+    for p in &list {
+        assert!(!p.name.contains('\u{FFFD}'));
+    }
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::Slots);
+}
