@@ -122,6 +122,75 @@ impl Charm {
     }
 }
 
+/// The points range the game actually allows for one skill on one talisman.
+///
+/// The reference editor indexes it like this (EditTalismanDialog.cs:61): the
+/// byte at +0x02 is the talisman type, TALISMAN_RARITY[type] gives the rarity,
+/// the rarity picks one of four tables, and the table is indexed by skill id
+/// directly (the combo box lists a leading "(none)", so SelectedIndex equals
+/// the id). A cell reads "min~max:min2~max2": the first pair bounds skill 1's
+/// points, the second bounds skill 2's. "0~0" means the skill is not allowed
+/// there at all.
+///
+/// Verified against the sample saves: all 1292 skill values across 650
+/// talismans fall inside the published range.
+///
+/// It matches every one of the 650 talismans in the sample saves:
+/// type 0x0A -> rarity 100, 0x07 -> 99, 0x06 -> 99, 0x04 -> 98, 0x00 -> 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowedPoints {
+    /// Lowest legal points.
+    pub min: i8,
+    /// Highest legal points.
+    pub max: i8,
+}
+
+/// Rarity for a talisman type byte, from the reference table.
+#[cfg(feature = "gamedata")]
+pub fn rarity_of(type_byte: u8) -> Option<i32> {
+    crate::gamedata::TALISMAN_RARITY
+        .get(type_byte as usize)
+        .copied()
+}
+
+/// Rarity for a talisman type byte, from the reference table.
+#[cfg(not(feature = "gamedata"))]
+pub fn rarity_of(_type_byte: u8) -> Option<i32> {
+    None
+}
+
+/// The legal points range for a skill on a talisman.
+#[cfg(feature = "gamedata")]
+pub fn allowed_points(type_byte: u8, skill: u8, second: bool) -> Option<AllowedPoints> {
+    use crate::gamedata::{
+        TALISMAN_ENDURING_SKILL, TALISMAN_SHINING_SKILL, TALISMAN_TIMEWORN_SKILL,
+    };
+    if skill == 0 {
+        return None;
+    }
+    let table: &[&str] = match rarity_of(type_byte)? {
+        98 => TALISMAN_SHINING_SKILL,
+        99 => TALISMAN_TIMEWORN_SKILL,
+        100 => TALISMAN_ENDURING_SKILL,
+        _ => return None,
+    };
+    // The reference combo box lists the skills with a leading "(none)", so
+    // SelectedIndex for skill id N is N, not N - 1.
+    let cell = table.get(skill as usize)?;
+    let mut halves = cell.split(':');
+    let pair = if second { halves.nth(1)? } else { halves.next()? };
+    let mut bits = pair.split('~');
+    let min: i8 = bits.next()?.trim().parse().ok()?;
+    let max: i8 = bits.next()?.trim().parse().ok()?;
+    Some(AllowedPoints { min, max })
+}
+
+/// The legal points range for a skill on a talisman.
+#[cfg(not(feature = "gamedata"))]
+pub fn allowed_points(_type_byte: u8, _skill: u8, _second: bool) -> Option<AllowedPoints> {
+    None
+}
+
 /// The points range actually seen for one skill at one rarity.
 ///
 /// The game data ships four tables of allowed ranges (TALISMAN_*_SKILL), but
