@@ -139,7 +139,8 @@ SD カード/
 | OPTIONS | 明るさ・振動・3D 表示・スライドパッドプロ |
 | QUEST FILES | SD カード内の .arc を探して開く |
 | QUEST | .arc の中のファイル一覧。A で編集、X でセーブへ書込、Y で中身を見る |
-| ENTRY VIEW | .rem / .sup / .sem / .esl / .qdp / .qdl をその場で解読して表示 |
+| ENTRY VIEW | .rem / .sup / .sem / .esl / .qdp / .qdl を解読して表示。.rem/.sup は **A でアイテムを差し替え**できる |
+| CONVERT SAVE | 3DS と Switch のコンテナを相互変換して書き出す |
 | QUEST PARAMETERS (.mib) | 96 項目を名前付きで編集。列挙型は値が切り替わる |
 | QUEST TEXT (.gmd) | クエスト名・依頼文などを編集（ソフトウェアキーボードを使用） |
 | CHECK | 検査結果の一覧。自動で直せる指摘には「修正」が付く |
@@ -216,7 +217,8 @@ SD カード/
 
 | 画面 | 操作 |
 |---|---|
-| SAVE FILES | A 開く / Y クエスト編集 / X オプション / - 再スキャン / + 終了 |
+| SAVE FILES | A 開く / Y クエスト編集 / **L 形式変換** / X オプション / - 再スキャン / + 終了 |
+| CONVERT SAVE | A 変換して書き出す / B 戻る |
 | CHARACTER SLOT | 上下 スロット / A キャラ / X アイテム / L お守り / R オトモ / Y クエスト / B 戻る |
 | CHARACTER | 上下 項目 / 左右 値 / X 刻み / A セーブへ書込 / B 戻る |
 | ITEM BOX | 上下 項目 / **LR 個数** / **R 種類を選ぶ** / **L 元に戻す** / X 刻み / Y 空欄表示 / A セーブへ書込 |
@@ -227,9 +229,9 @@ SD カード/
 | DOWNLOAD PALICO | A 追加・削除 / LR 言語 / X セーブへ書込 / B 戻る |
 | OPTIONS | 上下 項目 / 左右 値 / A セーブへ書込 / B 戻る |
 | QUEST FILES | A 開く / X セーブ内のクエスト / Y セーブ編集 / + 終了 |
-| QUESTS IN SAVE | A 編集 / - 1件抽出 / R 全件抽出 / B 戻る |
+| QUESTS IN SAVE | A 編集 / - 1件抽出 / R 全件抽出 / **Y 絞り込み / X クリア** / B 戻る |
 | QUEST | A 編集 / **Y 中身を見る** / X セーブへ書込 / - 1件抽出 / R 全件抽出 / L チェック / B 戻る |
-| ENTRY VIEW | B 戻る |
+| ENTRY VIEW | 上下 行 / **A アイテム変更**（.rem .sup のみ）/ X .arc へ書込 / B 戻る |
 | QUEST PARAMETERS | 上下 項目 / 左右 値 / X 刻み / A .arc へ書込 / B 戻る |
 | QUEST TEXT | A テキストを入力 / X .arc へ書込 / B 戻る |
 | CHECK | A 自動修正 / X .arc へ書込 / B 戻る |
