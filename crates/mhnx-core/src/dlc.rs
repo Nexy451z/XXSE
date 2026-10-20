@@ -21,8 +21,10 @@
 //! The 28 byte set at section + 0x4C looks tempting as "bit i = slot i" but
 //! that is provably wrong: the real save has bits 205..214 set while the quest
 //! array only has slots 0..204, and bit 25 clear while slot 25 holds a quest.
-//! Counting matches is not evidence either - 166 set bits over 175 records
-//! gives a chance agreement of about 142.
+//! Counting matches is not evidence either: the sample save currently holds
+//! 175 set bits for 175 records, but the same file had 166 when this note was
+//! first written and the quest set has grown since. The totals line up because
+//! one bit means one installed quest, not because bit i maps to slot i.
 //!
 //! The set is indexed by **catalogue entry**: mask bits 0..40 line up exactly
 //! with the 45 entry quest-equipment catalogue, and the remaining 135 set bits
