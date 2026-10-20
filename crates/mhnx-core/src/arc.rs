@@ -322,6 +322,7 @@ mod tests {
     fn round_trip_synthetic() {
         let a = Arc {
             version: ARC_VERSION,
+            header8: 0xFFFF_FFFE,
             entries: vec![
                 ArcEntry {
                     name: String::from("questData\\questData_1010001"),
@@ -362,6 +363,7 @@ mod tests {
     fn payloads_are_contiguous() {
         let a = Arc {
             version: ARC_VERSION,
+            header8: 0xFFFF_FFFE,
             entries: (0..3)
                 .map(|i| ArcEntry {
                     name: alloc::format!("e{}", i),

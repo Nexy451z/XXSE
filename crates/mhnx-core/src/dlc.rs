@@ -731,6 +731,7 @@ mod tests {
         mib[0x0C..0x10].copy_from_slice(&id.to_le_bytes());
         let a = crate::arc::Arc {
             version: crate::arc::ARC_VERSION,
+            header8: 0xFFFF_FFFE,
             entries: alloc::vec![crate::arc::ArcEntry {
                 name: alloc::string::String::from("questData\\questData_x"),
                 type_hash: 0x1BBF_D18E,
