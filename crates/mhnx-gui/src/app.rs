@@ -1935,6 +1935,24 @@ impl MhnxEditor {
         }
     }
 
+    /// Quest title for an id, by decoding its .gmd out of the open save.
+    fn quest_title_of(&self, id: i32) -> String {
+        let Some(save) = &self.save else {
+            return String::new();
+        };
+        dlc::list_quests(save)
+            .iter()
+            .find(|q| q.quest_id == id)
+            .and_then(|q| {
+                mhnx_core::arc::Arc::parse(&q.data).ok().and_then(|a| {
+                    a.by_ext("gmd")
+                        .and_then(|e| mhnx_core::quest::Gmd::from_bytes(&e.data).ok())
+                })
+            })
+            .and_then(|g| g.title().map(|t| t.to_string()))
+            .unwrap_or_default()
+    }
+
     fn tab_dlc(&mut self, ui: &mut egui::Ui) {
         ui.heading("ダウンロードクエスト");
         let Some(save) = &self.save else {
@@ -1949,10 +1967,55 @@ impl MhnxEditor {
             return;
         }
         let quests = dlc::list_quests(save);
+        let equipment = dlc::quest_equipment(save);
+        let used = equipment.iter().filter(|e| e.occupied).count();
         ui.horizontal(|ui| {
             ui.label(format!("導入済み {} 件", quests.len()));
             ui.label("絞り込み");
             ui.text_edit_singleline(&mut self.dlc_filter);
+        });
+        // The 45 quest-equipment entries were only readable once the low mask
+        // bits were proven to index this array directly.
+        egui::CollapsingHeader::new(format!(
+            "クエスト装備 {} / {} 枠",
+            used,
+            equipment.len()
+        ))
+        .id_salt("questequip")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "各枠の先頭4バイトがクエストIDです。並びはゲーム側のカタログ順で、ID順ではありません。",
+                )
+                .weak()
+                .small(),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("questequiplist")
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("questequipgrid")
+                        .num_columns(3)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("枠");
+                            ui.strong("クエストID");
+                            ui.strong("タイトル");
+                            ui.end_row();
+                            for e in &equipment {
+                                ui.label(format!("{}", e.index));
+                                if e.occupied {
+                                    ui.label(format!("{}", e.quest_id));
+                                    ui.label(self.quest_title_of(e.quest_id));
+                                } else {
+                                    ui.weak("—");
+                                    ui.weak("空き");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
         });
         ui.horizontal(|ui| {
             ui.label("抽出先");
