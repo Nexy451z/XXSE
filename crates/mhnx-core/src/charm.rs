@@ -122,6 +122,63 @@ impl Charm {
     }
 }
 
+/// The points range actually seen for one skill at one rarity.
+///
+/// The game data ships four tables of allowed ranges (TALISMAN_*_SKILL), but
+/// how they are indexed could not be established with confidence, so this
+/// derives the answer from the box itself instead of guessing: every talisman
+/// in it contributes one sample. A value outside the observed range is not
+/// proof of an illegal record, but it is worth flagging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PointsRange {
+    /// Lowest points seen.
+    pub low: i8,
+    /// Highest points seen.
+    pub high: i8,
+    /// How many talismans back this up.
+    pub samples: usize,
+}
+
+/// Observed points range for (rarity at +0x12, skill id).
+pub fn observed_points_range(
+    box_bytes: &[u8],
+    rarity: u8,
+    skill: u8,
+) -> Option<PointsRange> {
+    if box_bytes.len() < CHARM_BOX_SIZE || skill == 0 {
+        return None;
+    }
+    let mut out: Option<PointsRange> = None;
+    for i in 0..CHARM_COUNT {
+        let o = i * CHARM_RECORD;
+        let rec = &box_bytes[o..o + CHARM_RECORD];
+        if !is_talisman(rec) || rec[0x12] != rarity {
+            continue;
+        }
+        for (sid, pts) in [
+            (rec[0x0C], rec[0x0E] as i8),
+            (rec[0x0D], rec[0x0F] as i8),
+        ] {
+            if sid != skill {
+                continue;
+            }
+            out = Some(match out {
+                None => PointsRange {
+                    low: pts,
+                    high: pts,
+                    samples: 1,
+                },
+                Some(r) => PointsRange {
+                    low: r.low.min(pts),
+                    high: r.high.max(pts),
+                    samples: r.samples + 1,
+                },
+            });
+        }
+    }
+    out
+}
+
 /// Decode every talisman in an equipment box.
 ///
 /// box_bytes must be the 72000 bytes starting at slot + 0x62EE.
