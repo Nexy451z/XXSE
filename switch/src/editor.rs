@@ -657,6 +657,12 @@ fn service(ed: &mut Editor) -> bool {
             "書き出すファイル名（拡張子は自動）"
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
             "装備名か種類で絞り込み"
+        } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
+            "ギルドカードのコメント"
+        } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME
+            && idx < mhnx_core::hbedit::TEXT_GUILD_COMMENT
+        {
+            "オトモの名前"
         } else {
             "クエストテキスト"
         };
@@ -679,6 +685,26 @@ fn service(ed: &mut Editor) -> bool {
                 Some(s) if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER => {
                     ed.equip_filter = s;
                     ed.equip_cursor = 0;
+                }
+                Some(s) if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT => {
+                    if let Some(save) = &mut ed.save {
+                        let slot = ed.slot;
+                        mhnx_core::guildcard::set_comment(save, slot, &s);
+                        ed.dirty = true;
+                        ed.message = String::from("コメントを変更しました");
+                    }
+                }
+                Some(s) if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME => {
+                    let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
+                    if let Some(save) = &mut ed.save {
+                        let slot = ed.slot;
+                        // The name field is fixed width and NUL padded.
+                        let clipped: String = s.chars().take(20).collect();
+                        if mhnx_core::palico::set_name(save, slot, which, &clipped) {
+                            ed.dirty = true;
+                            ed.message = alloc::format!("オトモ {} の名前を変更しました", which);
+                        }
+                    }
                 }
                 Some(s) => ed.apply_text(idx, s),
                 None => ed.message = String::from("input cancelled"),
