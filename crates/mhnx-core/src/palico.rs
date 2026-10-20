@@ -220,10 +220,7 @@ pub fn set_name(save: &mut Save, slot: usize, index: usize, name: &str) -> bool 
     let Some(dst) = save.body_mut().get_mut(at..at + NAME_LEN) else {
         return false;
     };
-    dst.fill(0);
-    let bytes = name.as_bytes();
-    let n = bytes.len().min(NAME_LEN - 1);
-    dst[..n].copy_from_slice(&bytes[..n]);
+    crate::write_name_field(dst, name);
     true
 }
 

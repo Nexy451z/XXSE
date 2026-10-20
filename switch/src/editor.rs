@@ -26,6 +26,7 @@ extern "C" {
     fn fread(ptr: *mut c_void, size: usize, nmemb: usize, stream: *mut c_void) -> usize;
     fn fwrite(ptr: *const c_void, size: usize, nmemb: usize, stream: *mut c_void) -> usize;
     fn fclose(stream: *mut c_void) -> c_int;
+    fn remove(path: *const c_char) -> c_int;
 }
 
 // HidNpadButton bits (services/hid.h:256-296).
@@ -47,6 +48,8 @@ const BTN_DOWN: u64 = (1 << 15) | (1 << 19);
 // Right Stick Up/Down for fast page scrolling
 const BTN_RSTICK_UP: u64 = 1 << 21;
 const BTN_RSTICK_DOWN: u64 = 1 << 23;
+// Only directional buttons auto-repeat when held so action buttons (A/B/X/Y/L/R) never misfire.
+const BTN_REPEATABLE: u64 = BTN_LEFT | BTN_UP | BTN_RIGHT | BTN_DOWN;
 
 /// Folders scanned for content.
 const SAVE_DIRS: [&CStr; 3] = [
@@ -275,8 +278,89 @@ fn read_console_save() -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// Write all 175 bundled official quest `.arc` files out to `OUT_QUEST_DIR` on the SD card.
+pub fn extract_official_quests_to_sd() -> usize {
+    make_dirs(OUT_QUEST_DIR);
+    let mut written = 0usize;
+    for q in mhnx_core::dlc_bundle::OFFICIAL_QUESTS.iter() {
+        let data = mhnx_core::dlc_bundle::arc_bytes(q);
+        let path = format!("{}/q{:07}.arc", OUT_QUEST_DIR, q.quest_id);
+        if write_file(&path, data) {
+            written += 1;
+        }
+    }
+    written
+}
+
+/// Read an `.arc` file from `ed.arc_files[idx]` and install/overwrite it directly into `ed.save`.
+pub fn install_arc_file_into_save(ed: &mut Editor, idx: usize) {
+    if ed.save.is_none() {
+        ed.message = String::from("先にセーブデータを開いてください");
+        return;
+    }
+    let Some(path) = ed.arc_files.get(idx).cloned() else {
+        ed.message = String::from("クエストファイルが選択されていません");
+        return;
+    };
+    let bytes = match (&ed.arc, ed.arc_path.as_deref()) {
+        (Some(arc), Some(open)) if open == path => match arc.to_bytes() {
+            Ok(b) => b,
+            Err(_) => {
+                ed.message = String::from("アーカイブの再パックに失敗しました");
+                return;
+            }
+        },
+        _ => match read_file(&path) {
+            Some(b) => b,
+            None => {
+                ed.message = format!("ファイルを読み込めません: {}", path);
+                return;
+            }
+        },
+    };
+    let Some(id) = mhnx_core::hbedit::quest_id_of_arc(&bytes) else {
+        ed.message = String::from("クエストIDが読めません（.mib が含まれていません）");
+        return;
+    };
+    let Some(save) = &mut ed.save else {
+        return;
+    };
+    let already = mhnx_core::dlc::list_quests(save)
+        .iter()
+        .any(|q| q.quest_id == id);
+    let res = if already {
+        mhnx_core::dlc::install_quest(save, id, &bytes).map(|slot| (slot, false))
+    } else {
+        mhnx_core::dlc::add_quest(save, id, &bytes).map(|slot| (slot, true))
+    };
+    match res {
+        Ok((slot, added)) => {
+            ed.dirty = true;
+            ed.refresh_quest_titles();
+            ed.message = if added {
+                format!("クエスト {} をセーブの枠 {} に新規追加しました", id, slot)
+            } else {
+                format!("クエスト {} をセーブの枠 {} に上書きしました", id, slot)
+            };
+        }
+        Err(e) => {
+            ed.message = format!("クエストを追加できません: {}", e);
+        }
+    }
+}
+
 /// Write the save back to the console, keeping a copy on the SD card first.
 fn write_console_save(bytes: &[u8]) -> Result<String, String> {
+    // The console save is a header plus a 4,726,152 byte body. A 3DS save is
+    // the bare body, and writing one through the in place path would leave the
+    // file at its old length with the tail of the old save still on the end.
+    if bytes.len() != mhnx_core::save::SWITCH_SIZE {
+        return Err(alloc::format!(
+            "本体セーブは {} バイトの Switch 形式だけです（受け取ったのは {} バイト）",
+            mhnx_core::save::SWITCH_SIZE,
+            bytes.len()
+        ));
+    }
     let mount = crate::savedata::Mount::open().map_err(|e| e.describe())?;
     // Keep what the console holds now, so a bad edit can be undone without
     // having thought about it beforehand.
@@ -287,11 +371,34 @@ fn write_console_save(bytes: &[u8]) -> Result<String, String> {
     let backup_path = alloc::format!("{}/system_{}.bak", backup, stamp);
     if let Some(old) = old.as_ref() {
         let _ = write_file(&backup_path, old);
+        prune_old_backups(10);
     }
     mount
         .write_diff(bytes, old.as_deref())
         .map_err(|e| e.describe())?;
     Ok(backup_path)
+}
+
+/// Keep at most `max_keep` backup files in `SAFETY_DIR` so the SD card never fills up.
+fn prune_old_backups(max_keep: usize) {
+    let entries = list_dir(c"/switch/mhnxeditor/backups");
+    let mut baks: Vec<String> = entries
+        .into_iter()
+        .filter(|e| e.is_file && e.name.starts_with("system_") && e.name.ends_with(".bak"))
+        .map(|e| e.name)
+        .collect();
+    if baks.len() <= max_keep {
+        return;
+    }
+    baks.sort();
+    let remove_count = baks.len() - max_keep;
+    for name in baks.into_iter().take(remove_count) {
+        let full = format!("{}/{}", SAFETY_DIR, name);
+        let cpath = to_cstring(&full);
+        unsafe {
+            let _ = remove(cpath.as_ptr() as *const c_char);
+        }
+    }
 }
 
 /// Where the pre-write copies of the console save are kept.
@@ -569,6 +676,20 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
         ed.message = String::from("文字入力をキャンセルしました");
         force_redraw = true;
     }
+    if gui.wants_extract_official_arcs {
+        gui.wants_extract_official_arcs = false;
+        let written = extract_official_quests_to_sd();
+        ed.set_arc_files(scan_quests());
+        ed.message = format!(
+            "公式イベントクエスト {} 件を {} に展開しました",
+            written, OUT_QUEST_DIR
+        );
+        force_redraw = true;
+    }
+    if let Some(arc_idx) = gui.wants_install_arc_idx.take() {
+        install_arc_file_into_save(ed, arc_idx);
+        force_redraw = true;
+    }
 
     if let Some(req) = ed.take_request() {
         match req {
@@ -621,7 +742,13 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
         match w {
             Write::File { path, bytes } => {
                 let n = bytes.len();
-                if path == mhnx_core::hbedit::CONSOLE_SAVE || path.starts_with("nand:") {
+                // Only the two files the mount actually covers may take this
+                // path. Matching every "nand:" prefix meant the convert screen,
+                // which writes "nand:/system.3ds", went through here too and
+                // overwrote the console save with a 3DS body.
+                if path == mhnx_core::hbedit::CONSOLE_SAVE
+                    || path == "nand:/system_backup"
+                {
                     match write_console_save(&bytes) {
                         Ok(backup) => {
                             ed.dirty = false;
@@ -643,11 +770,16 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                     kept = write_file(&bak, &old);
                 }
                 if write_file(&path, &bytes) {
-                    ed.dirty = false;
-                    ed.message = if kept {
-                        format!("wrote {} bytes to {} (previous kept as .bak)", n, path)
+                    let is_arc = path.ends_with(".arc");
+                    if !is_arc || ed.save.is_none() {
+                        ed.dirty = false;
+                    }
+                    ed.message = if is_arc {
+                        format!("クエストファイルを保存しました: {} ({} B)", path, n)
+                    } else if kept {
+                        format!("セーブを保存しました: {} ({} B / .bak作成済)", path, n)
                     } else {
-                        format!("wrote {} bytes to {}", n, path)
+                        format!("セーブを保存しました: {} ({} B)", path, n)
                     };
                     // Keep the Switch save pair consistent.
                     if path.ends_with("/system") {
@@ -660,7 +792,7 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                         }
                     }
                 } else {
-                    ed.message = String::from("WRITE FAILED (SD card write protected?)");
+                    ed.message = String::from("書き込みに失敗しました（SDカードの空き容量・保護を確認してください）");
                 }
             }
         }
@@ -668,33 +800,33 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
 
     if let Some((idx, initial)) = ed.take_text_request() {
         force_redraw = true;
-        let header = if idx == mhnx_core::hbedit::TEXT_NAME {
-            "キャラクター名"
+        let (header, max_bytes) = if idx == mhnx_core::hbedit::TEXT_NAME {
+            ("キャラクター名 (最大31B / 全角10文字)", 31usize)
         } else if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
-            "アイテム名で絞り込み"
+            ("アイテム名で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
-            "スキル名で絞り込み"
+            ("スキル名で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {
-            "クエストIDかタイトルで絞り込み"
+            ("クエストIDかタイトルで絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_SAVE_NAME {
-            "書き出すファイル名（拡張子は自動）"
+            ("書き出すファイル名（拡張子は自動）", 48)
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
-            "装備名か種類で絞り込み"
+            ("装備名か種類で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
-            "ギルドカードのコメント"
+            ("ギルドカードのコメント", 54)
         } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME
             && idx < mhnx_core::hbedit::TEXT_GUILD_COMMENT
         {
-            "オトモの名前"
+            ("オトモの名前 (最大20B / 全角6文字)", 20)
         } else {
-            "クエストテキスト"
+            ("クエストテキスト", 180)
         };
         if !crate::swkbd::is_available() {
             // In Applet mode (launched from Album), Horizon OS forbids launching
             // the swkbd LibraryApplet. Use our built-in touch & controller OSK!
-            gui.open_osk(idx, header, &initial);
+            gui.open_osk(idx, header, &initial, max_bytes);
         } else {
-            match crate::swkbd::input_text(header, &initial, 0) {
+            match crate::swkbd::input_text(header, &initial, max_bytes) {
                 Some(s) => apply_text_result(ed, idx, s),
                 None => ed.message = String::from("文字入力をキャンセルしました"),
             }
@@ -750,28 +882,45 @@ pub fn run() -> i32 {
             let down = pad.buttons_down();
             let cur = pad.buttons_cur;
 
-            // Edge triggered, with accelerated auto-repeat while held.
-            let mut key: Option<Key> = None;
-            if cur != held {
-                key = key_from(down);
+            // Action buttons are edge-triggered; only directional movement repeats when held.
+            let mut key: Option<Key> = key_from(down);
+            let cur_dir = cur & BTN_REPEATABLE;
+            if cur_dir != held {
                 hold_frames = 0;
-                held = cur;
-            } else if cur != 0 && key_from(cur).is_some() {
+                held = cur_dir;
+            } else if key.is_none() && cur_dir != 0 {
                 hold_frames += 1;
                 if hold_frames >= REPEAT_DELAY {
-                    // Faster repeat after holding for a while
-                    hold_frames = if hold_frames > REPEAT_DELAY + 20 {
+                    hold_frames = if hold_frames > REPEAT_DELAY + 18 {
                         REPEAT_DELAY - 2
                     } else {
                         REPEAT_DELAY - 4
                     };
-                    key = key_from(cur);
+                    key = key_from(cur_dir);
                 }
             }
 
             if painter.gui.osk.is_some() {
+                if down & BTN_ZL != 0 {
+                    key = Some(Key::L);
+                } else if down & BTN_ZR != 0 {
+                    key = Some(Key::R);
+                }
                 if let Some(k) = key {
                     if painter.gui.handle_osk_key(k) {
+                        need_draw = true;
+                    }
+                }
+            } else if painter.gui.mib_picker.is_some() {
+                if down & BTN_RSTICK_UP != 0 {
+                    painter.gui.scroll_mib_picker(-8);
+                    need_draw = true;
+                } else if down & BTN_RSTICK_DOWN != 0 {
+                    painter.gui.scroll_mib_picker(8);
+                    need_draw = true;
+                }
+                if let Some(k) = key {
+                    if painter.gui.handle_mib_picker_key(&mut ed, k) {
                         need_draw = true;
                     }
                 }
@@ -780,23 +929,21 @@ pub fn run() -> i32 {
                     break;
                 }
 
-                // ZL cycles through the main sidebar tabs
+                // ZL / ZR intuitively moves up / down through the left sidebar tabs!
                 if down & BTN_ZL != 0 {
+                    painter.gui.cycle_sidebar_tab(&mut ed, false);
+                    need_draw = true;
+                } else if down & BTN_ZR != 0 {
                     painter.gui.cycle_sidebar_tab(&mut ed, true);
                     need_draw = true;
                 }
 
-                // Right stick Up/Down scrolls lists by 10 rows
+                // Right stick Up/Down scrolls lists by 8 rows
                 if down & BTN_RSTICK_UP != 0 {
-                    painter.gui.handle_touch(&mut ed, false, 0, 0);
-                    for _ in 0..8 {
-                        ed.input(Key::Up);
-                    }
+                    painter.gui.page_scroll(&mut ed, -8);
                     need_draw = true;
                 } else if down & BTN_RSTICK_DOWN != 0 {
-                    for _ in 0..8 {
-                        ed.input(Key::Down);
-                    }
+                    painter.gui.page_scroll(&mut ed, 8);
                     need_draw = true;
                 }
 
@@ -815,8 +962,11 @@ pub fn run() -> i32 {
                 }
 
                 if let Some(k) = key {
-                    ed.input(k);
-                    need_draw = true;
+                    // Don't double-send Key::Z when ZR was already used for tab cycling
+                    if k != Key::Z {
+                        painter.gui.handle_pad_key(&mut ed, k, cur);
+                        need_draw = true;
+                    }
                 }
             }
 

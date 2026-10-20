@@ -253,6 +253,8 @@ pub fn is_installed(save: &Save, quest_id: i32) -> bool {
 /// placed in a slot the catalogue never filled is still unverified, so the
 /// callers keep this behind an explicit opt in.
 pub fn set_installed(save: &mut Save, quest_id: i32, on: bool) -> Result<(), Error> {
+    // The module says every writer refuses an MHGU save; this one did not.
+    check_kind(save)?;
     let bit = bit_for_quest(quest_id).ok_or(Error::OutOfRange {
         context: "quest id is not in the DLC catalogue",
         value: quest_id as u32,
@@ -538,6 +540,7 @@ pub fn installed_flag(save: &Save, quest_id: i32) -> Option<bool> {
 /// into a slot no catalogue entry has ever filled. Callers should treat this
 /// as an experiment and keep a backup.
 pub fn add_quest(save: &mut Save, quest_id: i32, arc_bytes: &[u8]) -> Result<usize, Error> {
+    check_kind(save)?;
     if arc_bytes.len() > QUEST_MAX_PAYLOAD {
         return Err(Error::OutOfRange {
             context: "quest payload larger than a slot",
@@ -691,6 +694,240 @@ pub fn find_quest(save: &Save, quest_id: i32) -> Option<usize> {
         }
     }
     None
+}
+
+/// Install all 175 bundled official event & challenge quests (plus the 40
+/// challenge quest equipment loadouts and DLC section bonus header flags)
+/// into `save`.
+///
+/// Safe on both brand-new saves (that have never received any DLC) and saves
+/// that already have some or all quests installed:
+/// - Any quest already present in `save` with a valid payload size is kept as-is
+///   (preserving user edits), while ensuring its catalogue bitmask bit is set.
+/// - Any missing official quest is placed into its original default slot if free,
+///   or the first available free slot otherwise, with its bitmask bit set.
+/// - Any empty challenge quest equipment slot (0..40) is populated with its
+///   official fixed loadout data.
+/// - Any zeroed bytes in the DLC bonus header area (+0x0000..+0x45F4 outside
+///   the quest bitmask) are populated with the official DLC unlock data.
+///
+/// Returns `Ok((newly_added_quests, total_installed_official_quests))`.
+#[cfg(feature = "gamedata")]
+pub fn install_official_dlc_quests(save: &mut Save) -> Result<(usize, usize), Error> {
+    install_dlc_quests_by_category(save, true, false)
+}
+
+/// Install bundled quests filtered by category (`Official`, `Dead`),
+/// plus the 40 challenge quest equipment loadouts and DLC section header flags.
+///
+/// Returns `Ok((newly_added_quests, total_installed_in_selected_categories))`.
+#[cfg(feature = "gamedata")]
+pub fn install_dlc_quests_by_category(
+    save: &mut Save,
+    include_official: bool,
+    include_dead: bool,
+) -> Result<(usize, usize), Error> {
+    use crate::dlc_bundle::DlcQuestCategory;
+    check_kind(save)?;
+    let sec = section_start(save).ok_or(Error::OutOfRange {
+        context: "save has no DLC section",
+        value: 0,
+    })?;
+
+    // 1. Populate non-zero DLC section header slices without overwriting existing non-zero bytes
+    for h in crate::dlc_bundle::OFFICIAL_HEADER_SLICES.iter() {
+        let start = sec + h.rel_offset as usize;
+        let src = crate::dlc_bundle::header_slice_bytes(h);
+        if let Some(dst) = save.body_mut().get_mut(start..start + src.len()) {
+            for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                if *d == 0 {
+                    *d = s;
+                }
+            }
+        }
+    }
+
+    // 2. Populate the 40 challenge quest equipment records if empty
+    for eq in crate::dlc_bundle::OFFICIAL_EQUIPS.iter() {
+        let slot = eq.slot as usize;
+        if slot >= EQUIP_SLOTS {
+            continue;
+        }
+        let base = sec + EQUIP_ARRAY_OFFSET + slot * EQUIP_SLOT_SIZE;
+        let is_empty = save
+            .body()
+            .get(base..base + 8)
+            .map(|b| read_i32(b, 0) == 0 || read_i32(b, 4) <= 0)
+            .unwrap_or(false);
+        if is_empty {
+            let src = crate::dlc_bundle::equip_bytes(eq);
+            if let Some(dst) = save.body_mut().get_mut(base..base + EQUIP_SLOT_SIZE) {
+                dst.fill(0);
+                let copy_len = src.len().min(EQUIP_SLOT_SIZE);
+                dst[..copy_len].copy_from_slice(&src[..copy_len]);
+            }
+        }
+        let _ = set_installed(save, eq.quest_id, true);
+    }
+
+    // 3. Install matching bundled quests
+    let mut added = 0usize;
+    let mut total_present = 0usize;
+
+    for q in crate::dlc_bundle::OFFICIAL_QUESTS.iter() {
+        let matches_cat = match q.category {
+            DlcQuestCategory::Official => include_official,
+            DlcQuestCategory::Dead => include_dead,
+        };
+        if !matches_cat {
+            continue;
+        }
+
+        let arc_data = crate::dlc_bundle::arc_bytes(q);
+        if let Some(existing_slot) = find_quest(save, q.quest_id) {
+            let base = sec + QUEST_ARRAY_OFFSET + existing_slot * QUEST_SLOT_SIZE;
+            let cur_size = save
+                .body()
+                .get(base + 4..base + 8)
+                .map(|b| read_i32(b, 0))
+                .unwrap_or(0);
+            if cur_size <= 0 || cur_size as usize > QUEST_MAX_PAYLOAD {
+                if let Some(dst) = save.body_mut().get_mut(base..base + QUEST_SLOT_SIZE) {
+                    dst.fill(0);
+                    dst[0..4].copy_from_slice(&q.quest_id.to_le_bytes());
+                    dst[4..8].copy_from_slice(&(arc_data.len() as i32).to_le_bytes());
+                    dst[8..8 + arc_data.len()].copy_from_slice(arc_data);
+                }
+                added += 1;
+            }
+            let _ = set_installed(save, q.quest_id, true);
+            total_present += 1;
+            continue;
+        }
+
+        let def_slot = q.default_slot as usize;
+        let slot_is_free = |s: &Save, idx: usize| -> bool {
+            if idx >= QUEST_SLOTS {
+                return false;
+            }
+            let b = sec + QUEST_ARRAY_OFFSET + idx * QUEST_SLOT_SIZE;
+            s.body()
+                .get(b..b + 8)
+                .map(|slice| read_i32(slice, 0) == 0 && read_i32(slice, 4) == 0)
+                .unwrap_or(false)
+        };
+
+        let target_slot = if slot_is_free(save, def_slot) {
+            Some(def_slot)
+        } else {
+            (0..QUEST_SLOTS).find(|&idx| slot_is_free(save, idx))
+        };
+
+        if let Some(slot) = target_slot {
+            let base = sec + QUEST_ARRAY_OFFSET + slot * QUEST_SLOT_SIZE;
+            if let Some(dst) = save.body_mut().get_mut(base..base + QUEST_SLOT_SIZE) {
+                dst.fill(0);
+                dst[0..4].copy_from_slice(&q.quest_id.to_le_bytes());
+                dst[4..8].copy_from_slice(&(arc_data.len() as i32).to_le_bytes());
+                dst[8..8 + arc_data.len()].copy_from_slice(arc_data);
+            }
+            let _ = set_installed(save, q.quest_id, true);
+            added += 1;
+            total_present += 1;
+        }
+    }
+
+    Ok((added, total_present))
+}
+
+/// Remove a quest from `save` by its `quest_id`, clearing both its slot and its
+/// catalogue bitmask bit (if present in `DLC_CATALOG`).
+#[cfg(feature = "gamedata")]
+pub fn remove_quest_by_id(save: &mut Save, quest_id: i32) -> Result<usize, Error> {
+    check_kind(save)?;
+    let slot = find_quest(save, quest_id).ok_or(Error::Parse("quest is not in save"))?;
+    uninstall_quest(save, slot)?;
+    let _ = set_installed(save, quest_id, false);
+    Ok(slot)
+}
+
+/// Toggle a bundled quest in `save`:
+/// - If already installed, removes it and returns `Ok((slot, false))`.
+/// - If not installed, installs it into a free slot (and initializes DLC headers/equips)
+///   and returns `Ok((slot, true))`.
+#[cfg(feature = "gamedata")]
+pub fn toggle_bundled_quest(save: &mut Save, quest_id: i32) -> Result<(usize, bool), Error> {
+    check_kind(save)?;
+    if let Some(slot) = find_quest(save, quest_id) {
+        uninstall_quest(save, slot)?;
+        let _ = set_installed(save, quest_id, false);
+        return Ok((slot, false));
+    }
+    let meta = crate::dlc_bundle::find_official_quest(quest_id)
+        .ok_or(Error::Parse("quest id not in bundled catalogue"))?;
+    let sec = section_start(save).ok_or(Error::OutOfRange {
+        context: "save has no DLC section",
+        value: 0,
+    })?;
+
+    // Ensure DLC header slices and any matching challenge quest equipment are present
+    for h in crate::dlc_bundle::OFFICIAL_HEADER_SLICES.iter() {
+        let start = sec + h.rel_offset as usize;
+        let src = crate::dlc_bundle::header_slice_bytes(h);
+        if let Some(dst) = save.body_mut().get_mut(start..start + src.len()) {
+            for (d, &s) in dst.iter_mut().zip(src.iter()) {
+                if *d == 0 {
+                    *d = s;
+                }
+            }
+        }
+    }
+    for eq in crate::dlc_bundle::OFFICIAL_EQUIPS.iter() {
+        if eq.quest_id == quest_id {
+            let slot = eq.slot as usize;
+            if slot < EQUIP_SLOTS {
+                let base = sec + EQUIP_ARRAY_OFFSET + slot * EQUIP_SLOT_SIZE;
+                let src = crate::dlc_bundle::equip_bytes(eq);
+                if let Some(dst) = save.body_mut().get_mut(base..base + EQUIP_SLOT_SIZE) {
+                    dst.fill(0);
+                    let copy_len = src.len().min(EQUIP_SLOT_SIZE);
+                    dst[..copy_len].copy_from_slice(&src[..copy_len]);
+                }
+            }
+        }
+    }
+
+    let slot_is_free = |s: &Save, idx: usize| -> bool {
+        if idx >= QUEST_SLOTS {
+            return false;
+        }
+        let b = sec + QUEST_ARRAY_OFFSET + idx * QUEST_SLOT_SIZE;
+        s.body()
+            .get(b..b + 8)
+            .map(|slice| read_i32(slice, 0) == 0 && read_i32(slice, 4) == 0)
+            .unwrap_or(false)
+    };
+    let def_slot = meta.default_slot as usize;
+    let target_slot = if slot_is_free(save, def_slot) {
+        Some(def_slot)
+    } else {
+        (0..QUEST_SLOTS).find(|&idx| slot_is_free(save, idx))
+    };
+    let slot = target_slot.ok_or(Error::OutOfRange {
+        context: "no free quest slot (max 205)",
+        value: QUEST_SLOTS as u32,
+    })?;
+
+    let arc_data = crate::dlc_bundle::arc_bytes(meta);
+    let base = sec + QUEST_ARRAY_OFFSET + slot * QUEST_SLOT_SIZE;
+    if let Some(dst) = save.body_mut().get_mut(base..base + QUEST_SLOT_SIZE) {
+        dst.fill(0);
+        dst[0..4].copy_from_slice(&quest_id.to_le_bytes());
+        dst[4..8].copy_from_slice(&(arc_data.len() as i32).to_le_bytes());
+        dst[8..8 + arc_data.len()].copy_from_slice(arc_data);
+    }
+    let _ = set_installed(save, quest_id, true);
+    Ok((slot, true))
 }
 
 #[cfg(test)]
@@ -918,5 +1155,28 @@ mod tests {
         let s = empty_switch_save();
         assert!(check_kind(&s).is_ok());
         assert!(matches!(s.kind(), SaveKind::Switch | SaveKind::ThreeDs));
+    }
+
+    #[test]
+    #[cfg(feature = "gamedata")]
+    fn official_dlc_bundle_installs_all_189_quests_and_40_equips_into_empty_save() {
+        let mut s = empty_switch_save();
+        assert_eq!(list_quests(&s).len(), 0);
+        assert_eq!(installed_bit_count(&s), 0);
+
+        let (added, total) = install_official_dlc_quests(&mut s).expect("install official dlc");
+        assert_eq!(added, 189);
+        assert_eq!(total, 189);
+        assert_eq!(list_quests(&s).len(), 189);
+        assert_eq!(installed_bit_count(&s), 189);
+
+        let eqs = quest_equipment(&s);
+        let occupied_eqs = eqs.iter().filter(|e| e.occupied).count();
+        assert_eq!(occupied_eqs, 40);
+
+        // Calling a second time is idempotent and adds 0 new quests
+        let (added2, total2) = install_official_dlc_quests(&mut s).expect("second install");
+        assert_eq!(added2, 0);
+        assert_eq!(total2, 189);
     }
 }

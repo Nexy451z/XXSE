@@ -202,6 +202,29 @@ impl Arc {
     /// so re-saving an untouched archive is byte identical whatever level is
     /// asked for. Parse the bytes again if a real re-compress is wanted.
     pub fn to_bytes_with_level(&self, level: u8) -> Result<Vec<u8>, Error> {
+        self.write(level, true)
+    }
+
+    /// Write the archive with the payloads packed from the directory's end.
+    ///
+    /// The quest archives in romfs start their data at 0x8000 and leave about
+    /// 31KB of zeroes in front of it. That padding is what made a shipped
+    /// quest look far too big for a save slot: the payloads themselves are
+    /// only one to three kilobytes. Dropping it is not a re-compression, so
+    /// the streams are kept exactly as they are and only their offsets move.
+    pub fn to_bytes_compact(&self) -> Result<Vec<u8>, Error> {
+        let mut out = self.write(6, false)?;
+        // The archives in romfs carry 0xFFFFFFFE at +0x08 and the ones the game
+        // keeps in a save carry zero: 60 of each checked, no exceptions. A
+        // compacted archive is meant to go into a save, so it takes the save
+        // form rather than the value that came from romfs.
+        if out.len() >= 12 {
+            out[8..12].fill(0);
+        }
+        Ok(out)
+    }
+
+    fn write(&self, level: u8, keep_gaps: bool) -> Result<Vec<u8>, Error> {
         let count = self.entries.len();
         if count > u16::MAX as usize {
             return Err(Error::OutOfRange {
@@ -218,7 +241,7 @@ impl Arc {
             // matches, so an untouched entry costs nothing and an edited one
             // only moves its own bytes.
             let unchanged = matches!(&e.original, Some((_, decoded)) if *decoded == e.data);
-            if unchanged {
+            if unchanged && keep_gaps {
                 // Honour any gap the original file had before this payload.
                 if let Some(off) = e.original_offset {
                     if (off as usize) > cursor {

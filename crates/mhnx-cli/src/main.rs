@@ -227,6 +227,33 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// Do two paths name the same file on disk?
+fn same_file(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Strip the romfs padding so the archive fits a save slot.
+fn cmd_arc_compact(src: &str, out: &str) -> Result<(), String> {
+    let bytes = read(src)?;
+    let arc = Arc::parse(&bytes).map_err(|e| e.to_string())?;
+    let compact = arc.to_bytes_compact().map_err(|e| e.to_string())?;
+    std::fs::write(out, &compact).map_err(|e| e.to_string())?;
+    println!(
+        "{} ({} B) -> {} ({} B)",
+        src,
+        bytes.len(),
+        out,
+        compact.len()
+    );
+    Ok(())
+}
+
 /// Show the item sets and equipment sets of one character.
 fn cmd_mysets(path: &str, slot: Option<usize>) -> Result<(), String> {
     let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
@@ -432,6 +459,15 @@ fn cmd_equip_set(
 
 /// Add a quest the save does not list into a free slot.
 fn cmd_add_quest(save_path: &str, arc_path: &str, out: &str) -> Result<(), String> {
+    // Reading the input and writing the result to the same path silently
+    // modified the source while the message below claimed it had not been
+    // touched. Compare the resolved files so a differing suffix cannot slip by.
+    if same_file(save_path, out) {
+        return Err(format!(
+            "out must be a different file from the input save ({}); this command never writes the input",
+            save_path
+        ));
+    }
     let mut s = Save::from_bytes(&read(save_path)?).map_err(|e| e.to_string())?;
     let raw = read(arc_path)?;
     let a = Arc::parse(&raw).map_err(|e| e.to_string())?;
@@ -440,6 +476,11 @@ fn cmd_add_quest(save_path: &str, arc_path: &str, out: &str) -> Result<(), Strin
         .and_then(|e| e.data.get(0x0C..0x10))
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .ok_or("archive has no .mib")? as i32;
+    if s.kind() == mhnx_core::save::SaveKind::Mhgu {
+        return Err(String::from(
+            "this is an MHGU save; download quests are not supported for it",
+        ));
+    }
     let slot = dlc::add_quest(&mut s, id, &raw).map_err(|e| e.to_string())?;
     let bit = dlc::bit_for_quest(id).unwrap_or(0);
     std::fs::write(out, s.to_bytes()).map_err(|e| e.to_string())?;
@@ -955,6 +996,7 @@ fn main() -> ExitCode {
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
         "add-quest" if args.len() == 4 => cmd_add_quest(&args[1], &args[2], &args[3]),
+        "arc-compact" if args.len() == 3 => cmd_arc_compact(&args[1], &args[2]),
         "mysets" if args.len() == 2 => cmd_mysets(&args[1], None),
         "mysets" if args.len() == 3 => cmd_mysets(&args[1], args[2].parse().ok()),
         "guild-card" if args.len() == 2 => cmd_guild_card(&args[1], None),

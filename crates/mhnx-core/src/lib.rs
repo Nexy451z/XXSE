@@ -22,11 +22,28 @@
 
 extern crate alloc;
 
+/// Copy a name into a fixed width, NUL padded field.
+///
+/// The field is bytes, not characters, so the cut has to land on a character
+/// boundary: a three byte character at the end used to be split in half and
+/// every reader of the field then saw invalid UTF-8. The game itself writes
+/// one byte short of the field to keep a terminator.
+pub fn write_name_field(dst: &mut [u8], name: &str) {
+    dst.fill(0);
+    let room = dst.len().saturating_sub(1);
+    let mut end = name.len().min(room);
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    dst[..end].copy_from_slice(&name.as_bytes()[..end]);
+}
+
 pub mod arc;
 pub mod charm;
 pub mod check;
 pub mod crc;
 pub mod dlc;
+pub mod dlc_bundle;
 pub mod dlcats;
 pub mod equip;
 pub mod guildcard;
