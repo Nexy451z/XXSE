@@ -227,6 +227,17 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// Dump the strings of a standalone .gmd file.
+fn cmd_gmd_dump(path: &str, limit: usize) -> Result<(), String> {
+    let g = mhnx_core::quest::Gmd::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    println!("{}: key {:?}, {} string(s)", path, g.key, g.strings.len());
+    for (i, s) in g.strings.iter().enumerate().take(limit) {
+        let one = s.replace('\n', " / ");
+        println!("  {:>4}  {}", i, one);
+    }
+    Ok(())
+}
+
 /// List the 45 quest-equipment entries and which quest each belongs to.
 fn cmd_equip_list(path: &str) -> Result<(), String> {
     let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
@@ -722,6 +733,10 @@ fn main() -> ExitCode {
         "options" if args.len() == 2 => cmd_options(&args[1]),
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
+        "gmd-dump" if args.len() == 2 => cmd_gmd_dump(&args[1], 40),
+        "gmd-dump" if args.len() == 3 => {
+            cmd_gmd_dump(&args[1], args[2].parse().unwrap_or(40))
+        }
         "equip-list" if args.len() == 2 => cmd_equip_list(&args[1]),
         "equip-export" if args.len() == 3 => cmd_equip_export(&args[1], &args[2], None),
         "equip-export" if args.len() == 4 => {
