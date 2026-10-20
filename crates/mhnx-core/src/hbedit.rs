@@ -235,6 +235,13 @@ pub struct Editor {
     pub item_undo: Vec<Vec<u8>>,
     /// Which talisman skill the picker writes: 1 or 2.
     pub skill_pick_field: u8,
+    /// What the item picker writes: 0 = the item box, 1 = a record inside
+    /// the .rem / .sup entry that is being viewed.
+    pub item_pick_mode: u8,
+    /// Which reward record the picker will write.
+    pub entry_item_row: usize,
+    /// Cursor over the records of the open reward table.
+    pub entry_row_cursor: usize,
     /// Quest id / title filter for the save's quest list.
     pub quest_filter: String,
     /// Skill name filter used by the picker.
@@ -309,6 +316,9 @@ impl Editor {
             quest_titles: Vec::new(),
             item_undo: Vec::new(),
             skill_pick_field: 1,
+            item_pick_mode: 0,
+            entry_item_row: 0,
+            entry_row_cursor: 0,
             quest_filter: String::new(),
             skill_pick_filter: String::new(),
             skill_pick_cursor: 0,
@@ -585,6 +595,33 @@ impl Editor {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
                     self.cursor = self.entry;
+                }
+                Key::Up => {
+                    self.entry_row_cursor = self.entry_row_cursor.saturating_sub(1);
+                }
+                Key::Down => {
+                    self.entry_row_cursor += 1;
+                }
+                // Only the reward and supply tables hold editable records.
+                Key::A => {
+                    let ext = self
+                        .arc
+                        .as_ref()
+                        .and_then(|a| a.entries.get(self.entry))
+                        .and_then(|e| extension_for(e.type_hash));
+                    if matches!(ext, Some("rem") | Some("sup")) {
+                        self.entry_item_row = self.entry_row_cursor;
+                        self.item_pick_mode = 1;
+                        self.item_pick_cursor = 0;
+                        self.item_pick_filter.clear();
+                        self.screen = Screen::ItemPick;
+                        self.message = alloc::format!(
+                            "record {} - pick a new item",
+                            self.entry_row_cursor
+                        );
+                    } else {
+                        self.message = String::from("this entry has no editable records");
+                    }
                 }
                 Key::Plus => self.quit = true,
                 _ => {}
@@ -1129,6 +1166,7 @@ impl Editor {
             Key::L => self.undo_item(),
             Key::R => {
                 if let Some(&idx) = vis.get(self.cursor) {
+                    self.item_pick_mode = 0;
                     self.item_pick_target = idx;
                     self.item_pick_cursor = 0;
                     self.item_pick_filter.clear();
@@ -1173,6 +1211,35 @@ impl Editor {
     pub fn apply_item_filter(&mut self, text: String) {
         self.item_pick_filter = text;
         self.item_pick_cursor = 0;
+    }
+
+    /// Write one item id into the reward record the picker is aimed at.
+    fn store_reward_item(&mut self, id: u16) {
+        let row = self.entry_item_row;
+        let idx = self.entry;
+        let Some(a) = &mut self.arc else {
+            return;
+        };
+        let Some(e) = a.entries.get_mut(idx) else {
+            return;
+        };
+        let Ok(mut t) = crate::entries::ItemTable::parse(&e.data) else {
+            self.message = String::from("this table cannot be parsed");
+            return;
+        };
+        if row >= t.records.len() {
+            self.message = String::from("no such record");
+            return;
+        }
+        t.records[row].item = id;
+        if t.records[row].count == 0 {
+            t.records[row].count = 1;
+        }
+        e.data = t.to_bytes();
+        self.dirty = true;
+        let name = item_name_of(id);
+        self.message =
+            alloc::format!("record {} -> {} ({})  (X writes the .arc)", row, name, id);
     }
 
     /// Remember the item box before replacing an entry.
@@ -1353,6 +1420,13 @@ impl Editor {
             }
             Key::A => {
                 let matches = self.item_pick_matches();
+                if self.item_pick_mode == 1 {
+                    if let Some(&id) = matches.get(self.item_pick_cursor) {
+                        self.store_reward_item(id);
+                    }
+                    self.screen = Screen::EntryView;
+                    return;
+                }
                 if let Some(&id) = matches.get(self.item_pick_cursor) {
                     let slot = self.slot;
                     let box_i = self.item_pick_target;
@@ -1376,8 +1450,12 @@ impl Editor {
                 }
             }
             Key::B => {
-                self.screen = Screen::Items;
-                self.cursor = 0;
+                if self.item_pick_mode == 1 {
+                    self.screen = Screen::EntryView;
+                } else {
+                    self.screen = Screen::Items;
+                    self.cursor = 0;
+                }
             }
             Key::Plus => self.quit = true,
             _ => {}
@@ -1902,10 +1980,18 @@ impl Editor {
                                                 r.slot,
                                                 item_name_of(r.item)
                                             ),
-                                            false,
-                                            false,
+                                            true,
+                                            i == self.entry_row_cursor,
                                         );
                                     }
+                                    push(
+                                        &mut out,
+                                        String::from(
+                                            "  Up/Down row  A change item  X write .arc  B back",
+                                        ),
+                                        false,
+                                        false,
+                                    );
                                 }
                                 Err(_) => push(
                                     &mut out,
