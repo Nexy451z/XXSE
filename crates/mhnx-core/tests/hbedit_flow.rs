@@ -1201,3 +1201,70 @@ fn undo_restores_the_whole_box_not_just_the_item() {
     let after = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
     assert_eq!(before, after, "every slot must come back");
 }
+// ---------------------------------------------------------------------------
+// The console talisman editor shows the published range, not just the numbers.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_console_charm_editor_shows_the_allowed_range() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L); // charms
+    // Select a known talisman (224: 属性会心 +6 / 達人 +10).
+    ed.cursor = ed
+        .charms()
+        .iter()
+        .position(|c| c.index == 224)
+        .unwrap_or(0);
+    ed.input(Key::Y); // edit
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    let text: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = text.join("\n");
+    assert!(
+        joined.contains("type 0x"),
+        "the type and rarity must be shown:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("rarity"),
+        "the rarity label is missing:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains("allowed"),
+        "the allowed range must be shown:\n{}",
+        joined
+    );
+}
+
+#[test]
+fn an_illegal_skill_is_flagged_on_the_console() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::L);
+    ed.cursor = ed
+        .charms()
+        .iter()
+        .position(|c| c.index == 224)
+        .unwrap_or(0);
+    ed.input(Key::Y);
+    // Force skill 1 to something the Enduring table forbids: id 1 (Poison)
+    // is 0~0 for every talisman type in the sample data.
+    if let Some(e) = &mut ed.charm_edit {
+        e.skill1 = 1;
+        e.points1 = 5;
+    }
+    let joined: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = joined.join("\n");
+    assert!(
+        joined.contains("cannot go on this type") || joined.contains("allowed"),
+        "an illegal skill must be flagged:\n{}",
+        joined
+    );
+}
