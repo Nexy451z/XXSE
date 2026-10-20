@@ -74,6 +74,8 @@ pub struct MhnxEditor {
     /// Keep the picker filter after choosing, so several slots can be filled
     /// from one search.
     pub item_pick_keep_filter: bool,
+    /// Row selected inside the .rem / .sup reward table.
+    pub entry_item_sel: Option<usize>,
     /// Free-text filter for the talisman list.
     pub charm_filter: String,
     /// Search text inside the two skill pickers.
@@ -129,6 +131,7 @@ impl Default for MhnxEditor {
             dlc_outdir: String::new(),
             item_undo: Vec::new(),
             item_pick_keep_filter: true,
+            entry_item_sel: None,
             charm_filter: String::new(),
             skill_search1: String::new(),
             skill_search2: String::new(),
@@ -1642,6 +1645,7 @@ impl MhnxEditor {
                     if ext == "sup" { "支給品" } else { "報酬" }
                 ));
                 let mut changed = false;
+                let mut sel = self.entry_item_sel;
                 egui::ScrollArea::vertical()
                     .id_salt("itemtable")
                     .max_height(320.0)
@@ -1655,7 +1659,15 @@ impl MhnxEditor {
                                 }
                                 ui.end_row();
                                 for (i, r) in table.records.iter_mut().enumerate() {
-                                    ui.label(format!("{}", i));
+                                    if ui
+                                        .selectable_label(
+                                            sel == Some(i),
+                                            format!("{}", i),
+                                        )
+                                        .clicked()
+                                    {
+                                        sel = Some(i);
+                                    }
                                     let mut c = r.count as i32;
                                     if ui
                                         .add(egui::DragValue::new(&mut c).range(0..=127))
@@ -1677,6 +1689,67 @@ impl MhnxEditor {
                                 }
                             });
                     });
+                // Changing the item itself is the point of a reward table;
+                // only the count and the slot were editable before.
+                self.entry_item_sel = sel;
+                if let Some(i) = sel {
+                    if i < table.records.len() {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label(format!(
+                                "{} 行目のアイテムを変更",
+                                i
+                            ));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.item_pick_filter)
+                                    .hint_text("アイテム名で検索")
+                                    .desired_width(180.0),
+                            );
+                            if ui.small_button("クリア").clicked() {
+                                self.item_pick_filter.clear();
+                            }
+                        });
+                        let needle = self.item_pick_filter.trim().to_lowercase();
+                        if !needle.is_empty() {
+                            let mut hits: Vec<(u16, &'static str)> = Vec::new();
+                            for (id, name) in
+                                mhnx_core::gamedata::ITEM_NAME_LIST.iter().enumerate()
+                            {
+                                if id == 0 || id > 4095 {
+                                    continue;
+                                }
+                                if name.to_lowercase().contains(&needle) {
+                                    hits.push((id as u16, name));
+                                }
+                                if hits.len() >= 30 {
+                                    break;
+                                }
+                            }
+                            egui::ScrollArea::vertical()
+                                .id_salt("entryitempick")
+                                .max_height(140.0)
+                                .min_scrolled_height(140.0)
+                                .show(ui, |ui| {
+                                    for (id, name) in &hits {
+                                        if ui
+                                            .selectable_label(
+                                                table.records[i].item == *id,
+                                                format!("{:<6} {}", id, name),
+                                            )
+                                            .clicked()
+                                        {
+                                            table.records[i].item = *id;
+                                            if table.records[i].count == 0 {
+                                                table.records[i].count = 1;
+                                            }
+                                            changed = true;
+                                            self.item_pick_filter.clear();
+                                        }
+                                    }
+                                });
+                        }
+                    }
+                }
                 if changed {
                     if let Some(a) = &mut self.arc {
                         if let Some(e) = a.entries.get_mut(self.arc_selected) {
