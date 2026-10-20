@@ -1764,7 +1764,10 @@ impl MhnxEditor {
             };
             self.message = format!("{} 件の指摘", self.findings.len());
         }
-        for f in &self.findings {
+        // Cloned so the fix below can take &mut self while the list is shown.
+        let findings = self.findings.clone();
+        let mut want_fix = false;
+        for f in &findings {
             let (color, tag) = match f.severity {
                 Severity::Error => (egui::Color32::from_rgb(235, 120, 120), "エラー"),
                 Severity::Warn => (egui::Color32::from_rgb(235, 190, 90), "注意"),
@@ -1774,9 +1777,43 @@ impl MhnxEditor {
                 Some((name, off)) => format!(" ({} +0x{:X})", name, off),
                 None => String::new(),
             };
-            ui.label(
-                egui::RichText::new(format!("[{}] {}{}", tag, f.message, at)).color(color),
-            );
+            let mut fix_this = false;
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("[{}] {}{}", tag, f.message, at)).color(color),
+                );
+                // README promised a one-click fix for the 1人限定 problem and
+                // only the console ever had it.
+                if f.fixable && ui.small_button("修正").clicked() {
+                    fix_this = true;
+                }
+            });
+            if fix_this {
+                want_fix = true;
+            }
+        }
+        if want_fix {
+            {
+                let before = self.arc.as_mut().and_then(|a| {
+                    check::clear_one_player_only(a, 0x00)
+                });
+                match before {
+                    Some(old) => {
+                        // The fix edits the archive entry, so the .mib working
+                        // copy has to be refreshed or the next write puts the
+                        // old byte back.
+                        self.store_arc_entry(self.arc_selected);
+                        self.run_quest_check();
+                        self.message = format!(
+                            "参加条件1 を 0x{:02X} から 0x00 に直しました（.arc へ反映してください）",
+                            old
+                        );
+                    }
+                    None => {
+                        self.message = String::from("この指摘は自動で直せません");
+                    }
+                }
+            }
         }
     }
 
