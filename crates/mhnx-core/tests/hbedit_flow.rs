@@ -1751,7 +1751,7 @@ fn the_two_mask_regions_sit_where_the_reader_expects() {
     }
     let bytes = std::fs::read(real_save()).unwrap();
     let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
-    let body = s.body();
+    let body = s.body(); // body relative: no 36 byte header here
     let base = 0xB280usize;
     // 24 bytes at +0x34, 28 bytes at +0x4C: measured, and both are shared by
     // all three characters because they live outside the slot area.
@@ -1775,7 +1775,7 @@ fn installing_a_quest_leaves_both_masks_alone() {
     }
     let raw = std::fs::read(&arc).unwrap();
     let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
-    let base = 0xB280usize;
+    let base = 36 + 0xB280usize;
     let before: Vec<u8> = s.body()[base + 0x34..base + 0x68].to_vec();
     let a = mhnx_core::arc::Arc::parse(&raw).unwrap();
     let id = a
@@ -1790,4 +1790,60 @@ fn installing_a_quest_leaves_both_masks_alone() {
             "replacing an installed quest must not touch either mask"
         );
     }
+}
+
+#[test]
+fn the_first_mask_bits_track_the_quest_equipment_catalogue() {
+    if !real_save().exists() {
+        return;
+    }
+    let body = std::fs::read(real_save()).unwrap();
+    let base = 36 + 0xB280usize;
+    let mask = &body[base + 0x4C..base + 0x4C + 28];
+    let equipment = base + 0x1049F4;
+    let stride = mhnx_core::dlc::EQUIP_SLOT_SIZE;
+    let count = mhnx_core::dlc::EQUIP_SLOTS;
+    let mut set_bits = Vec::new();
+    let mut filled = Vec::new();
+    for i in 0..count {
+        if (mask[i >> 3] >> (i & 7)) & 1 == 1 {
+            set_bits.push(i);
+        }
+        // An entry counts as present when its first 32 bytes hold any
+        // non-zero byte. That is enough to separate used from empty here.
+        let off = equipment + i * stride;
+        if body[off..off + 32].iter().any(|b| *b != 0) {
+            filled.push(i);
+        }
+    }
+    assert_eq!(
+        set_bits, filled,
+        "bit i must mean equipment entry i is installed"
+    );
+    // The region is a strict prefix of the mask and it is not all set.
+    assert!(set_bits.len() > 30, "expected the catalogue to be mostly full");
+    assert!(set_bits.len() < count, "expected at least one empty entry");
+}
+
+#[test]
+fn the_catalogue_and_event_bits_add_up_to_the_installed_total() {
+    if !real_save().exists() {
+        return;
+    }
+    let body = std::fs::read(real_save()).unwrap();
+    let base = 36 + 0xB280usize;
+    let mask = &body[base + 0x4C..base + 0x4C + 28];
+    let total: usize = mask.iter().map(|b| b.count_ones() as usize).sum();
+    let catalogue = mhnx_core::dlc::EQUIP_SLOTS;
+    let below: usize = (0..catalogue)
+        .filter(|i| (mask[i >> 3] >> (i & 7)) & 1 == 1)
+        .count();
+    let above = total - below;
+    // 40 catalogue entries plus 135 event records is the 175 this save has.
+    assert_eq!(below + above, total);
+    assert_eq!(
+        below, 40,
+        "the catalogue part of the mask changed shape"
+    );
+    assert_eq!(above, 135, "the event part of the mask changed shape");
 }
