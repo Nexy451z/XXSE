@@ -46,6 +46,58 @@ use alloc::vec::Vec;
 use crate::save::Save;
 use crate::Error;
 
+/// One of the 45 quest-equipment entries the DLC section carries.
+///
+/// Every non-empty entry starts with the quest id it belongs to, which is what
+/// makes the low mask bits readable: bit i is set exactly when entry i holds
+/// data, and entry i names the quest. Verified against the sample save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestEquipment {
+    /// Index into the 45 entry array.
+    pub index: usize,
+    /// Quest id from the first four bytes, or 0 when the entry is empty.
+    pub quest_id: i32,
+    /// Does the entry hold any data at all?
+    pub occupied: bool,
+}
+
+/// Read the quest-equipment array.
+pub fn quest_equipment(save: &Save) -> Vec<QuestEquipment> {
+    let mut out = Vec::with_capacity(EQUIP_SLOTS);
+    let Some(sec) = section_start(save) else {
+        return out;
+    };
+    let body = save.body();
+    for i in 0..EQUIP_SLOTS {
+        let off = sec + EQUIP_ARRAY_OFFSET + i * EQUIP_SLOT_SIZE;
+        let Some(rec) = body.get(off..off + EQUIP_SLOT_SIZE) else {
+            break;
+        };
+        let occupied = rec.iter().any(|b| *b != 0);
+        let quest_id = if occupied {
+            i32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]])
+        } else {
+            0
+        };
+        out.push(QuestEquipment {
+            index: i,
+            quest_id,
+            occupied,
+        });
+    }
+    out
+}
+
+/// The raw bytes of one quest-equipment entry.
+pub fn quest_equipment_bytes(save: &Save, index: usize) -> Option<&[u8]> {
+    if index >= EQUIP_SLOTS {
+        return None;
+    }
+    let sec = section_start(save)?;
+    let off = sec + EQUIP_ARRAY_OFFSET + index * EQUIP_SLOT_SIZE;
+    save.body().get(off..off + EQUIP_SLOT_SIZE)
+}
+
 /// Number of downloadable quest slots.
 pub const QUEST_SLOTS: usize = 205;
 /// Size of one quest slot.

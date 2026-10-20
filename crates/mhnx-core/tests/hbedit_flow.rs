@@ -1847,3 +1847,68 @@ fn the_catalogue_and_event_bits_add_up_to_the_installed_total() {
     );
     assert_eq!(above, 135, "the event part of the mask changed shape");
 }
+
+#[test]
+fn the_quest_equipment_entries_name_installed_quests() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    let entries = mhnx_core::dlc::quest_equipment(&s);
+    assert_eq!(entries.len(), mhnx_core::dlc::EQUIP_SLOTS);
+
+    let installed: Vec<i32> = mhnx_core::dlc::list_quests(&s)
+        .iter()
+        .map(|q| q.quest_id)
+        .collect();
+    let used: Vec<_> = entries.iter().filter(|e| e.occupied).collect();
+    assert_eq!(used.len(), 40, "the sample save uses 40 of the 45 entries");
+
+    // Every entry names a quest that is actually installed.
+    for e in &used {
+        assert!(
+            installed.contains(&e.quest_id),
+            "entry {} names quest {}, which is not installed",
+            e.index,
+            e.quest_id
+        );
+    }
+
+    // The ids are neither consecutive nor sorted: entries 0..13 run 1020001..,
+    // then 14..19 jump to 1120001.., then 20 goes back to 1020015. The array
+    // follows the game's catalogue order, which is not id order, so only
+    // uniqueness is asserted here.
+    let mut seen = std::collections::BTreeSet::new();
+    for e in &used {
+        assert!(seen.insert(e.quest_id), "quest {} appears twice", e.quest_id);
+    }
+    assert!(
+        used.iter().any(|e| e.quest_id >= 1120000),
+        "the sample save should cover both challenge id ranges"
+    );
+
+    // The occupancy must agree with the mask bit for the same index.
+    let base = 0xB280usize;
+    let mask = &s.body()[base + 0x4C..base + 0x4C + 28];
+    for e in &entries {
+        let bit = (mask[e.index >> 3] >> (e.index & 7)) & 1 == 1;
+        assert_eq!(bit, e.occupied, "entry {} and its mask bit disagree", e.index);
+    }
+}
+
+#[test]
+fn an_empty_equipment_entry_returns_zeros() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    // Index 25 is empty in the sample save.
+    let Some(b) = mhnx_core::dlc::quest_equipment_bytes(&s, 25) else {
+        panic!("entry 25 should be addressable");
+    };
+    assert_eq!(b.len(), mhnx_core::dlc::EQUIP_SLOT_SIZE);
+    assert!(b.iter().all(|x| *x == 0), "entry 25 should be blank");
+    assert!(mhnx_core::dlc::quest_equipment_bytes(&s, 45).is_none(), "45 is out of range");
+}
