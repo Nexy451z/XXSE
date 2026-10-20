@@ -227,6 +227,51 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// List the 45 quest-equipment entries and which quest each belongs to.
+fn cmd_equip_list(path: &str) -> Result<(), String> {
+    let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    let entries = dlc::quest_equipment(&s);
+    let mut used = 0usize;
+    println!("{} quest-equipment entries", entries.len());
+    for e in &entries {
+        if e.occupied {
+            used += 1;
+            println!("  [{:>2}] quest {}", e.index, e.quest_id);
+        } else {
+            println!("  [{:>2}] empty", e.index);
+        }
+    }
+    println!("{}/{} used", used, entries.len());
+    Ok(())
+}
+
+/// Dump one quest-equipment entry, or all of them, to files.
+fn cmd_equip_export(path: &str, dir: &str, only: Option<usize>) -> Result<(), String> {
+    let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let mut written = 0usize;
+    for i in 0..dlc::EQUIP_SLOTS {
+        if let Some(want) = only {
+            if want != i {
+                continue;
+            }
+        }
+        let Some(bytes) = dlc::quest_equipment_bytes(&s, i) else {
+            continue;
+        };
+        if bytes.iter().all(|b| *b == 0) {
+            continue;
+        }
+        let id = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let out = format!("{}/equip_{:02}_{}.bin", dir, i, id);
+        std::fs::write(&out, bytes).map_err(|e| e.to_string())?;
+        println!("wrote {}", out);
+        written += 1;
+    }
+    println!("{} file(s)", written);
+    Ok(())
+}
+
 /// Report every talisman whose skills or points the game would reject.
 fn cmd_charm_check(path: &str) -> Result<(), String> {
     let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
@@ -677,6 +722,11 @@ fn main() -> ExitCode {
         "options" if args.len() == 2 => cmd_options(&args[1]),
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
+        "equip-list" if args.len() == 2 => cmd_equip_list(&args[1]),
+        "equip-export" if args.len() == 3 => cmd_equip_export(&args[1], &args[2], None),
+        "equip-export" if args.len() == 4 => {
+            cmd_equip_export(&args[1], &args[2], args[3].parse().ok())
+        }
         "charms" if args.len() == 2 => cmd_charms(&args[1], None),
         "charms" if args.len() == 3 => cmd_charms(&args[1], args[2].parse().ok()),
         "skills" if args.len() == 1 => cmd_skills(),
