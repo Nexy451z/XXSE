@@ -60,6 +60,8 @@ pub enum Screen {
     CharmEdit,
     /// Decoded view of one .rem / .sup / .sem / .esl / .qdp / .qdl entry.
     EntryView,
+    /// Skill name picker for the talisman editor.
+    SkillPick,
     /// Item name search, opened from the item box with R.
     ItemPick,
     /// Download Palicoes (配信オトモ).
@@ -164,6 +166,8 @@ pub fn item_name_of(id: u16) -> alloc::string::String {
 }
 /// Sentinel id for "ask for an item name to filter the picker by".
 pub const TEXT_ITEM_FILTER: usize = usize::MAX - 1;
+/// Sentinel id for "ask for a skill name to filter the picker by".
+pub const TEXT_SKILL_FILTER: usize = usize::MAX - 2;
 
 /// The editable character fields, in menu order.
 pub const CHAR_FIELDS: &[(&str, &str)] = &[
@@ -217,6 +221,12 @@ pub struct Editor {
     pub charm_cursor: usize,
     /// The charm being edited, if the editor form is open.
     pub charm_edit: Option<CharmEdit>,
+    /// Which talisman skill the picker writes: 1 or 2.
+    pub skill_pick_field: u8,
+    /// Skill name filter used by the picker.
+    pub skill_pick_filter: String,
+    /// Cursor inside the filtered skill list.
+    pub skill_pick_cursor: usize,
     /// Item name filter used by the picker.
     pub item_pick_filter: String,
     /// Cursor inside the filtered item list.
@@ -282,6 +292,9 @@ impl Editor {
             findings: Vec::new(),
             charm_cursor: 0,
             charm_edit: None,
+            skill_pick_field: 1,
+            skill_pick_filter: String::new(),
+            skill_pick_cursor: 0,
             item_pick_filter: String::new(),
             item_pick_cursor: 0,
             item_pick_target: 0,
@@ -549,6 +562,7 @@ impl Editor {
             Screen::ArcList => self.input_arc_list(key),
             Screen::SaveQuests => self.input_save_quests(key),
             Screen::ItemPick => self.input_item_pick(key),
+            Screen::SkillPick => self.input_skill_pick(key),
             Screen::EntryView => match key {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
@@ -701,6 +715,20 @@ impl Editor {
                     4 => e.skill2 = ((e.skill2 as i64 + d).rem_euclid(256)) as u8,
                     5 => e.points2 = (e.points2 as i64 + d).clamp(-127, 127) as i8,
                     _ => {}
+                }
+            }
+            // Y on a skill row opens the name picker: typing a number is
+            // hopeless when there are 306 skills.
+            Key::Y => {
+                if e.field == 2 || e.field == 4 {
+                    self.skill_pick_field = if e.field == 2 { 1 } else { 2 };
+                    self.skill_pick_filter.clear();
+                    self.skill_pick_cursor = 0;
+                    self.charm_edit = Some(e);
+                    self.screen = Screen::SkillPick;
+                    self.message = String::from("pick a skill by name");
+                } else {
+                    self.message = String::from("move to a skill row first");
                 }
             }
             Key::X => self.step = (self.step + 1) % STEPS.len(),
@@ -1118,6 +1146,75 @@ impl Editor {
     pub fn apply_item_filter(&mut self, text: String) {
         self.item_pick_filter = text;
         self.item_pick_cursor = 0;
+    }
+
+    /// Skill ids whose name matches the current filter, in id order.
+    pub fn skill_pick_matches(&self) -> Vec<u8> {
+        let needle = self.skill_pick_filter.trim().to_lowercase();
+        #[cfg(feature = "gamedata")]
+        {
+            let mut out = Vec::new();
+            for (i, name) in crate::skills::SKILL_NAMES.iter().enumerate() {
+                let id = (i + 1) as u8;
+                if needle.is_empty() || name.to_lowercase().contains(&needle) {
+                    out.push(id);
+                }
+            }
+            out
+        }
+        #[cfg(not(feature = "gamedata"))]
+        {
+            let _ = needle;
+            Vec::new()
+        }
+    }
+
+    /// The io layer answers a skill filter request with this.
+    pub fn apply_skill_filter(&mut self, text: String) {
+        self.skill_pick_filter = text;
+        self.skill_pick_cursor = 0;
+    }
+
+    fn input_skill_pick(&mut self, key: Key) {
+        let n = self.skill_pick_matches().len();
+        match key {
+            Key::Up => {
+                self.skill_pick_cursor = (self.skill_pick_cursor + n.saturating_sub(1)) % n.max(1)
+            }
+            Key::Down => self.skill_pick_cursor = (self.skill_pick_cursor + 1) % n.max(1),
+            Key::Left => self.skill_pick_cursor = self.skill_pick_cursor.saturating_sub(10),
+            Key::Right => {
+                if n > 0 {
+                    self.skill_pick_cursor = (self.skill_pick_cursor + 10).min(n - 1);
+                }
+            }
+            Key::Y => {
+                self.pending_text = Some((TEXT_SKILL_FILTER, self.skill_pick_filter.clone()));
+            }
+            Key::X => {
+                self.skill_pick_filter.clear();
+                self.skill_pick_cursor = 0;
+            }
+            Key::A => {
+                let matches = self.skill_pick_matches();
+                if let Some(&id) = matches.get(self.skill_pick_cursor) {
+                    if let Some(e) = &mut self.charm_edit {
+                        if self.skill_pick_field == 1 {
+                            e.skill1 = id;
+                        } else {
+                            e.skill2 = id;
+                        }
+                    }
+                    let name = crate::skills::skill_name(id).unwrap_or("?");
+                    self.message =
+                        alloc::format!("skill {} -> {} ({})", self.skill_pick_field, name, id);
+                }
+                self.screen = Screen::CharmEdit;
+            }
+            Key::B => self.screen = Screen::CharmEdit,
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
     }
 
     fn input_item_pick(&mut self, key: Key) {
@@ -1988,6 +2085,46 @@ impl Editor {
                 push(
                     &mut out,
                     String::from("  A delete  Y edit  L new  X write save  B back"),
+                    false,
+                    false,
+                );
+            }
+            Screen::SkillPick => {
+                let matches = self.skill_pick_matches();
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "PICK SKILL {}   filter: {}   ({} match)",
+                        self.skill_pick_field,
+                        if self.skill_pick_filter.is_empty() {
+                            "(all)"
+                        } else {
+                            &self.skill_pick_filter
+                        },
+                        matches.len()
+                    ),
+                    false,
+                    false,
+                );
+                let mut start = self.skill_pick_cursor.saturating_sub(8);
+                if start + 16 > matches.len() {
+                    start = matches.len().saturating_sub(16);
+                }
+                for (i, id) in matches.iter().enumerate().skip(start).take(16) {
+                    push(
+                        &mut out,
+                        alloc::format!(
+                            "  {:<4} {}",
+                            id,
+                            crate::skills::skill_name(*id).unwrap_or("?")
+                        ),
+                        true,
+                        i == self.skill_pick_cursor,
+                    );
+                }
+                push(
+                    &mut out,
+                    String::from("  A choose  Y type  X clear  Up/Down  Left/Right +-10  B back"),
                     false,
                     false,
                 );

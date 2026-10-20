@@ -359,7 +359,8 @@ fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Gmd => "A edit text  X write .arc  B back",
         Check => "A fix  X write .arc  B back",
         Charms => "A delete  Y new/edit  X write save  B back",
-        CharmEdit => "Up/Down row  Left/Right value  X step  A write  B back",
+        CharmEdit => "Up/Down row  L/R value  Y pick skill  X step  A write  B back",
+        SkillPick => "A choose  Y type  X clear  B back",
         Palico => "A add/remove  L R language  X write save  B back",
         Options => "Up/Down row  Left/Right value  A write save  B back",
     }
@@ -475,6 +476,8 @@ fn service(ed: &mut Editor) -> bool {
             "キャラクター名"
         } else if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
             "アイテム名で絞り込み"
+        } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
+            "スキル名で絞り込み"
         } else {
             "クエストテキスト"
         };
@@ -491,6 +494,7 @@ fn service(ed: &mut Editor) -> bool {
                     ed.apply_name(clipped)
                 }
                 Some(s) if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER => ed.apply_item_filter(s),
+                Some(s) if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER => ed.apply_skill_filter(s),
                 Some(s) => ed.apply_text(idx, s),
                 None => ed.message = String::from("input cancelled"),
             }
