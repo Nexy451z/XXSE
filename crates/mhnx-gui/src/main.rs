@@ -90,6 +90,24 @@ fn main() -> eframe::Result<()> {
             if let Ok(s) = std::env::var("MHNXEDITOR_ITEM_FILTER") {
                 app.item_pick_filter = s;
             }
+            // Select a talisman by its box index, the way clicking it does.
+            if let Ok(s) = std::env::var("MHNXEDITOR_CHARM_SELECT") {
+                if let Ok(idx) = s.parse::<usize>() {
+                    app.charm_index = idx;
+                    if let Some(save) = &app.save {
+                        if let Some(c) = save
+                            .charms(app.slot)
+                            .and_then(|l| l.into_iter().find(|c| c.index == idx))
+                        {
+                            app.charm_slots = c.slots;
+                            app.charm_skill1 = c.skill1;
+                            app.charm_points1 = c.points1;
+                            app.charm_skill2 = c.skill2;
+                            app.charm_points2 = c.points2;
+                        }
+                    }
+                }
+            }
             if let Ok(s) = std::env::var("MHNXEDITOR_OPEN_ARC") {
                 app.open_arc(std::path::PathBuf::from(s));
             }

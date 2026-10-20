@@ -1938,6 +1938,11 @@ impl MhnxEditor {
             return;
         };
         let charms = save.charms(self.slot).unwrap_or_default();
+        // Copied out of the save so the editor closures can hold &mut self.
+        let charm_box: Vec<u8> = save
+            .equipment_box(self.slot)
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
         let total = charms.len();
         ui.horizontal(|ui| {
             ui.heading("お守り");
@@ -2034,6 +2039,52 @@ impl MhnxEditor {
                         self.charm_points2 = p as i8;
                     }
                 });
+                // Show what the box itself says is normal for this skill, so
+                // a wild value is visible before it is written. The shipped
+                // range tables could not be indexed with confidence, so this
+                // is derived from the save rather than guessed.
+                if !charm_box.is_empty() {
+                    let b = &charm_box[..];
+                    for (label, sid, pts) in [
+                        ("スキル1", self.charm_skill1, self.charm_points1),
+                        ("スキル2", self.charm_skill2, self.charm_points2),
+                    ] {
+                        if sid == 0 {
+                            continue;
+                        }
+                        match mhnx_core::charm::observed_points_range(b, 100, sid) {
+                            Some(r) if pts < r.low || pts > r.high => {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(235, 190, 90),
+                                    format!(
+                                        "{} {} は {:+} ですが、レア度100 の実在値は {:+}〜{:+}（{}件）",
+                                        label,
+                                        mhnx_core::skills::skill_name(sid).unwrap_or("?"),
+                                        pts,
+                                        r.low,
+                                        r.high,
+                                        r.samples
+                                    ),
+                                );
+                            }
+                            Some(r) => {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} {} の実在値 {:+}〜{:+}（{}件）",
+                                        label,
+                                        mhnx_core::skills::skill_name(sid).unwrap_or("?"),
+                                        r.low,
+                                        r.high,
+                                        r.samples
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                            }
+                            None => {}
+                        }
+                    }
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button("適用").clicked() {
