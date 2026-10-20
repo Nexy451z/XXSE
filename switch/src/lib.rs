@@ -15,6 +15,7 @@ extern crate alloc;
 
 pub mod app;
 pub mod editor;
+pub mod savedata;
 pub mod swkbd;
 pub mod sys;
 pub mod text;

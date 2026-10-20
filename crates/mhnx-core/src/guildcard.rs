@@ -141,3 +141,69 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::save::Save;
+/// Rewrite the card's hunter rank.
+pub fn set_hunter_rank(save: &mut Save, slot: usize, rank: u16) -> bool {
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return false;
+    };
+    let o = base + OFF_GUILD_CARD + GC_HR;
+    let Some(b) = save.body_mut().get_mut(o..o + 2) else {
+        return false;
+    };
+    b.copy_from_slice(&rank.to_le_bytes());
+    true
+}
+
+/// Rewrite the card's own play time, in seconds.
+pub fn set_play_time(save: &mut Save, slot: usize, seconds: u32) -> bool {
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return false;
+    };
+    let o = base + OFF_GUILD_CARD + GC_PLAY_TIME;
+    let Some(b) = save.body_mut().get_mut(o..o + 4) else {
+        return false;
+    };
+    b.copy_from_slice(&seconds.to_le_bytes());
+    true
+}
+
+/// Rewrite the profile comment. Longer text is truncated to the field.
+pub fn set_comment(save: &mut Save, slot: usize, text: &str) -> bool {
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return false;
+    };
+    let o = base + OFF_GUILD_CARD + GC_COMMENT;
+    let Some(dst) = save.body_mut().get_mut(o..o + GC_COMMENT_CHARS * 2) else {
+        return false;
+    };
+    dst.fill(0);
+    for (i, ch) in text.chars().take(GC_COMMENT_CHARS).enumerate() {
+        let v = ch as u32;
+        // Anything outside the basic plane cannot fit in a single unit.
+        let unit = if v <= 0xFFFF { v as u16 } else { 0x30FB };
+        dst[i * 2..i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    true
+}
+
+/// Rewrite one arena entry's time, in hundredths of a second.
+pub fn set_arena_time(
+    save: &mut Save,
+    slot: usize,
+    arena: usize,
+    rank: usize,
+    centis: u16,
+) -> bool {
+    if arena >= ARENA_COUNT || rank >= ARENA_RANKS {
+        return false;
+    }
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return false;
+    };
+    let o = base + OFF_ARENA + (arena * ARENA_RANKS + rank) * ARENA_ENTRY;
+    let Some(dst) = save.body_mut().get_mut(o..o + 2) else {
+        return false;
+    };
+    dst.copy_from_slice(&centis.to_le_bytes());
+    true
+}

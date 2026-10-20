@@ -100,6 +100,8 @@ pub enum Key {
     /// Minus on the Switch pad.
     Minus,
     Plus,
+    /// ZR on the Switch pad, or the Z key in the PC build.
+    Z,
 }
 
 /// Something the I/O layer has to do.
@@ -215,6 +217,23 @@ pub const TEXT_QUEST_FILTER: usize = usize::MAX - 3;
 pub const TEXT_SAVE_NAME: usize = usize::MAX - 4;
 /// Sentinel id for "ask which equipment to show".
 pub const TEXT_EQUIP_FILTER: usize = usize::MAX - 5;
+
+/// Quest id taken from an archive's .mib.
+///
+/// The id is the first field of the .mib, so an archive can be placed in the
+/// right slot whatever its file name says.
+pub fn quest_id_of_arc(bytes: &[u8]) -> Option<i32> {
+    let arc = crate::arc::Arc::parse(bytes).ok()?;
+    let e = arc
+        .entries
+        .iter()
+        .find(|e| crate::arc::extension_for(e.type_hash) == Some("mib"))?;
+    let b = e.data.get(0x0C..0x10)?;
+    Some(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Pseudo path that stands for the console's own save, not a file on the SD card.
+pub const CONSOLE_SAVE: &str = "nand:/system";
 
 /// The editable character fields, in menu order.
 pub const CHAR_FIELDS: &[(&str, &str)] = &[
@@ -694,6 +713,9 @@ impl Editor {
                         self.message = String::from("this entry has no editable records");
                     }
                 }
+                // X was advertised on this screen but had no arm, so pressing
+                // it did nothing at all.
+                Key::X => self.request_write_arc(),
                 Key::Plus => self.quit = true,
                 _ => {}
             },
@@ -1743,8 +1765,57 @@ impl Editor {
                 self.cursor = 0;
                 self.message = String::from("save editor");
             }
+            // Z installs the highlighted archive into the save: the one action
+            // the console could not do at all before.
+            Key::Z => self.install_selected_arc(),
             Key::Plus => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// Install the highlighted .arc into the save's download quest slots.
+    ///
+    /// The id comes from the archive itself rather than its file name: every
+    /// quest carries a .mib whose first field is the id.
+    fn install_selected_arc(&mut self) {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        }
+        let Some(path) = self.arc_files.get(self.cursor).cloned() else {
+            self.message = String::from("クエストが選ばれていません");
+            return;
+        };
+        // The archive has to be open already: the console layer owns file
+        // access, so installing straight from the list would need a second
+        // round trip. Pressing A first is one extra button.
+        let bytes = match (&self.arc, self.arc_path.as_deref()) {
+            (Some(arc), Some(open)) if open == path => match arc.to_bytes() {
+                Ok(b) => b,
+                Err(_) => {
+                    self.message = String::from("アーカイブを書き出せません");
+                    return;
+                }
+            },
+            _ => {
+                self.message = String::from("先に A でクエストを開いてから Z を押してください");
+                return;
+            }
+        };
+        let Some(id) = quest_id_of_arc(&bytes) else {
+            self.message = String::from("クエストIDが読めません（.mib がない）");
+            return;
+        };
+        let Some(save) = &mut self.save else {
+            return;
+        };
+        match crate::dlc::add_quest(save, id, &bytes) {
+            Ok(slot) => {
+                self.dirty = true;
+                self.refresh_quest_titles();
+                self.message = format!("クエスト {} を枠 {} に追加しました", id, slot);
+            }
+            Err(e) => self.message = format!("追加できません: {:?}", e),
         }
     }
 
@@ -2078,12 +2149,27 @@ impl Editor {
             self.message = String::from("open a save first");
             return;
         };
-        match dlc::install_quest(s, id as i32, &raw) {
-            Ok(slot) => {
+        // A quest the save already lists is overwritten in place; a new one
+        // needs its catalogue bit as well, which is what add_quest does.
+        let already = dlc::list_quests(s)
+            .iter()
+            .any(|q| q.quest_id == id as i32);
+        let result = if already {
+            dlc::install_quest(s, id as i32, &raw).map(|slot| (slot, false))
+        } else {
+            dlc::add_quest(s, id as i32, &raw).map(|slot| (slot, true))
+        };
+        match result {
+            Ok((slot, added)) => {
                 self.dirty = true;
-                self.message = format!("installed quest {} into slot {}", id, slot);
+                self.refresh_quest_titles();
+                self.message = if added {
+                    format!("クエスト {} を新規に枠 {} へ追加しました", id, slot)
+                } else {
+                    format!("クエスト {} を枠 {} に上書きしました", id, slot)
+                };
             }
-            Err(e) => self.message = format!("install failed: {}", e),
+            Err(e) => self.message = format!("書き込み失敗: {:?}", e),
         }
     }
 
@@ -2103,9 +2189,19 @@ impl Editor {
         match self.screen {
             Screen::SaveList => {
                 push(&mut out, format!("SAVE FILES  ({} found)", self.save_files.len()), false, false);
-                push(&mut out, String::from("/switch/mhnxeditor/saves/"), false, false);
+                push(
+                    &mut out,
+                    String::from("本体のセーブ or /switch/mhnxeditor/saves/"),
+                    false,
+                    false,
+                );
                 for (i, f) in self.save_files.iter().enumerate() {
-                    push(&mut out, format!("  {}", f), true, i == self.cursor);
+                    let label = if f == CONSOLE_SAVE {
+                        String::from("  本体のセーブ (NAND) - 直接編集")
+                    } else {
+                        format!("  {}", f)
+                    };
+                    push(&mut out, label, true, i == self.cursor);
                 }
                 if self.save_files.is_empty() {
                     push(&mut out, String::from("  (none)"), false, false);

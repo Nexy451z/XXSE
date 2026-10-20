@@ -41,6 +41,7 @@ const BTN_LEFT: u64 = 1 << 12;
 const BTN_UP: u64 = 1 << 13;
 const BTN_RIGHT: u64 = 1 << 14;
 const BTN_DOWN: u64 = 1 << 15;
+const BTN_ZR: u64 = 1 << 19;
 
 /// Folders scanned for content.
 const SAVE_DIRS: [&CStr; 3] = [
@@ -233,6 +234,9 @@ fn list_dir(path: &CStr) -> Vec<Entry> {
 /// Collect save candidates from every candidate folder.
 fn scan_saves() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    // The console's own save comes first: editing it in place is the point of
+    // the tool, and the SD copies are for backups.
+    out.push(String::from(mhnx_core::hbedit::CONSOLE_SAVE));
     for d in SAVE_DIRS.iter() {
         let dir = d.to_str().unwrap_or("/");
         for e in list_dir(d) {
@@ -256,6 +260,38 @@ fn scan_saves() -> Vec<String> {
     out
 }
 
+/// Mount the console save and read it, with a Japanese message on failure.
+fn read_console_save() -> Result<Vec<u8>, String> {
+    let mount = crate::savedata::Mount::open().map_err(|e| {
+        alloc::format!("{}", e.text())
+    })?;
+    let bytes = mount.read().map_err(|e| alloc::format!("{}", e.text()))?;
+    if !crate::savedata::looks_like_save(&bytes) {
+        return Err(String::from("セーブのサイズが想定と違います"));
+    }
+    Ok(bytes)
+}
+
+/// Write the save back to the console, keeping a copy on the SD card first.
+fn write_console_save(bytes: &[u8]) -> Result<String, String> {
+    let mount = crate::savedata::Mount::open().map_err(|e| alloc::format!("{}", e.text()))?;
+    // Keep what the console holds now, so a bad edit can be undone without
+    // having thought about it beforehand.
+    let backup = String::from(SAFETY_DIR);
+    make_dirs(SAFETY_DIR);
+    let old = mount.read().ok();
+    let stamp = crate::savedata::stamp();
+    let backup_path = alloc::format!("{}/system_{}.bak", backup, stamp);
+    if let Some(old) = old.as_ref() {
+        let _ = write_file(&backup_path, old);
+    }
+    mount.write(bytes).map_err(|e| alloc::format!("{}", e.text()))?;
+    mount.commit().map_err(|e| alloc::format!("{}", e.text()))?;
+    Ok(backup_path)
+}
+
+/// Where the pre-write copies of the console save are kept.
+const SAFETY_DIR: &str = "/switch/mhnxeditor/backups";
 /// Collect .arc quest files from every candidate folder.
 fn scan_quests() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -307,7 +343,16 @@ impl Painter {
                 }
                 sys::log_line("");
                 sys::log_line(&format!(">> {}", ed.message));
-                sys::log_line(hint(ed.screen));
+                let mut bar = alloc::string::String::new();
+                for (k, label) in actions(ed.screen) {
+                    if !bar.is_empty() {
+                        bar.push_str("   ");
+                    }
+                    bar.push_str(k);
+                    bar.push(' ');
+                    bar.push_str(label);
+                }
+                sys::log_line(&bar);
                 unsafe { sys::consoleUpdate(core::ptr::null_mut()) };
             }
             Some(c) => {
@@ -316,7 +361,8 @@ impl Painter {
                 let h = c.height();
                 c.clear(0xFF10_1014);
                 c.rect(0, 0, w, 40, 0xFF20_2430);
-                c.text(12, 10, "mhnxeditor", 0xFFFF_FFFF);
+                c.text(12, 10, "mhnxeditor", 0xFF80_80_88);
+                c.text(120, 10, title(ed.screen), 0xFFFF_FFFF);
                 let mut y = 52;
                 for l in &lines {
                     let color = if l.cursor {
@@ -335,41 +381,128 @@ impl Painter {
                 }
                 c.rect(0, h - 76, w, 76, 0xFF20_2430);
                 c.text(12, h - 68, &ed.message, 0xFFFF_D070);
-                c.text(12, h - 44, hint(ed.screen), 0xFFB0_B0B8);
+                // Buttons as chips, so nothing has to be memorised.
+                let mut x: i32 = 12;
+                for (k, label) in actions(ed.screen) {
+                    let text = alloc::format!("{} {}", k, label);
+                    let w_chip = (text.chars().count() as i32) * 11 + 16;
+                    c.rect(x, h - 46, w_chip, 30, 0xFF2E_3444);
+                    c.text(x + 8, h - 40, &text, 0xFFD8_D8E0);
+                    x += w_chip + 6;
+                }
                 c.present();
             }
         }
     }
 }
 
-/// Context sensitive button hint for the current screen.
-fn hint(screen: mhnx_core::hbedit::Screen) -> &'static str {
+/// Screen title shown in the header.
+fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
     use mhnx_core::hbedit::Screen::*;
     match screen {
-        SaveList => "A open  Y quest editor  L convert  X options  - rescan  + exit",
-        Convert => "A convert and write   Y name   B back",
-        Slots => "Up/Down slot  A char  X items  - equip  L charms  R palico  Y quest  B back",
-        Equip => "Up/Down row  Y filter  X clear  L guild  R palicos  B back",
-        Char => "Up/Down field  Left/Right value  X step  - records  Y sets  A save  B back",
-        Hunts => "Up/Down row   B back",
-        Guild => "B back",
-        Roster => "Up/Down row   B back",
-        Sets => "B back",
-        ArcList => "A open quest   X quests in save   Y save editor   + exit",
-        SaveQuests => "A edit  - extract  R all  Y filter  X clear  L equip  B back",
-        QuestEquip => "Up/Down row   B back",
-        ItemPick => "A choose  Y filter  X clear  B back",
-        Items => "Up/Down  L/R count  R pick  L undo  X step  Y empty  A save  B back",
-        ArcEntries => "A edit  Y view  X save  - extract  R all  L check  B back",
-        EntryView => "Up/Down row  A change item  X write .arc  B back",
-        Mib => "Up/Down field  Left/Right value  X step  A write .arc  B back",
-        Gmd => "A edit text  X write .arc  B back",
-        Check => "A fix  X write .arc  B back",
-        Charms => "A delete  Y new/edit  X write save  B back",
-        CharmEdit => "Up/Down row  L/R value  Y pick skill  X step  A write  B back",
-        SkillPick => "A choose  Y type  X clear  B back",
-        Palico => "A add/remove  L R language  X write save  B back",
-        Options => "Up/Down row  Left/Right value  A write save  B back",
+        SaveList => "セーブを開く",
+        Convert => "3DS <-> Switch 変換",
+        Slots => "キャラクター選択",
+        Char => "キャラクター編集",
+        Items => "アイテムボックス",
+        ItemPick => "アイテムを選ぶ",
+        Charms => "お守り",
+        CharmEdit => "お守り編集",
+        SkillPick => "スキルを選ぶ",
+        Equip => "装備",
+        QuestEquip => "クエスト装備",
+        SaveQuests => "クエスト (セーブ内)",
+        ArcList => "クエスト (.arc)",
+        ArcEntries => "クエストの中身",
+        EntryView => "エントリ",
+        Mib => "クエスト条件",
+        Gmd => "クエスト本文",
+        Check => "クエスト検査",
+        Hunts => "狩猟記録",
+        Guild => "ギルドカード",
+        Roster => "オトモ",
+        Sets => "マイセット",
+        Palico => "配信オトモ",
+        Options => "設定",
+    }
+}
+
+/// The buttons that do something on this screen, as (key, label).
+///
+/// The footer draws these as chips, so a screen never needs the user to
+/// remember a key that is not on screen.
+fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static str, &'static str)] {
+    use mhnx_core::hbedit::Screen::*;
+    match screen {
+        SaveList => &[
+            ("A", "開く"),
+            ("Y", "クエスト"),
+            ("L", "変換"),
+            ("X", "設定"),
+            ("-", "再読込"),
+            ("+", "終了"),
+        ],
+        Convert => &[("A", "変換して保存"), ("Y", "名前"), ("B", "戻る")],
+        Slots => &[
+            ("A", "キャラ"),
+            ("X", "アイテム"),
+            ("-", "装備"),
+            ("L", "お守り"),
+            ("R", "オトモ"),
+            ("Y", "クエスト"),
+            ("B", "戻る"),
+        ],
+        Char => &[
+            ("A", "保存"),
+            ("</>", "値を変更"),
+            ("X", "刻み"),
+            ("-", "狩猟記録"),
+            ("Y", "マイセット"),
+            ("B", "戻る"),
+        ],
+        Items => &[
+            ("R", "種類を変える"),
+            ("</>", "個数"),
+            ("X", "刻み"),
+            ("Y", "空き表示"),
+            ("L", "元に戻す"),
+            ("A", "保存"),
+            ("B", "戻る"),
+        ],
+        ItemPick => &[("A", "決定"), ("Y", "名前で絞る"), ("X", "クリア"), ("B", "戻る")],
+        Charms => &[("Y", "新規/編集"), ("L", "新規"), ("A", "削除"), ("X", "保存"), ("B", "戻る")],
+        CharmEdit => &[("Y", "スキル選択"), ("</>", "値"), ("A", "保存"), ("B", "戻る")],
+        SkillPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
+        Equip => &[("Y", "絞る"), ("X", "クリア"), ("L", "ギルド"), ("R", "オトモ"), ("B", "戻る")],
+        QuestEquip => &[("B", "戻る")],
+        SaveQuests => &[
+            ("A", "編集"),
+            ("-", "書き出す"),
+            ("R", "全部"),
+            ("Y", "絞る"),
+            ("L", "装備"),
+            ("B", "戻る"),
+        ],
+        ArcList => &[("A", "開く"), ("Z", "クエスト追加"), ("X", "セーブ内"), ("Y", "セーブ編集"), ("+", "終了")],
+        ArcEntries => &[
+            ("A", "編集"),
+            ("Y", "表示"),
+            ("X", "保存"),
+            ("-", "書き出す"),
+            ("R", "全部"),
+            ("L", "検査"),
+            ("B", "戻る"),
+        ],
+        EntryView => &[("A", "値変更"), ("X", ".arc 保存"), ("B", "戻る")],
+        Mib => &[("</>", "値変更"), ("X", "刻み"), ("A", ".arc 保存"), ("B", "戻る")],
+        Gmd => &[("A", "文章編集"), ("X", ".arc 保存"), ("B", "戻る")],
+        Check => &[("A", "修正"), ("X", ".arc 保存"), ("B", "戻る")],
+        Hunts => &[("B", "戻る")],
+        Guild => &[("B", "戻る")],
+        Roster => &[("B", "戻る")],
+        Sets => &[("B", "戻る")],
+        Palico => &[("A", "追加/削除"), ("L", "言語"), ("R", "言語"), ("X", "保存"), ("B", "戻る")],
+        Options => &[("</>", "値変更"), ("A", "保存"), ("B", "戻る")],
     }
 }
 
@@ -400,6 +533,8 @@ fn key_from(buttons: u64) -> Option<Key> {
         Some(Key::R)
     } else if buttons & BTN_MINUS != 0 {
         Some(Key::Minus)
+    } else if buttons & BTN_ZR != 0 {
+        Some(Key::Z)
     } else if buttons & BTN_PLUS != 0 {
         Some(Key::Plus)
     } else {
@@ -419,9 +554,16 @@ fn service(ed: &mut Editor) -> bool {
             Request::ReadSave(i) => {
                 let path = ed.save_files.get(i).cloned();
                 if let Some(p) = path {
-                    match read_file(&p) {
-                        Some(b) => ed.open_save_bytes(&p, &b),
-                        None => ed.message = format!("cannot read {}", p),
+                    if p == mhnx_core::hbedit::CONSOLE_SAVE {
+                        match read_console_save() {
+                            Ok(b) => ed.open_save_bytes(&p, &b),
+                            Err(msg) => ed.message = msg,
+                        }
+                    } else {
+                        match read_file(&p) {
+                            Some(b) => ed.open_save_bytes(&p, &b),
+                            None => ed.message = format!("cannot read {}", p),
+                        }
                     }
                 }
             }
@@ -458,6 +600,19 @@ fn service(ed: &mut Editor) -> bool {
         match w {
             Write::File { path, bytes } => {
                 let n = bytes.len();
+                if path == mhnx_core::hbedit::CONSOLE_SAVE || path.starts_with("nand:") {
+                    match write_console_save(&bytes) {
+                        Ok(backup) => {
+                            ed.message = format!(
+                                "本体のセーブに {} バイト書き込みました（控え: {}）",
+                                n, backup
+                            );
+                        }
+                        Err(msg) => ed.message = msg,
+                    }
+                    ed.take_request();
+                    return force_redraw;
+                }
                 // Keep the file we are about to replace. Nothing used to hold
                 // the previous contents, so one bad write lost the save.
                 let mut kept = false;

@@ -29,6 +29,16 @@ pub struct Service {
     pub pointer_buffer_size: u16,
 }
 
+/// `AccountUid` (services/account.h): two u64 halves.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AccountUid {
+    pub uid: [u64; 2],
+}
+
+/// Account initialize mode: the application's own account info.
+pub const ACCOUNT_SERVICE_TYPE_APPLICATION: u32 = 0;
+
 /// `FsFileSystem` (services/fs.h): { Service s; }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -223,6 +233,17 @@ extern "C" {
 
     // --- kernel/svc.h --------------------------------------------------------------
     pub fn svcSleepThread(nano: i64);
+
+    // --- services/account.h -------------------------------------------------------
+    pub fn accountInitialize(mode: u32) -> Result;
+    pub fn accountExit();
+    pub fn accountGetPreselectedUser(out: *mut AccountUid) -> Result;
+
+    // --- runtime/devices/fs_dev.h ---------------------------------------------------
+    /// Mounts a title's save data so it can be opened as "save:/<file>".
+    pub fn fsdevMountSaveData(name: *const c_char, application_id: u64, uid: AccountUid) -> Result;
+    pub fn fsdevCommitDevice(name: *const c_char) -> Result;
+    pub fn fsdevUnmountDevice(name: *const c_char) -> Result;
 
     // --- services/fs.h -------------------------------------------------------------
     pub fn fsInitialize() -> Result;

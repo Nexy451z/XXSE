@@ -172,7 +172,10 @@ Invoke-Tool $nacptool @('--create', $appTitle, $appAuthor, $appVersion, $nacp)
 
 Step 'elf2nro'
 $nro = Join-Path $outDir "$appName.nro"
-Invoke-Tool $elf2nro @($elf, $nro, "--icon=$devkitProFwd/libnx/default_icon.jpg", "--nacp=$nacp")
+# Use our own icon when present; fall back to libnx's default.
+$icon = Join-Path $PSScriptRoot 'icon.jpg'
+if (-not (Test-Path $icon)) { $icon = "$devkitProFwd/libnx/default_icon.jpg" }
+Invoke-Tool $elf2nro @($elf, $nro, "--icon=$icon", "--nacp=$nacp")
 
 # ---------------------------------------------------------------------------
 # 6. Verify the NRO container
