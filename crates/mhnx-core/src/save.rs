@@ -450,7 +450,34 @@ impl Save {
         ] {
             self.body[base + off..base + off + 4].copy_from_slice(&v);
         }
+        self.sync_guild_card_appearance(c.slot);
         Ok(())
+    }
+
+    /// Copy the appearance bytes into the guild card's own copy.
+    ///
+    /// The card carries a second copy of the same eight bytes at
+    /// OFF_GUILD_CARD + 0x19 and of the four colours at +0x38. In the sample
+    /// save both copies are byte for byte identical for every character, so
+    /// changing only the live one would leave the card describing the old
+    /// hunter.
+    pub fn sync_guild_card_appearance(&mut self, slot: usize) -> bool {
+        let Some(base) = self.slot_base(slot).map(|b| b as usize) else {
+            return false;
+        };
+        let gc = base + OFF_GUILD_CARD;
+        let src = base + OFF_VOICE;
+        let (Some(dst), Some(from)) = (
+            self.body.get(gc + 0x19..gc + 0x21),
+            self.body.get(src..src + 8).map(|s| s.to_vec()),
+        ) else {
+            return false;
+        };
+        let _ = dst;
+        self.body[gc + 0x19..gc + 0x21].copy_from_slice(&from);
+        let colors = self.body[base + OFF_SKIN_COLOR..base + OFF_SKIN_COLOR + 16].to_vec();
+        self.body[gc + 0x38..gc + 0x48].copy_from_slice(&colors);
+        true
     }
 
     /// Decode the item box of a slot.
