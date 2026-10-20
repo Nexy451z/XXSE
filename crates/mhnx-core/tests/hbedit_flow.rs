@@ -1519,3 +1519,92 @@ fn b_leaves_the_picker_without_writing() {
     assert_eq!(ed.screen, Screen::EntryView, "B returns to the view");
     assert_eq!(ed.arc.as_ref().unwrap().entries[5].data, before, "nothing written");
 }
+
+// ---------------------------------------------------------------------------
+// Torture: random key sequences must not panic or corrupt anything.
+// ---------------------------------------------------------------------------
+
+const ALL_KEYS: [Key; 11] = [
+    Key::Up,
+    Key::Down,
+    Key::Left,
+    Key::Right,
+    Key::A,
+    Key::B,
+    Key::X,
+    Key::Y,
+    Key::L,
+    Key::R,
+    Key::Minus,
+];
+
+#[test]
+fn random_key_sequences_never_panic_or_lose_the_save() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut seed = 0x1234_5678u64;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    let mut screens_seen = std::collections::BTreeSet::new();
+    for round in 0..40 {
+        let mut ed = Editor::new();
+        open_save(&mut ed);
+        let body_len = ed.save.as_ref().unwrap().body().len();
+        for _ in 0..400 {
+            let key = ALL_KEYS[next() % ALL_KEYS.len()];
+            ed.input(key);
+            screens_seen.insert(format!("{:?}", ed.screen));
+            if let Some(s) = &ed.save {
+                let now = s.to_bytes();
+                let back = mhnx_core::save::Save::from_bytes(&now).unwrap_or_else(|e| {
+                    panic!("round {} produced an unparseable save: {:?}", round, e)
+                });
+                assert_eq!(back.body().len(), body_len, "round {}: body length changed", round);
+            }
+        }
+        if let Some(s) = &ed.save {
+            let out = s.to_bytes();
+            let back = mhnx_core::save::Save::from_bytes(&out).unwrap();
+            assert_eq!(back.to_bytes(), out, "round {} did not round trip", round);
+        }
+    }
+    assert!(
+        screens_seen.len() >= 6,
+        "the fuzz only reached {:?}",
+        screens_seen
+    );
+}
+
+#[test]
+fn random_keys_on_an_arc_never_produce_a_broken_archive() {
+    let Some(p) = sample_arc() else { return };
+    let bytes = std::fs::read(&p).unwrap();
+    let mut seed = 0x9E37_79B9u64;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (seed >> 33) as usize
+    };
+    for round in 0..30 {
+        let mut ed = Editor::new();
+        ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+        for _ in 0..300 {
+            ed.input(ALL_KEYS[next() % ALL_KEYS.len()]);
+            if let Some(a) = &ed.arc {
+                let out = a
+                    .to_bytes()
+                    .unwrap_or_else(|e| panic!("round {}: repack failed: {:?}", round, e));
+                let back = mhnx_core::arc::Arc::parse(&out)
+                    .unwrap_or_else(|e| panic!("round {}: repack produced junk: {:?}", round, e));
+                assert_eq!(
+                    back.entries.len(),
+                    a.entries.len(),
+                    "round {}: entry count changed",
+                    round
+                );
+            }
+        }
+    }
+}
