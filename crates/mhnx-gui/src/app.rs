@@ -206,14 +206,41 @@ impl MhnxEditor {
         self.message = "編集内容を保存データに反映しました (まだファイルには書いていません)".to_owned();
     }
 
+    /// Copy the file that is about to be overwritten to <name>.bak.
+    ///
+    /// Nothing used to keep the previous contents: one bad write and the save
+    /// was gone. Returns the backup path when one was made.
+    fn backup_before_write(path: &std::path::Path) -> Option<PathBuf> {
+        if !path.exists() {
+            return None;
+        }
+        let bak = path.with_extension(
+            path.extension()
+                .map(|e| format!("{}.bak", e.to_string_lossy()))
+                .unwrap_or_else(|| String::from("bak")),
+        );
+        match std::fs::copy(path, &bak) {
+            Ok(_) => Some(bak),
+            Err(_) => None,
+        }
+    }
+
     pub fn write_current(&mut self, path: PathBuf) {
         self.apply_to_save();
         let Some(s) = &self.save else { return };
+        let backup = Self::backup_before_write(&path);
         match std::fs::write(&path, s.to_bytes()) {
             Ok(_) => {
                 self.dirty = false;
                 self.save_path = Some(path.clone());
-                self.message = format!("書き出しました: {}", path.display());
+                self.message = match backup {
+                    Some(b) => format!(
+                        "書き出しました: {}（元のファイルは {} に退避）",
+                        path.display(),
+                        b.display()
+                    ),
+                    None => format!("書き出しました: {}", path.display()),
+                };
             }
             Err(e) => self.message = format!("書き出し失敗: {}", e),
         }
