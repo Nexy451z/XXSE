@@ -2918,7 +2918,7 @@ fn the_console_lists_the_palicos() {
     let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
     let joined = lines.join("\n");
     assert!(joined.contains("PALICOS"), "{}", joined);
-    assert!(joined.contains("Lv"), "{}", joined);
+    assert!(joined.contains("変更中: レベル"), "{}", joined);
     // Every name must have survived decoding.
     for p in &list {
         assert!(!p.name.contains('\u{FFFD}'));
@@ -3741,26 +3741,15 @@ fn audit_a_quest_the_save_does_not_have_can_be_added() {
 }
 
 #[test]
-fn gap_the_guild_card_is_display_only() {
+fn audit_the_guild_card_can_be_edited() {
     if !real_save().exists() {
         return;
     }
-    audit_assert_read_only(
-        "Guild",
-        |ed| {
-            ed.input(Key::Minus);
-            ed.input(Key::L);
-            assert_eq!(ed.screen, Screen::Guild);
-        },
-        &AUDIT_EDIT_KEYS,
-    );
-
-    // It renders rank, comment and arena times, which is why it reads as an
-    // editor; nothing on it writes a byte.
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::Minus);
     ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Guild);
     let joined = ed
         .lines()
         .iter()
@@ -3769,59 +3758,65 @@ fn gap_the_guild_card_is_display_only() {
         .join("\n");
     assert!(joined.contains("GUILD CARD"), "{}", joined);
     assert!(joined.contains("comment"), "{}", joined);
+    // The rank is the first field, so Right raises it by one.
+    let before = ed.save.as_ref().and_then(|s| {
+        mhnx_core::guildcard::hunter_rank(s, ed.slot)
+    });
+    ed.input(Key::Right);
+    let after = ed.save.as_ref().and_then(|s| {
+        mhnx_core::guildcard::hunter_rank(s, ed.slot)
+    });
+    assert_eq!(
+        after,
+        before.map(|v| (v + 1).min(999)),
+        "the card rank did not move"
+    );
+    assert!(ed.dirty);
 }
 
 #[test]
-fn gap_the_palico_roster_is_display_only() {
+fn audit_the_palico_roster_can_be_edited() {
     if !real_save().exists() {
         return;
     }
-    audit_assert_read_only(
-        "Roster",
-        |ed| {
-            ed.input(Key::Minus);
-            ed.input(Key::R);
-            assert_eq!(ed.screen, Screen::Roster);
-        },
-        &AUDIT_EDIT_KEYS,
-    );
-
-    // Up/Down move the cursor, so the screen looks interactive.
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::Minus);
     ed.input(Key::R);
+    assert_eq!(ed.screen, Screen::Roster);
     assert!(!ed.palicos().is_empty());
-    let before = ed.roster_cursor;
+    // Up/Down still move the cursor.
+    let before_cursor = ed.roster_cursor;
     ed.input(Key::Down);
-    assert_ne!(ed.roster_cursor, before);
-    // palico::set_name / set_exp / set_level / set_enthusiasm exist; no screen
-    // calls them.
+    assert_ne!(ed.roster_cursor, before_cursor);
+    ed.input(Key::Up);
+    // Left lowers the highlighted level.
+    let before = ed.palicos()[0].clone();
+    ed.input(Key::Left);
+    let after = ed.palicos()[0].clone();
+    assert_eq!(after.level, before.level.saturating_sub(1).max(1));
+    assert!(ed.dirty);
 }
 
 #[test]
-fn gap_the_hunt_records_are_display_only() {
+fn audit_the_hunt_records_can_be_edited() {
     if !real_save().exists() {
         return;
     }
-    audit_assert_read_only(
-        "Hunts",
-        |ed| {
-            ed.input(Key::A);
-            ed.input(Key::Minus);
-            assert_eq!(ed.screen, Screen::Hunts);
-        },
-        &AUDIT_EDIT_KEYS,
-    );
-
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::A);
     ed.input(Key::Minus);
+    assert_eq!(ed.screen, Screen::Hunts);
     assert!(ed.hunt_rows().len() > 100);
-    // Save::set_hunt_count / set_capture_count / set_monster_size exist and are
-    // exercised by the library tests, but no screen calls them.
     assert!(ed.hunt_rows().iter().any(|(_, slay, _, _, _)| *slay > 0));
+    // Right raises the slay count of the highlighted monster.
+    let before = ed.hunt_rows()[0];
+    ed.input(Key::Right);
+    let after = ed.hunt_rows()[0];
+    assert_eq!(after.0, before.0);
+    assert_eq!(after.1, before.1 + 1, "the slay count did not move");
+    assert!(ed.dirty);
 }
 
 #[test]
