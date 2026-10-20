@@ -2237,3 +2237,86 @@ fn the_console_lists_the_quest_equipment_entries() {
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::SaveQuests);
 }
+
+// ---------------------------------------------------------------------------
+// Adding a quest the save does not already list. This needed the catalogue.
+// ---------------------------------------------------------------------------
+
+fn sample_quest_arc(id: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(format!(
+        "C:/anyWorkspace/nx/mhxx/save_editor/mhxx_quetool/quest/q{}.arc",
+        id
+    ));
+    if p.exists() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn a_new_quest_can_be_added_to_a_free_slot() {
+    let Some(arc) = sample_quest_arc("1010002") else {
+        return;
+    };
+    if !real_save().exists() {
+        return;
+    }
+    let raw = std::fs::read(&arc).unwrap();
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let before = mhnx_core::dlc::list_quests(&s).len();
+    // It must be in the catalogue but not installed.
+    assert!(mhnx_core::dlc::bit_for_quest(1010002).is_some());
+    assert!(!mhnx_core::dlc::is_installed(&s, 1010002));
+    assert!(!mhnx_core::dlc::list_quests(&s)
+        .iter()
+        .any(|q| q.quest_id == 1010002));
+
+    let slot = mhnx_core::dlc::add_quest(&mut s, 1010002, &raw).expect("add");
+    // The slot must be one that was free, and now hold the payload verbatim.
+    let after = mhnx_core::dlc::list_quests(&s);
+    assert_eq!(after.len(), before + 1);
+    let q = after.iter().find(|q| q.quest_id == 1010002).expect("installed");
+    assert_eq!(q.slot, slot);
+    assert_eq!(q.data, raw, "the payload must be carried over unchanged");
+    // And the mask bit must be set.
+    assert!(mhnx_core::dlc::is_installed(&s, 1010002));
+    assert_eq!(mhnx_core::dlc::bit_for_quest(1010002), Some(65));
+    // The save must still round trip.
+    let out = s.to_bytes();
+    let back = mhnx_core::save::Save::from_bytes(&out).unwrap();
+    assert_eq!(back.to_bytes(), out);
+    assert_eq!(mhnx_core::dlc::list_quests(&back).len(), before + 1);
+}
+
+#[test]
+fn adding_an_installed_quest_is_refused() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let existing = mhnx_core::dlc::list_quests(&s)[0].quest_id;
+    let r = mhnx_core::dlc::add_quest(&mut s, existing, &[0u8; 16]);
+    assert!(r.is_err(), "adding an installed quest must fail");
+}
+
+#[test]
+fn adding_a_quest_outside_the_catalogue_is_refused() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let r = mhnx_core::dlc::add_quest(&mut s, 9999999, &[0u8; 16]);
+    assert!(r.is_err(), "an id the catalogue does not list must be refused");
+}
+
+#[test]
+fn an_oversized_payload_is_refused() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let big = vec![0u8; mhnx_core::dlc::QUEST_MAX_PAYLOAD + 1];
+    let r = mhnx_core::dlc::add_quest(&mut s, 1010002, &big);
+    assert!(r.is_err(), "a payload that cannot fit must be refused");
+}

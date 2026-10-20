@@ -386,6 +386,72 @@ pub fn installed_flag(save: &Save, quest_id: i32) -> Option<bool> {
 ///
 /// Fails if the save does not already hold that quest, because adding one
 /// would need its catalogue bit and a slot number cannot address that set.
+/// Install a quest into a slot the save does not already use.
+///
+/// This is the operation the tool has always refused: without the catalogue a
+/// quest id could not be turned into a mask bit, so a new entry would be a
+/// quest the game either lists but cannot load, or never lists at all. The
+/// catalogue is now embedded, so the bit is computable and both halves can be
+/// written together.
+///
+/// Still unverified on hardware: whether the game accepts a quest written
+/// into a slot no catalogue entry has ever filled. Callers should treat this
+/// as an experiment and keep a backup.
+pub fn add_quest(save: &mut Save, quest_id: i32, arc_bytes: &[u8]) -> Result<usize, Error> {
+    if arc_bytes.len() > QUEST_MAX_PAYLOAD {
+        return Err(Error::OutOfRange {
+            context: "quest payload larger than a slot",
+            value: arc_bytes.len() as u32,
+        });
+    }
+    if bit_for_quest(quest_id).is_none() {
+        return Err(Error::OutOfRange {
+            context: "quest id is not in the DLC catalogue",
+            value: quest_id as u32,
+        });
+    }
+    if list_quests(save).iter().any(|q| q.quest_id == quest_id) {
+        return Err(Error::OutOfRange {
+            context: "quest is already installed",
+            value: quest_id as u32,
+        });
+    }
+    let sec = section_start(save).ok_or(Error::OutOfRange {
+        context: "save has no DLC section",
+        value: 0,
+    })?;
+    // The first slot whose size is zero is free: a used slot always has a
+    // non-zero length.
+    let empty = (0..QUEST_SLOTS).find(|i| {
+        let base = sec + QUEST_ARRAY_OFFSET + i * QUEST_SLOT_SIZE;
+        save.body()
+            .get(base + 4..base + 8)
+            .map(|b| read_i32(b, 0))
+            .unwrap_or(-1)
+            == 0
+    });
+    let Some(slot) = empty else {
+        return Err(Error::OutOfRange {
+            context: "no free quest slot",
+            value: QUEST_SLOTS as u32,
+        });
+    };
+    let base = sec + QUEST_ARRAY_OFFSET + slot * QUEST_SLOT_SIZE;
+    let rec = save
+        .body_mut()
+        .get_mut(base..base + QUEST_SLOT_SIZE)
+        .ok_or(Error::OutOfRange {
+            context: "quest slot",
+            value: base as u32,
+        })?;
+    rec.fill(0);
+    rec[0..4].copy_from_slice(&(quest_id as u32).to_le_bytes());
+    rec[4..8].copy_from_slice(&(arc_bytes.len() as u32).to_le_bytes());
+    rec[8..8 + arc_bytes.len()].copy_from_slice(arc_bytes);
+    set_installed(save, quest_id, true)?;
+    Ok(slot)
+}
+
 pub fn install_quest(save: &mut Save, quest_id: i32, arc_bytes: &[u8]) -> Result<usize, Error> {
     check_kind(save)?;
     if quest_id <= 0 {
