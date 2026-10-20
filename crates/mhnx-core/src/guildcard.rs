@@ -138,5 +138,6 @@ pub fn comment(save: &Save, slot: usize) -> Option<String> {
 }
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::save::Save;
