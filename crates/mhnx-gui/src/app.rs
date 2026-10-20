@@ -20,6 +20,7 @@ pub enum Tab {
     Items,
     Quest,
     Dlc,
+    Charm,
     Extras,
     About,
 }
@@ -67,6 +68,11 @@ pub struct MhnxEditor {
     pub dlc_filter: String,
     /// Output folder for the quest extractor.
     pub dlc_outdir: String,
+    /// Free-text filter for the talisman list.
+    pub charm_filter: String,
+    /// Search text inside the two skill pickers.
+    pub skill_search1: String,
+    pub skill_search2: String,
     /// Charm editor fields.
     pub charm_index: usize,
     pub charm_skill1: u8,
@@ -115,6 +121,9 @@ impl Default for MhnxEditor {
             item_pick_filter: String::new(),
             dlc_filter: String::new(),
             dlc_outdir: String::new(),
+            charm_filter: String::new(),
+            skill_search1: String::new(),
+            skill_search2: String::new(),
             charm_index: 0,
             charm_skill1: 1,
             charm_points1: 1,
@@ -578,6 +587,7 @@ impl eframe::App for MhnxEditor {
             Tab::Items => self.tab_items(ui),
             Tab::Quest => self.tab_quest(ui),
             Tab::Dlc => self.tab_dlc(ui),
+            Tab::Charm => self.tab_charm(ui),
             Tab::Extras => self.tab_extras(ui),
             Tab::About => self.tab_about(ui),
         });
@@ -735,7 +745,8 @@ impl MhnxEditor {
                         ui.selectable_value(&mut self.tab, Tab::Items, "アイテム");
                         ui.selectable_value(&mut self.tab, Tab::Quest, "クエスト");
                         ui.selectable_value(&mut self.tab, Tab::Dlc, "DLC");
-                        ui.selectable_value(&mut self.tab, Tab::Extras, "設定/オトモ");
+                        ui.selectable_value(&mut self.tab, Tab::Charm, "お守り");
+                ui.selectable_value(&mut self.tab, Tab::Extras, "設定/オトモ");
         ui.selectable_value(&mut self.tab, Tab::About, "情報");
                     });
                     ui.separator();
@@ -1335,8 +1346,25 @@ impl MhnxEditor {
                                             }
                                         }
                                     });
+                            } else if f.kind == FieldKind::Bytes {
+                                // Byte blobs (the five monster slots and the
+                                // rest) are not numbers: a 64 bit shift used to
+                                // panic here in a debug build and render ten
+                                // controls that could never write anything.
+                                let mut s = String::new();
+                                for b in self.mib_bytes.iter().skip(f.offset).take(f.size) {
+                                    s.push_str(&format!("{:02X}", b));
+                                }
+                                ui.label(egui::RichText::new(s).monospace());
+                                ui.label(
+                                    egui::RichText::new("生バイト（下の 16 進表で編集）")
+                                        .small()
+                                        .weak(),
+                                );
+                                ui.end_row();
+                                continue;
                             } else {
-                                let width = (f.size * 8) as u32;
+                                let width = ((f.size.min(8)) * 8) as u32;
                                 let signed = matches!(
                                     f.kind,
                                     FieldKind::I8 | FieldKind::I16 | FieldKind::I32
@@ -1776,6 +1804,240 @@ impl MhnxEditor {
             }
         }
     }
+
+    /// Searchable skill picker: 306 Japanese names, index = id - 1.
+    fn skill_combo(
+        ui: &mut egui::Ui,
+        id_salt: &str,
+        current: &mut u8,
+        search: &mut String,
+    ) -> bool {
+        let shown = mhnx_core::skills::skill_name(*current)
+            .map(|s| format!("{} ({})", s, current))
+            .unwrap_or_else(|| format!("なし ({})", current));
+        let mut picked: Option<u8> = None;
+        egui::ComboBox::from_id_salt(id_salt)
+            .selected_text(shown)
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(search)
+                        .hint_text("スキル名で検索")
+                        .desired_width(240.0),
+                );
+                if ui.small_button("クリア").clicked() {
+                    search.clear();
+                }
+                if *current != 0 && ui.small_button("なし に戻す").clicked() {
+                    picked = Some(0);
+                }
+                let needle = search.trim().to_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt(id_salt)
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (i, name) in mhnx_core::skills::SKILL_NAMES.iter().enumerate() {
+                            let id = (i + 1) as u8;
+                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(*current == id, format!("{:<4} {}", id, name))
+                                .clicked()
+                            {
+                                picked = Some(id);
+                            }
+                        }
+                    });
+            });
+        match picked {
+            Some(id) => {
+                *current = id;
+                search.clear();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Talisman editing: the list on the left, the editor on the right.
+    fn tab_charm(&mut self, ui: &mut egui::Ui) {
+        let Some(save) = &self.save else {
+            ui.centered_and_justified(|ui| ui.label("セーブを開いてください"));
+            return;
+        };
+        let charms = save.charms(self.slot).unwrap_or_default();
+        let total = charms.len();
+        ui.horizontal(|ui| {
+            ui.heading("お守り");
+            ui.label(format!(
+                "スロット {} / {} 個（装備ボックス 2000 枠のうち）",
+                self.slot + 1,
+                total
+            ));
+            ui.label("絞り込み");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.charm_filter)
+                    .hint_text("スキル名・番号")
+                    .desired_width(180.0),
+            );
+        });
+
+        let needle = self.charm_filter.trim().to_lowercase();
+        let shown: Vec<_> = charms
+            .iter()
+            .filter(|c| {
+                if needle.is_empty() {
+                    return true;
+                }
+                c.summary().to_lowercase().contains(&needle)
+                    || format!("{}", c.index).contains(&needle)
+            })
+            .collect();
+        ui.label(format!("{} 件表示", shown.len()));
+
+        let mut pick: Option<usize> = None;
+        let mut drop_idx: Option<usize> = None;
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("charmlist")
+                    .max_height(460.0)
+                    .min_scrolled_height(460.0)
+                    .show(ui, |ui| {
+                        for c in &shown {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .selectable_label(
+                                        self.charm_index == c.index,
+                                        format!("{:<6} {}", c.index, c.summary()),
+                                    )
+                                    .clicked()
+                                {
+                                    pick = Some(c.index);
+                                }
+                                if ui.small_button("削除").clicked() {
+                                    drop_idx = Some(c.index);
+                                }
+                            });
+                        }
+                    });
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_min_width(360.0);
+                ui.label(egui::RichText::new("選択中のお守り").strong());
+                ui.horizontal(|ui| {
+                    ui.label("枠");
+                    ui.add(egui::DragValue::new(&mut self.charm_index).range(0..=1999));
+                    ui.label(egui::RichText::new("装飾スロット").weak());
+                    for n in 0..=3u8 {
+                        if ui
+                            .selectable_label(self.charm_slots == n, format!("{}", "●".repeat(n as usize)))
+                            .clicked()
+                        {
+                            self.charm_slots = n;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("スキル1");
+                    Self::skill_combo(ui, "sk1", &mut self.charm_skill1, &mut self.skill_search1);
+                    let mut p = self.charm_points1 as i32;
+                    if ui
+                        .add(egui::DragValue::new(&mut p).range(-128..=127).prefix("+"))
+                        .changed()
+                    {
+                        self.charm_points1 = p as i8;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("スキル2");
+                    Self::skill_combo(ui, "sk2", &mut self.charm_skill2, &mut self.skill_search2);
+                    let mut p = self.charm_points2 as i32;
+                    if ui
+                        .add(egui::DragValue::new(&mut p).range(-128..=127).prefix("+"))
+                        .changed()
+                    {
+                        self.charm_points2 = p as i8;
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("適用").clicked() {
+                        let c = mhnx_core::charm::Charm {
+                            index: self.charm_index,
+                            slots: self.charm_slots,
+                            skill1: self.charm_skill1,
+                            points1: self.charm_points1,
+                            skill2: self.charm_skill2,
+                            points2: self.charm_points2,
+                        };
+                        if let Some(s) = &mut self.save {
+                            if s.set_charm(self.slot, &c) {
+                                self.dirty = true;
+                                self.message = format!("お守り {} を更新しました", c.index);
+                            } else {
+                                self.message = String::from(
+                                    "書き込めません（武器・防具の枠は保護されています）",
+                                );
+                            }
+                        }
+                    }
+                    if ui.button("空き枠に新規作成").clicked() {
+                        let new = mhnx_core::charm::Charm {
+                            index: self.charm_index,
+                            slots: 0,
+                            skill1: 0,
+                            points1: 0,
+                            skill2: 0,
+                            points2: 0,
+                        };
+                        if let Some(s) = &mut self.save {
+                            if s.set_charm(self.slot, &new) {
+                                self.dirty = true;
+                                self.message =
+                                    format!("空き枠 {} にお守りを作りました", self.charm_index);
+                            } else {
+                                self.message = String::from(
+                                    "その枠は空きではないか、保護されています",
+                                );
+                            }
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "装飾スロットは ● の数、ポイントは符号付きです。レア度ごとの許容範囲は未検証なので、実在するお守りに近い値にしてください。",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+        });
+
+        if let Some(i) = pick {
+            if let Some(c) = charms.iter().find(|c| c.index == i) {
+                self.charm_index = c.index;
+                self.charm_slots = c.slots;
+                self.charm_skill1 = c.skill1;
+                self.charm_points1 = c.points1;
+                self.charm_skill2 = c.skill2;
+                self.charm_points2 = c.points2;
+            }
+        }
+        if let Some(i) = drop_idx {
+            if let Some(s) = &mut self.save {
+                if s.clear_charm(self.slot, i) {
+                    self.dirty = true;
+                    self.message = format!("お守り {} を削除しました", i);
+                }
+            }
+        }
+    }
+
 
     fn tab_extras(&mut self, ui: &mut egui::Ui) {
         if self.save.is_none() {
