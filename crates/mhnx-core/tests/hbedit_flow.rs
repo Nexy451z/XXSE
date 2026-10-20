@@ -1716,3 +1716,78 @@ fn the_two_real_headers_differ_only_in_the_name_hash() {
     // And the bodies really are identical, which is what makes the pair safe.
     assert_eq!(a[36..], b[36..], "the bodies must be identical");
 }
+
+// ---------------------------------------------------------------------------
+// DLC section layout. These numbers are load bearing: the section must end
+// exactly at the first character slot, so a wrong size would overwrite it.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_dlc_section_fills_the_gap_up_to_the_first_slot() {
+    use mhnx_core::dlc;
+    let start = 0xB280usize;
+    let quests = dlc::QUEST_ARRAY_OFFSET as usize;
+    let count = dlc::QUEST_SLOTS as usize;
+    let stride = mhnx_core::dlc::QUEST_SLOT_SIZE as usize;
+    let equip = mhnx_core::dlc::EQUIP_ARRAY_OFFSET as usize;
+    let equip_count = mhnx_core::dlc::EQUIP_SLOTS as usize;
+    let equip_stride = mhnx_core::dlc::EQUIP_SLOT_SIZE as usize;
+    assert_eq!(
+        quests + count * stride,
+        equip,
+        "the quest array must end where the equipment array starts"
+    );
+    assert_eq!(
+        start + equip + equip_count * equip_stride,
+        mhnx_core::save::FIRST_SLOT_BASE as usize,
+        "the DLC section must end exactly at the first character slot"
+    );
+}
+
+#[test]
+fn the_two_mask_regions_sit_where_the_reader_expects() {
+    if !real_save().exists() {
+        return;
+    }
+    let bytes = std::fs::read(real_save()).unwrap();
+    let s = mhnx_core::save::Save::from_bytes(&bytes).unwrap();
+    let body = s.body();
+    let base = 0xB280usize;
+    // 24 bytes at +0x34, 28 bytes at +0x4C: measured, and both are shared by
+    // all three characters because they live outside the slot area.
+    let unknown = &body[base + 0x34..base + 0x34 + 24];
+    let installed = &body[base + 0x4C..base + 0x4C + 28];
+    let ones = |a: &[u8]| a.iter().map(|b| b.count_ones() as usize).sum::<usize>();
+    // Recorded so a change in the sample save is noticed rather than assumed.
+    assert_eq!(ones(unknown), 112, "the +0x34 mask changed");
+    assert_eq!(ones(installed), 175, "the +0x4C mask changed");
+    assert!(
+        !unknown.iter().all(|b| *b == 0) && !installed.iter().all(|b| *b == 0),
+        "both masks should hold data"
+    );
+}
+
+#[test]
+fn installing_a_quest_leaves_both_masks_alone() {
+    let Some(arc) = sample_arc() else { return };
+    if !real_save().exists() {
+        return;
+    }
+    let raw = std::fs::read(&arc).unwrap();
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let base = 0xB280usize;
+    let before: Vec<u8> = s.body()[base + 0x34..base + 0x68].to_vec();
+    let a = mhnx_core::arc::Arc::parse(&raw).unwrap();
+    let id = a
+        .by_ext("mib")
+        .and_then(|e| e.data.get(0x0C..0x10))
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .unwrap() as i32;
+    if mhnx_core::dlc::install_quest(&mut s, id, &raw).is_ok() {
+        let after: Vec<u8> = s.body()[base + 0x34..base + 0x68].to_vec();
+        assert_eq!(
+            before, after,
+            "replacing an installed quest must not touch either mask"
+        );
+    }
+}
