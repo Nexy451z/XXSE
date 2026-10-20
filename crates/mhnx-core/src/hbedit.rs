@@ -66,6 +66,8 @@ pub enum Screen {
     Convert,
     /// The equipment box of the current character.
     Equip,
+    /// The 45 quest-equipment entries the DLC section carries.
+    QuestEquip,
     /// Item name search, opened from the item box with R.
     ItemPick,
     /// Download Palicoes (配信オトモ).
@@ -618,6 +620,7 @@ impl Editor {
             Screen::SkillPick => self.input_skill_pick(key),
             Screen::Convert => self.input_convert(key),
             Screen::Equip => self.input_equip(key),
+            Screen::QuestEquip => self.input_quest_equip(key),
             Screen::EntryView => match key {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
@@ -1410,6 +1413,32 @@ impl Editor {
             .collect()
     }
 
+    /// The DLC section's 45 quest-equipment entries.
+    pub fn quest_equipment(&self) -> Vec<crate::dlc::QuestEquipment> {
+        match &self.save {
+            Some(s) => crate::dlc::quest_equipment(s),
+            None => Vec::new(),
+        }
+    }
+
+    fn input_quest_equip(&mut self, key: Key) {
+        let n = self.quest_equipment().len();
+        match key {
+            Key::Up => self.cursor = self.cursor.saturating_sub(1),
+            Key::Down => {
+                if n > 0 {
+                    self.cursor = (self.cursor + 1).min(n - 1);
+                }
+            }
+            Key::B => {
+                self.screen = Screen::SaveQuests;
+                self.cursor = 0;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
     fn input_equip(&mut self, key: Key) {
         let n = self.equipment().len();
         match key {
@@ -1721,6 +1750,11 @@ impl Editor {
             Key::X => {
                 self.quest_filter.clear();
                 self.save_quest_cursor = 0;
+            }
+            // L shows the quest-equipment entries behind the low mask bits.
+            Key::L => {
+                self.screen = Screen::QuestEquip;
+                self.cursor = 0;
             }
             Key::B => {
                 self.screen = Screen::ArcList;
@@ -2442,6 +2476,45 @@ impl Editor {
                 push(
                     &mut out,
                     String::from("  A delete  Y edit  L new  X write save  B back"),
+                    false,
+                    false,
+                );
+            }
+            Screen::QuestEquip => {
+                let list = self.quest_equipment();
+                let used = list.iter().filter(|e| e.occupied).count();
+                push(
+                    &mut out,
+                    alloc::format!("QUEST EQUIPMENT   {} / {} used", used, list.len()),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    String::from("  The first four bytes of each entry are its quest id."),
+                    false,
+                    false,
+                );
+                let mut start = self.cursor.saturating_sub(8);
+                if start + 16 > list.len() {
+                    start = list.len().saturating_sub(16);
+                }
+                for (i, e) in list.iter().enumerate().skip(start).take(16) {
+                    let id = if e.occupied {
+                        alloc::format!("{}", e.quest_id)
+                    } else {
+                        alloc::string::String::from("(empty)")
+                    };
+                    push(
+                        &mut out,
+                        alloc::format!("  slot {:>2}   quest {}", e.index, id),
+                        true,
+                        i == self.cursor,
+                    );
+                }
+                push(
+                    &mut out,
+                    String::from("  Up/Down row   B back"),
                     false,
                     false,
                 );

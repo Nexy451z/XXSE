@@ -2194,3 +2194,46 @@ fn the_console_equipment_filter_narrows_and_clears() {
     let lines = ed.lines();
     assert!(lines[0].text.contains("EQUIPMENT"));
 }
+
+#[test]
+fn the_console_lists_the_quest_equipment_entries() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Y); // quest editor
+    ed.input(Key::X); // quests inside the save
+    assert_eq!(ed.screen, Screen::SaveQuests);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::QuestEquip);
+    let list = ed.quest_equipment();
+    assert_eq!(list.len(), mhnx_core::dlc::EQUIP_SLOTS);
+    let used = list.iter().filter(|e| e.occupied).count();
+    assert_eq!(used, 40, "the sample save uses 40 entries");
+    assert!(list.iter().any(|e| !e.occupied), "some entries are empty");
+    // Every used entry names a quest that is installed.
+    let installed: Vec<i32> = mhnx_core::dlc::list_quests(ed.save.as_ref().unwrap())
+        .iter()
+        .map(|q| q.quest_id)
+        .collect();
+    for e in list.iter().filter(|e| e.occupied) {
+        assert!(
+            installed.contains(&e.quest_id),
+            "entry {} names quest {} which is not installed",
+            e.index,
+            e.quest_id
+        );
+    }
+    let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = lines.join("\n");
+    assert!(joined.contains("QUEST EQUIPMENT"), "{}", joined);
+    assert!(joined.contains("40 / 45 used"), "{}", joined);
+    // Navigation is bounded and B returns to the list.
+    for _ in 0..60 {
+        ed.input(Key::Down);
+    }
+    assert!(ed.cursor < list.len());
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::SaveQuests);
+}
