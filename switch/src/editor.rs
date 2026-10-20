@@ -28,20 +28,25 @@ extern "C" {
     fn fclose(stream: *mut c_void) -> c_int;
 }
 
-// HidNpadButton bits.
+// HidNpadButton bits (services/hid.h:256-296).
 const BTN_A: u64 = 1 << 0;
 const BTN_B: u64 = 1 << 1;
 const BTN_X: u64 = 1 << 2;
 const BTN_Y: u64 = 1 << 3;
 const BTN_L: u64 = 1 << 6;
 const BTN_R: u64 = 1 << 7;
+const BTN_ZL: u64 = 1 << 8;
+const BTN_ZR: u64 = 1 << 9;
 const BTN_PLUS: u64 = 1 << 10;
 const BTN_MINUS: u64 = 1 << 11;
-const BTN_LEFT: u64 = 1 << 12;
-const BTN_UP: u64 = 1 << 13;
-const BTN_RIGHT: u64 = 1 << 14;
-const BTN_DOWN: u64 = 1 << 15;
-const BTN_ZR: u64 = 1 << 19;
+// D-Pad + Left Stick pseudo-buttons (HidNpadButton_AnyLeft/Up/Right/Down)
+const BTN_LEFT: u64 = (1 << 12) | (1 << 16);
+const BTN_UP: u64 = (1 << 13) | (1 << 17);
+const BTN_RIGHT: u64 = (1 << 14) | (1 << 18);
+const BTN_DOWN: u64 = (1 << 15) | (1 << 19);
+// Right Stick Up/Down for fast page scrolling
+const BTN_RSTICK_UP: u64 = 1 << 21;
+const BTN_RSTICK_DOWN: u64 = 1 << 23;
 
 /// Folders scanned for content.
 const SAVE_DIRS: [&CStr; 3] = [
@@ -262,10 +267,8 @@ fn scan_saves() -> Vec<String> {
 
 /// Mount the console save and read it, with a Japanese message on failure.
 fn read_console_save() -> Result<Vec<u8>, String> {
-    let mount = crate::savedata::Mount::open().map_err(|e| {
-        alloc::format!("{}", e.text())
-    })?;
-    let bytes = mount.read().map_err(|e| alloc::format!("{}", e.text()))?;
+    let mount = crate::savedata::Mount::open().map_err(|e| e.describe())?;
+    let bytes = mount.read().map_err(|e| e.describe())?;
     if !crate::savedata::looks_like_save(&bytes) {
         return Err(String::from("セーブのサイズが想定と違います"));
     }
@@ -274,7 +277,7 @@ fn read_console_save() -> Result<Vec<u8>, String> {
 
 /// Write the save back to the console, keeping a copy on the SD card first.
 fn write_console_save(bytes: &[u8]) -> Result<String, String> {
-    let mount = crate::savedata::Mount::open().map_err(|e| alloc::format!("{}", e.text()))?;
+    let mount = crate::savedata::Mount::open().map_err(|e| e.describe())?;
     // Keep what the console holds now, so a bad edit can be undone without
     // having thought about it beforehand.
     let backup = String::from(SAFETY_DIR);
@@ -285,8 +288,9 @@ fn write_console_save(bytes: &[u8]) -> Result<String, String> {
     if let Some(old) = old.as_ref() {
         let _ = write_file(&backup_path, old);
     }
-    mount.write(bytes).map_err(|e| alloc::format!("{}", e.text()))?;
-    mount.commit().map_err(|e| alloc::format!("{}", e.text()))?;
+    mount
+        .write_diff(bytes, old.as_deref())
+        .map_err(|e| e.describe())?;
     Ok(backup_path)
 }
 
@@ -322,19 +326,21 @@ fn scan_quests() -> Vec<String> {
 /// back to libnx' ASCII console so the editor is always usable.
 struct Painter {
     canvas: Option<crate::text::Canvas>,
+    gui: crate::ui::GuiState,
 }
 
 impl Painter {
     fn new() -> Self {
         Painter {
             canvas: crate::text::Canvas::new(),
+            gui: crate::ui::GuiState::new(),
         }
     }
 
     fn draw(&mut self, ed: &Editor) {
-        let lines = ed.lines();
         match &mut self.canvas {
             None => {
+                let lines = ed.lines();
                 unsafe { sys::consoleClear() };
                 sys::log_line("mhnxeditor - MHXX editor (Switch)");
                 sys::log_line("=====================================================");
@@ -356,48 +362,14 @@ impl Painter {
                 unsafe { sys::consoleUpdate(core::ptr::null_mut()) };
             }
             Some(c) => {
-                // Header, rows, footer. Depths are chosen for a 1280x720 panel.
-                let w = c.width();
-                let h = c.height();
-                c.clear(0xFF10_1014);
-                c.rect(0, 0, w, 40, 0xFF20_2430);
-                c.text(12, 10, "mhnxeditor", 0xFF80_80_88);
-                c.text(120, 10, title(ed.screen), 0xFFFF_FFFF);
-                let mut y = 52;
-                for l in &lines {
-                    let color = if l.cursor {
-                        0xFF60_D0FF
-                    } else if l.selectable {
-                        0xFFE0_E0E0
-                    } else {
-                        0xFFA0_A0A8
-                    };
-                    let prefix = if l.cursor { "> " } else { "  " };
-                    c.text(12, y, &format!("{}{}", prefix, l.text), color);
-                    y += 22;
-                    if y > h - 90 {
-                        break;
-                    }
-                }
-                c.rect(0, h - 76, w, 76, 0xFF20_2430);
-                c.text(12, h - 68, &ed.message, 0xFFFF_D070);
-                // Buttons as chips, so nothing has to be memorised.
-                let mut x: i32 = 12;
-                for (k, label) in actions(ed.screen) {
-                    let text = alloc::format!("{} {}", k, label);
-                    let w_chip = (text.chars().count() as i32) * 11 + 16;
-                    c.rect(x, h - 46, w_chip, 30, 0xFF2E_3444);
-                    c.text(x + 8, h - 40, &text, 0xFFD8_D8E0);
-                    x += w_chip + 6;
-                }
-                c.present();
+                self.gui.draw(c, ed);
             }
         }
     }
 }
 
 /// Screen title shown in the header.
-fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
+pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
     use mhnx_core::hbedit::Screen::*;
     match screen {
         SaveList => "セーブを開く",
@@ -431,7 +403,7 @@ fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
 ///
 /// The footer draws these as chips, so a screen never needs the user to
 /// remember a key that is not on screen.
-fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static str, &'static str)] {
+pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static str, &'static str)] {
     use mhnx_core::hbedit::Screen::*;
     match screen {
         SaveList => &[
@@ -474,7 +446,7 @@ fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static str, &'stat
         CharmEdit => &[("Y", "スキル選択"), ("</>", "値"), ("A", "保存"), ("B", "戻る")],
         SkillPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
         Equip => &[("Y", "絞る"), ("X", "クリア"), ("L", "ギルド"), ("R", "オトモ"), ("B", "戻る")],
-        QuestEquip => &[("B", "戻る")],
+        QuestEquip => &[("A", "中身を開く/変更"), ("B", "戻る")],
         SaveQuests => &[
             ("A", "編集"),
             ("-", "書き出す"),
@@ -497,9 +469,9 @@ fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static str, &'stat
         Mib => &[("</>", "値変更"), ("X", "刻み"), ("A", ".arc 保存"), ("B", "戻る")],
         Gmd => &[("A", "文章編集"), ("X", ".arc 保存"), ("B", "戻る")],
         Check => &[("A", "修正"), ("X", ".arc 保存"), ("B", "戻る")],
-        Hunts => &[("B", "戻る")],
-        Guild => &[("B", "戻る")],
-        Roster => &[("B", "戻る")],
+        Hunts => &[("</>", "値"), ("X", "項目"), ("A", "反映"), ("B", "戻る")],
+        Guild => &[("</>", "値"), ("X", "項目"), ("A", "コメント"), ("B", "戻る")],
+        Roster => &[("</>", "値"), ("X", "項目"), ("A", "名前"), ("B", "戻る")],
         Sets => &[("B", "戻る")],
         Palico => &[("A", "追加/削除"), ("L", "言語"), ("R", "言語"), ("X", "保存"), ("B", "戻る")],
         Options => &[("</>", "値変更"), ("A", "保存"), ("B", "戻る")],
@@ -542,13 +514,62 @@ fn key_from(buttons: u64) -> Option<Key> {
     }
 }
 
+/// Apply a completed text input (from `swkbd` or the built-in OSK) to `Editor`.
+fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
+    if idx == mhnx_core::hbedit::TEXT_NAME {
+        let clipped: String = s.chars().take(31).collect();
+        ed.apply_name(clipped);
+    } else if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
+        ed.apply_item_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
+        ed.apply_skill_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {
+        ed.apply_quest_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_SAVE_NAME {
+        ed.apply_convert_name(s);
+    } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
+        ed.equip_filter = s;
+        ed.equip_cursor = 0;
+    } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
+        if let Some(save) = &mut ed.save {
+            let slot = ed.slot;
+            mhnx_core::guildcard::set_comment(save, slot, &s);
+            ed.dirty = true;
+            ed.message = String::from("コメントを変更しました");
+        }
+    } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME {
+        let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
+        if let Some(save) = &mut ed.save {
+            let slot = ed.slot;
+            let clipped: String = s.chars().take(20).collect();
+            if mhnx_core::palico::set_name(save, slot, which, &clipped) {
+                ed.dirty = true;
+                ed.message = alloc::format!("オトモ {} の名前を変更しました", which);
+            }
+        }
+    } else {
+        ed.apply_text(idx, s);
+    }
+}
+
 /// Answer everything the editor asked for.
 ///
 /// Returns true when the screen must be fully redrawn even if nothing else
 /// changed - which is the case after the software keyboard applet has been
 /// shown, because it takes over the display.
-fn service(ed: &mut Editor) -> bool {
+fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
     let mut force_redraw = false;
+
+    if let Some((idx, s)) = gui.osk_result.take() {
+        apply_text_result(ed, idx, s);
+        force_redraw = true;
+    }
+    if gui.osk_cancelled {
+        gui.osk_cancelled = false;
+        ed.message = String::from("文字入力をキャンセルしました");
+        force_redraw = true;
+    }
+
     if let Some(req) = ed.take_request() {
         match req {
             Request::ReadSave(i) => {
@@ -603,6 +624,7 @@ fn service(ed: &mut Editor) -> bool {
                 if path == mhnx_core::hbedit::CONSOLE_SAVE || path.starts_with("nand:") {
                     match write_console_save(&bytes) {
                         Ok(backup) => {
+                            ed.dirty = false;
                             ed.message = format!(
                                 "本体のセーブに {} バイト書き込みました（控え: {}）",
                                 n, backup
@@ -621,6 +643,7 @@ fn service(ed: &mut Editor) -> bool {
                     kept = write_file(&bak, &old);
                 }
                 if write_file(&path, &bytes) {
+                    ed.dirty = false;
                     ed.message = if kept {
                         format!("wrote {} bytes to {} (previous kept as .bak)", n, path)
                     } else {
@@ -667,47 +690,13 @@ fn service(ed: &mut Editor) -> bool {
             "クエストテキスト"
         };
         if !crate::swkbd::is_available() {
-            ed.message = String::from("keyboard unavailable in this mode");
+            // In Applet mode (launched from Album), Horizon OS forbids launching
+            // the swkbd LibraryApplet. Use our built-in touch & controller OSK!
+            gui.open_osk(idx, header, &initial);
         } else {
-            // 0 means "the largest length swkbd accepts". A limit of 60 used
-            // to silently cut every quest description: all 141 shipped quests
-            // have at least one string longer than that (longest 117).
             match crate::swkbd::input_text(header, &initial, 0) {
-                Some(s) if idx == mhnx_core::hbedit::TEXT_NAME => {
-                    // The save stores 31 bytes for a name.
-                    let clipped: String = s.chars().take(31).collect();
-                    ed.apply_name(clipped)
-                }
-                Some(s) if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER => ed.apply_item_filter(s),
-                Some(s) if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER => ed.apply_skill_filter(s),
-                Some(s) if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER => ed.apply_quest_filter(s),
-                Some(s) if idx == mhnx_core::hbedit::TEXT_SAVE_NAME => ed.apply_convert_name(s),
-                Some(s) if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER => {
-                    ed.equip_filter = s;
-                    ed.equip_cursor = 0;
-                }
-                Some(s) if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT => {
-                    if let Some(save) = &mut ed.save {
-                        let slot = ed.slot;
-                        mhnx_core::guildcard::set_comment(save, slot, &s);
-                        ed.dirty = true;
-                        ed.message = String::from("コメントを変更しました");
-                    }
-                }
-                Some(s) if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME => {
-                    let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
-                    if let Some(save) = &mut ed.save {
-                        let slot = ed.slot;
-                        // The name field is fixed width and NUL padded.
-                        let clipped: String = s.chars().take(20).collect();
-                        if mhnx_core::palico::set_name(save, slot, which, &clipped) {
-                            ed.dirty = true;
-                            ed.message = alloc::format!("オトモ {} の名前を変更しました", which);
-                        }
-                    }
-                }
-                Some(s) => ed.apply_text(idx, s),
-                None => ed.message = String::from("input cancelled"),
+                Some(s) => apply_text_result(ed, idx, s),
+                None => ed.message = String::from("文字入力をキャンセルしました"),
             }
         }
     }
@@ -741,13 +730,10 @@ pub fn run() -> i32 {
     ed.set_save_files(scan_saves());
     ed.set_arc_files(scan_quests());
     ed.message = format!(
-        "{} save file(s), {} quest file(s) - press - to rescan",
+        "セーブ {} 件 / クエスト {} 件を検出しました（タッチ・スティック・ボタン対応）",
         ed.save_files.len(),
         ed.arc_files.len()
     );
-    if using_canvas {
-        ed.message = format!("{} (Japanese text enabled)", ed.message);
-    }
 
     let mut held: u64 = 0;
     let mut hold_frames: u32 = 0;
@@ -756,6 +742,7 @@ pub fn run() -> i32 {
         sys::padConfigureInput(1, HID_NPAD_STYLE_SET_NPAD_STANDARD);
         let mut pad = sys::PadState::ZERO;
         sys::padInitializeWithMask(&mut pad, PAD_ANY_ID_MASK);
+        sys::hidInitializeTouchScreen();
 
         let mut need_draw = true;
         while sys::appletMainLoop() {
@@ -763,24 +750,7 @@ pub fn run() -> i32 {
             let down = pad.buttons_down();
             let cur = pad.buttons_cur;
 
-            if down & BTN_PLUS != 0 {
-                break;
-            }
-
-            // Minus means "extract this quest" on the quest-entry screen, so
-            // the global rescan only fires elsewhere.
-            if down & BTN_MINUS != 0 && !ed.uses_minus() {
-                ed.set_save_files(scan_saves());
-                ed.set_arc_files(scan_quests());
-                ed.message = format!(
-                    "rescan: {} save file(s), {} quest file(s)",
-                    ed.save_files.len(),
-                    ed.arc_files.len()
-                );
-                need_draw = true;
-            }
-
-            // Edge triggered, with a simple auto repeat while held.
+            // Edge triggered, with accelerated auto-repeat while held.
             let mut key: Option<Key> = None;
             if cur != held {
                 key = key_from(down);
@@ -789,19 +759,94 @@ pub fn run() -> i32 {
             } else if cur != 0 && key_from(cur).is_some() {
                 hold_frames += 1;
                 if hold_frames >= REPEAT_DELAY {
-                    hold_frames = REPEAT_DELAY * 2 / 3;
+                    // Faster repeat after holding for a while
+                    hold_frames = if hold_frames > REPEAT_DELAY + 20 {
+                        REPEAT_DELAY - 2
+                    } else {
+                        REPEAT_DELAY - 4
+                    };
                     key = key_from(cur);
                 }
             }
 
-            if let Some(k) = key {
-                ed.input(k);
+            if painter.gui.osk.is_some() {
+                if let Some(k) = key {
+                    if painter.gui.handle_osk_key(k) {
+                        need_draw = true;
+                    }
+                }
+            } else {
+                if down & BTN_PLUS != 0 {
+                    break;
+                }
+
+                // ZL cycles through the main sidebar tabs
+                if down & BTN_ZL != 0 {
+                    painter.gui.cycle_sidebar_tab(&mut ed, true);
+                    need_draw = true;
+                }
+
+                // Right stick Up/Down scrolls lists by 10 rows
+                if down & BTN_RSTICK_UP != 0 {
+                    painter.gui.handle_touch(&mut ed, false, 0, 0);
+                    for _ in 0..8 {
+                        ed.input(Key::Up);
+                    }
+                    need_draw = true;
+                } else if down & BTN_RSTICK_DOWN != 0 {
+                    for _ in 0..8 {
+                        ed.input(Key::Down);
+                    }
+                    need_draw = true;
+                }
+
+                // Minus means "extract this quest" on the quest-entry screen, so
+                // the global rescan only fires elsewhere.
+                if (down & BTN_MINUS != 0 && !ed.uses_minus()) || painter.gui.wants_rescan {
+                    painter.gui.wants_rescan = false;
+                    ed.set_save_files(scan_saves());
+                    ed.set_arc_files(scan_quests());
+                    ed.message = format!(
+                        "再スキャン完了: セーブ {} 件 / クエスト {} 件",
+                        ed.save_files.len(),
+                        ed.arc_files.len()
+                    );
+                    need_draw = true;
+                }
+
+                if let Some(k) = key {
+                    ed.input(k);
+                    need_draw = true;
+                }
+            }
+
+            // Touch screen input
+            let mut touch_state = sys::HidTouchScreenState::ZERO;
+            let n_states = sys::hidGetTouchScreenStates(&mut touch_state, 1);
+            let (touching, tx, ty) = if n_states > 0 && touch_state.count > 0 {
+                let t = touch_state.touches[0];
+                (true, t.x as i32, t.y as i32)
+            } else {
+                (false, 0, 0)
+            };
+            if painter.gui.handle_touch(&mut ed, touching, tx, ty) {
+                need_draw = true;
+            }
+            if painter.gui.wants_rescan {
+                painter.gui.wants_rescan = false;
+                ed.set_save_files(scan_saves());
+                ed.set_arc_files(scan_quests());
+                ed.message = format!(
+                    "再スキャン完了: セーブ {} 件 / クエスト {} 件",
+                    ed.save_files.len(),
+                    ed.arc_files.len()
+                );
                 need_draw = true;
             }
 
             let before = ed.message.clone();
-            let forced = service(&mut ed);
-            if forced || ed.message != before || ed.dirty {
+            let forced = service(&mut ed, &mut painter.gui);
+            if forced || ed.message != before {
                 need_draw = true;
             }
 

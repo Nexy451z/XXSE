@@ -32,6 +32,13 @@ pub enum Tab {
 }
 
 /// The whole application.
+/// Two-step confirmation for the destructive charm delete.
+#[derive(Default)]
+pub struct CharmConfirm {
+    /// The charm waiting for a second click.
+    pub delete: Option<usize>,
+}
+
 pub struct MhnxEditor {
     pub tab: Tab,
     pub status: String,
@@ -46,6 +53,8 @@ pub struct MhnxEditor {
     pub items: Vec<ItemSlot>,
     pub item_filter: String,
     pub item_selected: Option<usize>,
+    /// Which charm the delete button is waiting for a second click on.
+    pub charm_confirm: CharmConfirm,
     pub item_show_empty: bool,
 
     // ---- quest ----
@@ -128,6 +137,7 @@ impl Default for MhnxEditor {
             items: Vec::new(),
             item_filter: String::new(),
             item_selected: None,
+        charm_confirm: CharmConfirm::default(),
             item_show_empty: false,
             arc_path: None,
             arc: None,
@@ -1174,6 +1184,17 @@ impl MhnxEditor {
             {
                 self.undo_item();
             }
+            // Adding is the first thing anyone wants from an item editor, so
+            // it gets its own button instead of "turn on empty slots and
+            // scroll to the end".
+            let can_add = !self.items.is_empty() && self.items.iter().any(|s| s.id == 0);
+            if ui
+                .add_enabled(can_add, egui::Button::new("アイテムを追加"))
+                .on_hover_text("空きスロットに回復薬を入れ、選択状態にします")
+                .clicked()
+            {
+                self.add_item_to_box(9);
+            }
         });
 
         // The detail panel sits above the table: the table fills whatever is
@@ -1281,6 +1302,30 @@ impl MhnxEditor {
         }
     }
 
+    /// Put an item into the first empty box slot and select it for editing.
+    ///
+    /// Without this, adding an item meant turning on the empty slots, scrolling
+    /// to the end of 2242 rows and typing an id: the box is append only in
+    /// spirit, so the tool should do that for the user.
+    pub fn add_item_to_box(&mut self, id: u16) {
+        if self.items.is_empty() {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        }
+        let slot = match self.items.iter().position(|s| s.id == 0) {
+            Some(i) => i,
+            None => {
+                self.message = "アイテムボックスに空きがありません".to_owned();
+                return;
+            }
+        };
+        self.push_item_undo();
+        self.items[slot] = ItemSlot { id, count: 1 };
+        self.item_selected = Some(slot);
+        self.item_show_empty = true;
+        self.apply_to_save();
+        self.message = format!("{} を箱 {} に追加しました", item_name(id), slot + 1);
+    }
     fn item_detail_panel(&mut self, ui: &mut egui::Ui) {
         let Some(i) = self.item_selected else {
             ui.label(egui::RichText::new("行をクリックすると、ここで種類と個数を変更できます").weak());
@@ -1694,6 +1739,10 @@ impl MhnxEditor {
                                         .changed()
                                     {
                                         self.mib_bytes[o] = b as u8;
+                                        // Editing the buffer is a real change:
+                                        // without this the window still said
+                                        // "no changes" and closing lost it.
+                                        self.dirty = true;
                                     }
                                 }
                                 let txt: String = (0..16)
@@ -2766,8 +2815,17 @@ impl MhnxEditor {
                                 {
                                     pick = Some(c.index);
                                 }
-                                if ui.small_button("削除").clicked() {
-                                    drop_idx = Some(c.index);
+                                // Deleting an entry is destructive and one
+                                // click used to be enough, so it asks first.
+                                let armed = self.charm_confirm.delete == Some(c.index);
+                                let label = if armed { "削除する?" } else { "削除" };
+                                if ui.small_button(label).clicked() {
+                                    if armed {
+                                        drop_idx = Some(c.index);
+                                        self.charm_confirm.delete = None;
+                                    } else {
+                                        self.charm_confirm.delete = Some(c.index);
+                                    }
                                 }
                             });
                         }
@@ -2791,9 +2849,12 @@ impl MhnxEditor {
                     }
                 });
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
+                // Wrapped, not a plain row: the skill combo is 260pt wide, so
+                // a single row pushed the points field off the right edge.
+                ui.horizontal_wrapped(|ui| {
                     ui.label("スキル1");
                     Self::skill_combo(ui, "sk1", &mut self.charm_skill1, &mut self.skill_search1);
+                    ui.label("ポイント");
                     let mut p = self.charm_points1 as i32;
                     if ui
                         .add(egui::DragValue::new(&mut p).range(-128..=127).prefix("+"))
@@ -2802,9 +2863,10 @@ impl MhnxEditor {
                         self.charm_points1 = p as i8;
                     }
                 });
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("スキル2");
                     Self::skill_combo(ui, "sk2", &mut self.charm_skill2, &mut self.skill_search2);
+                    ui.label("ポイント");
                     let mut p = self.charm_points2 as i32;
                     if ui
                         .add(egui::DragValue::new(&mut p).range(-128..=127).prefix("+"))
@@ -2889,7 +2951,24 @@ impl MhnxEditor {
                             }
                         }
                     }
-                    if ui.button("空き枠に新規作成").clicked() {
+                    // Find the first free box slot instead of making the user
+                    // type one: charm::first_free already knows where it is.
+                    if ui
+                        .button("空き枠に新規作成")
+                        .on_hover_text("最初の空きスロットにお守りを作ります")
+                        .clicked()
+                    {
+                        let free = match &self.save {
+                            Some(s) => s
+                                .equipment_box(self.slot)
+                                .and_then(|b| mhnx_core::charm::first_free(&b)),
+                            None => None,
+                        };
+                        let Some(free) = free else {
+                            self.message = String::from("空き枠がありません");
+                            return;
+                        };
+                        self.charm_index = free;
                         let new = mhnx_core::charm::Charm {
                             index: self.charm_index,
                             slots: 0,

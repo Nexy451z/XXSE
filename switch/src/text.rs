@@ -1,31 +1,16 @@
-//! Japanese-capable text rendering for the Switch build.
+//! Japanese-capable text and 2D GUI rendering for the Switch build.
 //!
 //! Pipeline:
 //!
 //!   pl:u shared font   (plInitialize / plGetSharedFontByType, PlSharedFontType_Standard)
 //!     -> stb_truetype  (hidden behind switch/tools/font_shim.c, one C file)
-//!       -> 8-bit coverage glyph cache (this file)
+//!       -> 8-bit coverage glyph cache (this file, 3 font sizes)
 //!         -> libnx linear framebuffer (nwindow + framebuffer*, PIXEL_FORMAT_RGBA_8888)
 //!
-//! The public surface is the one the rest of the crate was written against:
-//! Canvas::new / width / height / clear / text / rect / present.  Everything
-//! else here is an implementation detail, plus two read-only helpers
-//! (line_height, text_width), an on-device font probe and an on-device
-//! Canvas smoke test used by examples/text_probe.rs.
-//!
-//! Threading / lifetime: a Canvas owns the default NWindow, its framebuffer
-//! and the pl:u session, so exactly one may exist at a time and it must be
-//! used from the thread that created it.  It must be dropped before plExit is
-//! called by anything else; Drop does framebufferClose + plExit for you.
-//!
-//! Colours are 0xAABBGGRR.  On a little-endian machine those four bytes are
+//! Colours are 0xAABBGGRR. On a little-endian machine those four bytes are
 //! R,G,B,A in memory, which is exactly libnx RGBA8(r,g,b,a)
-//! (display/framebuffer.h:12) for PIXEL_FORMAT_RGBA_8888, so no conversion is
-//! needed anywhere in this file.  The alpha byte is an opacity multiplier for
-//! text() and is written verbatim by clear()/rect().
-//!
-//! Coordinates: text(x, y, ...) puts the top of the line box at y (the pen
-//! baseline is y + ascent), one line only.  A newline stops the run.
+//! (display/framebuffer.h:12) for PIXEL_FORMAT_RGBA_8888. Use `rgb(r, g, b)`
+//! and `rgba(r, g, b, a)` to construct colours cleanly in standard RGB order.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -37,10 +22,6 @@ use crate::sys::Result as NxResult;
 
 // ---------------------------------------------------------------------------
 // libnx FFI
-//
-// Transcribed from $(DEVKITPRO)/libnx/include (libnx 4.12.0).  Line numbers
-// refer to the headers as installed here and are repeated in
-// docs/switch_text.md.
 // ---------------------------------------------------------------------------
 
 extern "C" {
@@ -68,10 +49,7 @@ extern "C" {
     fn framebufferEnd(fb: *mut Framebuffer);
 }
 
-// switch/tools/font_shim.c - the only C code, so stb_truetype's structs never
-// have to be duplicated in Rust.  Return codes of mhnx_font_glyph:
-//   -2 not in font, -1 bad handle, 0 rasterised / blank glyph,
-//   >0 bytes needed (metrics-only query: out == NULL or out_cap < w*h).
+// switch/tools/font_shim.c
 extern "C" {
     fn mhnx_font_create(data: *const u8, len: i32, pixel_height: f32) -> *mut c_void;
     fn mhnx_font_ascent(font: *mut c_void) -> i32;
@@ -96,8 +74,6 @@ extern "C" {
 // libnx structures and constants
 // ---------------------------------------------------------------------------
 
-/// switch/services/pl.h:28-33
-///   typedef struct { u32 type; u32 offset; u32 size; void* address; } PlFontData;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PlFontData {
@@ -116,7 +92,6 @@ impl PlFontData {
     };
 }
 
-/// switch/nvidia/map.h:4-12 (NvKind is a C enum, i.e. 32 bit)
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NvMap {
@@ -129,7 +104,6 @@ struct NvMap {
     is_cpu_cacheable: bool,
 }
 
-/// switch/display/framebuffer.h:45-56
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Framebuffer {
@@ -168,10 +142,6 @@ impl Framebuffer {
     };
 }
 
-// Layout checks.  These numbers were verified against the installed headers
-// with a devkitA64 C translation unit full of _Static_asserts (see
-// docs/switch_text.md); if libnx ever changes, this file fails to compile
-// instead of corrupting the stack.
 const _: () = {
     use core::mem::offset_of;
     use core::mem::size_of;
@@ -199,45 +169,76 @@ const _: () = {
     assert!(offset_of!(Framebuffer, has_init) == 76);
 };
 
-/// PlServiceType_User (pl.h:12).  System (1) lost shared-font access in
-/// firmware 16.0.0, so pl:u is the only safe choice.
 const PL_SERVICE_TYPE_USER: u32 = 0;
-/// PlSharedFontType_Standard (pl.h:18): Japan / US / Europe, contains kana and
-/// the JIS kanji set.
 const PL_SHARED_FONT_TYPE_STANDARD: u32 = 0;
-/// PIXEL_FORMAT_RGBA_8888 (switch/display/types.h:11)
 const PIXEL_FORMAT_RGBA_8888: u32 = 1;
 
 const FB_WIDTH: u32 = 1280;
 const FB_HEIGHT: u32 = 720;
 const FB_COUNT: u32 = 2;
 
-/// Glyph rasterisation height.  24 px gives ~24 readable menu lines on 720p
-/// and keeps the shared font below a millisecond per new glyph on the A57.
-const FONT_PIXEL_HEIGHT: f32 = 24.0;
+const FONT_HEIGHT_SMALL: f32 = 17.0;
+const FONT_HEIGHT_MEDIUM: f32 = 22.0;
+const FONT_HEIGHT_LARGE: f32 = 28.0;
 
-/// The glyph cache is dropped wholesale above this size: 24x24 kanji are
-/// ~576 bytes each, so 2 MiB holds >3000 distinct characters.
-const MAX_CACHE_BYTES: usize = 2 * 1024 * 1024;
+/// 4 MiB cache holds >6000 glyphs across the 3 font sizes.
+const MAX_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Advance used when neither the character nor '?' exists in the font.
-const FALLBACK_ADVANCE: i32 = 12;
+const FALLBACK_ADVANCE: i32 = 11;
 
 // ---------------------------------------------------------------------------
-// Colour
+// Colour & FontSize
 // ---------------------------------------------------------------------------
 
 /// A 32 bit RGBA colour in the framebuffer's native order (0xAABBGGRR).
 pub type Color = u32;
 
-/// Opaque black, convenient as a clear() argument.
-pub const BLACK: Color = 0xFF00_0000;
+/// Construct a native framebuffer colour from standard (R, G, B, A) bytes.
+#[inline]
+pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color {
+    ((a as u32) << 24) | ((b as u32) << 16) | ((g as u32) << 8) | (r as u32)
+}
+
+/// Construct an opaque native framebuffer colour from standard (R, G, B) bytes.
+#[inline]
+pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+    rgba(r, g, b, 0xFF)
+}
+
+/// Opaque black.
+pub const BLACK: Color = rgb(0, 0, 0);
 /// Opaque white.
-pub const WHITE: Color = 0xFFFF_FFFF;
+pub const WHITE: Color = rgb(255, 255, 255);
+
+/// Font size tier.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum FontSize {
+    /// 17px — captions, badges, byte offsets, notes.
+    Small = 0,
+    /// 22px — standard rows, sidebar items, buttons.
+    Medium = 1,
+    /// 28px — screen headers, large numbers, slot names.
+    Large = 2,
+}
+
+impl FontSize {
+    #[inline]
+    fn idx(self) -> usize {
+        self as usize
+    }
+}
 
 // ---------------------------------------------------------------------------
 // glyph cache
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+struct FontSlot {
+    handle: *mut c_void,
+    ascent: i32,
+    descent: i32,
+    line_gap: i32,
+}
 
 #[derive(Clone, Copy)]
 struct GlyphMetrics {
@@ -254,7 +255,6 @@ struct CachedGlyph {
     xoff: i32,
     yoff: i32,
     advance: i32,
-    /// w*h 8-bit coverage bytes, row stride w.  Empty for blank glyphs.
     pixels: Vec<u8>,
 }
 
@@ -262,36 +262,23 @@ struct CachedGlyph {
 // Canvas
 // ---------------------------------------------------------------------------
 
-/// A software framebuffer plus the shared-font rasteriser that draws into it.
+/// A software framebuffer plus multi-size shared-font rasteriser and 2D GUI primitives.
 pub struct Canvas {
     fb: Framebuffer,
-    /// Shadow/back buffer returned by framebufferBegin, null between frames.
     back: *mut u8,
     stride: u32,
     width: i32,
     height: i32,
-    font: *mut c_void,
-    ascent: i32,
-    descent: i32,
-    line_gap: i32,
-    /// Keyed by char, because the pixel height is a build-time constant.
-    /// no_std + alloc has no HashMap without pulling in hashbrown, and a
-    /// BTreeMap is more than fast enough for a few hundred glyphs.
+    fonts: [FontSlot; 3],
     cache: BTreeMap<u32, CachedGlyph>,
     cache_bytes: usize,
 }
 
 impl Canvas {
-    /// Create the canvas: pl:u session + standard shared font + a linear,
-    /// double buffered framebuffer on the default window.
-    ///
-    /// Returns None when any of those steps fail so the caller can fall back
-    /// to libnx' ASCII console.  Note that the console owns the default window
-    /// too: call consoleExit() before Canvas::new(), and do not call
-    /// consoleInit() again while the Canvas is alive.
+    /// Create the canvas: pl:u session + standard shared font (3 sizes) + a linear,
+    /// double-buffered framebuffer on the default window.
     pub fn new() -> Option<Self> {
         unsafe {
-            // 1. Shared font.
             if !sys::r_succeeded(plInitialize(PL_SERVICE_TYPE_USER)) {
                 return None;
             }
@@ -302,30 +289,53 @@ impl Canvas {
                 return None;
             }
 
-            // 2. stb_truetype handle.  The data is not copied: pl keeps the
-            //    shared memory mapped until plExit().
-            let font = mhnx_font_create(
-                font_data.address as *const u8,
-                font_data.size as i32,
-                FONT_PIXEL_HEIGHT,
-            );
-            if font.is_null() {
+            let data_ptr = font_data.address as *const u8;
+            let data_len = font_data.size as i32;
+
+            let f_md = mhnx_font_create(data_ptr, data_len, FONT_HEIGHT_MEDIUM);
+            if f_md.is_null() {
                 plExit();
                 return None;
             }
-            let ascent = mhnx_font_ascent(font);
-            let descent = mhnx_font_descent(font);
-            let line_gap = mhnx_font_line_gap(font);
-            if ascent <= 0 {
-                mhnx_font_destroy(font);
+            let ascent_md = mhnx_font_ascent(f_md);
+            if ascent_md <= 0 {
+                mhnx_font_destroy(f_md);
                 plExit();
                 return None;
             }
 
-            // 3. Framebuffer.
+            let f_sm = mhnx_font_create(data_ptr, data_len, FONT_HEIGHT_SMALL);
+            let f_lg = mhnx_font_create(data_ptr, data_len, FONT_HEIGHT_LARGE);
+
+            let make_slot = |f: *mut c_void, fallback: *mut c_void| -> FontSlot {
+                let h = if f.is_null() { fallback } else { f };
+                FontSlot {
+                    handle: h,
+                    ascent: mhnx_font_ascent(h),
+                    descent: mhnx_font_descent(h),
+                    line_gap: mhnx_font_line_gap(h),
+                }
+            };
+
+            let fonts = [
+                make_slot(f_sm, f_md),
+                make_slot(f_md, f_md),
+                make_slot(f_lg, f_md),
+            ];
+
+            let destroy_fonts = |slots: &[FontSlot; 3]| {
+                let mut seen: [*mut c_void; 3] = [core::ptr::null_mut(); 3];
+                for (i, s) in slots.iter().enumerate() {
+                    if !s.handle.is_null() && !seen[..i].contains(&s.handle) {
+                        mhnx_font_destroy(s.handle);
+                    }
+                    seen[i] = s.handle;
+                }
+            };
+
             let win = nwindowGetDefault();
             if win.is_null() {
-                mhnx_font_destroy(font);
+                destroy_fonts(&fonts);
                 plExit();
                 return None;
             }
@@ -347,14 +357,14 @@ impl Canvas {
                 FB_COUNT,
             );
             if !sys::r_succeeded(rc) {
-                mhnx_font_destroy(font);
+                destroy_fonts(&fonts);
                 plExit();
                 return None;
             }
             let rc = framebufferMakeLinear(&mut fb);
             if !sys::r_succeeded(rc) {
                 framebufferClose(&mut fb);
-                mhnx_font_destroy(font);
+                destroy_fonts(&fonts);
                 plExit();
                 return None;
             }
@@ -365,56 +375,59 @@ impl Canvas {
                 stride: 0,
                 width: width as i32,
                 height: height as i32,
-                font,
-                ascent,
-                descent,
-                line_gap,
+                fonts,
                 cache: BTreeMap::new(),
                 cache_bytes: 0,
             })
         }
     }
 
-    /// Screen width in pixels.
+    #[inline]
     pub fn width(&self) -> i32 {
         self.width
     }
 
-    /// Screen height in pixels.
+    #[inline]
     pub fn height(&self) -> i32 {
         self.height
     }
 
-    /// Distance between the baselines of two consecutive text() lines.
     pub fn line_height(&self) -> i32 {
-        let h = self.ascent - self.descent + self.line_gap;
+        self.line_height_sized(FontSize::Medium)
+    }
+
+    pub fn line_height_sized(&self, size: FontSize) -> i32 {
+        let f = &self.fonts[size.idx()];
+        let h = f.ascent - f.descent + f.line_gap;
         if h > 0 {
             h
         } else {
-            self.ascent + 4
+            f.ascent + 4
         }
     }
 
-    /// Pixel width of s when drawn with text().  Not part of the original
-    /// stub surface; populates the same glyph cache text() uses.
     pub fn text_width(&mut self, s: &str) -> i32 {
+        self.text_width_sized(s, FontSize::Medium)
+    }
+
+    pub fn text_width_sized(&mut self, s: &str, size: FontSize) -> i32 {
         let mut total = 0i32;
         for raw in s.chars() {
             if raw == '\n' || raw == '\r' {
                 break;
             }
             let mut ch = sanitize(raw);
-            let mut m = self.ensure_glyph(ch);
+            let mut m = self.ensure_glyph(size, ch);
             if m.is_none() && ch != '?' {
                 ch = '?';
-                m = self.ensure_glyph(ch);
+                m = self.ensure_glyph(size, ch);
             }
             total = total.saturating_add(m.map(|g| g.advance).unwrap_or(FALLBACK_ADVANCE));
         }
         total
     }
 
-    /// Fill the whole screen.  The colour (including alpha) is stored as is.
+    /// Fill the whole screen with an opaque colour.
     pub fn clear(&mut self, color: Color) {
         self.begin_frame();
         if self.back.is_null() {
@@ -430,27 +443,29 @@ impl Canvas {
         }
     }
 
-    /// Draw one line of UTF-8 text with the top of the line box at (x, y).
-    ///
-    /// Characters outside the BMP (emoji, rare CJK ext. B+) are drawn as '?'.
-    /// Characters missing from the shared font also fall back to '?'.  Only
-    /// control characters below U+0020 are dropped; '\n' ends the line.
+    /// Draw one line of UTF-8 text at the default (Medium) font size.
     pub fn text(&mut self, x: i32, y: i32, s: &str, color: Color) {
+        self.text_sized(x, y, s, color, FontSize::Medium);
+    }
+
+    /// Draw one line of UTF-8 text at the specified `FontSize`.
+    pub fn text_sized(&mut self, x: i32, y: i32, s: &str, color: Color, size: FontSize) {
         self.begin_frame();
         if self.back.is_null() {
             return;
         }
-        let baseline = y.saturating_add(self.ascent);
+        let ascent = self.fonts[size.idx()].ascent;
+        let baseline = y.saturating_add(ascent);
         let mut pen = x;
         for raw in s.chars() {
             if raw == '\n' || raw == '\r' {
                 break;
             }
             let mut ch = sanitize(raw);
-            let mut metrics = self.ensure_glyph(ch);
+            let mut metrics = self.ensure_glyph(size, ch);
             if metrics.is_none() && ch != '?' {
                 ch = '?';
-                metrics = self.ensure_glyph(ch);
+                metrics = self.ensure_glyph(size, ch);
             }
             let Some(m) = metrics else {
                 pen = pen.saturating_add(FALLBACK_ADVANCE);
@@ -464,7 +479,8 @@ impl Canvas {
                 let screen_h = self.height;
                 let px = pen.saturating_add(m.xoff);
                 let py = baseline.saturating_add(m.yoff);
-                if let Some(g) = self.cache.get(&(ch as u32)) {
+                let cache_key = ((size.idx() as u32) << 24) | (ch as u32);
+                if let Some(g) = self.cache.get(&cache_key) {
                     unsafe {
                         blend_glyph(back, stride, screen_w, screen_h, px, py, g, color);
                     }
@@ -474,9 +490,145 @@ impl Canvas {
         }
     }
 
-    /// Draw a filled rectangle.  The colour (including alpha) is stored as is
-    /// and clipped to the screen.
+    /// Draw text truncated to `max_w` pixels so columns never collide.
+    pub fn text_clipped(
+        &mut self,
+        x: i32,
+        y: i32,
+        max_w: i32,
+        s: &str,
+        color: Color,
+        size: FontSize,
+    ) {
+        if max_w <= 0 {
+            return;
+        }
+        let full_w = self.text_width_sized(s, size);
+        if full_w <= max_w {
+            self.text_sized(x, y, s, color, size);
+            return;
+        }
+        let dots = "..";
+        let dots_w = self.text_width_sized(dots, size);
+        let budget = (max_w - dots_w).max(0);
+        self.begin_frame();
+        if self.back.is_null() {
+            return;
+        }
+        let ascent = self.fonts[size.idx()].ascent;
+        let baseline = y.saturating_add(ascent);
+        let mut pen = x;
+        for raw in s.chars() {
+            if raw == '\n' || raw == '\r' {
+                break;
+            }
+            let mut ch = sanitize(raw);
+            let mut metrics = self.ensure_glyph(size, ch);
+            if metrics.is_none() && ch != '?' {
+                ch = '?';
+                metrics = self.ensure_glyph(size, ch);
+            }
+            let adv = metrics.map(|m| m.advance).unwrap_or(FALLBACK_ADVANCE);
+            if pen - x + adv > budget {
+                break;
+            }
+            if let Some(m) = metrics {
+                if m.w > 0 && m.h > 0 {
+                    let back = self.back;
+                    let stride = self.stride;
+                    let screen_w = self.width;
+                    let screen_h = self.height;
+                    let px = pen.saturating_add(m.xoff);
+                    let py = baseline.saturating_add(m.yoff);
+                    let cache_key = ((size.idx() as u32) << 24) | (ch as u32);
+                    if let Some(g) = self.cache.get(&cache_key) {
+                        unsafe {
+                            blend_glyph(back, stride, screen_w, screen_h, px, py, g, color);
+                        }
+                    }
+                }
+            }
+            pen = pen.saturating_add(adv);
+        }
+        if budget > 0 {
+            self.text_sized(pen, y, dots, color, size);
+        }
+    }
+
+    /// Draw right-aligned text ending at `right_x`.
+    pub fn text_right(&mut self, right_x: i32, y: i32, s: &str, color: Color, size: FontSize) {
+        let w = self.text_width_sized(s, size);
+        self.text_sized(right_x - w, y, s, color, size);
+    }
+
+    /// Draw text centered horizontally and vertically within `(x, y, w, h)`.
+    pub fn text_centered(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        s: &str,
+        color: Color,
+        size: FontSize,
+    ) {
+        let tw = self.text_width_sized(s, size);
+        let f = &self.fonts[size.idx()];
+        let th = f.ascent - f.descent;
+        let tx = x + (w - tw) / 2;
+        let ty = y + (h - th) / 2 - 1;
+        self.text_sized(tx, ty, s, color, size);
+    }
+
+    /// Draw a filled rectangle (supports alpha blending when alpha < 255).
     pub fn rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
+        self.begin_frame();
+        if self.back.is_null() || w <= 0 || h <= 0 {
+            return;
+        }
+        let alpha = (color >> 24) & 0xFF;
+        if alpha == 0 {
+            return;
+        }
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = x.saturating_add(w).min(self.width);
+        let y1 = y.saturating_add(h).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let stride = self.stride as usize;
+        if alpha == 255 {
+            for py in y0..y1 {
+                let row = unsafe { self.back.add(py as usize * stride) } as *mut u32;
+                for px in x0..x1 {
+                    unsafe { core::ptr::write_unaligned(row.add(px as usize), color) };
+                }
+            }
+        } else {
+            for py in y0..y1 {
+                let row = unsafe { self.back.add(py as usize * stride) } as *mut u32;
+                for px in x0..x1 {
+                    unsafe {
+                        let dst = row.add(px as usize);
+                        let old = core::ptr::read_unaligned(dst);
+                        core::ptr::write_unaligned(dst, blend_pixel(old, color, alpha));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draw a vertical gradient rectangle from `top_color` to `bot_color`.
+    pub fn rect_gradient_v(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        top_color: Color,
+        bot_color: Color,
+    ) {
         self.begin_frame();
         if self.back.is_null() || w <= 0 || h <= 0 {
             return;
@@ -489,17 +641,211 @@ impl Canvas {
             return;
         }
         let stride = self.stride as usize;
+        let denom = (h - 1).max(1) as u32;
         for py in y0..y1 {
+            let t = ((py - y).clamp(0, h - 1) as u32 * 255) / denom;
+            let row_col = blend_pixel(top_color, bot_color, t);
             let row = unsafe { self.back.add(py as usize * stride) } as *mut u32;
             for px in x0..x1 {
-                unsafe { core::ptr::write_unaligned(row.add(px as usize), color) };
+                unsafe { core::ptr::write_unaligned(row.add(px as usize), row_col) };
             }
         }
     }
 
-    /// Present the frame (framebufferEnd).  After this the next drawing call
-    /// starts a new frame; the back buffer is not preserved between frames, so
-    /// a full redraw (clear + content) is expected each time.
+    /// Draw a 1px horizontal line.
+    #[inline]
+    pub fn hline(&mut self, x: i32, y: i32, w: i32, color: Color) {
+        self.rect(x, y, w, 1, color);
+    }
+
+    /// Draw a 1px vertical line.
+    #[inline]
+    pub fn vline(&mut self, x: i32, y: i32, h: i32, color: Color) {
+        self.rect(x, y, 1, h, color);
+    }
+
+    /// Draw a rectangular border of `thickness` pixels.
+    pub fn border(&mut self, x: i32, y: i32, w: i32, h: i32, thickness: i32, color: Color) {
+        if w <= 0 || h <= 0 || thickness <= 0 {
+            return;
+        }
+        let t = thickness.min(w / 2).min(h / 2).max(1);
+        self.rect(x, y, w, t, color);
+        self.rect(x, y + h - t, w, t, color);
+        self.rect(x, y + t, t, h - t * 2, color);
+        self.rect(x + w - t, y + t, t, h - t * 2, color);
+    }
+
+    /// Draw an anti-aliased rounded rectangle.
+    pub fn round_rect(&mut self, x: i32, y: i32, w: i32, h: i32, radius: i32, color: Color) {
+        let r = radius.min(w / 2).min(h / 2);
+        if r <= 1 {
+            self.rect(x, y, w, h, color);
+            return;
+        }
+        self.begin_frame();
+        if self.back.is_null() || w <= 0 || h <= 0 {
+            return;
+        }
+        let alpha = (color >> 24) & 0xFF;
+        if alpha == 0 {
+            return;
+        }
+
+        // Fill middle horizontal band (full width, y + r .. y + h - r)
+        if h > r * 2 {
+            self.rect(x, y + r, w, h - r * 2, color);
+        }
+        // Fill top and bottom inner bands (x + r .. x + w - r)
+        if w > r * 2 {
+            self.rect(x + r, y, w - r * 2, r, color);
+            self.rect(x + r, y + h - r, w - r * 2, r, color);
+        }
+
+        // Draw the 4 rounded corners with smooth subpixel coverage
+        let r2 = r * 2;
+        let inner_sq = (r2 - 1) * (r2 - 1);
+        let outer_sq = (r2 + 1) * (r2 + 1);
+        let band = (outer_sq - inner_sq).max(1);
+
+        for dy in 0..r {
+            let dy2 = (r - 1 - dy) * 2 + 1;
+            for dx in 0..r {
+                let dx2 = (r - 1 - dx) * 2 + 1;
+                let d2 = dx2 * dx2 + dy2 * dy2;
+                if d2 >= outer_sq {
+                    continue;
+                }
+                let cov = if d2 <= inner_sq {
+                    alpha
+                } else {
+                    (alpha * ((outer_sq - d2) as u32)) / (band as u32)
+                };
+                if cov == 0 {
+                    continue;
+                }
+                let corners = [
+                    (x + dx, y + dy),
+                    (x + w - 1 - dx, y + dy),
+                    (x + dx, y + h - 1 - dy),
+                    (x + w - 1 - dx, y + h - 1 - dy),
+                ];
+                for &(px, py) in &corners {
+                    self.put_pixel_blend(px, py, color, cov);
+                }
+            }
+        }
+    }
+
+    /// Draw an anti-aliased rounded rectangle outline of `thickness` pixels.
+    pub fn round_rect_border(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        radius: i32,
+        thickness: i32,
+        color: Color,
+    ) {
+        if w <= 0 || h <= 0 || thickness <= 0 {
+            return;
+        }
+        let r = radius.min(w / 2).min(h / 2);
+        if r <= 1 {
+            self.border(x, y, w, h, thickness, color);
+            return;
+        }
+        self.begin_frame();
+        if self.back.is_null() {
+            return;
+        }
+        let alpha = (color >> 24) & 0xFF;
+        if alpha == 0 {
+            return;
+        }
+        let t = thickness.max(1);
+        // Straight edges
+        if w > r * 2 {
+            self.rect(x + r, y, w - r * 2, t, color);
+            self.rect(x + r, y + h - t, w - r * 2, t, color);
+        }
+        if h > r * 2 {
+            self.rect(x, y + r, t, h - r * 2, color);
+            self.rect(x + w - t, y + r, t, h - r * 2, color);
+        }
+
+        // Corner arcs
+        let ro2 = r * 2;
+        let ri2 = (r - t).max(0) * 2;
+        let out_max = (ro2 + 1) * (ro2 + 1);
+        let out_min = (ro2 - 1).max(0) * (ro2 - 1).max(0);
+        let in_max = (ri2 + 1) * (ri2 + 1);
+        let in_min = (ri2 - 1).max(0) * (ri2 - 1).max(0);
+
+        for dy in 0..r {
+            let dy2 = (r - 1 - dy) * 2 + 1;
+            for dx in 0..r {
+                let dx2 = (r - 1 - dx) * 2 + 1;
+                let d2 = dx2 * dx2 + dy2 * dy2;
+                if d2 >= out_max || d2 <= in_min {
+                    continue;
+                }
+                let cov_out = if d2 <= out_min {
+                    255u32
+                } else {
+                    ((out_max - d2) as u32 * 255) / ((out_max - out_min).max(1) as u32)
+                };
+                let cov_in = if d2 >= in_max {
+                    255u32
+                } else {
+                    ((d2 - in_min) as u32 * 255) / ((in_max - in_min).max(1) as u32)
+                };
+                let cov = (cov_out.min(cov_in) * alpha) / 255;
+                if cov == 0 {
+                    continue;
+                }
+                let corners = [
+                    (x + dx, y + dy),
+                    (x + w - 1 - dx, y + dy),
+                    (x + dx, y + h - 1 - dy),
+                    (x + w - 1 - dx, y + h - 1 - dy),
+                ];
+                for &(px, py) in &corners {
+                    self.put_pixel_blend(px, py, color, cov);
+                }
+            }
+        }
+    }
+
+    /// Draw an anti-aliased filled circle centered at `(cx, cy)` with radius `r`.
+    pub fn circle(&mut self, cx: i32, cy: i32, r: i32, color: Color) {
+        if r <= 0 {
+            return;
+        }
+        self.round_rect(cx - r, cy - r, r * 2, r * 2, r, color);
+    }
+
+    #[inline]
+    fn put_pixel_blend(&mut self, px: i32, py: i32, color: Color, cov: u32) {
+        if px < 0 || py < 0 || px >= self.width || py >= self.height || cov == 0 {
+            return;
+        }
+        unsafe {
+            let dst = self
+                .back
+                .add(py as usize * self.stride as usize + px as usize * 4)
+                as *mut u32;
+            if cov >= 255 {
+                core::ptr::write_unaligned(dst, color | 0xFF00_0000);
+            } else {
+                let old = core::ptr::read_unaligned(dst);
+                core::ptr::write_unaligned(dst, blend_pixel(old, color, cov));
+            }
+        }
+    }
+
+    /// Present the frame (framebufferEnd).
     pub fn present(&mut self) {
         if self.back.is_null() {
             return;
@@ -508,11 +854,9 @@ impl Canvas {
         self.back = core::ptr::null_mut();
     }
 
-    /// Rasterise (or fetch from the cache) one glyph.  None means "not in the
-    /// font"; the caller substitutes '?'.
-    fn ensure_glyph(&mut self, ch: char) -> Option<GlyphMetrics> {
-        let key = ch as u32;
-        if let Some(g) = self.cache.get(&key) {
+    fn ensure_glyph(&mut self, size: FontSize, ch: char) -> Option<GlyphMetrics> {
+        let cache_key = ((size.idx() as u32) << 24) | (ch as u32);
+        if let Some(g) = self.cache.get(&cache_key) {
             return Some(GlyphMetrics {
                 w: g.w,
                 h: g.h,
@@ -526,11 +870,12 @@ impl Canvas {
             self.cache_bytes = 0;
         }
 
+        let font_handle = self.fonts[size.idx()].handle;
         let (mut w, mut h, mut xoff, mut yoff, mut advance) = (0i32, 0i32, 0i32, 0i32, 0i32);
         let need = unsafe {
             mhnx_font_glyph(
-                self.font,
-                key as i32,
+                font_handle,
+                ch as i32,
                 core::ptr::null_mut(),
                 0,
                 &mut w,
@@ -549,8 +894,8 @@ impl Canvas {
             let mut buf = vec![0u8; need as usize];
             let rc = unsafe {
                 mhnx_font_glyph(
-                    self.font,
-                    key as i32,
+                    font_handle,
+                    ch as i32,
                     buf.as_mut_ptr(),
                     need,
                     &mut w,
@@ -565,13 +910,27 @@ impl Canvas {
                 pixels = buf;
             }
         }
-        let metrics = GlyphMetrics { w, h, xoff, yoff, advance };
-        self.cache.insert(key, CachedGlyph { w, h, xoff, yoff, advance, pixels });
+        let metrics = GlyphMetrics {
+            w,
+            h,
+            xoff,
+            yoff,
+            advance,
+        };
+        self.cache.insert(
+            cache_key,
+            CachedGlyph {
+                w,
+                h,
+                xoff,
+                yoff,
+                advance,
+                pixels,
+            },
+        );
         Some(metrics)
     }
 
-    /// Lazy framebufferBegin: a frame starts with the first drawing call and
-    /// ends at present().
     fn begin_frame(&mut self) {
         if !self.back.is_null() || self.width <= 0 || self.height <= 0 {
             return;
@@ -594,12 +953,14 @@ impl Drop for Canvas {
                 self.back = core::ptr::null_mut();
             }
             framebufferClose(&mut self.fb);
-            if !self.font.is_null() {
-                mhnx_font_destroy(self.font);
-                self.font = core::ptr::null_mut();
+            let mut seen: [*mut c_void; 3] = [core::ptr::null_mut(); 3];
+            for (i, s) in self.fonts.iter_mut().enumerate() {
+                if !s.handle.is_null() && !seen[..i].contains(&s.handle) {
+                    mhnx_font_destroy(s.handle);
+                }
+                seen[i] = s.handle;
+                s.handle = core::ptr::null_mut();
             }
-            // Must come last: the glyph cache and stb_truetype still point
-            // into the shared memory this unmaps.
             plExit();
         }
     }
@@ -609,10 +970,6 @@ impl Drop for Canvas {
 // drawing primitives
 // ---------------------------------------------------------------------------
 
-/// Strip characters the shared font has no use for.  Outside the BMP there is
-/// no glyph (and stb_truetype only looks at the BMP anyway), so those become
-/// '?'.  Other control characters become a space; '\n'/'\r' are handled by the
-/// caller.
 fn sanitize(ch: char) -> char {
     let c = ch as u32;
     if c > 0xFFFF {
@@ -634,7 +991,6 @@ fn blend_pixel(dst: Color, color: Color, coverage: u32) -> Color {
     0xFF00_0000 | (b << 16) | (g << 8) | r
 }
 
-/// Blend one cached glyph onto the framebuffer with clipping.
 unsafe fn blend_glyph(
     back: *mut u8,
     stride: u32,
@@ -683,14 +1039,11 @@ unsafe fn blend_glyph(
 // on-device self test / probe
 // ---------------------------------------------------------------------------
 
-/// Result of probe_shared_font(): proves the font -> glyph -> bitmap chain
-/// without touching the framebuffer.
 pub struct FontProbe {
     pub font_address: usize,
     pub font_size: u32,
     pub ascent: i32,
     pub descent: i32,
-    /// True when the shared font uses CFF outlines rather than TrueType glyf.
     pub cff: bool,
     pub glyphs: u32,
     pub inked: u32,
@@ -700,15 +1053,6 @@ pub struct FontProbe {
     pub first_inked: Option<char>,
 }
 
-/// Load PlSharedFontType_Standard through pl:u and rasterise every character
-/// of sample.
-///
-/// None means plInitialize/plGetSharedFontByType/stb_truetype failed, i.e. the
-/// Japanese path is unusable and the caller should keep the ASCII console.
-/// Some(probe) with inked > 0 means the whole chain works.  This opens its own
-/// pl:u session, so call it before Canvas::new() (or after dropping the
-/// Canvas) to avoid two framebuffers fighting over the default window - it
-/// never touches the framebuffer itself.
 pub fn probe_shared_font(sample: &str) -> Option<FontProbe> {
     unsafe {
         if !sys::r_succeeded(plInitialize(PL_SERVICE_TYPE_USER)) {
@@ -723,7 +1067,7 @@ pub fn probe_shared_font(sample: &str) -> Option<FontProbe> {
         let font = mhnx_font_create(
             font_data.address as *const u8,
             font_data.size as i32,
-            FONT_PIXEL_HEIGHT,
+            FONT_HEIGHT_MEDIUM,
         );
         if font.is_null() {
             plExit();
@@ -803,24 +1147,21 @@ pub fn probe_shared_font(sample: &str) -> Option<FontProbe> {
     }
 }
 
-/// Draw a fixed Japanese/ASCII sample plus a colour bar into a fresh Canvas,
-/// count the pixels that differ from the black background, present it, and
-/// hand the Canvas back to the caller.
-///
-/// The Canvas is still presenting the test frame when this returns, so the
-/// caller can hold it on screen (and then drop it) before re-initialising the
-/// console.  None means Canvas::new() failed.
 pub fn canvas_self_test() -> Option<(Canvas, CanvasSmoke)> {
     let mut canvas = Canvas::new()?;
     canvas.clear(BLACK);
     canvas.rect(0, 0, 1280, 8, 0xFF33_99FF);
     let text_y = 40;
     canvas.text(40, text_y, "クエスト名 テスト", WHITE);
-    canvas.text(40, text_y + canvas.line_height(), "ASCII: mhnxeditor 0.1", 0xFF66_FF66);
+    canvas.text(
+        40,
+        text_y + canvas.line_height(),
+        "ASCII: mhnxeditor 0.1",
+        0xFF66_FF66,
+    );
     let bar_y = text_y + canvas.line_height() * 2;
     canvas.rect(40, bar_y, 400, 8, 0xFF00_00FF);
 
-    // Count non-black pixels through the back buffer before presenting.
     let mut lit = 0u32;
     canvas.begin_frame();
     if !canvas.back.is_null() {
@@ -829,7 +1170,8 @@ pub fn canvas_self_test() -> Option<(Canvas, CanvasSmoke)> {
                 let p = unsafe {
                     canvas
                         .back
-                        .add(y * canvas.stride as usize + x * 4) as *const u32
+                        .add(y * canvas.stride as usize + x * 4)
+                        as *const u32
                 };
                 if unsafe { core::ptr::read_unaligned(p) } != BLACK {
                     lit += 1;
@@ -846,7 +1188,6 @@ pub fn canvas_self_test() -> Option<(Canvas, CanvasSmoke)> {
     Some((canvas, smoke))
 }
 
-/// Result of canvas_self_test().
 pub struct CanvasSmoke {
     pub lit_pixels: u32,
     pub width: i32,

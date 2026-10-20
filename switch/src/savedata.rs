@@ -17,6 +17,8 @@ pub const MHXX_TITLE_ID: u64 = 0x0100_C380_0049_C000;
 pub const DEVICE: &CStr = c"save";
 /// The save file inside that device.
 pub const SAVE_FILE: &CStr = c"save:/system";
+/// The companion backup file inside that device.
+pub const SAVE_BACKUP_FILE: &CStr = c"save:/system_backup";
 
 /// Why a save operation did not work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,18 +31,46 @@ pub enum SaveError {
     NotMounted(u32),
     /// The file could not be opened or read.
     Io,
+    /// Detailed I/O error with step name and libnx Result code.
+    IoDetail(&'static str, u32),
     /// The bytes are not an MHXX save.
     NotMhxx,
 }
 
 impl SaveError {
+    /// A description with the raw result code, so a failure can be told apart
+    /// from the others without guessing: the numbers are what libnx returns.
+    pub fn describe(self) -> alloc::string::String {
+        use alloc::string::ToString;
+        match self {
+            SaveError::NotMounted(rc) => alloc::format!(
+                "本体セーブを開けません（コード 0x{:08X}）。MHXXが裏で起動中の場合は一度ゲームを終了してください",
+                rc
+            ),
+            SaveError::IoDetail(step, rc) => alloc::format!(
+                "セーブの読み書きに失敗しました（{} / コード 0x{:08X}）",
+                step,
+                rc
+            ),
+            SaveError::Io => {
+                let rc = unsafe { sys::fsdevGetLastResult() };
+                if rc != 0 {
+                    alloc::format!("セーブの読み書きに失敗しました（コード 0x{:08X}）", rc)
+                } else {
+                    alloc::string::String::from("セーブの読み書きに失敗しました")
+                }
+            }
+            other => other.text().to_string(),
+        }
+    }
+
     /// A short Japanese description for the screen.
     pub fn text(self) -> &'static str {
         match self {
             SaveError::Account => "アカウントサービスの初期化に失敗しました",
             SaveError::NoUser => "ユーザーが選択されていません",
             SaveError::NotMounted(_) => "このゲームのセーブがまだありません（一度ゲームを起動してください）",
-            SaveError::Io => "セーブの読み書きに失敗しました",
+            SaveError::Io | SaveError::IoDetail(_, _) => "セーブの読み書きに失敗しました",
             SaveError::NotMhxx => "MHXX のセーブではありません",
         }
     }
@@ -52,24 +82,73 @@ pub struct Mount {
 }
 
 impl Mount {
-    /// Mount the MHXX save of the currently selected user.
+    /// Mount the MHXX save of the currently selected or active user.
+    ///
+    /// Supports both Title Override mode (`acc:u0`) and Applet / Album mode
+    /// (`acc:u1` / `acc:su`), and falls back across preselected user, last
+    /// opened user, auto-selected user, and all console user profiles so that
+    /// the profile owning MHXX save data is found automatically.
     pub fn open() -> Result<Mount, SaveError> {
         unsafe {
-            let rc = sys::accountInitialize(sys::ACCOUNT_SERVICE_TYPE_APPLICATION);
-            if rc != 0 {
+            let service_types = [
+                sys::ACCOUNT_SERVICE_TYPE_APPLICATION,
+                sys::ACCOUNT_SERVICE_TYPE_SYSTEM,
+                sys::ACCOUNT_SERVICE_TYPE_ADMINISTRATOR,
+            ];
+            let mut acc_ok = false;
+            for &mode in &service_types {
+                if sys::accountInitialize(mode) == 0 {
+                    acc_ok = true;
+                    break;
+                }
+            }
+            if !acc_ok {
                 return Err(SaveError::Account);
             }
+
+            let mut candidates: alloc::vec::Vec<sys::AccountUid> = alloc::vec::Vec::new();
+            let mut push_unique = |uid: sys::AccountUid| {
+                if uid.is_valid() && !candidates.contains(&uid) {
+                    candidates.push(uid);
+                }
+            };
+
             let mut uid = sys::AccountUid::default();
-            let rc = sys::accountGetPreselectedUser(&mut uid);
+            if sys::accountGetPreselectedUser(&mut uid) == 0 {
+                push_unique(uid);
+            }
+            uid = sys::AccountUid::default();
+            if sys::accountGetLastOpenedUser(&mut uid) == 0 {
+                push_unique(uid);
+            }
+            uid = sys::AccountUid::default();
+            if sys::accountTrySelectUserWithoutInteraction(&mut uid, false) == 0 {
+                push_unique(uid);
+            }
+            let mut all_uids = [sys::AccountUid::default(); 8];
+            let mut total: i32 = 0;
+            if sys::accountListAllUsers(all_uids.as_mut_ptr(), 8, &mut total) == 0 {
+                let count = (total.max(0) as usize).min(all_uids.len());
+                for &u in &all_uids[..count] {
+                    push_unique(u);
+                }
+            }
+
             sys::accountExit();
-            if rc != 0 {
+
+            if candidates.is_empty() {
                 return Err(SaveError::NoUser);
             }
-            let rc = sys::fsdevMountSaveData(DEVICE.as_ptr(), MHXX_TITLE_ID, uid);
-            if rc != 0 {
-                return Err(SaveError::NotMounted(rc));
+
+            let mut last_rc = 0;
+            for candidate in candidates {
+                let rc = sys::fsdevMountSaveData(DEVICE.as_ptr(), MHXX_TITLE_ID, candidate);
+                if rc == 0 {
+                    return Ok(Mount { mounted: true });
+                }
+                last_rc = rc;
             }
-            Ok(Mount { mounted: true })
+            Err(SaveError::NotMounted(last_rc))
         }
     }
 
@@ -78,12 +157,35 @@ impl Mount {
         read_file(SAVE_FILE).ok_or(SaveError::Io)
     }
 
-    /// Replace the save file's contents.
-    ///
-    /// The bytes are written to a temporary file first and only then moved
-    /// into place, so an interrupted write cannot leave a half written save.
+    /// Replace the save file's contents in-place.
     pub fn write(&self, bytes: &[u8]) -> Result<(), SaveError> {
-        write_file_atomic(SAVE_FILE, bytes).ok_or(SaveError::Io)
+        self.write_diff(bytes, None)
+    }
+
+    /// Write `save:/system` in-place (only writing modified 16 KB blocks when
+    /// `old` is provided) and also keep `save:/system_backup` in sync if it
+    /// exists on the console.
+    pub fn write_diff(&self, bytes: &[u8], old: Option<&[u8]>) -> Result<(), SaveError> {
+        unsafe {
+            if remove(c"save:/system.new".as_ptr()) == 0 {
+                let _ = sys::fsdevCommitDevice(DEVICE.as_ptr());
+            }
+        }
+        write_save_in_place(SAVE_FILE, bytes, old)?;
+
+        if bytes.len() > mhnx_core::save::SWITCH_HEADER_SIZE {
+            if let Some(old_bak) = read_file(SAVE_BACKUP_FILE) {
+                if old_bak.len() == bytes.len() {
+                    let body = &bytes[mhnx_core::save::SWITCH_HEADER_SIZE..];
+                    let hdr = mhnx_core::save::switch_header("system_backup", body.len());
+                    let mut bak_bytes = alloc::vec::Vec::with_capacity(bytes.len());
+                    bak_bytes.extend_from_slice(&hdr);
+                    bak_bytes.extend_from_slice(body);
+                    let _ = write_save_in_place(SAVE_BACKUP_FILE, &bak_bytes, Some(&old_bak));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Push the written bytes to the console.
@@ -93,7 +195,7 @@ impl Mount {
             if rc == 0 {
                 Ok(())
             } else {
-                Err(SaveError::Io)
+                Err(SaveError::IoDetail("commit", rc))
             }
         }
     }
@@ -119,7 +221,6 @@ extern "C" {
     fn fseek(stream: *mut c_void, off: i64, whence: i32) -> i32;
     fn ftell(stream: *mut c_void) -> i64;
     fn remove(path: *const c_char) -> i32;
-    fn rename(from: *const c_char, to: *const c_char) -> i32;
 }
 
 const SEEK_SET: i32 = 0;
@@ -149,28 +250,94 @@ pub fn read_file(path: &CStr) -> Option<Vec<u8>> {
     }
 }
 
-/// Write a whole file through a temporary name, then rename it into place.
-fn write_file_atomic(path: &CStr, bytes: &[u8]) -> Option<()> {
-    // "save:/system.new" shares the device prefix with the target.
-    let tmp = c"save:/system.new";
+/// Write a save file in-place (`r+b` with fallback to `wb`), committing every
+/// 256 KB so the SaveData journal never overflows. When `old` has the same
+/// length as `bytes`, only modified 16 KB blocks are written.
+fn write_save_in_place(
+    path: &CStr,
+    bytes: &[u8],
+    old: Option<&[u8]>,
+) -> Result<(), SaveError> {
+    const CHUNK: usize = 16 * 1024;
+    const COMMIT_THRESHOLD: usize = 256 * 1024;
+
     unsafe {
-        remove(tmp.as_ptr());
-        let f = fopen(tmp.as_ptr(), c"wb".as_ptr());
+        let can_diff = old.map(|o| o.len() == bytes.len()).unwrap_or(false);
+        let mut f = fopen(path.as_ptr(), c"r+b".as_ptr());
         if f.is_null() {
-            return None;
+            f = fopen(path.as_ptr(), c"wb".as_ptr());
         }
-        let n = fwrite(bytes.as_ptr() as *const c_void, 1, bytes.len(), f);
-        let closed = fclose(f);
-        if n != bytes.len() || closed != 0 {
-            remove(tmp.as_ptr());
-            return None;
+        if f.is_null() {
+            let rc = sys::fsdevGetLastResult();
+            return Err(SaveError::IoDetail("fopen", rc));
         }
-        if rename(tmp.as_ptr(), path.as_ptr()) != 0 {
-            remove(tmp.as_ptr());
-            return None;
+
+        let mut uncommitted = 0usize;
+        let mut any_written = false;
+        let mut offset = 0usize;
+
+        while offset < bytes.len() {
+            let end = (offset + CHUNK).min(bytes.len());
+            let slice = &bytes[offset..end];
+            let needs_write = if can_diff {
+                let old_slice = &old.unwrap()[offset..end];
+                slice != old_slice
+            } else {
+                true
+            };
+
+            if needs_write {
+                if fseek(f, offset as i64, SEEK_SET) != 0 {
+                    let rc = sys::fsdevGetLastResult();
+                    fclose(f);
+                    return Err(SaveError::IoDetail("fseek", rc));
+                }
+                let n = fwrite(slice.as_ptr() as *const c_void, 1, slice.len(), f);
+                if n != slice.len() {
+                    let rc = sys::fsdevGetLastResult();
+                    fclose(f);
+                    return Err(SaveError::IoDetail("fwrite", rc));
+                }
+                any_written = true;
+                uncommitted += slice.len();
+
+                if uncommitted >= COMMIT_THRESHOLD {
+                    if fclose(f) != 0 {
+                        let rc = sys::fsdevGetLastResult();
+                        return Err(SaveError::IoDetail("fclose", rc));
+                    }
+                    let rc = sys::fsdevCommitDevice(DEVICE.as_ptr());
+                    if rc != 0 {
+                        return Err(SaveError::IoDetail("commit", rc));
+                    }
+                    f = fopen(path.as_ptr(), c"r+b".as_ptr());
+                    if f.is_null() {
+                        let rc2 = sys::fsdevGetLastResult();
+                        return Err(SaveError::IoDetail("reopen", rc2));
+                    }
+                    uncommitted = 0;
+                }
+            }
+            offset = end;
+        }
+
+        if !any_written && !bytes.is_empty() {
+            let hdr_len = bytes.len().min(36);
+            if fseek(f, 0, SEEK_SET) == 0 {
+                let _ = fwrite(bytes.as_ptr() as *const c_void, 1, hdr_len, f);
+            }
+        }
+
+        if fclose(f) != 0 {
+            let rc = sys::fsdevGetLastResult();
+            return Err(SaveError::IoDetail("fclose", rc));
+        }
+        let rc = sys::fsdevCommitDevice(DEVICE.as_ptr());
+        if rc != 0 {
+            return Err(SaveError::IoDetail("commit", rc));
         }
     }
-    Some(())
+    Ok(())
 }
 
 /// A sortable stamp for backup file names.

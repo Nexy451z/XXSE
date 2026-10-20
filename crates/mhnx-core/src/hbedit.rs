@@ -334,6 +334,12 @@ pub struct Editor {
     pub roster_field: usize,
     /// Which guild card field (rank, clock, comment) is being changed.
     pub guild_field: usize,
+    /// Whether the quest-equipment screen is showing the items of one slot.
+    pub qe_open: bool,
+    /// Cursor inside that item list.
+    pub qe_item_cursor: usize,
+    /// The entry the item picker will write to when it is opened from there.
+    pub qe_target: crate::dlc::QuestEquipItem,
     /// Equipment list filter and cursor.
     pub equip_filter: String,
     /// Cursor over the filtered equipment list.
@@ -381,9 +387,9 @@ pub struct Editor {
     pending_write: Option<Write>,
     pending_text: Option<TextRequest>,
     /// Working copy of the .mib bytes.
-    mib_bytes: Vec<u8>,
+    pub mib_bytes: Vec<u8>,
     /// Working copy of the .gmd strings.
-    gmd: Option<Gmd>,
+    pub gmd: Option<Gmd>,
 }
 
 impl Default for Editor {
@@ -418,6 +424,15 @@ impl Editor {
             roster_cursor: 0,
             roster_field: 0,
             guild_field: 0,
+            qe_open: false,
+            qe_item_cursor: 0,
+            qe_target: crate::dlc::QuestEquipItem {
+                record: 0,
+                list: crate::dlc::QuestEquipList::Supply,
+                index: 0,
+                item: 0,
+                count: 0,
+            },
             equip_filter: String::new(),
             equip_cursor: 0,
             item_pick_mode: 0,
@@ -601,7 +616,8 @@ impl Editor {
 
     // ------------------------------------------------------------ get/set
 
-    fn character(&self) -> Option<Character> {
+    /// Read the currently selected character slot from the open save.
+    pub fn character(&self) -> Option<Character> {
         self.save.as_ref()?.read_character(self.slot)
     }
 
@@ -1734,19 +1750,62 @@ impl Editor {
     }
     fn input_quest_equip(&mut self, key: Key) {
         let n = self.quest_equipment().len();
+        // Two levels: the slot list, and the items inside the chosen slot.
+        let items = if self.qe_open {
+            self.quest_equip_items().len()
+        } else {
+            0
+        };
         match key {
-            Key::Up => self.cursor = self.cursor.saturating_sub(1),
+            Key::Up => {
+                if self.qe_open {
+                    self.qe_item_cursor = self.qe_item_cursor.saturating_sub(1);
+                } else {
+                    self.cursor = self.cursor.saturating_sub(1);
+                }
+            }
             Key::Down => {
-                if n > 0 {
+                if self.qe_open {
+                    if items > 0 {
+                        self.qe_item_cursor = (self.qe_item_cursor + 1).min(items - 1);
+                    }
+                } else if n > 0 {
                     self.cursor = (self.cursor + 1).min(n - 1);
                 }
             }
+            // A opens the slot, then asks for a new item for the chosen entry.
+            Key::A => {
+                if self.qe_open {
+                    if let Some(entry) = self.quest_equip_items().get(self.qe_item_cursor).copied() {
+                        self.item_pick_mode = 2;
+                        self.qe_target = entry;
+                        self.item_pick_cursor = 0;
+                        self.item_pick_filter.clear();
+                        self.screen = Screen::ItemPick;
+                    }
+                } else if n > 0 {
+                    self.qe_open = true;
+                    self.qe_item_cursor = 0;
+                }
+            }
             Key::B => {
-                self.screen = Screen::SaveQuests;
-                self.cursor = 0;
+                if self.qe_open {
+                    self.qe_open = false;
+                } else {
+                    self.screen = Screen::SaveQuests;
+                    self.cursor = 0;
+                }
             }
             Key::Plus => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// Items inside the quest-equipment slot under the cursor.
+    pub fn quest_equip_items(&self) -> Vec<crate::dlc::QuestEquipItem> {
+        match &self.save {
+            Some(s) => crate::dlc::quest_equipment_items(s, self.cursor),
+            None => Vec::new(),
         }
     }
 
@@ -1867,6 +1926,46 @@ impl Editor {
                     self.screen = Screen::EntryView;
                     return;
                 }
+                // Mode 2 writes into a quest-equipment entry instead of the
+                // item box.
+                if self.item_pick_mode == 2 {
+                    if let Some(&id) = matches.get(self.item_pick_cursor) {
+                        let t = self.qe_target;
+                        let slot = self.slot;
+                        let slot_index = self.cursor;
+                        if let Some(s) = &mut self.save {
+                            if crate::dlc::set_quest_equipment_item(
+                                s,
+                                slot_index,
+                                t.record,
+                                t.list,
+                                t.index,
+                                id,
+                                t.count.max(1),
+                            )
+                            .is_ok()
+                            {
+                                self.dirty = true;
+                                self.message = alloc::format!(
+                                    "クエスト装備 rec{} {}[{}] -> {} ({})",
+                                    t.record,
+                                    match t.list {
+                                        crate::dlc::QuestEquipList::Supply => "支給品",
+                                        crate::dlc::QuestEquipList::Ammo => "弾",
+                                    },
+                                    t.index,
+                                    item_name_of(id),
+                                    id
+                                );
+                            } else {
+                                self.message = String::from("書き込めませんでした");
+                                let _ = slot;
+                            }
+                        }
+                    }
+                    self.screen = Screen::QuestEquip;
+                    return;
+                }
                 if let Some(&id) = matches.get(self.item_pick_cursor) {
                     let slot = self.slot;
                     let box_i = self.item_pick_target;
@@ -1892,6 +1991,8 @@ impl Editor {
             Key::B => {
                 if self.item_pick_mode == 1 {
                     self.screen = Screen::EntryView;
+                } else if self.item_pick_mode == 2 {
+                    self.screen = Screen::QuestEquip;
                 } else {
                     self.screen = Screen::Items;
                     self.cursor = 0;
@@ -3096,18 +3197,64 @@ impl Editor {
                 if start + 16 > list.len() {
                     start = list.len().saturating_sub(16);
                 }
-                for (i, e) in list.iter().enumerate().skip(start).take(16) {
-                    let id = if e.occupied {
-                        alloc::format!("{}", e.quest_id)
-                    } else {
-                        alloc::string::String::from("(empty)")
-                    };
+                // With a slot opened, the items inside it replace the slot
+                // list: the console has room for one level at a time.
+                if self.qe_open {
+                    let items = self.quest_equip_items();
                     push(
                         &mut out,
-                        alloc::format!("  slot {:>2}   quest {}", e.index, id),
-                        true,
-                        i == self.cursor,
+                        alloc::format!("  slot {} の中身  ({} 件)", self.cursor, items.len()),
+                        false,
+                        false,
                     );
+                    let mut start = self.qe_item_cursor.saturating_sub(7);
+                    if start + 15 > items.len() {
+                        start = items.len().saturating_sub(15);
+                    }
+                    for (i, it) in items.iter().enumerate().skip(start).take(15) {
+                        let kind = match it.list {
+                            crate::dlc::QuestEquipList::Supply => "支給",
+                            crate::dlc::QuestEquipList::Ammo => "弾  ",
+                        };
+                        push(
+                            &mut out,
+                            alloc::format!(
+                                "  rec{} {}[{:>2}] {:>5} x{:<3} {}",
+                                it.record,
+                                kind,
+                                it.index,
+                                it.item,
+                                it.count,
+                                if it.item == 0 {
+                                    alloc::string::String::from("-")
+                                } else {
+                                    item_name_of(it.item)
+                                }
+                            ),
+                            true,
+                            i == self.qe_item_cursor,
+                        );
+                    }
+                    push(
+                        &mut out,
+                        String::from("  A アイテム変更   B 戻る"),
+                        false,
+                        false,
+                    );
+                } else {
+                    for (i, e) in list.iter().enumerate().skip(start).take(16) {
+                        let id = if e.occupied {
+                            alloc::format!("{}", e.quest_id)
+                        } else {
+                            alloc::string::String::from("(empty)")
+                        };
+                        push(
+                            &mut out,
+                            alloc::format!("  slot {:>2}   quest {}", e.index, id),
+                            true,
+                            i == self.cursor,
+                        );
+                    }
                 }
                 push(
                     &mut out,

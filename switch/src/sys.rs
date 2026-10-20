@@ -31,13 +31,23 @@ pub struct Service {
 
 /// `AccountUid` (services/account.h): two u64 halves.
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct AccountUid {
     pub uid: [u64; 2],
 }
 
-/// Account initialize mode: the application's own account info.
+impl AccountUid {
+    pub fn is_valid(&self) -> bool {
+        self.uid[0] != 0 || self.uid[1] != 0
+    }
+}
+
+/// Account initialize mode: the application's own account info (`acc:u0`).
 pub const ACCOUNT_SERVICE_TYPE_APPLICATION: u32 = 0;
+/// Account initialize mode: system account service (`acc:u1`), works in Applet mode.
+pub const ACCOUNT_SERVICE_TYPE_SYSTEM: u32 = 1;
+/// Account initialize mode: administrator account service (`acc:su`), works in Applet/System mode.
+pub const ACCOUNT_SERVICE_TYPE_ADMINISTRATOR: u32 = 2;
 
 /// `FsFileSystem` (services/fs.h): { Service s; }
 #[repr(C)]
@@ -175,6 +185,63 @@ impl PadState {
     }
 }
 
+/// `HidTouchState` (services/hid.h:648-658).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HidTouchState {
+    pub delta_time: u64,
+    pub attributes: u32,
+    pub finger_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub diameter_x: u32,
+    pub diameter_y: u32,
+    pub rotation_angle: u32,
+    pub reserved: u32,
+}
+
+impl HidTouchState {
+    pub const ZERO: Self = Self {
+        delta_time: 0,
+        attributes: 0,
+        finger_id: 0,
+        x: 0,
+        y: 0,
+        diameter_x: 0,
+        diameter_y: 0,
+        rotation_angle: 0,
+        reserved: 0,
+    };
+}
+
+/// `HidTouchScreenState` (services/hid.h:661-666).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HidTouchScreenState {
+    pub sampling_number: u64,
+    pub count: i32,
+    pub reserved: u32,
+    pub touches: [HidTouchState; 16],
+}
+
+impl HidTouchScreenState {
+    pub const ZERO: Self = Self {
+        sampling_number: 0,
+        count: 0,
+        reserved: 0,
+        touches: [HidTouchState::ZERO; 16],
+    };
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<HidTouchState>() == 40);
+    assert!(core::mem::offset_of!(HidTouchState, x) == 16);
+    assert!(core::mem::offset_of!(HidTouchState, y) == 20);
+    assert!(core::mem::size_of::<HidTouchScreenState>() == 656);
+    assert!(core::mem::offset_of!(HidTouchScreenState, count) == 8);
+    assert!(core::mem::offset_of!(HidTouchScreenState, touches) == 16);
+};
+
 /// Opaque `PrintConsole` (runtime/devices/console.h) - we always pass NULL,
 /// which makes libnx use its built-in default console.
 #[repr(C)]
@@ -227,6 +294,8 @@ extern "C" {
     pub fn padConfigureInput(max_players: u32, style_set: u32);
     pub fn padInitializeWithMask(pad: *mut PadState, mask: u64);
     pub fn padUpdate(pad: *mut PadState);
+    pub fn hidInitializeTouchScreen();
+    pub fn hidGetTouchScreenStates(states: *mut HidTouchScreenState, count: usize) -> usize;
 
     // --- services/applet.h ---------------------------------------------------------
     pub fn appletMainLoop() -> bool;
@@ -238,12 +307,23 @@ extern "C" {
     pub fn accountInitialize(mode: u32) -> Result;
     pub fn accountExit();
     pub fn accountGetPreselectedUser(out: *mut AccountUid) -> Result;
+    pub fn accountGetLastOpenedUser(out: *mut AccountUid) -> Result;
+    pub fn accountTrySelectUserWithoutInteraction(
+        out: *mut AccountUid,
+        is_network_service_account_required: bool,
+    ) -> Result;
+    pub fn accountListAllUsers(
+        uids: *mut AccountUid,
+        max_uids: i32,
+        actual_total: *mut i32,
+    ) -> Result;
 
     // --- runtime/devices/fs_dev.h ---------------------------------------------------
     /// Mounts a title's save data so it can be opened as "save:/<file>".
     pub fn fsdevMountSaveData(name: *const c_char, application_id: u64, uid: AccountUid) -> Result;
     pub fn fsdevCommitDevice(name: *const c_char) -> Result;
     pub fn fsdevUnmountDevice(name: *const c_char) -> Result;
+    pub fn fsdevGetLastResult() -> Result;
 
     // --- services/fs.h -------------------------------------------------------------
     pub fn fsInitialize() -> Result;
