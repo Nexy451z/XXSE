@@ -1811,7 +1811,7 @@ impl MhnxEditor {
                     .striped(true)
                     .num_columns(5)
                     .show(ui, |ui| {
-                        for h in ["枠", "クエスト ID", "サイズ", ""] {
+                        for h in ["枠", "クエスト ID", "サイズ", "タイトル", ""] {
                             ui.strong(h);
                         }
                         ui.end_row();
@@ -1819,14 +1819,27 @@ impl MhnxEditor {
                             if q.data.is_empty() {
                                 continue;
                             }
-                            let name = item_name(0);
-                            let _ = name;
-                            if !needle.is_empty() && !format!("{}", q.quest_id).contains(&needle) {
+                            // The .gmd inside the archive carries the
+                            // title; decoding it here is what makes the filter
+                            // able to match on one at all.
+                            let title = Arc::parse(&q.data)
+                                .ok()
+                                .and_then(|a| {
+                                    a.by_ext("gmd")
+                                        .and_then(|e| Gmd::from_bytes(&e.data).ok())
+                                })
+                                .and_then(|g| g.title().map(|t| t.to_owned()))
+                                .unwrap_or_default();
+                            if !needle.is_empty()
+                                && !format!("{}", q.quest_id).contains(&needle)
+                                && !title.to_lowercase().contains(&needle)
+                            {
                                 continue;
                             }
                             ui.label(format!("{}", q.slot));
                             ui.label(format!("{}", q.quest_id));
                             ui.label(format!("{} B", q.size));
+                            ui.label(title);
                             if ui.small_button("編集").clicked() {
                                 open_edit = Some(q.quest_id);
                             }
