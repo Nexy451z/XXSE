@@ -170,6 +170,8 @@ pub fn item_name_of(id: u16) -> alloc::string::String {
 pub const TEXT_ITEM_FILTER: usize = usize::MAX - 1;
 /// Sentinel id for "ask for a skill name to filter the picker by".
 pub const TEXT_SKILL_FILTER: usize = usize::MAX - 2;
+/// Sentinel id for "ask for a quest id or title to filter the list by".
+pub const TEXT_QUEST_FILTER: usize = usize::MAX - 3;
 
 /// The editable character fields, in menu order.
 pub const CHAR_FIELDS: &[(&str, &str)] = &[
@@ -233,6 +235,8 @@ pub struct Editor {
     pub item_undo: Vec<Vec<u8>>,
     /// Which talisman skill the picker writes: 1 or 2.
     pub skill_pick_field: u8,
+    /// Quest id / title filter for the save's quest list.
+    pub quest_filter: String,
     /// Skill name filter used by the picker.
     pub skill_pick_filter: String,
     /// Cursor inside the filtered skill list.
@@ -305,6 +309,7 @@ impl Editor {
             quest_titles: Vec::new(),
             item_undo: Vec::new(),
             skill_pick_field: 1,
+            quest_filter: String::new(),
             skill_pick_filter: String::new(),
             skill_pick_cursor: 0,
             item_pick_filter: String::new(),
@@ -1431,6 +1436,27 @@ impl Editor {
         }
     }
 
+    /// The save's quests after the filter, in slot order.
+    pub fn filtered_quests(&self) -> Vec<crate::dlc::InstalledQuest> {
+        let needle = self.quest_filter.trim().to_lowercase();
+        self.save_quests()
+            .into_iter()
+            .filter(|q| {
+                if needle.is_empty() {
+                    return true;
+                }
+                format!("{}", q.quest_id).contains(&needle)
+                    || self.quest_title(q.quest_id).to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    /// The io layer answers a quest filter request with this.
+    pub fn apply_quest_filter(&mut self, text: String) {
+        self.quest_filter = text;
+        self.save_quest_cursor = 0;
+    }
+
     /// Cached title for a quest id.
     pub fn quest_title(&self, id: i32) -> &str {
         self.quest_titles
@@ -1487,7 +1513,7 @@ impl Editor {
     }
 
     fn input_save_quests(&mut self, key: Key) {
-        let list = self.save_quests();
+        let list = self.filtered_quests();
         let n = list.len();
         match key {
             Key::Up => {
@@ -1511,6 +1537,14 @@ impl Editor {
             }
             Key::R => {
                 self.pending_request = Some(Request::ExtractQuests { ids: Vec::new() });
+            }
+            // 175 quests at 16 rows a page needs a filter.
+            Key::Y => {
+                self.pending_text = Some((TEXT_QUEST_FILTER, self.quest_filter.clone()));
+            }
+            Key::X => {
+                self.quest_filter.clear();
+                self.save_quest_cursor = 0;
             }
             Key::B => {
                 self.screen = Screen::ArcList;
@@ -2016,13 +2050,15 @@ impl Editor {
                 );
             }
             Screen::SaveQuests => {
-                let list = self.save_quests();
+                let list = self.filtered_quests();
+                let note = if self.quest_filter.trim().is_empty() {
+                    alloc::string::String::new()
+                } else {
+                    alloc::format!(" of {}   filter: {}", self.quest_titles.len(), self.quest_filter)
+                };
                 push(
                     &mut out,
-                    format!(
-                        "QUESTS INSIDE THIS SAVE   {} found",
-                        list.len()
-                    ),
+                    alloc::format!("QUESTS INSIDE THIS SAVE   {} shown{}", list.len(), note),
                     false,
                     false,
                 );
