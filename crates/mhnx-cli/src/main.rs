@@ -227,6 +227,41 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// Show the monster hunt, capture and size records of one character.
+fn cmd_hunts(path: &str, slot: usize) -> Result<(), String> {
+    let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    let Some(hunt) = s.hunt_counts(slot) else {
+        return Err(format!("slot {} has no hunt table", slot + 1));
+    };
+    let cap = s.capture_counts(slot).unwrap_or_default();
+    let size = s.monster_sizes(slot).unwrap_or_default();
+    println!("slot {}: {} monsters", slot + 1, hunt.len());
+    println!("{:>4}  {:>6}  {:>6}  {:>10}", "id", "slay", "capture", "size");
+    for i in 0..hunt.len() {
+        if hunt[i] == 0 && cap.get(i).copied().unwrap_or(0) == 0 {
+            continue;
+        }
+        let sz = size
+            .get(i)
+            .map(|(a, b)| {
+                if *a == 0 && *b == 0 {
+                    String::from("-")
+                } else {
+                    format!("{}..{}", a, b)
+                }
+            })
+            .unwrap_or_default();
+        println!(
+            "{:>4}  {:>6}  {:>6}  {:>10}",
+            i,
+            hunt[i],
+            cap.get(i).copied().unwrap_or(0),
+            sz
+        );
+    }
+    Ok(())
+}
+
 /// List the supply and ammo items inside a quest-equipment slot.
 fn cmd_equip_items(save_path: &str, slot: usize) -> Result<(), String> {
     let s = Save::from_bytes(&read(save_path)?).map_err(|e| e.to_string())?;
@@ -809,6 +844,8 @@ fn main() -> ExitCode {
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
         "add-quest" if args.len() == 4 => cmd_add_quest(&args[1], &args[2], &args[3]),
+        "hunts" if args.len() == 2 => cmd_hunts(&args[1], 0),
+        "hunts" if args.len() == 3 => cmd_hunts(&args[1], args[2].parse().unwrap_or(0)),
         "equip-items" if args.len() == 3 => {
             cmd_equip_items(&args[1], args[2].parse().unwrap_or(0))
         }
