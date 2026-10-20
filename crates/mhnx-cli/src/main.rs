@@ -227,6 +227,69 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// Report every talisman whose skills or points the game would reject.
+fn cmd_charm_check(path: &str) -> Result<(), String> {
+    let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    let mut total = 0usize;
+    let mut bad = 0usize;
+    for slot in 0..3 {
+        let Some(box_) = s.equipment_box(slot) else { continue };
+        for i in 0..mhnx_core::charm::CHARM_COUNT {
+            let o = i * mhnx_core::charm::CHARM_RECORD;
+            let Some(rec) = box_.get(o..o + mhnx_core::charm::CHARM_RECORD) else {
+                continue;
+            };
+            if !mhnx_core::charm::is_talisman(rec) {
+                continue;
+            }
+            total += 1;
+            let ty = rec[0x02];
+            if ty == 0 {
+                println!("slot {} #{}: type 0, which the game does not define", slot + 1, i);
+                bad += 1;
+                continue;
+            }
+            for (label, sid, pts, second) in [
+                ("skill 1", rec[0x0C], rec[0x0E] as i8, false),
+                ("skill 2", rec[0x0D], rec[0x0F] as i8, true),
+            ] {
+                if sid == 0 {
+                    continue;
+                }
+                let Some(r) = mhnx_core::charm::allowed_points(ty, sid, second) else {
+                    continue;
+                };
+                let name = mhnx_core::skills::skill_name(sid).unwrap_or("?");
+                if r.min == 0 && r.max == 0 {
+                    println!(
+                        "slot {} #{}: {} {} cannot go on type 0x{:02X}",
+                        slot + 1,
+                        i,
+                        label,
+                        name,
+                        ty
+                    );
+                    bad += 1;
+                } else if pts < r.min || pts > r.max {
+                    println!(
+                        "slot {} #{}: {} {} is {:+} but the range is {:+}..{:+}",
+                        slot + 1,
+                        i,
+                        label,
+                        name,
+                        pts,
+                        r.min,
+                        r.max
+                    );
+                    bad += 1;
+                }
+            }
+        }
+    }
+    println!("{} talismans checked, {} problem(s)", total, bad);
+    Ok(())
+}
+
 fn cmd_check(path: &str) -> Result<(), String> {
     let a = Arc::parse(&read(path)?).map_err(|e| e.to_string())?;
     let findings = mhnx_core::check::check_quest(&a);
@@ -613,6 +676,7 @@ fn main() -> ExitCode {
         "fix-oneplayer" if args.len() == 3 => cmd_fix_oneplayer(&args[1], &args[2]),
         "options" if args.len() == 2 => cmd_options(&args[1]),
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
+        "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
         "charms" if args.len() == 2 => cmd_charms(&args[1], None),
         "charms" if args.len() == 3 => cmd_charms(&args[1], args[2].parse().ok()),
         "skills" if args.len() == 1 => cmd_skills(),
