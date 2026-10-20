@@ -227,16 +227,69 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
-/// Show the monster hunt, capture and size records of one character.
-fn cmd_hunts(path: &str, slot: usize) -> Result<(), String> {
+/// Show the guild card and the arena records of one character.
+fn cmd_guild_card(path: &str, slot: Option<usize>) -> Result<(), String> {
     let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    let slot = match slot {
+        Some(n) if (1..=3).contains(&n) => n - 1,
+        Some(_) => return Err(String::from("slot must be 1, 2 or 3")),
+        None => 0,
+    };
+    let hr = mhnx_core::guildcard::hunter_rank(&s, slot).unwrap_or(0);
+    let time = mhnx_core::guildcard::play_time(&s, slot).unwrap_or(0);
+    let id = mhnx_core::guildcard::card_id(&s, slot).unwrap_or([0; 8]);
+    let comment = mhnx_core::guildcard::comment(&s, slot).unwrap_or_default();
+    println!("slot {} guild card", slot + 1);
+    println!("  hunter rank : {}", hr);
+    println!("  card time   : {}s ({}:{:02}:{:02})", time, time / 3600, (time % 3600) / 60, time % 60);
+    println!("  card id     : {}", id.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(""));
+    println!("  comment     : {}", comment);
+
+    let log = mhnx_core::guildcard::arena(&s, slot);
+    let mut any = false;
+    for a in 0..mhnx_core::guildcard::ARENA_COUNT {
+        let rows: Vec<_> = log.iter().filter(|e| e.arena == a && !e.is_empty()).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        any = true;
+        print!("  arena {:>2} :", a);
+        for e in rows {
+            let (m, sec, cs) = e.as_clock();
+            print!("  {}:{:02}.{:02}", m, sec, cs);
+        }
+        println!();
+    }
+    if !any {
+        println!("  arena       : no records");
+    }
+    Ok(())
+}
+
+/// Show the monster hunt, capture and size records of one character.
+/// The slot argument is 1, 2 or 3, matching every other command here.
+fn cmd_hunts(path: &str, wanted: Option<usize>) -> Result<(), String> {
+    let s = Save::from_bytes(&read(path)?).map_err(|e| e.to_string())?;
+    let slot = match wanted {
+        Some(n) => {
+            if !(1..=3).contains(&n) {
+                return Err(String::from("slot must be 1, 2 or 3"));
+            }
+            n - 1
+        }
+        None => 0,
+    };
     let Some(hunt) = s.hunt_counts(slot) else {
         return Err(format!("slot {} has no hunt table", slot + 1));
     };
     let cap = s.capture_counts(slot).unwrap_or_default();
     let size = s.monster_sizes(slot).unwrap_or_default();
+    let names = &mhnx_core::gamedata::MONSTER_HUNT_NAMES;
     println!("slot {}: {} monsters", slot + 1, hunt.len());
-    println!("{:>4}  {:>6}  {:>6}  {:>10}", "id", "slay", "capture", "size");
+    println!(
+        "{:>4}  {:<26} {:>6} {:>6} {:>10}",
+        "id", "monster", "slay", "capture", "size"
+    );
     for i in 0..hunt.len() {
         if hunt[i] == 0 && cap.get(i).copied().unwrap_or(0) == 0 {
             continue;
@@ -252,8 +305,9 @@ fn cmd_hunts(path: &str, slot: usize) -> Result<(), String> {
             })
             .unwrap_or_default();
         println!(
-            "{:>4}  {:>6}  {:>6}  {:>10}",
+            "{:>4}  {:<26} {:>6} {:>6} {:>10}",
             i,
+            names.get(i).copied().unwrap_or("?"),
             hunt[i],
             cap.get(i).copied().unwrap_or(0),
             sz
@@ -844,8 +898,10 @@ fn main() -> ExitCode {
         "palicoes" if args.len() == 2 => cmd_palicoes(&args[1]),
         "charm-check" if args.len() == 2 => cmd_charm_check(&args[1]),
         "add-quest" if args.len() == 4 => cmd_add_quest(&args[1], &args[2], &args[3]),
-        "hunts" if args.len() == 2 => cmd_hunts(&args[1], 0),
-        "hunts" if args.len() == 3 => cmd_hunts(&args[1], args[2].parse().unwrap_or(0)),
+        "guild-card" if args.len() == 2 => cmd_guild_card(&args[1], None),
+        "guild-card" if args.len() == 3 => cmd_guild_card(&args[1], args[2].parse().ok()),
+        "hunts" if args.len() == 2 => cmd_hunts(&args[1], None),
+        "hunts" if args.len() == 3 => cmd_hunts(&args[1], args[2].parse().ok()),
         "equip-items" if args.len() == 3 => {
             cmd_equip_items(&args[1], args[2].parse().unwrap_or(0))
         }

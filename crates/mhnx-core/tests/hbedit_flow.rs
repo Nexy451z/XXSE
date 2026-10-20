@@ -2600,3 +2600,153 @@ fn a_monster_size_can_be_written_and_read_back() {
     assert!(s.set_capture_count(0, 5, 7));
     assert_eq!(s.capture_counts(0).unwrap()[5], 7);
 }
+
+// ---------------------------------------------------------------------------
+// The guild card keeps its own copy of the appearance.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_guild_card_mirrors_the_appearance_in_the_sample_save() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    use mhnx_core::save::*;
+    for slot in 0..3 {
+        let Some(base) = s.slot_base(slot).map(|b| b as usize) else {
+            continue;
+        };
+        let gc = base + OFF_GUILD_CARD;
+        let body = s.body();
+        assert_eq!(
+            &body[gc + 0x19..gc + 0x21],
+            &body[base + OFF_VOICE..base + OFF_VOICE + 8],
+            "slot {}: the card appearance does not match the character",
+            slot + 1
+        );
+        assert_eq!(
+            &body[gc + 0x38..gc + 0x48],
+            &body[base + OFF_SKIN_COLOR..base + OFF_SKIN_COLOR + 16],
+            "slot {}: the card colours do not match the character",
+            slot + 1
+        );
+    }
+}
+
+#[test]
+fn editing_the_appearance_updates_the_guild_card_too() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    use mhnx_core::save::*;
+    let mut c = s.read_character(0).expect("a character");
+    c.hairstyle = c.hairstyle.wrapping_add(7);
+    c.skin_color = [1, 2, 3, 255];
+    s.write_character(&c).unwrap();
+    let base = s.slot_base(0).unwrap() as usize;
+    let gc = base + OFF_GUILD_CARD;
+    assert_eq!(s.body()[gc + 0x19 + 5], c.hairstyle, "card hairstyle is stale");
+    assert_eq!(
+        &s.body()[gc + 0x38..gc + 0x3C],
+        &[1, 2, 3, 255],
+        "card colours are stale"
+    );
+    // And the two copies agree afterwards.
+    assert_eq!(
+        &s.body()[gc + 0x19..gc + 0x21],
+        &s.body()[base + OFF_VOICE..base + OFF_VOICE + 8]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Guild card and arena log.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_guild_card_agrees_with_the_character() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    for slot in 0..3 {
+        let Some(hr_card) = mhnx_core::guildcard::hunter_rank(&s, slot) else {
+            continue;
+        };
+        let c = s.read_character(slot).expect("character");
+        assert_eq!(
+            hr_card, c.hunter_rank,
+            "slot {}: the card HR differs from the character",
+            slot + 1
+        );
+        // The card's clock is a snapshot, so it never runs ahead.
+        let card = mhnx_core::guildcard::play_time(&s, slot).unwrap();
+        assert!(
+            card <= c.play_time as u32,
+            "slot {}: the card is ahead of the character ({} > {})",
+            slot + 1,
+            card,
+            c.play_time
+        );
+        assert!(c.play_time as u32 - card < 3600, "the card is very stale");
+    }
+}
+
+#[test]
+fn the_arena_log_holds_ordered_centisecond_times() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let log = mhnx_core::guildcard::arena(&s, 0);
+    assert_eq!(
+        log.len(),
+        mhnx_core::guildcard::ARENA_COUNT * mhnx_core::guildcard::ARENA_RANKS
+    );
+    let mut recorded = 0;
+    for a in 0..mhnx_core::guildcard::ARENA_COUNT {
+        let times: Vec<u16> = log
+            .iter()
+            .filter(|e| e.arena == a && !e.is_empty())
+            .map(|e| e.centis)
+            .collect();
+        // Within one arena the ranks are ordered fastest first.
+        for w in times.windows(2) {
+            assert!(
+                w[0] <= w[1],
+                "arena {} has out of order times: {:?}",
+                a,
+                times
+            );
+        }
+        recorded += times.len();
+    }
+    assert!(recorded >= 10, "expected some arena records, got {}", recorded);
+    // A time that reads as a sane arena run.
+    let first = log.iter().find(|e| !e.is_empty()).expect("a recorded time");
+    let (m, sec, cs) = first.as_clock();
+    assert!(
+        (1..30).contains(&m),
+        "a {}-minute arena run is not plausible ({:02}:{:02}.{:02})",
+        m,
+        m,
+        sec,
+        cs
+    );
+}
+
+#[test]
+fn the_arena_clock_converts_hundredths() {
+    let t = mhnx_core::guildcard::ArenaTime {
+        arena: 0,
+        rank: 0,
+        centis: 57_544,
+        extra: [0, 0],
+    };
+    assert_eq!(t.as_clock(), (9, 35, 44), "57,544 hundredths is 9:35.44");
+    let t = mhnx_core::guildcard::ArenaTime {
+        centis: 0,
+        ..t
+    };
+    assert!(t.is_empty());
+}

@@ -29,6 +29,7 @@ pub mod crc;
 pub mod dlc;
 pub mod dlcats;
 pub mod equip;
+pub mod guildcard;
 pub mod equipnames;
 pub mod entries;
 pub mod hbedit;
