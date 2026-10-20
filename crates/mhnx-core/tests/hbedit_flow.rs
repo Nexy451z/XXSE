@@ -2503,3 +2503,100 @@ fn a_repacked_archive_is_byte_identical_to_the_original() {
     }
     assert!(checked > 0, "no archives were checked");
 }
+
+// ---------------------------------------------------------------------------
+// Monster hunt records.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_three_monster_tables_line_up_with_each_other() {
+    // The strongest evidence for the count is arithmetic, not the roster:
+    // hunt 0x5EA6 + 137*2 = capture 0x5FB8, + 137*2 = size 0x60CA,
+    // + 137*4 = 0x62EE, which is exactly where the equipment box begins.
+    use mhnx_core::save::*;
+    assert_eq!(OFF_MONSTER_HUNT + MONSTER_COUNT * 2, OFF_MONSTER_CAPTURE);
+    assert_eq!(OFF_MONSTER_CAPTURE + MONSTER_COUNT * 2, OFF_MONSTER_SIZE);
+    assert_eq!(OFF_MONSTER_SIZE + MONSTER_COUNT * 4, OFF_EQUIPMENT_BOX);
+    assert_eq!(MONSTER_TABLE_SIZE, MONSTER_COUNT * 2);
+    assert_eq!(MONSTER_SIZE_TABLE_SIZE, MONSTER_COUNT * 4);
+}
+
+#[test]
+fn the_sample_save_holds_plausible_hunt_records() {
+    if !real_save().exists() {
+        return;
+    }
+    let s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let hunt = s.hunt_counts(0).expect("hunt table");
+    let cap = s.capture_counts(0).expect("capture table");
+    let size = s.monster_sizes(0).expect("size table");
+    assert_eq!(hunt.len(), mhnx_core::save::MONSTER_COUNT);
+    assert_eq!(cap.len(), mhnx_core::save::MONSTER_COUNT);
+    assert_eq!(size.len(), mhnx_core::save::MONSTER_COUNT);
+
+    // Hunt counts must look like counts: a few hundred at most, and the
+    // character has certainly hunted something.
+    let total: u32 = hunt.iter().map(|v| *v as u32).sum();
+    assert!(total > 1000, "the sample character should have hunted a lot");
+    assert!(
+        hunt.iter().all(|v| *v <= 9999),
+        "a hunt count above 9999 is not a count"
+    );
+    assert_eq!(
+        hunt.iter().filter(|v| **v > 0).count() > 40,
+        true,
+        "expected many monsters hunted"
+    );
+    // The first table counts slays, not total encounters, so a monster that is
+    // almost always captured can show more captures than slays. Only a broad
+    // disagreement would mean the tables are mismatched.
+    let over: Vec<_> = (0..hunt.len()).filter(|i| cap[*i] > hunt[*i]).collect();
+    assert!(
+        over.len() <= 3,
+        "{} monsters have more captures than slays, first few: {:?}",
+        over.len(),
+        over.iter()
+            .take(5)
+            .map(|i| (*i, cap[*i], hunt[*i]))
+            .collect::<Vec<_>>()
+    );
+    // Recorded sizes look like the percentages the game shows.
+    let recorded: Vec<_> = size.iter().filter(|(a, b)| *a != 0 || *b != 0).collect();
+    assert!(recorded.len() > 40, "expected many monsters sized");
+    for (a, b) in &recorded {
+        assert!(*a >= 20 && *a <= 300, "small size {} is not a percentage", a);
+        assert!(*b >= 20 && *b <= 300, "big size {} is not a percentage", b);
+        assert!(a <= b, "small {} should not exceed big {}", a, b);
+    }
+}
+
+#[test]
+fn a_hunt_count_can_be_written_and_read_back() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let before = s.to_bytes();
+    assert!(s.set_hunt_count(0, 3, 1234));
+    assert_eq!(s.hunt_counts(0).unwrap()[3], 1234);
+    // Only that monster's two bytes move.
+    let after = s.to_bytes();
+    let diff: Vec<usize> = (0..after.len()).filter(|i| after[*i] != before[*i]).collect();
+    let at = 36 + 0x126474 + mhnx_core::save::OFF_MONSTER_HUNT + 3 * 2;
+    assert!(diff.iter().all(|d| *d >= at && *d < at + 2), "diff {:?}", diff);
+    // Out of range is refused rather than writing somewhere else.
+    assert!(!s.set_hunt_count(0, mhnx_core::save::MONSTER_COUNT, 1));
+    assert!(!s.set_monster_size(0, mhnx_core::save::MONSTER_COUNT, 1, 2));
+}
+
+#[test]
+fn a_monster_size_can_be_written_and_read_back() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut s = mhnx_core::save::Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    assert!(s.set_monster_size(0, 5, 90, 130));
+    assert_eq!(s.monster_sizes(0).unwrap()[5], (90, 130));
+    assert!(s.set_capture_count(0, 5, 7));
+    assert_eq!(s.capture_counts(0).unwrap()[5], 7);
+}

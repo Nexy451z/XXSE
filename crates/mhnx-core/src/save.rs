@@ -120,6 +120,14 @@ pub const OFF_MONSTER_CAPTURE: usize = 0x5FB8;
 pub const OFF_MONSTER_SIZE: usize = 0x60CA;
 pub const MONSTER_TABLE_SIZE: usize = 274;
 pub const MONSTER_SIZE_TABLE_SIZE: usize = 548;
+
+/// Number of monsters the hunt records cover.
+///
+/// The three tables sit back to back and the last one ends exactly where the
+/// equipment box starts: 0x5EA6 + 137*2 = 0x5FB8, + 137*2 = 0x60CA,
+/// + 137*4 = 0x62EE. That arithmetic is the evidence for the count, not a
+/// guess from the monster roster.
+pub const MONSTER_COUNT: usize = 137;
 /// Palico roster: 84 records of 324 bytes.
 pub const OFF_PALICO: usize = 0x23BB6;
 pub const PALICO_SIZE: usize = 27_216;
@@ -463,6 +471,92 @@ impl Save {
         Ok(())
     }
 
+    /// Hunt counts, one per monster, in the order the save stores them.
+    pub fn hunt_counts(&self, slot: usize) -> Option<Vec<u16>> {
+        let r = self.slot_field(slot, OFF_MONSTER_HUNT, MONSTER_TABLE_SIZE)?;
+        let b = self.body.get(r)?;
+        Some(
+            (0..MONSTER_COUNT)
+                .map(|i| u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]))
+                .collect(),
+        )
+    }
+
+    /// Capture counts, one per monster.
+    pub fn capture_counts(&self, slot: usize) -> Option<Vec<u16>> {
+        let r = self.slot_field(slot, OFF_MONSTER_CAPTURE, MONSTER_TABLE_SIZE)?;
+        let b = self.body.get(r)?;
+        Some(
+            (0..MONSTER_COUNT)
+                .map(|i| u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]))
+                .collect(),
+        )
+    }
+
+    /// Smallest and largest size recorded per monster, as the game shows them.
+    pub fn monster_sizes(&self, slot: usize) -> Option<Vec<(u16, u16)>> {
+        let r = self.slot_field(slot, OFF_MONSTER_SIZE, MONSTER_SIZE_TABLE_SIZE)?;
+        let b = self.body.get(r)?;
+        Some(
+            (0..MONSTER_COUNT)
+                .map(|i| {
+                    let o = i * 4;
+                    (
+                        u16::from_le_bytes([b[o], b[o + 1]]),
+                        u16::from_le_bytes([b[o + 2], b[o + 3]]),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Set one monster's hunt count.
+    pub fn set_hunt_count(&mut self, slot: usize, monster: usize, value: u16) -> bool {
+        self.set_monster_u16(slot, OFF_MONSTER_HUNT, monster, value)
+    }
+
+    /// Set one monster's capture count.
+    pub fn set_capture_count(&mut self, slot: usize, monster: usize, value: u16) -> bool {
+        self.set_monster_u16(slot, OFF_MONSTER_CAPTURE, monster, value)
+    }
+
+    /// Set one monster's smallest and largest recorded size.
+    pub fn set_monster_size(
+        &mut self,
+        slot: usize,
+        monster: usize,
+        small: u16,
+        big: u16,
+    ) -> bool {
+        if monster >= MONSTER_COUNT {
+            return false;
+        }
+        let Some(r) = self.slot_field(slot, OFF_MONSTER_SIZE, MONSTER_SIZE_TABLE_SIZE) else {
+            return false;
+        };
+        let o = r.start + monster * 4;
+        let Some(b) = self.body.get_mut(o..o + 4) else {
+            return false;
+        };
+        b[0..2].copy_from_slice(&small.to_le_bytes());
+        b[2..4].copy_from_slice(&big.to_le_bytes());
+        true
+    }
+
+    fn set_monster_u16(&mut self, slot: usize, table: usize, monster: usize, value: u16) -> bool {
+        if monster >= MONSTER_COUNT {
+            return false;
+        }
+        let Some(r) = self.slot_field(slot, table, MONSTER_TABLE_SIZE) else {
+            return false;
+        };
+        let o = r.start + monster * 2;
+        let Some(b) = self.body.get_mut(o..o + 2) else {
+            return false;
+        };
+        b.copy_from_slice(&value.to_le_bytes());
+        true
+    }
     /// Decode the talismans (お守り) held in a slot's equipment box.
     ///
     /// The box also holds weapons and armour; see the charm module.
