@@ -4746,9 +4746,24 @@ impl GuiState {
     }
 }
 
+/// Text that stays readable on top of `c`.
+///
+/// This used to ignore its argument and return white, so the key caps drew
+/// white on bright green and orange: 2.1 to 3.2 to 1, under every threshold.
+/// Rec. 601 luma is enough to pick the side, and integer maths keeps it const.
 #[inline]
-const fn white_or_dark(_c: Color) -> Color {
-    rgb(255, 255, 255)
+const fn white_or_dark(c: Color) -> Color {
+    let r = (c & 0xFF) as u32;
+    let g = ((c >> 8) & 0xFF) as u32;
+    let b = ((c >> 16) & 0xFF) as u32;
+    let luma = (r * 299 + g * 587 + b * 114) / 1000;
+    // 120, not the midpoint: the red used for destructive buttons sits at 129
+    // and reads far better with dark text (5.4 to 1) than white (3.5 to 1).
+    if luma >= 120 {
+        rgb(14, 17, 24)
+    } else {
+        rgb(255, 255, 255)
+    }
 }
 
 /// Accurate controller hint chips for the Switch GUI footer.

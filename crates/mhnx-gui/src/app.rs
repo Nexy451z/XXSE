@@ -1113,9 +1113,13 @@ impl MhnxEditor {
                         // Commit the edits first: reload_from_save() rebuilds
                         // the character, item box and talisman buffers from the
                         // save, so anything not applied yet was silently lost.
+                        // The hunt tables live in their own buffers and were
+                        // lost exactly this way: the save stayed clean while
+                        // the window showed "unsaved".
                         if self.dirty {
                             self.apply_to_save();
                         }
+                        self.apply_hunts();
                         self.slot = i;
                         self.reload_from_save();
                         self.message = format!("スロット {} に切り替えました", i + 1);
@@ -1324,8 +1328,15 @@ impl MhnxEditor {
                 "開く",
             ),
             Confirm::ClearDlc => (
-                "クエストを全部消します",
-                "導入済みのクエストをすべて削除します。元に戻せません。".to_string(),
+                "クエストを削除します",
+                match self.pending_dlc_slot {
+                    Some(s) => format!(
+                        "枠 {} のクエストを削除します。元に戻せません。
+（ゲーム側には空の項目が残ることがあります）",
+                        s
+                    ),
+                    None => "クエストを削除します。元に戻せません。".to_string(),
+                },
                 "削除する",
             ),
             Confirm::Charm(n) => (
