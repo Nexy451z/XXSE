@@ -200,6 +200,10 @@ impl MhnxEditor {
     pub fn reload_from_save(&mut self) {
         self.items.clear();
         self.item_selected = None;
+        // The undo snapshots are whole item boxes from the slot that was open.
+        // Keeping them across a slot change let one press of undo write the
+        // previous character's 186 items into the new character's box.
+        self.item_undo.clear();
         let Some(s) = &self.save else { return };
         if let Some(c) = s.read_character(self.slot) {
             self.edit = c;
@@ -307,6 +311,9 @@ impl MhnxEditor {
     /// Write a Switch save as both system and system_backup into a directory.
     pub fn write_switch_pair(&mut self, dir: PathBuf) {
         self.apply_to_save();
+        // The hunt tables live in their own buffers; without this the export
+        // silently wrote the values from disk instead of the ones on screen.
+        self.apply_hunts();
         let Some(s) = &self.save else { return };
         if s.kind() == SaveKind::ThreeDs {
             self.message = "3DS セーブのままです。先に Switch 形式へ変換してください".to_owned();
@@ -319,10 +326,27 @@ impl MhnxEditor {
         a.extend_from_slice(&body);
         let mut b = bak.to_vec();
         b.extend_from_slice(&body);
+        // This pair is what the console actually loads, so replacing it
+        // deserves the same copy the single file overwrite keeps. Two files go
+        // out, two come back.
+        let saved_a = Self::backup_before_write(&dir.join("system"));
+        let saved_b = Self::backup_before_write(&dir.join("system_backup"));
         let r1 = std::fs::write(dir.join("system"), &a);
         let r2 = std::fs::write(dir.join("system_backup"), &b);
         self.message = match (r1, r2) {
-            (Ok(_), Ok(_)) => format!("system と system_backup を書き出しました: {}", dir.display()),
+            (Ok(_), Ok(_)) => {
+                self.dirty = false;
+                let kept = saved_a.iter().chain(saved_b.iter()).count();
+                if kept > 0 {
+                    format!(
+                        "system と system_backup を書き出しました（元のファイルは {} 件退避）: {}",
+                        kept,
+                        dir.display()
+                    )
+                } else {
+                    format!("system と system_backup を書き出しました: {}", dir.display())
+                }
+            }
             _ => "書き出しに失敗しました".to_owned(),
         };
     }
@@ -330,9 +354,13 @@ impl MhnxEditor {
     /// Export the body as a 3DS save.
     pub fn export_3ds(&mut self, path: PathBuf) {
         self.apply_to_save();
+        self.apply_hunts();
         let Some(s) = &self.save else { return };
         match std::fs::write(&path, s.to_3ds_bytes()) {
-            Ok(_) => self.message = format!("3DS 形式で書き出しました: {}", path.display()),
+            Ok(_) => {
+                self.dirty = false;
+                self.message = format!("3DS 形式で書き出しました: {}", path.display());
+            }
             Err(e) => self.message = format!("書き出し失敗: {}", e),
         }
     }
@@ -394,8 +422,7 @@ impl MhnxEditor {
                 self.arc = Some(a);
                 self.arc_path = Some(path.clone());
                 self.arc_from_save = None;
-                self.arc_selected = idx;
-                self.select_arc_entry(idx);
+                self.load_arc_entry(idx);
                 self.run_quest_check();
                 self.message = format!("クエストを読み込みました: {}", path.display());
             }
@@ -436,8 +463,7 @@ impl MhnxEditor {
                 // No path: this arc lives in the save, not on disk.
                 self.arc_path = None;
                 self.arc_from_save = Some(quest_id);
-                self.arc_selected = idx;
-                self.select_arc_entry(idx);
+                self.load_arc_entry(idx);
                 self.run_quest_check();
                 self.tab = Tab::Quest;
                 self.message = format!(
@@ -534,14 +560,24 @@ impl MhnxEditor {
         }
     }
 
+    /// Switch to another entry of the archive that is already open.
+    ///
+    /// The buffer of the entry being left is flushed first: mib_bytes and gmd
+    /// hold the live edits, so switching without this threw away whatever was
+    /// typed in the previous entry. Callers must not assign arc_selected
+    /// themselves, or this sees no change and skips the flush.
     pub fn select_arc_entry(&mut self, index: usize) {
-        // Flush the buffer of the entry being left first: mib_bytes and gmd
-        // hold the live edits, so switching entries without this threw away
-        // whatever the user had typed in the previous one.
         let prev = self.arc_selected;
-        if self.arc.is_some() && prev != index {
+        if self.arc.is_some() && prev != index && prev < self.arc.as_ref().map(|a| a.entries.len()).unwrap_or(0) {
             self.store_arc_entry(prev);
         }
+        self.load_arc_entry(index);
+    }
+
+    /// Point the editors at an entry of a freshly opened archive, discarding
+    /// whatever the previous archive had in the buffers.
+    pub fn load_arc_entry(&mut self, index: usize) {
+        self.arc_selected = index;
         self.mib = None;
         self.gmd = None;
         self.mib_bytes.clear();
@@ -1035,6 +1071,11 @@ impl MhnxEditor {
         }
         ui.heading(format!("キャラクター スロット {}", self.slot + 1));
         ui.add_space(4.0);
+        // Every widget below writes into self.edit, which is only pushed into
+        // the save by apply_to_save. Nothing here used to mark the save dirty,
+        // so the window said "no changes", a slot switch rebuilt self.edit from
+        // the save and the edits disappeared without a word.
+        let before = self.edit.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("char").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("名前");
@@ -1131,6 +1172,9 @@ impl MhnxEditor {
                 }
             });
         });
+        if self.edit != before {
+            self.dirty = true;
+        }
     }
 
     fn tab_items(&mut self, ui: &mut egui::Ui) {
@@ -1528,7 +1572,8 @@ impl MhnxEditor {
                 }
             });
         if let Some(i) = pending_arc {
-            self.arc_selected = i;
+            // No pre-assignment: select_arc_entry has to see the old index so
+            // it can flush the edits made in the entry being left.
             self.select_arc_entry(i);
         }
 
