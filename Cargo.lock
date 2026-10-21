@@ -1515,21 +1515,21 @@ dependencies = [
 
 [[package]]
 name = "mhnx-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "mhnx-core",
 ]
 
 [[package]]
 name = "mhnx-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "miniz_oxide 0.8.9",
 ]
 
 [[package]]
 name = "mhnx-gui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "eframe",
  "egui",

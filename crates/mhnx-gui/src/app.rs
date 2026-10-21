@@ -1189,6 +1189,20 @@ impl MhnxEditor {
         });
     }
 
+    /// A button that destroys something.
+    ///
+    /// They used to look exactly like every other button, so the one action
+    /// that cannot be undone sat in the same row as the harmless ones.
+    fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
+        let fill = egui::Color32::from_rgb(92, 52, 56);
+        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 142, 142));
+        ui.add(
+            egui::Button::new(egui::RichText::new(label).color(egui::Color32::from_rgb(240, 190, 190)))
+                .fill(fill)
+                .stroke(stroke),
+        )
+    }
+
     fn tab_save(&mut self, ui: &mut egui::Ui) {
         if self.save.is_none() {
             ui.centered_and_justified(|ui| ui.label("左上の「セーブを開く」から system ファイルを選んでください"));
@@ -1405,8 +1419,7 @@ impl MhnxEditor {
             ui.label("絞り込み");
             ui.text_edit_singleline(&mut self.item_filter);
             ui.checkbox(&mut self.item_show_empty, "空きスロットも表示");
-            if ui
-                .button("全アイテムを 99 個にする")
+            if Self::danger_button(ui, "全アイテムを 99 個にする")
                 .on_hover_text("1 回で戻せます")
                 .clicked()
             {
@@ -1631,7 +1644,7 @@ impl MhnxEditor {
                 self.items[i].count = c;
                 touched = true;
             }
-            if ui.button("空にする").clicked() {
+            if Self::danger_button(ui, "空にする").clicked() {
                 self.push_item_undo();
                 self.items[i] = ItemSlot::default();
                 touched = true;
@@ -2991,7 +3004,7 @@ impl MhnxEditor {
                             if ui.small_button("抽出").clicked() {
                                 extract_one = Some(q.quest_id);
                             }
-                            if ui.small_button("空にする").clicked() {
+                            if Self::danger_button(ui, "空にする").clicked() {
                                 wipe = Some(q.slot);
                             }
                             ui.end_row();

@@ -44,6 +44,10 @@ const BG_VAL_ACTIVE: Color = rgb(44, 44, 50);
 const BG_BTN: Color = rgb(52, 52, 57);
 const BG_BTN_PRIMARY: Color = rgb(74, 85, 104);
 const BG_BTN_WARN: Color = rgb(107, 78, 42);
+/// Fill for a button that destroys something. The accent red is a text
+/// colour and reads as pale pink as a fill; this one is a surface, and white
+/// on it measures 6.6 to 1.
+const BG_DANGER: Color = rgb(160, 58, 68);
 const BG_FOOTER: Color = rgb(28, 28, 31);
 
 const BORDER_SUBTLE: Color = rgb(58, 58, 65);
@@ -3653,7 +3657,7 @@ impl GuiState {
                     72,
                     34,
                     6,
-                    if armed { rgb(92, 46, 52) } else { rgb(58, 36, 40) },
+                    if armed { BG_DANGER } else { BG_BTN },
                 );
                 c.round_rect_border(
                     bx3,
@@ -3670,7 +3674,7 @@ impl GuiState {
                     72,
                     34,
                     if armed { "本当に?" } else { "削除" },
-                    rgb(220, 142, 142),
+                    if armed { TEXT_PRIMARY } else { ACCENT_RED },
                     FontSize::Small,
                 );
                 self.add_hit(bx3, ry + 6, 72, 34, UiAction::RemoveSaveQuest(q.quest_id));

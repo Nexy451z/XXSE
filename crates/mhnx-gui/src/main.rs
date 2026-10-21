@@ -30,9 +30,9 @@ fn apply_theme(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     let c = |r: u8, g: u8, b: u8| Color32::from_rgb(r, g, b);
 
-    v.panel_fill = c(20, 20, 22);
+    v.panel_fill = c(24, 24, 26);
     v.window_fill = c(28, 28, 32);
-    v.extreme_bg_color = c(16, 16, 18);
+    v.extreme_bg_color = c(20, 20, 22);
     v.faint_bg_color = c(36, 36, 40);
     v.code_bg_color = c(24, 24, 27);
 
@@ -48,20 +48,22 @@ fn apply_theme(ctx: &egui::Context) {
 
     v.widgets.hovered.bg_fill = c(66, 66, 72);
     v.widgets.hovered.weak_bg_fill = c(58, 58, 63);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, c(143, 182, 196));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, c(161, 161, 170));
     v.widgets.hovered.fg_stroke = Stroke::new(1.0, c(240, 240, 243));
 
     v.widgets.active.bg_fill = c(80, 80, 88);
     v.widgets.active.weak_bg_fill = c(74, 74, 80);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, c(143, 182, 196));
+    v.widgets.active.bg_stroke = Stroke::new(1.0, c(228, 228, 231));
     v.widgets.active.fg_stroke = Stroke::new(1.0, c(255, 255, 255));
 
-    v.selection.bg_fill = c(74, 85, 104);
+    v.selection.bg_fill = c(58, 58, 64);
     v.selection.stroke = Stroke::new(1.0, c(228, 228, 231));
-    v.hyperlink_color = c(143, 182, 196);
-    v.warn_fg_color = c(195, 154, 103);
-    v.error_fg_color = c(220, 142, 142);
+    v.hyperlink_color = c(161, 161, 170);
+    v.warn_fg_color = c(161, 161, 170);
+    v.error_fg_color = c(229, 72, 77);
 
+    v.weak_text_color = Some(c(161, 161, 170));
+    v.striped = true;
     ctx.set_visuals(v);
 
     // Two problems the default style leaves: lists end mid-row with nothing
@@ -72,6 +74,7 @@ fn apply_theme(ctx: &egui::Context) {
     // Solid alone is still invisible when the list is at rest.
     style.spacing.scroll.dormant_handle_opacity = 0.45;
     style.spacing.item_spacing = egui::vec2(6.0, 5.0);
+    style.visuals.disabled_alpha = 0.6;
     style.spacing.button_padding = egui::vec2(8.0, 4.0);
     style.spacing.interact_size.y = 22.0;
     use egui::{FontFamily, FontId, TextStyle};
