@@ -385,9 +385,16 @@ fn write_console_save(bytes: &[u8]) -> Result<String, String> {
             "いまのセーブを読み直せないため控えを作れません。セーブは変更していません",
         ));
     }
-    mount
-        .write_diff(bytes, old.as_deref())
-        .map_err(|e| e.describe())?;
+    // The write goes out in blocks and cannot be rolled back. It is refused
+    // unless the copy above is on the card, so a failure half way through is
+    // recoverable: say where from, in the message the user actually sees.
+    if let Err(err) = mount.write_diff(bytes, old.as_deref()) {
+        return Err(alloc::format!(
+            "本体セーブへの書き込みに失敗しました（{}）。書き込み途中の可能性があるので、控え {} を SD カードから戻してください",
+            err.describe(),
+            backup_path
+        ));
+    }
     Ok(backup_path)
 }
 

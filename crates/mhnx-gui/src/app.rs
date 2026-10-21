@@ -2262,10 +2262,11 @@ impl MhnxEditor {
                 });
                 match before {
                     Some(old) => {
-                        // The fix edits the archive entry, so the .mib working
-                        // copy has to be refreshed or the next write puts the
-                        // old byte back.
-                        self.store_arc_entry(self.arc_selected);
+                        // The fix edits the archive entry itself. Storing the
+                        // working buffer here put the pre-fix byte straight
+                        // back over it, so the fix undid itself: read the
+                        // entry back instead of writing the buffer out.
+                        self.load_arc_entry(self.arc_selected);
                         self.run_quest_check();
                         self.message = format!(
                             "参加条件1 を 0x{:02X} から 0x00 に直しました（.arc へ反映してください）",
