@@ -98,6 +98,7 @@ Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
 ゲームファイルは含まれません。
 '@
+$readme | Set-Content (Join-Path $stage 'README.txt') -Encoding utf8
 
 $zip = Join-Path $outDir "$name.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }

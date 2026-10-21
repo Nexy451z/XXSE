@@ -2,6 +2,8 @@
 
 Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
+**Alpha v0.2.0**
+
 ## 動作環境
 
 | 版 | 動くところ |
@@ -41,6 +43,14 @@ pwsh -File .\tools\make_release.ps1
 ```
 
 Switch 版のビルドには devkitPro（libnx）と rustup の `aarch64-nintendo-switch-libnx` が必要です。
+
+## 画面
+
+両方とも落ち着いたグレー基調です。色は意味がある箇所だけに残しています。
+
+- 選択中の行 … 細い枠と左のバー
+- 危険な操作 … 赤系。削除は2回押しで確定
+- 文字 … 本文・副文・補足の3段階
 
 ## 注意
 
