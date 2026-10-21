@@ -6,7 +6,11 @@ license.workspace = true
 description = "Monster Hunter XX (3DS/Switch) save & quest data library - no_std compatible"
 
 [features]
-default = ["std"]
+# gamedata is on by default because dlc::bit_for_quest and the item box
+# validation need the catalogue: a plain cargo test -p mhnx-core did not
+# compile without it. The console build turns defaults off and asks for just
+# this feature, so nothing grows there.
+default = ["std", "gamedata"]
 std = []
 # game data tables (item/equip/monster names) - large, can be disabled
 gamedata = []
