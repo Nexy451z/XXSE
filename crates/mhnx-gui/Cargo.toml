@@ -3,10 +3,10 @@ name = "mhnx-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "mhnxeditor - MHXX save & quest editor GUI"
+description = "XXSE - Monster Hunter XX (NX) Save Editor"
 
 [[bin]]
-name = "mhnxeditor"
+name = "XXSE"
 path = "src/main.rs"
 
 [features]

@@ -1,13 +1,13 @@
 [package]
 name = "mhnx-switch"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "MHXX MHNX Editor for Nintendo Switch (libnx homebrew / .nro)"
+description = "XXSE - Monster Hunter XX (NX) Save Editor for Nintendo Switch (libnx homebrew)"
 license = "MIT OR Apache-2.0"
 publish = false
 
 [[bin]]
-name = "mhnxeditor"
+name = "XXSE"
 path = "src/main.rs"
 
 # The same sources can also be built as a staticlib (see README "Alternative

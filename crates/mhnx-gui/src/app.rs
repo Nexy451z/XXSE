@@ -913,7 +913,7 @@ impl MhnxEditor {
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("mhnxeditor");
+                ui.heading("XXSE");
                 ui.separator();
                 if ui.button("セーブを開く").clicked() {
                     if let Some(p) = rfd::FileDialog::new()
@@ -3584,7 +3584,7 @@ impl MhnxEditor {
     }
 
     fn tab_about(&mut self, ui: &mut egui::Ui) {
-        ui.heading("mhnxeditor");
+        ui.heading("XXSE");
         ui.label("Monster Hunter XX / MHGU のセーブとクエストを編集するツールです。");
         ui.add_space(6.0);
         ui.label("・セーブは 3DS / Switch の両形式に対応");

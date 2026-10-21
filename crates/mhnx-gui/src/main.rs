@@ -48,7 +48,7 @@ fn main() -> eframe::Result<()> {
             // Fits a 1536x864 display: 820 plus the title bar and taskbar did not.
         .with_inner_size([1180.0, 740.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("mhnxeditor - Monster Hunter XX save & quest editor"),
+            .with_title("XXSE - Monster Hunter XX (NX) Save Editor"),
         ..Default::default()
     };
 
