@@ -13,9 +13,9 @@ use crate::sys::{
 };
 
 /// File the SD card demo reads. The SD root is the fsdev root, i.e. "/".
-const DEMO_FILE: &CStr = c"/switch/mhnxeditor/hello.txt";
+const DEMO_FILE: &CStr = c"/switch/XXSE/hello.txt";
 /// Directory the SD card demo lists.
-const DEMO_DIR: &CStr = c"/switch/mhnxeditor";
+const DEMO_DIR: &CStr = c"/switch/XXSE";
 
 /// Print one line through libnx' console (printf -> newlib -> libnx console).
 pub fn log(args: core::fmt::Arguments<'_>) {
@@ -95,7 +95,7 @@ pub fn run(argc: i32, argv: *const *const c_char) -> i32 {
 }
 
 fn banner(argc: i32, argv: *const *const c_char) {
-    log(format_args!("mhnxeditor - MHXX MHNX Editor (Nintendo Switch)"));
+    log(format_args!("XXSE - MHXX Save Editor (Nintendo Switch)"));
     log(format_args!("mhnx-switch {} / {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")));
     log(format_args!("--------------------------------------------------"));
 

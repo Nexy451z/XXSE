@@ -4,7 +4,7 @@ members = ["crates/mhnx-core", "crates/mhnx-gui", "crates/mhnx-cli"]
 exclude = ["switch"]
 
 [workspace.package]
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["Nexy451z"]
 license = "MIT"

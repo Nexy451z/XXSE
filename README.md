@@ -2,7 +2,7 @@
 
 Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
-**Alpha v0.2.3**
+**Alpha v0.2.4**
 
 ## 動作環境
 
@@ -24,7 +24,9 @@ Monster Hunter XX (3DS / Switch) のセーブエディタです。
 SD カードのルート/
 └─ switch/
    └─ XXSE/
-      └─ XXSE.nro
+      ├─ XXSE.nro
+      ├─ backups/          書き込み前の控え
+      └─ mhxx/quest/arc/   クエストの書き出し先
 ```
 
 hbmenu から起動します。PC 版は XXSE.exe をそのまま実行してください。
@@ -54,7 +56,7 @@ Switch 版のビルドには devkitPro（libnx）と rustup の `aarch64-nintend
 
 ## 注意
 
-書き込み前に `/switch/mhnxeditor/backups/` へ控えを作ります。セーブは必ずバックアップを取ってから使ってください。
+書き込み前に `/switch/XXSE/backups/` へ控えを作ります。セーブは必ずバックアップを取ってから使ってください。
 
 ## ライセンス
 

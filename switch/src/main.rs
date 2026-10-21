@@ -1,4 +1,4 @@
-//! mhnxeditor - Nintendo Switch (.nro) entry point.
+//! XXSE - Nintendo Switch (.nro) entry point.
 //!
 //! `#![no_main]`: libnx' crt0 (switch_crt0.o inside libnx.a, pulled in because
 //! switch.ld sets ENTRY(_start)) provides `_start` and calls

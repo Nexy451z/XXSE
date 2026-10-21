@@ -52,25 +52,34 @@ const BTN_RSTICK_DOWN: u64 = 1 << 23;
 const BTN_REPEATABLE: u64 = BTN_LEFT | BTN_UP | BTN_RIGHT | BTN_DOWN;
 
 /// Folders scanned for content.
-const SAVE_DIRS: [&CStr; 3] = [
+///
+/// The tool is called XXSE now, so it looks there first. The old
+/// /switch/mhnxeditor paths stay in the list: files left by earlier versions
+/// are still the user's saves and quests, and dropping them would look like
+/// the tool had lost them.
+const SAVE_DIRS: [&CStr; 5] = [
+    c"/switch/XXSE/saves",
+    c"/switch/XXSE",
     c"/switch/mhnxeditor/saves",
     c"/switch/mhnxeditor",
     c"/mhnxeditor/saves",
 ];
-const QUEST_DIRS: [&CStr; 5] = [
-    c"/switch/mhnxeditor/mhxx/quest/arc", // where extract_quests writes
+const QUEST_DIRS: [&CStr; 7] = [
+    c"/switch/XXSE/mhxx/quest/arc", // where extract_quests writes
+    c"/switch/XXSE/quest/arc",
+    c"/switch/XXSE/quest",
+    c"/switch/mhnxeditor/mhxx/quest/arc",
     c"/switch/mhnxeditor/quest/arc",
     c"/switch/mhnxeditor/quest",
-    c"/switch/mhnxeditor/quests",
     c"/mhnxeditor/quest",
 ];
 
 /// Where quest arcs are written when extracting from a save.
 ///
 /// The user asked for a folder beside the .nro, so the tree is
-/// <sd>/switch/mhnxeditor/mhxx/quest/arc/ - one place for everything the tool
+/// <sd>/switch/XXSE/mhxx/quest/arc/ - one place for everything the tool
 /// produces, with room for other kinds of output later.
-pub const OUT_QUEST_DIR: &str = "/switch/mhnxeditor/mhxx/quest/arc";
+pub const OUT_QUEST_DIR: &str = "/switch/XXSE/mhxx/quest/arc";
 
 /// Repeating a held button would be nicer, but edge triggered keeps the code
 /// simple and predictable. This many frames must pass before a repeat.
@@ -405,7 +414,7 @@ fn write_console_save(bytes: &[u8]) -> Result<String, String> {
 
 /// Keep at most `max_keep` backup files in `SAFETY_DIR` so the SD card never fills up.
 fn prune_old_backups(max_keep: usize) {
-    let entries = list_dir(c"/switch/mhnxeditor/backups");
+    let entries = list_dir(c"/switch/XXSE/backups");
     let mut baks: Vec<String> = entries
         .into_iter()
         .filter(|e| e.is_file && e.name.starts_with("system_") && e.name.ends_with(".bak"))
@@ -426,7 +435,12 @@ fn prune_old_backups(max_keep: usize) {
 }
 
 /// Where the pre-write copies of the console save are kept.
-const SAFETY_DIR: &str = "/switch/mhnxeditor/backups";
+/// Where a copy of the console save is kept before it is written.
+///
+/// This moved with the rename. Copies made by earlier versions stay in
+/// /switch/mhnxeditor/backups and are untouched; nothing reads them
+/// automatically, so if one is needed it has to be restored by hand.
+const SAFETY_DIR: &str = "/switch/XXSE/backups";
 /// Collect .arc quest files from every candidate folder.
 fn scan_quests() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -473,7 +487,7 @@ impl Painter {
             None => {
                 let lines = ed.lines();
                 unsafe { sys::consoleClear() };
-                sys::log_line("mhnxeditor - MHXX editor (Switch)");
+                sys::log_line("XXSE - MHXX save editor (Switch)");
                 sys::log_line("=====================================================");
                 for l in &lines {
                     sys::log_line(&format!("{}{}", if l.cursor { ">" } else { " " }, l.text));

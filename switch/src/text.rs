@@ -1156,7 +1156,7 @@ pub fn canvas_self_test() -> Option<(Canvas, CanvasSmoke)> {
     canvas.text(
         40,
         text_y + canvas.line_height(),
-        "ASCII: mhnxeditor 0.1",
+        "ASCII: XXSE 0.2",
         0xFF66_FF66,
     );
     let bar_y = text_y + canvas.line_height() * 2;

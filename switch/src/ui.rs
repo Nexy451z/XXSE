@@ -143,7 +143,7 @@ pub enum UiAction {
     MibPickerClose,
     /// Install all downloadable Palicoes of the current language into the open save.
     InstallAllPalicoes,
-    /// Unpack all 175 bundled official `.arc` files to SD card (`/switch/mhnxeditor/mhxx/quest/arc`).
+    /// Unpack all 175 bundled official `.arc` files to SD card (`/switch/XXSE/mhxx/questt/arc`).
     ExtractOfficialArcs,
     /// Install the `.arc` file at `idx` in `ArcList` directly into the open save.
     InstallArcRow(usize),
@@ -1962,7 +1962,7 @@ impl GuiState {
                 path.as_str()
             };
             let sub_desc = if is_nand {
-                "保存時に自動で /switch/mhnxeditor/backups/ にバックアップを作成します"
+                "保存時に自動で /switch/XXSE/backups/ にバックアップを作成します"
             } else {
                 "SDカード内のセーブデータファイル（保存時に .bak を作成します）"
             };
