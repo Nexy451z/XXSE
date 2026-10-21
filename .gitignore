@@ -4,14 +4,16 @@
 
 # Scratch space and generated data
 /.work
+/out
 /dist/quests_all
 /dist/quests_out
 /dist/shots
+/dist/sd
 /dist/_*
-
-# Built binaries (rebuild with cargo / switch\build.ps1)
-/dist/*.exe
+/dist/*.nsp
 /dist/*.nro
+/dist/*.exe
+/release
 
 # Editor and OS noise
 *.swp
@@ -29,5 +31,7 @@ Thumbs.db
 /crates/mhnx-core/src/dlc_bundle_gen.rs
 /crates/mhnx-core/src/dlc_bundle.rs
 
-# Release archives
-/release
+# Save files must never be committed.
+/**/system
+/**/system_backup
+*.saveslot
