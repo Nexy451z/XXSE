@@ -241,6 +241,15 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
     }
 }
 
+/// Parse a number the user typed, refusing anything that is not one.
+///
+/// These arguments used to fall back to zero, so a typo silently wrote to slot
+/// zero (or item zero) and reported success.
+fn num<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, String> {
+    text.parse::<T>()
+        .map_err(|_| format!("{} must be a number, got {:?}", what, text))
+}
+
 /// Write a save back over the file it came from, keeping a copy first.
 ///
 /// These commands take the save path and nothing else, so they rewrite the
@@ -1032,19 +1041,21 @@ fn main() -> ExitCode {
         "guild-card" if args.len() == 3 => cmd_guild_card(&args[1], args[2].parse().ok()),
         "hunts" if args.len() == 2 => cmd_hunts(&args[1], None),
         "hunts" if args.len() == 3 => cmd_hunts(&args[1], args[2].parse().ok()),
-        "equip-items" if args.len() == 3 => {
-            cmd_equip_items(&args[1], args[2].parse().unwrap_or(0))
-        }
-        "equip-set" if args.len() == 9 => cmd_equip_set(
-            &args[1],
-            args[2].parse().unwrap_or(0),
-            args[3].parse().unwrap_or(0),
-            &args[4],
-            args[5].parse().unwrap_or(0),
-            args[6].parse().unwrap_or(0),
-            args[7].parse().unwrap_or(1),
-            &args[8],
-        ),
+        "equip-items" if args.len() == 3 => (|| {
+            cmd_equip_items(&args[1], num(&args[2], "slot")?)
+        })(),
+        "equip-set" if args.len() == 9 => (|| {
+            cmd_equip_set(
+                &args[1],
+                num(&args[2], "slot")?,
+                num(&args[3], "record")?,
+                &args[4],
+                num(&args[5], "index")?,
+                num(&args[6], "item")?,
+                num(&args[7], "count")?,
+                &args[8],
+            )
+        })(),
         "gmd-dump" if args.len() == 2 => cmd_gmd_dump(&args[1], 40),
         "gmd-dump" if args.len() == 3 => {
             cmd_gmd_dump(&args[1], args[2].parse().unwrap_or(40))
@@ -1057,12 +1068,12 @@ fn main() -> ExitCode {
         "charms" if args.len() == 2 => cmd_charms(&args[1], None),
         "charms" if args.len() == 3 => cmd_charms(&args[1], args[2].parse().ok()),
         "skills" if args.len() == 1 => cmd_skills(),
-        "slot-export" if args.len() == 4 => {
-            cmd_slot_export(&args[1], args[2].parse().unwrap_or(0), &args[3])
-        }
-        "slot-import" if args.len() == 4 => {
-            cmd_slot_import(&args[1], args[2].parse().unwrap_or(0), &args[3])
-        }
+        "slot-export" if args.len() == 4 => (|| {
+            cmd_slot_export(&args[1], num(&args[2], "slot")?, &args[3])
+        })(),
+        "slot-import" if args.len() == 4 => (|| {
+            cmd_slot_import(&args[1], num(&args[2], "slot")?, &args[3])
+        })(),
         "items" if args.len() == 2 => cmd_items(&args[1], None),
         "items" if args.len() == 3 => cmd_items(&args[1], args[2].parse().ok()),
         "cats" if args.len() == 1 => cmd_cats(),
@@ -1070,7 +1081,7 @@ fn main() -> ExitCode {
             Ok(id) => cmd_cat_add(&args[1], &args[2], id),
             Err(e) => Err(e),
         },
-        "cat-del" if args.len() == 3 => cmd_cat_del(&args[1], args[2].parse().unwrap_or(0)),
+        "cat-del" if args.len() == 3 => (|| cmd_cat_del(&args[1], num(&args[2], "index")?))(),
         other => {
             eprintln!("unknown or incomplete command: {}\n", other);
             usage();
