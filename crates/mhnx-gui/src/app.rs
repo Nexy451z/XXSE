@@ -71,6 +71,8 @@ pub struct MhnxEditor {
     pub item_selected: Option<usize>,
     /// Which charm the delete button is waiting for a second click on.
     pub charm_confirm: CharmConfirm,
+    /// Row of the item table to scroll into view once.
+    pub scroll_to_item: Option<usize>,
     /// A destructive action waiting for the user to say yes.
     pub confirm: Confirm,
     /// Set when the user has just agreed to drop unsaved edits.
@@ -160,6 +162,7 @@ impl Default for MhnxEditor {
             item_filter: String::new(),
             item_selected: None,
         charm_confirm: CharmConfirm::default(),
+        scroll_to_item: None,
         confirm: Confirm::default(),
         discard_ok: false,
         pending_dlc_slot: None,
@@ -1027,7 +1030,20 @@ impl MhnxEditor {
                     (Tab::Extras, "設定/オトモ"),
                     (Tab::About, "情報"),
                 ] {
-                    ui.selectable_value(&mut self.tab, tab, label);
+                    // A save has to be open before a tab can be anything but a
+                    // dead end: eleven of them were just a line of text.
+                    let enabled = self.save.is_some() || matches!(tab, Tab::Save | Tab::About);
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.selectable_value(&mut self.tab, tab, label);
+                    });
+                }
+                if self.save.is_none() {
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("セーブを開くと他のタブが使えます")
+                            .weak()
+                            .small(),
+                    );
                 }
             });
         });
@@ -1467,7 +1483,13 @@ impl MhnxEditor {
 
         ui.label(format!("{} 件", rows.len()));
         let mut selected = self.item_selected;
-        TableBuilder::new(ui)
+        // Scroll once to a row that was just added: the new row sits at the
+        // end of two thousand, so without this nothing appears to happen.
+        let scroll_target = self
+            .scroll_to_item
+            .take()
+            .and_then(|t| rows.iter().position(|i| *i == t));
+        let mut table = TableBuilder::new(ui)
             .striped(true)
             // Without this only the 20px box-number cell is clickable, which
             // nobody discovers.
@@ -1475,7 +1497,11 @@ impl MhnxEditor {
             .column(Column::exact(70.0))
             .column(Column::exact(80.0))
             .column(Column::remainder())
-            .column(Column::exact(90.0))
+            .column(Column::exact(90.0));
+        if let Some(pos) = scroll_target {
+            table = table.scroll_to_row(pos, Some(egui::Align::Center));
+        }
+        table
             .header(22.0, |mut h| {
                 h.col(|ui| {
                     ui.strong("箱 #");
@@ -1570,6 +1596,9 @@ impl MhnxEditor {
         self.items[slot] = ItemSlot { id, count: 1 };
         self.item_selected = Some(slot);
         self.item_show_empty = true;
+        // The new row is at the end of 2300, so without this the user sees the
+        // list jump nowhere and has no idea the item was added.
+        self.scroll_to_item = Some(slot);
         self.apply_to_save();
         self.message = format!("{} を箱 {} に追加しました", item_name(id), slot + 1);
     }

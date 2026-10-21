@@ -541,9 +541,9 @@ fn charm_screen_creates_and_deletes() {
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::CharmEdit);
     let lines = ed.lines();
-    assert!(lines[0].text.contains("CHARM EDIT"));
+    assert!(lines[0].text.contains("お守りの編集"));
     // The defaults are a usable charm.
-    assert!(lines[3].text.contains("skill 1 id"));
+    assert!(lines[3].text.contains("スキル1 ID"));
 
     // A new charm starts as a copy of a real one, so the seed values come from
     // the box rather than from invented defaults. Read them, then bump.
@@ -1119,7 +1119,7 @@ fn y_off_a_skill_row_says_so_instead_of_opening() {
     ed.input(Key::Up); // skill 1 -> deco slots
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::CharmEdit);
-    assert!(ed.message.contains("skill row"), "message was {}", ed.message);
+    assert!(ed.message.contains("スキルの行"), "message was {}", ed.message);
 }
 
 #[test]
@@ -1175,7 +1175,7 @@ fn replacing_an_item_can_be_taken_back() {
         restored[target].id, before[target].id,
         "undo must restore the old item"
     );
-    assert!(ed.message.contains("restored"), "message was {}", ed.message);
+    assert!(ed.message.contains("元に戻しました"), "message was {}", ed.message);
 }
 
 #[test]
@@ -1187,7 +1187,7 @@ fn undo_with_nothing_to_take_back_says_so() {
     open_save(&mut ed);
     ed.input(Key::X);
     ed.input(Key::L);
-    assert!(ed.message.contains("nothing to undo"), "message was {}", ed.message);
+    assert!(ed.message.contains("取り消せる操作がありません"), "message was {}", ed.message);
 }
 
 #[test]
@@ -1293,7 +1293,7 @@ fn l_on_the_save_list_opens_the_convert_screen() {
     assert_eq!(ed.screen, Screen::Convert);
     let joined: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
     let joined = joined.join("\n");
-    assert!(joined.contains("CONVERT SAVE"), "{}", joined);
+    assert!(joined.contains("セーブ形式の変換"), "{}", joined);
     assert!(joined.contains("source"), "{}", joined);
     assert!(joined.contains("3DS"), "the target must be named:\n{}", joined);
 }

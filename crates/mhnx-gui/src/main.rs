@@ -63,6 +63,27 @@ fn apply_theme(ctx: &egui::Context) {
     v.error_fg_color = c(220, 142, 142);
 
     ctx.set_visuals(v);
+
+    // Two problems the default style leaves: lists end mid-row with nothing
+    // to say they scroll, because a floating bar is invisible at rest, and
+    // the body text is 12.5px, which is small for a table of numbers.
+    let mut style = (*ctx.style()).clone();
+    style.spacing.scroll = egui::style::ScrollStyle::solid();
+    // Solid alone is still invisible when the list is at rest.
+    style.spacing.scroll.dormant_handle_opacity = 0.45;
+    style.spacing.item_spacing = egui::vec2(6.0, 5.0);
+    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.spacing.interact_size.y = 22.0;
+    use egui::{FontFamily, FontId, TextStyle};
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(18.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(13.5, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        (TextStyle::Button, FontId::new(13.5, FontFamily::Proportional)),
+        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+    ]
+    .into();
+    ctx.set_style(style);
 }
 fn install_japanese_font(ctx: &egui::Context) -> Option<String> {
     for path in JP_FONT_CANDIDATES {

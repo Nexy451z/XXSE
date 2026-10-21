@@ -507,7 +507,7 @@ impl Editor {
             if index < g.strings.len() {
                 g.strings[index] = text;
                 self.dirty = true;
-                self.message = String::from("text updated - press X to write the .arc");
+                self.message = String::from("テキストを更新しました（X で .arc に書き込み）");
             }
         }
     }
@@ -520,7 +520,7 @@ impl Editor {
             if let Some(s) = &mut self.save {
                 let _ = s.write_character(&c);
                 self.dirty = true;
-                self.message = String::from("name updated - press A to write the save");
+                self.message = String::from("名前を更新しました（A でセーブに書き込み）");
             }
         }
     }
@@ -758,7 +758,7 @@ impl Editor {
                             self.entry_row_cursor
                         );
                     } else {
-                        self.message = String::from("this entry has no editable records");
+                        self.message = String::from("このエントリに編集できる項目はありません");
                     }
                 }
                 // X was advertised on this screen but had no arm, so pressing
@@ -785,7 +785,7 @@ impl Editor {
         self.screen = Screen::Charms;
         self.cursor = 0;
         if self.charms().is_empty() {
-            self.message = String::from("no charms yet - press Y to create one");
+            self.message = String::from("お守りがありません（Y で作成）");
         }
     }
 
@@ -923,9 +923,9 @@ impl Editor {
                     self.skill_pick_cursor = 0;
                     self.charm_edit = Some(e);
                     self.screen = Screen::SkillPick;
-                    self.message = String::from("pick a skill by name");
+                    self.message = String::from("スキルを名前から選んでください");
                 } else {
-                    self.message = String::from("move to a skill row first");
+                    self.message = String::from("先にスキルの行へ移動してください");
                 }
             }
             Key::X => self.step = (self.step + 1) % STEPS.len(),
@@ -981,9 +981,9 @@ impl Editor {
             Key::L | Key::R => {
                 self.palico_lang = 1 - self.palico_lang;
                 self.message = if self.palico_lang == 0 {
-                    String::from("Japanese Palico names")
+                    String::from("オトモ名（日本語）")
                 } else {
-                    String::from("English Palico names")
+                    String::from("オトモ名（英語）")
                 };
             }
             Key::A => {
@@ -1125,7 +1125,7 @@ impl Editor {
                     .map(|f| f.fixable)
                     .unwrap_or(false);
                 if !fixable {
-                    self.message = String::from("this finding cannot be fixed automatically");
+                    self.message = String::from("この指摘は自動で直せません");
                     return;
                 }
                 if let Some(a) = &mut self.arc {
@@ -1142,7 +1142,7 @@ impl Editor {
                             // store_entry() would write the old bytes back.
                             self.load_entry();
                         }
-                        None => self.message = String::from("no .mib entry"),
+                        None => self.message = String::from(".mib がありません"),
                     }
                 }
             }
@@ -1172,7 +1172,7 @@ impl Editor {
                     path: p,
                     bytes: s.to_bytes(),
                 });
-                self.message = String::from("writing save...");
+                self.message = String::from("セーブに書き込み中...");
             }
         }
     }
@@ -1183,9 +1183,9 @@ impl Editor {
         // all here, which read as a broken button.
         if self.arc_path.is_none() {
             self.message = if self.save.is_some() {
-                String::from("press X on the entry list to write this quest back into the save")
+                String::from("エントリ一覧で X を押すと、このクエストをセーブに書き戻します")
             } else {
-                String::from("open a save, or use Y to save this .arc to a file")
+                String::from("セーブを開くか、Y で .arc をファイルに保存してください")
             };
             return;
         }
@@ -1194,9 +1194,9 @@ impl Editor {
                 match a.to_bytes() {
                     Ok(bytes) => {
                         self.pending_write = Some(Write::File { path: p, bytes });
-                        self.message = String::from("writing .arc...");
+                        self.message = String::from(".arc に書き込み中...");
                     }
-                    Err(_) => self.message = String::from("repack failed"),
+                    Err(_) => self.message = String::from("再構築に失敗しました"),
                 }
             }
         }
@@ -1214,12 +1214,12 @@ impl Editor {
             Key::Y => {
                 self.screen = Screen::ArcList;
                 self.cursor = 0;
-                self.message = String::from("quest editor");
+                self.message = String::from("クエスト編集");
             }
             Key::X => {
                 self.screen = Screen::Options;
                 self.cursor = 0;
-                self.message = String::from("options");
+                self.message = String::from("設定");
             }
             // L converts between the 3DS and Switch containers.
             Key::L => {
@@ -1247,7 +1247,7 @@ impl Editor {
             Key::R => {
                 self.screen = Screen::Palico;
                 self.cursor = 0;
-                self.message = String::from("L/R switches the name language");
+                self.message = String::from("L/R で名前の言語を切り替え");
             }
             Key::A => {
                 self.screen = Screen::Char;
@@ -1271,7 +1271,7 @@ impl Editor {
             Key::Y => {
                 self.screen = Screen::ArcList;
                 self.cursor = 0;
-                self.message = String::from("quest editor");
+                self.message = String::from("クエスト編集");
             }
             Key::Plus => self.quit = true,
             _ => {}
@@ -1414,11 +1414,11 @@ impl Editor {
             return;
         };
         let Ok(mut t) = crate::entries::ItemTable::parse(&e.data) else {
-            self.message = String::from("this table cannot be parsed");
+            self.message = String::from("この表を読み取れません");
             return;
         };
         if row >= t.records.len() {
-            self.message = String::from("no such record");
+            self.message = String::from("その記録はありません");
             return;
         }
         t.records[row].item = id;
@@ -1450,7 +1450,7 @@ impl Editor {
     /// Put the item box back the way it was.
     fn undo_item(&mut self) {
         let Some(raw) = self.item_undo.pop() else {
-            self.message = String::from("nothing to undo");
+            self.message = String::from("取り消せる操作がありません");
             return;
         };
         let slots = crate::itembox::decode(&raw);
@@ -1458,7 +1458,7 @@ impl Editor {
         if let Some(s) = &mut self.save {
             if s.write_item_box(slot, &slots).is_ok() {
                 self.dirty = true;
-                self.message = String::from("item box restored");
+                self.message = String::from("アイテムボックスを元に戻しました");
             }
         }
     }
@@ -1493,15 +1493,15 @@ impl Editor {
     /// Build the converted save and hand the bytes to the io layer.
     fn convert_now(&mut self) {
         let Some(save) = &self.save else {
-            self.message = String::from("open a save first");
+            self.message = String::from("先にセーブを開いてください");
             return;
         };
         if save.kind() == crate::save::SaveKind::Mhgu {
-            self.message = String::from("MHGU is not converted here");
+            self.message = String::from("MHGU はここでは変換できません");
             return;
         }
         let Some(base) = self.save_path.clone() else {
-            self.message = String::from("this save has no path");
+            self.message = String::from("このセーブにはパスがありません");
             return;
         };
         // The console save lives on a mounted save area, and that area holds
@@ -1534,7 +1534,7 @@ impl Editor {
                         "Switch (36 byte header synthesised)",
                     ),
                     Err(_) => {
-                        self.message = String::from("cannot build a Switch container");
+                        self.message = String::from("Switch 形式を作れません");
                         return;
                     }
                 }
@@ -2064,7 +2064,7 @@ impl Editor {
             // X lists the quests that live inside the save instead of on disk.
             Key::X => {
                 if self.save.is_none() {
-                    self.message = String::from("open a save first");
+                    self.message = String::from("先にセーブを開いてください");
                     return;
                 }
                 let n = self.save_quests().len();
@@ -2078,7 +2078,7 @@ impl Editor {
             Key::Y => {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
-                self.message = String::from("save editor");
+                self.message = String::from("セーブ編集");
             }
             // Z installs the highlighted archive into the save: the one action
             // the console could not do at all before.
@@ -2444,7 +2444,7 @@ impl Editor {
                         self.screen = Screen::Gmd;
                         self.cursor = 0;
                     }
-                    _ => self.message = String::from("this entry type cannot be edited"),
+                    _ => self.message = String::from("この種類のエントリは編集できません"),
                 }
             }
             // Y shows the entry decoded, whatever its type. The six container
@@ -2454,7 +2454,7 @@ impl Editor {
                 // across or every entry shows whichever one was opened last.
                 self.entry = self.cursor;
                 self.screen = Screen::EntryView;
-                self.message = String::from("B goes back");
+                self.message = String::from("B で戻る");
             }
             Key::X => self.install_into_save(),
             Key::L => self.run_check(),
@@ -2468,7 +2468,7 @@ impl Editor {
                     .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                     .unwrap_or(0);
                 if id == 0 {
-                    self.message = String::from("cannot read the quest id");
+                    self.message = String::from("クエストIDを読めません");
                 } else {
                     self.pending_request = Some(Request::ExtractQuests { ids: alloc::vec![id] });
                 }
@@ -2543,7 +2543,7 @@ impl Editor {
                         self.message = format!("{} -> {} (ID: {})", f.ja, mname, next_id);
                         return;
                     }
-                    self.message = String::from("raw byte field - not editable here");
+                    self.message = String::from("生バイトの項目です（ここでは編集できません）");
                     return;
                 }
                 let cur = questfields::read_u32(&self.mib_bytes, f.offset, f.kind).unwrap_or(0);
@@ -2619,7 +2619,7 @@ impl Editor {
         // it was opened, so an edit followed by X silently saved nothing.
         self.store_entry();
         let Some(a) = &self.arc else {
-            self.message = String::from("open a quest first");
+            self.message = String::from("先にクエストを開いてください");
             return;
         };
         let id = a
@@ -2628,18 +2628,18 @@ impl Editor {
             .map(|m| m.quest_id())
             .unwrap_or(0);
         if id == 0 {
-            self.message = String::from("cannot read the quest id");
+            self.message = String::from("クエストIDを読めません");
             return;
         }
         let raw = match a.to_bytes() {
             Ok(b) => b,
             Err(_) => {
-                self.message = String::from("repack failed");
+                self.message = String::from("再構築に失敗しました");
                 return;
             }
         };
         let Some(s) = &mut self.save else {
-            self.message = String::from("open a save first");
+            self.message = String::from("先にセーブを開いてください");
             return;
         };
         // A quest the save already lists is overwritten in place; a new one
@@ -2701,7 +2701,7 @@ impl Editor {
                 }
             }
             Screen::Slots => {
-                push(&mut out, String::from("CHARACTER SLOT"), false, false);
+                push(&mut out, String::from("キャラクター枠"), false, false);
                 if let Some(s) = &self.save {
                     push(
                         &mut out,
@@ -2799,7 +2799,7 @@ impl Editor {
                     .as_ref()
                     .and_then(|a| a.entries.get(self.entry));
                 match entry {
-                    None => push(&mut out, String::from("no entry"), false, false),
+                    None => push(&mut out, String::from("エントリなし"), false, false),
                     Some(e) => {
                         let ext = extension_for(e.type_hash).unwrap_or("?");
                         push(
@@ -3080,7 +3080,7 @@ impl Editor {
                 );
             }
             Screen::Mib => {
-                push(&mut out, String::from("QUEST PARAMETERS (.mib)"), false, false);
+                push(&mut out, String::from("クエスト条件 (.mib)"), false, false);
                 let fields = questfields::MIB_FIELDS;
                 let mut start = self.mib_cursor.saturating_sub(9);
                 if start + 18 > fields.len() {
@@ -3536,7 +3536,7 @@ impl Editor {
                 );
             }
             Screen::Convert => {
-                push(&mut out, String::from("CONVERT SAVE"), false, false);
+                push(&mut out, String::from("セーブ形式の変換"), false, false);
                 match (&self.save, &self.save_path) {
                     (None, _) => push(&mut out, String::from("  no save open"), false, false),
                     (Some(s), p) => {
@@ -3623,29 +3623,29 @@ impl Editor {
                 );
             }
             Screen::CharmEdit => {
-                push(&mut out, String::from("CHARM EDIT"), false, false);
+                push(&mut out, String::from("お守りの編集"), false, false);
                 let e = self.charm_edit.unwrap_or_default();
                 let rows: [(alloc::string::String, alloc::string::String); 6] = [
-                    (String::from("slot #"), format!("{}", e.index)),
-                    (String::from("deco slots"), format!("{}", e.slots)),
+                    (String::from("枠"), format!("{}", e.index)),
+                    (String::from("装飾スロット"), format!("{}", e.slots)),
                     (
-                        String::from("skill 1 id"),
+                        String::from("スキル1 ID"),
                         format!(
                             "{}  ({})",
                             e.skill1,
                             crate::skills::skill_name(e.skill1).unwrap_or("none")
                         ),
                     ),
-                    (String::from("skill 1 points"), format!("{:+}", e.points1)),
+                    (String::from("スキル1 ポイント"), format!("{:+}", e.points1)),
                     (
-                        String::from("skill 2 id"),
+                        String::from("スキル2 ID"),
                         format!(
                             "{}  ({})",
                             e.skill2,
                             crate::skills::skill_name(e.skill2).unwrap_or("none")
                         ),
                     ),
-                    (String::from("skill 2 points"), format!("{:+}", e.points2)),
+                    (String::from("スキル2 ポイント"), format!("{:+}", e.points2)),
                 ];
                 for (i, (k, v)) in rows.iter().enumerate() {
                     push(
@@ -3754,24 +3754,24 @@ impl Editor {
                 );
             }
             Screen::Options => {
-                push(&mut out, String::from("OPTIONS"), false, false);
+                push(&mut out, String::from("設定"), false, false);
                 let o = self
                     .save
                     .as_ref()
                     .map(|s| s.options())
                     .unwrap_or_else(Options::default);
                 let rows = [
-                    (String::from("brightness"), format!("{}", o.brightness)),
+                    (String::from("明るさ"), format!("{}", o.brightness)),
                     (
-                        String::from("rumble"),
+                        String::from("振動"),
                         String::from(if o.rumble != 0 { "on" } else { "off" }),
                     ),
                     (
-                        String::from("disable 3D"),
+                        String::from("3D を無効化"),
                         String::from(if o.disable_3d != 0 { "yes" } else { "no" }),
                     ),
                     (
-                        String::from("circle pad pro"),
+                        String::from("スライドパッドプロ"),
                         String::from(if o.circle_pad_pro != 0 { "on" } else { "off" }),
                     ),
                 ];
