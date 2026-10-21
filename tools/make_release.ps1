@@ -58,62 +58,46 @@ if (Test-Path $sdcard) {
 
 $readme = @'
 XXSE - Monster Hunter XX (NX) Save Editor
-==========================================
+Alpha v0.1.0
 
-Version : Alpha v0.1.0
-Author  : Nexy451z
+Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
-!! This is an alpha build. Nothing is guaranteed to work.
-!! Back up your save before using it, and keep the copy.
-
-
-What is in this zip
--------------------
-  switch/XXSE/XXSE.nro   Switch homebrew. Extract this zip to the root of
-                         your SD card so the path becomes
-                         /switch/XXSE/XXSE.nro, then start it from hbmenu.
-  XXSE.exe               PC build (Windows). No installer, no DLLs.
-
-
-Requirements (Switch)
----------------------
-  - Atmosphre (custom firmware) on a console that can already run homebrew
-  - Firmware 21 or newer needs a recent libnx; this build uses 4.10+
-  - Start it from hbmenu. Launching from the album works too, but the system
-    keyboard is unavailable there, so use the built-in one.
-
-
-Backups
+動作環境
 --------
-  Before it writes to the console save, the tool copies what is there to
-  /switch/mhnxeditor/backups/ on the SD card. If a write fails, that copy is
-  what you restore from. On the PC side a .bak is left next to any file it
-  overwrites.
+  XXSE.nro  Nintendo Switch (Atmosphere 1.12 以降 / ファーム 23.0.1 で確認)
+  XXSE.exe  Windows 10 / 11
 
+配置
+----
+  SD カードのルートに展開してください。
 
-About the download quest feature
---------------------------------
-  This release does NOT include any game data. The built-in list of official
-  download quests is produced by tools/gen_official_dlc.py from your own copy
-  of the game; without it the tool works normally and that one convenience
-  feature is simply unavailable.
+    SD カードのルート/
+    └─ switch/
+       └─ XXSE/
+          └─ XXSE.nro
 
-  Edit .arc files, change your save, install quests you already have - all of
-  that works. Only the 'import every official quest' shortcut needs the data.
+  hbmenu から起動します。PC 版は XXSE.exe をそのまま実行してください。
 
+ビルド
+------
+  cargo build --release -p mhnx-gui -p mhnx-cli   PC 版
+  .\switch\build.ps1                             Switch 版
+  pwsh -File .\tools\make_release.ps1            リリース用 zip
 
-Licence
--------
-  MIT. See the LICENSE file in the repository.
+  Switch 版のビルドには devkitPro (libnx) と rustup の
+  aarch64-nintendo-switch-libnx が必要です。
 
+注意
+----
+  書き込み前に /switch/mhnxeditor/backups/ へ控えを作ります。
+  セーブは必ずバックアップを取ってから使ってください。
 
-No warranty
-------------
-  Provided as is, with no warranty of any kind. This is an unofficial tool
-  and is not affiliated with or endorsed by Capcom or Nintendo. Use at your
-  own risk; a save editor can destroy a save.
+ライセンス: MIT
+
+---
+
+ゲームファイルは含まれません。
 '@
-$readme | Set-Content (Join-Path $stage 'README.txt') -Encoding utf8
 
 $zip = Join-Path $outDir "$name.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
