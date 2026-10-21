@@ -41,6 +41,20 @@ USAGE:
   mhnx cats                            list the downloadable Palicoes and their ids
   mhnx cat-add <system> <jp|en> <id>   install a download Palico
   mhnx cat-del <system> <index>        remove a download Palico from a slot
+  mhnx add-quest <system> <in.arc> <out>   add a quest the save does not list yet
+  mhnx arc-compact <in.arc> <out.arc>  drop the romfs padding so it fits a slot
+  mhnx hunts <system> [slot]           hunt records: slays, captures, sizes
+  mhnx guild-card <system> [slot]      guild card: rank, clock, comment, arena
+  mhnx mysets <system> [slot]          item sets and equipment sets
+  mhnx equip <system> [slot]           equipment box summary
+  mhnx quests <system>                 every download quest in the save
+  mhnx mib-fields                      every .mib field with its offset and name
+  mhnx cat                            list one downloadable Palico catalogue record
+  mhnx gmd-dump <file.gmd>             dump the strings of a standalone .gmd
+  mhnx arc-gmd-entry <arc> <index>     dump one .gmd entry by index
+  mhnx verify <system>                 read and write back, report any change
+
+Commands that rewrite a save in place keep a copy next to it as <file>.bak.
 "#
     );
 }
@@ -212,7 +226,7 @@ fn cmd_install(save_path: &str, arc_path: &str) -> Result<(), String> {
         .ok_or("short .mib")?;
     let slot = dlc::install_quest(&mut s, id as i32, &raw).map_err(|e| e.to_string())?;
     let out = s.to_bytes();
-    std::fs::write(save_path, &out).map_err(|e| e.to_string())?;
+    write_in_place(save_path, &out)?;
     println!("installed quest {} into slot {} of {}", id, slot, save_path);
     println!("NOTE: write system_backup too - the game keeps the pair in sync");
     Ok(())
@@ -225,6 +239,21 @@ fn severity_tag(s: mhnx_core::check::Severity) -> &'static str {
         Warn => "WARN ",
         Info => "info ",
     }
+}
+
+/// Write a save back over the file it came from, keeping a copy first.
+///
+/// These commands take the save path and nothing else, so they rewrite the
+/// user's file in place. A tool that can do that without leaving a copy is one
+/// bad run away from losing a save.
+fn write_in_place(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let bak = format!("{}.bak", path);
+    if let Ok(old) = std::fs::read(path) {
+        std::fs::write(&bak, &old).map_err(|e| format!("cannot keep a copy at {}: {}", bak, e))?;
+    }
+    std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+    println!("kept a copy at {}", bak);
+    Ok(())
 }
 
 /// Do two paths name the same file on disk?
@@ -711,7 +740,7 @@ fn cmd_slot_import(save: &str, slot: usize, inp: &str) -> Result<(), String> {
         .map(|c| c.name)
         .unwrap_or_default();
     let out = s.to_bytes();
-    std::fs::write(save, &out).map_err(|e| e.to_string())?;
+    write_in_place(save, &out)?;
     println!(
         "imported {} bytes into slot {} (character {}) of {}",
         data.len(),
@@ -795,7 +824,7 @@ fn cmd_cat_add(save: &str, lang: &str, id: u8) -> Result<(), String> {
     };
     let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
     let slot = s.install_dlc_palico(lang, id).map_err(|e| e.to_string())?;
-    std::fs::write(save, s.to_bytes()).map_err(|e| e.to_string())?;
+    write_in_place(save, &s.to_bytes())?;
     let name = s.dlc_palicoes().get(slot).map(|c| c.name.clone()).unwrap_or_default();
     println!("installed {} (id 0x{:02X}) into slot {}", name, id, slot + 1);
     println!("NOTE: write system_backup too");
@@ -815,7 +844,7 @@ fn cmd_cat_del(save: &str, index: usize) -> Result<(), String> {
     if !s.remove_dlc_palico(index - 1) {
         return Err(String::from("could not clear the slot"));
     }
-    std::fs::write(save, s.to_bytes()).map_err(|e| e.to_string())?;
+    write_in_place(save, &s.to_bytes())?;
     println!("removed slot {} ({})", index, name);
     Ok(())
 }
