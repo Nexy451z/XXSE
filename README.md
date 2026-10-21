@@ -1,14 +1,16 @@
-# mhnxeditor
+# XXSE - Monster Hunter XX (NX) Save Editor
 
 Monster Hunter XX (3DS / Switch) の**セーブ**と**クエスト**を扱う Rust 製エディタ。
 
 | 成果物 | 対象 | 説明 |
 |---|---|---|
-| **mhnxeditor.exe** | PC (Windows) | egui/eframe による GUI エディタ |
-| **mhnxeditor.nro** | Nintendo Switch (Atmosphere homebrew) | libnx 上で動く homebrew |
+| **XXSE.exe** | PC (Windows) | egui/eframe による GUI エディタ |
+| **XXSE.nro** | Nintendo Switch (Atmosphere homebrew) | libnx 上で動く homebrew |
 | **mhnx-core** | 共通 | no_std + alloc で動く解析ライブラリ |
 
 同じコアライブラリを PC と Switch の両方で使うため、解析ロジックの二重実装が無い。
+
+作者: **Nexy451z**
 
 ---
 
@@ -77,7 +79,7 @@ Monster Hunter XX (3DS / Switch) の**セーブ**と**クエスト**を扱う Ru
 ```powershell
 cd nx\mhxx\mhnxeditor
 cargo build --release -p mhnx-gui
-# -> target\release\mhnxeditor.exe
+# -> target\release\XXSE.exe
 ```
 
 依存: Rust 1.75+ (stable)。Windows 以外でもビルドできる (フォント読み込みだけ Windows 前提)。
@@ -89,7 +91,7 @@ devkitPro (devkitA64 + libnx) が必要。詳細は [docs/switch_build.md](docs/
 ```powershell
 cd nx\mhxx\mhnxeditor\switch
 .\build.ps1
-# -> ..\dist\mhnxeditor.nro
+# -> ..\dist\XXSE.nro
 ```
 
 ---
@@ -98,8 +100,8 @@ cd nx\mhxx\mhnxeditor\switch
 
 | ファイル | サイズ | 説明 |
 |---|---|---|
-| @@dist/mhnxeditor.exe@@ | 約 5.9 MB | PC 版 GUI (単体で動作、追加 DLL 不要) |
-| @@dist/mhnxeditor.nro@@ | 約 1.7 MB (1,726,153 B) | Switch homebrew |
+| @@dist/XXSE.exe@@ | 約 5.9 MB | PC 版 GUI (単体で動作、追加 DLL 不要) |
+| @@dist/XXSE.nro@@ | 約 1.7 MB (1,726,153 B) | Switch homebrew |
 | @@dist/shots/*.png@@ | — | 全タブの実レンダリング結果 (UI スモークテスト) |
 
 ---
@@ -133,7 +135,7 @@ cd nx\mhxx\mhnxeditor\switch
 ```text
 SD カード/
   switch/
-    mhnxeditor.nro            <- hbmenu から起動
+    XXSE.nro            <- hbmenu から起動
     mhnxeditor/
       saves/                  <- セーブ（system）を置く
         system
@@ -223,7 +225,7 @@ mhnx dlc-list <system>            入っているクエスト一覧
 ```text
 SD カード/
   switch/
-    mhnxeditor.nro          <- hbmenu から起動
+    XXSE.nro          <- hbmenu から起動
     mhnxeditor/
       saves/                <- ここに system を置く
         system
@@ -284,8 +286,8 @@ mhnxeditor/
       src/gamedata.rs        アイテム / 装備名テーブル (自動生成)
       tests/real_data.rs     実データに対する統合テスト
       src/questfields.rs     .mib 96 項目 (うち 10 は生バイト表示) + 15 enum (docs/quest_fields.json から自動生成)
-    mhnx-gui/                PC 版 (egui/eframe) -> mhnxeditor.exe
-  switch/                    Switch 版 (libnx) -> mhnxeditor.nro
+    mhnx-gui/                PC 版 (egui/eframe) -> XXSE.exe
+  switch/                    Switch 版 (libnx) -> XXSE.nro
     src/editor.rs            SD カードのセーブを読み書きする本体 UI
     src/sys.rs               libnx / newlib のバインディング
     build.ps1                再現可能なビルドスクリプト
@@ -321,7 +323,7 @@ $env:MHNXEDITOR_SCREENSHOT = "shot.png"
 $env:MHNXEDITOR_OPEN_SAVE  = "...\system"
 $env:MHNXEDITOR_OPEN_ARC   = "...\q1010165.arc"
 $env:MHNXEDITOR_OPEN_TAB   = "quest"
-.\dist\mhnxeditor.exe
+.\dist\XXSE.exe
 ```
 
 数フレーム描画して PNG を保存し終了する。UI のどこかで panic すれば PNG が生成されないので、
@@ -380,7 +382,7 @@ $env:MHNXEDITOR_OPEN_TAB   = "quest"
 
 ```text
 sd:/switch/mhnxeditor/
-    mhnxeditor.nro
+    XXSE.nro
     saves/                 <- セーブを置く場所（任意）
     quest/arc/             <- クエストを置く場所（任意）
     mhxx/quest/arc/        <- 抽出したクエストの出力先

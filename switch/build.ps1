@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds mhnxeditor.nro (Nintendo Switch homebrew) from the Rust crate in this folder.
+    Builds XXSE.nro (Nintendo Switch homebrew) from the Rust crate in this folder.
 
 .DESCRIPTION
     Route "cargo" (default)
@@ -43,10 +43,11 @@ $repoRoot   = Split-Path -Parent $switchDir
 $distDir    = Join-Path $repoRoot 'dist'
 $targetJson = Join-Path $switchDir 'targets\aarch64-nintendo-switch-libnx.json'
 $targetName = 'aarch64-nintendo-switch-libnx'
-$appName    = 'mhnxeditor'
-$appTitle   = 'mhnxeditor'
-$appAuthor  = 'mhnx project'
-$appVersion = '0.1.0'
+$appName    = 'XXSE'
+# Shown by hbmenu: one line of title, one of author.
+$appTitle   = 'XXSE'
+$appAuthor  = 'Nexy451z'
+$appVersion = '1.0.0'
 
 function Step([string] $Message) { Write-Host ""; Write-Host "==> $Message" -ForegroundColor Cyan }
 function Info([string] $Message) { Write-Host "    $Message" }
@@ -203,7 +204,7 @@ if ($modOffset + 4 -le $bytes.Length) {
 # ---------------------------------------------------------------------------
 Step "Stage -> $distDir"
 if (-not (Test-Path $distDir)) { New-Item -ItemType Directory -Path $distDir | Out-Null }
-$distNro = Join-Path $distDir 'mhnxeditor.nro'
+$distNro = Join-Path $distDir 'XXSE.nro'
 Copy-Item $nro $distNro -Force
 $sdcard = Join-Path $switchDir 'sdcard'
 if (Test-Path $sdcard) {
@@ -226,7 +227,7 @@ if ($Probe) {
     $probeElf = Join-Path $outDir 'examples\text_probe'
     if (-not (Test-Path $probeElf)) { Die "probe ELF not found: $probeElf" }
     $probeNacp = Join-Path $outDir 'mhnx_probe.nacp'
-    Invoke-Tool $nacptool @('--create', 'mhnx probe', $appAuthor, $appVersion, $probeNacp)
+    Invoke-Tool $nacptool @('--create', 'XXSE probe', $appAuthor, $appVersion, $probeNacp)
     $probeNro = Join-Path $outDir 'mhnx_probe.nro'
     Invoke-Tool $elf2nro @($probeElf, $probeNro, "--icon=$devkitProFwd/libnx/default_icon.jpg", "--nacp=$probeNacp")
     if (-not (Test-Path $distDir)) { New-Item -ItemType Directory -Path $distDir | Out-Null }
@@ -240,7 +241,7 @@ if ($Probe) {
 }
 
 Write-Host ''
-Write-Host 'OK: mhnxeditor.nro built.' -ForegroundColor Green
+Write-Host 'OK: XXSE.nro built.' -ForegroundColor Green
 Write-Host "    ELF : $elf"
 Write-Host "    NRO : $distNro"
-Write-Host '    Copy dist/mhnxeditor.nro and dist/switch/ to the SD card root, then start it from hbmenu.'
+Write-Host '    Copy dist/XXSE.nro and dist/switch/ to the SD card root, then start it from hbmenu.'
