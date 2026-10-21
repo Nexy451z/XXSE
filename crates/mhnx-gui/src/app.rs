@@ -219,10 +219,22 @@ impl MhnxEditor {
             Save::from_bytes(&b).map_err(|e| e.to_string())
         }) {
             Ok(s) => {
+                // MHGU is a different game: the slot stride and the section
+                // layout differ, so every offset this tool edits is wrong for
+                // it. Only the DLC tab used to say so, and it said so after the
+                // work was done. Refuse the write outright instead.
+                let mhgu = s.kind() == SaveKind::Mhgu;
                 self.save = Some(s);
                 self.save_path = Some(path.clone());
                 self.dirty = false;
-                self.message = format!("読み込みました: {}", path.display());
+                self.message = if mhgu {
+                    format!(
+                        "読み込みましたが MHGU のセーブです: {}（このツールは MHXX 用なので保存できません）",
+                        path.display()
+                    )
+                } else {
+                    format!("読み込みました: {}", path.display())
+                };
                 self.reload_from_save();
             }
             Err(e) => self.message = format!("読み込み失敗: {}", e),
@@ -317,7 +329,23 @@ impl MhnxEditor {
     }
 
     pub fn write_current(&mut self, path: PathBuf) {
+        // See open_save: the offsets are MHXX's, so writing an MHGU save back
+        // would corrupt it.
+        if matches!(&self.save, Some(s) if s.kind() == SaveKind::Mhgu) {
+            self.message =
+                "MHGU のセーブは保存できません（このツールのオフセットは MHXX 用です）".to_owned();
+            return;
+        }
         self.apply_to_save();
+        // The Switch header carries a CRC of the file name at +0x14, so a save
+        // written out under another name kept the checksum of the name it was
+        // read under. Saving over the same file is still a no-op: rebuilding
+        // the header for the name it already had produces the same bytes.
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if let Some(s) = &mut self.save {
+                s.refresh_header(name);
+            }
+        }
         // The hunt tables are edited in their own buffers, which used to reach
         // the save only if the user pressed the apply button first: writing
         // straight from the table silently dropped the changes.
@@ -727,6 +755,12 @@ impl MhnxEditor {
             self.message = "このセーブに配信クエストはありません".to_owned();
             return 0;
         }
+        // An empty path is not a directory: create_dir_all("") returns Ok and
+        // the loop below then wrote every quest into the working directory.
+        if outdir.trim().is_empty() {
+            self.message = "出力先を指定してください（空のままだと書き出しません）".to_owned();
+            return 0;
+        }
         let dir = std::path::Path::new(outdir);
         if let Err(e) = std::fs::create_dir_all(dir) {
             self.message = format!("出力先を作れません: {}", e);
@@ -1008,7 +1042,16 @@ impl MhnxEditor {
                                 ui.label(kind);
                                 ui.end_row();
                                 ui.label("ファイルサイズ");
-                                ui.label(format!("{} B", s.to_bytes().len()));
+                                // The whole 4.7MB save used to be serialised
+                                // just to print its length, every frame.
+                                ui.label(format!(
+                                    "{} B",
+                                    if s.kind().has_header() {
+                                        mhnx_core::save::SWITCH_HEADER_SIZE + s.body().len()
+                                    } else {
+                                        s.body().len()
+                                    }
+                                ));
                                 ui.end_row();
                                 ui.label("本体サイズ");
                                 ui.label(format!("{} B", s.body().len()));
@@ -3204,7 +3247,8 @@ impl MhnxEditor {
         }
         // Everything is gathered up front and applied at the end: the buttons
         // need &mut self.save while the widgets borrow it for reading.
-        let save = self.save.as_ref().unwrap().clone();
+        // Only the few values the tab actually shows are copied out; cloning
+        // the whole 4.7MB save here cost about a millisecond every frame.
         let mut set_opts: Option<mhnx_core::save::Options> = None;
         let mut add_cat: Option<(usize, usize)> = None;
         let mut drop_cat: Option<usize> = None;
@@ -3214,7 +3258,7 @@ impl MhnxEditor {
         let mut want_import = false;
 
         ui.heading("本体オプション");
-        let o = save.options();
+        let o = self.save.as_ref().unwrap().options();
         ui.horizontal(|ui| {
             ui.label("明るさ");
             let mut b = o.brightness as i32;
@@ -3233,8 +3277,11 @@ impl MhnxEditor {
 
         ui.separator();
         ui.heading("配信オトモ");
-        let cats: Vec<_> = save
-            .dlc_palicoes()
+        let cats: Vec<_> = self
+            .save
+            .as_ref()
+            .map(|s| s.dlc_palicoes())
+            .unwrap_or_default()
             .into_iter()
             .filter(|c| c.id != 0)
             .collect();
@@ -3267,6 +3314,11 @@ impl MhnxEditor {
                 mhnx_core::dlcats::Lang::En
             };
             let ids = mhnx_core::dlcats::all_ids();
+            // Asked once per frame instead of once per combo entry.
+            let used: Vec<bool> = match &self.save {
+                Some(s) => ids.iter().map(|id| s.has_dlc_palico(*id)).collect(),
+                None => Vec::new(),
+            };
             let shown = ids
                 .get(self.cat_id)
                 .and_then(|id| mhnx_core::dlcats::record(lang, *id))
@@ -3280,7 +3332,7 @@ impl MhnxEditor {
                         let name = mhnx_core::dlcats::record(lang, *id)
                             .map(mhnx_core::dlcats::record_name)
                             .unwrap_or_default();
-                        let used = save.has_dlc_palico(*id);
+                        let used = used.get(i).copied().unwrap_or(false);
                         ui.selectable_value(
                             &mut self.cat_id,
                             i,
@@ -3299,7 +3351,11 @@ impl MhnxEditor {
 
         ui.separator();
         ui.heading("お守り");
-        let charms = save.charms(self.slot).unwrap_or_default();
+        let charms = self
+            .save
+            .as_ref()
+            .and_then(|s| s.charms(self.slot))
+            .unwrap_or_default();
         ui.label(format!("スロット {}: {} 個のお守り", self.slot + 1, charms.len()));
         egui::ScrollArea::vertical()
             .id_salt("charms")
@@ -3434,7 +3490,7 @@ impl MhnxEditor {
                 .set_file_name(format!("slot{}.saveslot", self.slot + 1))
                 .save_file()
             {
-                if let Some(bytes) = save.export_slot(self.slot) {
+                if let Some(bytes) = self.save.as_ref().and_then(|s| s.export_slot(self.slot)) {
                     match std::fs::write(&p, &bytes) {
                         Ok(()) => self.message = format!("書き出しました: {}", p.display()),
                         Err(e) => self.message = format!("書き出せません: {}", e),
