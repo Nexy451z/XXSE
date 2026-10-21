@@ -1476,7 +1476,7 @@ impl MhnxEditor {
                     });
                     row.col(|ui| {
                         let mut c = count;
-                        let r = ui.add(egui::DragValue::new(&mut c).range(0..=127));
+                        let r = ui.add(egui::DragValue::new(&mut c).range(0..=99));
                         // One snapshot per drag, not per pixel.
                         if r.drag_started() || (r.changed() && !r.dragged()) {
                             self.push_item_undo();
@@ -1562,7 +1562,7 @@ impl MhnxEditor {
             }
             let mut c = self.items[i].count;
             if ui
-                .add(egui::DragValue::new(&mut c).range(0..=127).prefix("個数 "))
+                .add(egui::DragValue::new(&mut c).range(0..=99).prefix("個数 "))
                 .changed()
             {
                 self.items[i].count = c;
@@ -1604,7 +1604,9 @@ impl MhnxEditor {
             if name.to_lowercase().contains(&needle) {
                 hits.push((id as u16, name));
             }
-            if hits.len() >= 40 {
+            // No cut-off: a search that stopped at forty hid matches for any
+            // broad term, and the list below scrolls anyway.
+            if hits.len() >= 400 {
                 break;
             }
         }
@@ -2085,7 +2087,7 @@ impl MhnxEditor {
                                     }
                                     let mut c = r.count as i32;
                                     if ui
-                                        .add(egui::DragValue::new(&mut c).range(0..=127))
+                                        .add(egui::DragValue::new(&mut c).range(0..=99))
                                         .changed()
                                     {
                                         r.count = c as u8;
@@ -2324,22 +2326,28 @@ impl MhnxEditor {
         }
     }
 
-    /// Quest title for an id, by decoding its .gmd out of the open save.
-    fn quest_title_of(&self, id: i32) -> String {
-        let Some(save) = &self.save else {
-            return String::new();
-        };
-        dlc::list_quests(save)
-            .iter()
-            .find(|q| q.quest_id == id)
-            .and_then(|q| {
-                mhnx_core::arc::Arc::parse(&q.data).ok().and_then(|a| {
-                    a.by_ext("gmd")
-                        .and_then(|e| mhnx_core::quest::Gmd::from_bytes(&e.data).ok())
-                })
+    /// The title carried by one quest payload.
+    fn title_of(data: &[u8]) -> String {
+        mhnx_core::arc::Arc::parse(data)
+            .ok()
+            .and_then(|a| {
+                a.by_ext("gmd")
+                    .and_then(|e| mhnx_core::quest::Gmd::from_bytes(&e.data).ok())
             })
             .and_then(|g| g.title().map(|t| t.to_string()))
             .unwrap_or_default()
+    }
+
+    /// Titles for a list of quests, built in one pass.
+    ///
+    /// This used to be called per row and each call re-listed and re-parsed
+    /// every quest in the save, so a 175 quest save cost thousands of parses a
+    /// frame.
+    fn quest_titles(quests: &[dlc::InstalledQuest]) -> std::collections::HashMap<i32, String> {
+        quests
+            .iter()
+            .map(|q| (q.quest_id, Self::title_of(&q.data)))
+            .collect()
     }
 
     fn tab_sets(&mut self, ui: &mut egui::Ui) {
@@ -2740,25 +2748,39 @@ impl MhnxEditor {
                 .weak()
                 .small(),
         );
-        egui::ScrollArea::vertical()
+        // Only the rows on screen are built: a save can hold seven hundred
+        // entries and a plain grid laid every one of them out each frame.
+        use egui_extras::{Column, TableBuilder};
+        TableBuilder::new(ui)
             .id_salt("equiplist")
-            .show(ui, |ui| {
-                egui::Grid::new("equipgrid")
-                    .num_columns(4)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for h in ["枠", "種類", "名前", "Lv"] {
-                            ui.strong(h);
-                        }
-                        ui.end_row();
-                        for e in &rows {
-                            ui.label(format!("{}", e.index));
-                            ui.label(mhnx_core::equip::type_name(e.kind));
-                            ui.label(mhnx_core::equip::name(e));
-                            ui.label(format!("{}", e.level));
-                            ui.end_row();
-                        }
+            .striped(true)
+            .column(Column::exact(60.0))
+            .column(Column::exact(110.0))
+            .column(Column::remainder())
+            .column(Column::exact(60.0))
+            .header(22.0, |mut h| {
+                for t in ["枠", "種類", "名前", "Lv"] {
+                    h.col(|ui| {
+                        ui.strong(t);
                     });
+                }
+            })
+            .body(|body| {
+                body.rows(20.0, rows.len(), |mut row| {
+                    let e = rows[row.index()];
+                    row.col(|ui| {
+                        ui.label(format!("{}", e.index));
+                    });
+                    row.col(|ui| {
+                        ui.label(mhnx_core::equip::type_name(e.kind));
+                    });
+                    row.col(|ui| {
+                        ui.label(mhnx_core::equip::name(e));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{}", e.level));
+                    });
+                });
             });
     }
 
@@ -2776,6 +2798,7 @@ impl MhnxEditor {
             return;
         }
         let quests = dlc::list_quests(save);
+        let titles = Self::quest_titles(&quests);
         let equipment = dlc::quest_equipment(save);
         let used = equipment.iter().filter(|e| e.occupied).count();
         ui.horizontal(|ui| {
@@ -2826,7 +2849,12 @@ impl MhnxEditor {
                                 ui.label(format!("{}", e.index));
                                 if e.occupied {
                                     ui.label(format!("{}", e.quest_id));
-                                    ui.label(self.quest_title_of(e.quest_id));
+                                    ui.label(
+                                        titles
+                                            .get(&e.quest_id)
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                    );
                                 } else {
                                     ui.weak("—");
                                     ui.weak("空き");
