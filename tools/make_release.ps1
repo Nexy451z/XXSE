@@ -26,6 +26,16 @@ foreach ($f in @($nro, $exe)) {
     if (-not (Test-Path $f)) { throw "missing: $f (build first)" }
 }
 
+# The bundle of official quests must not reach a release: it is game data.
+# Detect it by the names inside the quest archives the blob carries.
+foreach ($f in @($nro, $exe)) {
+    $bytes = [System.IO.File]::ReadAllBytes($f)
+    $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+    if ($text.Contains('questData_')) {
+        throw "$f contains the official quest bundle. Rebuild without dlc_bundle_gen.rs and official_dlc.bin present."
+    }
+}
+
 $name = "XXSE-$($Version.Replace(' ', '-'))"
 $outDir = Join-Path $Root 'release'
 $stage  = Join-Path $outDir $name
@@ -90,6 +100,11 @@ About the download quest feature
 
   Edit .arc files, change your save, install quests you already have - all of
   that works. Only the 'import every official quest' shortcut needs the data.
+
+
+Licence
+-------
+  MIT. See the LICENSE file in the repository.
 
 
 No warranty
