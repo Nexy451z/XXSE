@@ -32,6 +32,22 @@ pub enum Tab {
 }
 
 /// The whole application.
+/// Destructive actions that have to be confirmed before they happen.
+#[derive(Default, PartialEq)]
+pub enum Confirm {
+    /// Nothing is waiting.
+    #[default]
+    None,
+    /// Quit with unwritten edits.
+    Quit,
+    /// Open this save, dropping the unwritten edits.
+    DiscardForOpen(PathBuf),
+    /// Empty the DLC section.
+    ClearDlc,
+    /// Delete one charm.
+    Charm(usize),
+}
+
 /// Two-step confirmation for the destructive charm delete.
 #[derive(Default)]
 pub struct CharmConfirm {
@@ -55,6 +71,12 @@ pub struct MhnxEditor {
     pub item_selected: Option<usize>,
     /// Which charm the delete button is waiting for a second click on.
     pub charm_confirm: CharmConfirm,
+    /// A destructive action waiting for the user to say yes.
+    pub confirm: Confirm,
+    /// Set when the user has just agreed to drop unsaved edits.
+    pub discard_ok: bool,
+    /// The download quest slot waiting for the delete confirmation.
+    pub pending_dlc_slot: Option<usize>,
     pub item_show_empty: bool,
 
     // ---- quest ----
@@ -138,6 +160,9 @@ impl Default for MhnxEditor {
             item_filter: String::new(),
             item_selected: None,
         charm_confirm: CharmConfirm::default(),
+        confirm: Confirm::default(),
+        discard_ok: false,
+        pending_dlc_slot: None,
             item_show_empty: false,
             arc_path: None,
             arc: None,
@@ -182,6 +207,14 @@ impl Default for MhnxEditor {
 impl MhnxEditor {
     // ---------------------------------------------------------------- save
     pub fn open_save(&mut self, path: PathBuf) {
+        // Loading another file replaced whatever was in the working copies,
+        // and nothing had been written yet. Ask once, and remember the answer
+        // for the very next attempt so the caller can simply try again.
+        if self.dirty && Some(&path) != self.save_path.as_ref() && !self.discard_ok {
+            self.confirm = Confirm::DiscardForOpen(path);
+            return;
+        }
+        self.discard_ok = false;
         match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| {
             Save::from_bytes(&b).map_err(|e| e.to_string())
         }) {
@@ -753,6 +786,12 @@ impl MhnxEditor {
 
 impl eframe::App for MhnxEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Closing the window with unwritten edits used to lose them silently.
+        if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.discard_ok {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.confirm = Confirm::Quit;
+        }
+        self.confirm_dialog(ctx);
         self.top_bar(ctx);
         // Tabs live in their own bar: laying them out inside the side panel
         // made the panel grow to fit the row, so it covered more than half the
@@ -1177,12 +1216,99 @@ impl MhnxEditor {
         }
     }
 
+    /// Delete one download quest, after the dialog has said yes.
+    pub fn clear_dlc(&mut self) {
+        let Some(slot) = self.pending_dlc_slot.take() else {
+            return;
+        };
+        if let Some(s) = &mut self.save {
+            match dlc::uninstall_quest(s, slot) {
+                Ok(()) => {
+                    self.dirty = true;
+                    self.message =
+                        "空にしました（導入フラグは消せないため、ゲーム側には残ります）".to_owned();
+                }
+                Err(e) => self.message = format!("空にできません: {}", e),
+            }
+        }
+    }
+
+    /// Delete one charm, after the dialog has said yes.
+    pub fn delete_charm(&mut self, index: usize) {
+        if let Some(s) = &mut self.save {
+            if s.clear_charm(self.slot, index) {
+                self.dirty = true;
+                self.message = format!("お守り {} を削除しました", index);
+            }
+        }
+    }
+
+    /// A modal that asks before something irreversible happens.
+    fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        let (title, body, yes) = match &self.confirm {
+            Confirm::None => return,
+            Confirm::Quit => (
+                "未保存の変更があります",
+                "保存せずに終了しますか？".to_string(),
+                "保存せず終了",
+            ),
+            Confirm::DiscardForOpen(p) => (
+                "未保存の変更があります",
+                format!("保存せずに別のセーブを開きますか？\n{}", p.display()),
+                "開く",
+            ),
+            Confirm::ClearDlc => (
+                "クエストを全部消します",
+                "導入済みのクエストをすべて削除します。元に戻せません。".to_string(),
+                "削除する",
+            ),
+            Confirm::Charm(n) => (
+                "お守りを削除します",
+                format!("枠 {} のお守りを削除します。元に戻せません。", n),
+                "削除する",
+            ),
+        };
+        let mut answer: Option<bool> = None;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(body);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(yes).clicked() {
+                        answer = Some(true);
+                    }
+                    if ui.button("やめる").clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => {
+                let what = core::mem::replace(&mut self.confirm, Confirm::None);
+                self.discard_ok = true;
+                match what {
+                    Confirm::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Confirm::DiscardForOpen(p) => self.open_save(p),
+                    Confirm::ClearDlc => self.clear_dlc(),
+                    Confirm::Charm(n) => self.delete_charm(n),
+                    Confirm::None => {}
+                }
+            }
+            Some(false) => self.confirm = Confirm::None,
+            None => {}
+        }
+    }
     fn tab_items(&mut self, ui: &mut egui::Ui) {
         if self.items.is_empty() {
             ui.centered_and_justified(|ui| ui.label("セーブを開くとアイテムボックスを表示します"));
             return;
         }
-        ui.horizontal(|ui| {
+        // Wrapped, because the row is wider than the content area at the
+        // default window size and the last buttons fell off the right edge.
+        ui.horizontal_wrapped(|ui| {
             ui.label("絞り込み");
             ui.text_edit_singleline(&mut self.item_filter);
             ui.checkbox(&mut self.item_show_empty, "空きスロットも表示");
@@ -1732,6 +1858,16 @@ impl MhnxEditor {
             if let Some(id) = new_id {
                 if let Some(m) = &mut self.mib {
                     m.set_quest_id(id);
+                }
+            }
+
+            // A field edit only reaches mib_bytes; the archive still holds the
+            // old payload until it is stored. Marking the save dirty without
+            // storing it made the window say "unsaved" and then clear that
+            // flag on save, because the saved bytes never carried the edit.
+            if let Some(m) = &self.mib {
+                if m.raw != self.mib_bytes {
+                    self.dirty = true;
                 }
             }
 
@@ -2731,16 +2867,9 @@ impl MhnxEditor {
             self.message = format!("{} 件を書き出しました", n);
         }
         if let Some(slot) = wipe {
-            if let Some(s) = &mut self.save {
-                match dlc::uninstall_quest(s, slot) {
-                    Ok(()) => {
-                        self.dirty = true;
-                        self.message =
-                            "空にしました（導入フラグは消せないため、ゲーム側には残ります）".to_owned();
-                    }
-                    Err(e) => self.message = format!("空にできません: {}", e),
-                }
-            }
+            // Deleting a quest is not undoable, so it asks first.
+            self.confirm = Confirm::ClearDlc;
+            self.pending_dlc_slot = Some(slot);
         }
     }
 

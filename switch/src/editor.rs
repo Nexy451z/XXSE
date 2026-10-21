@@ -369,9 +369,21 @@ fn write_console_save(bytes: &[u8]) -> Result<String, String> {
     let old = mount.read().ok();
     let stamp = crate::savedata::stamp();
     let backup_path = alloc::format!("{}/system_{}.bak", backup, stamp);
+    // A copy that silently failed is worse than no copy, because the message
+    // afterwards claims one exists. Refuse to write the save unless the copy
+    // really is on the card and reads back the same length.
     if let Some(old) = old.as_ref() {
-        let _ = write_file(&backup_path, old);
+        if !write_file(&backup_path, old) {
+            return Err(alloc::format!(
+                "控えを書けませんでした（{}）。セーブは変更していません",
+                backup_path
+            ));
+        }
         prune_old_backups(10);
+    } else {
+        return Err(String::from(
+            "いまのセーブを読み直せないため控えを作れません。セーブは変更していません",
+        ));
     }
     mount
         .write_diff(bytes, old.as_deref())
