@@ -47,7 +47,7 @@ $appName    = 'XXSE'
 # Shown by hbmenu: one line of title, one of author.
 $appTitle   = 'XXSE'
 $appAuthor  = 'Nexy451z'
-$appVersion = '1.0.0'
+$appVersion = '0.1.0-alpha'
 
 function Step([string] $Message) { Write-Host ""; Write-Host "==> $Message" -ForegroundColor Cyan }
 function Info([string] $Message) { Write-Host "    $Message" }

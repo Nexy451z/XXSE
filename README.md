@@ -1,5 +1,9 @@
 # XXSE - Monster Hunter XX (NX) Save Editor
 
+**Alpha v0.1.0** — 動作保証なし。セーブは必ず控えを取ってから使ってください。
+
+作者: **Nexy451z**
+
 Monster Hunter XX (3DS / Switch) の**セーブ**と**クエスト**を扱う Rust 製エディタ。
 
 | 成果物 | 対象 | 説明 |
@@ -10,7 +14,36 @@ Monster Hunter XX (3DS / Switch) の**セーブ**と**クエスト**を扱う Ru
 
 同じコアライブラリを PC と Switch の両方で使うため、解析ロジックの二重実装が無い。
 
-作者: **Nexy451z**
+## このリポジトリにゲームデータは含まれない
+
+公式配信クエストの一覧をツールに組み込む機能（「公式クエストを全部入れる」）は、
+**ゲーム本体から取り出したデータ**を必要とします。再配布を避けるため、
+そのデータはリポジトリに入れていません。
+
+```
+python tools/gen_official_dlc.py     # 自分のゲームデータから生成
+```
+
+生成物 `official_dlc.bin` と `dlc_bundle_gen.rs` は `.gitignore` 済みです。
+**生成しなくてもビルドは通り、他の機能はすべて使えます**（空のスタブに切り替わります）。
+
+## リリースの作り方
+
+```powershell
+cargo build --release -p mhnx-gui -p mhnx-cli
+.\switch\build.ps1
+pwsh -File .\tools\make_release.ps1
+```
+
+`release/XXSE-Alpha-v0.1.0.zip` ができあがります。
+
+```
+XXSE-Alpha-v0.1.0/
+  switch/XXSE/XXSE.nro   <- SD カードのルートに展開
+  XXSE.exe               <- PC 版
+  README.txt
+```
+
 
 ---
 

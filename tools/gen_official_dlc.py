@@ -7,7 +7,7 @@ PLAYABLE_DIR = r"C:\anyWorkspace\nx\mhxx\arcs\all_event\playable"
 DEAD_DIR = r"C:\anyWorkspace\nx\mhxx\arcs\all_event\dead"
 SAVE_PATH = r"C:\Users\haruk\Downloads\system"
 OUT_BIN = r"C:\anyWorkspace\nx\mhxx\mhnxeditor\crates\mhnx-core\src\official_dlc.bin"
-OUT_RS = r"C:\anyWorkspace\nx\mhxx\mhnxeditor\crates\mhnx-core\src\dlc_bundle.rs"
+OUT_RS = r"C:\anyWorkspace\nx\mhxx\mhnxeditor\crates\mhnx-core\src\dlc_bundle_gen.rs"
 
 
 def parse_arc_title_and_id(b: bytes):
@@ -126,7 +126,7 @@ def main():
         "//! and the complete DLC section dump.",
         "",
         "/// Raw packed binary blob containing all 223 .arc files, 40 .equ records, and DLC header slices.",
-        'pub static OFFICIAL_DLC_BLOB: &[u8] = include_bytes!("official_dlc.bin");',
+        'pub static OFFICIAL_DLC_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/official_dlc.bin"));',
         "",
         "/// Category of a bundled quest.",
         "#[derive(Debug, Clone, Copy, PartialEq, Eq)]",
