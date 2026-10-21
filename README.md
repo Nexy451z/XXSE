@@ -2,7 +2,7 @@
 
 Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
-**Alpha v0.2.0**
+**Alpha v0.2.1**
 
 ## 動作環境
 
