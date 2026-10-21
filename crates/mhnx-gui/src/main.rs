@@ -56,8 +56,12 @@ fn apply_theme(ctx: &egui::Context) {
     v.widgets.active.bg_stroke = Stroke::new(1.0, c(228, 228, 231));
     v.widgets.active.fg_stroke = Stroke::new(1.0, c(255, 255, 255));
 
-    v.selection.bg_fill = c(58, 58, 64);
-    v.selection.stroke = Stroke::new(1.0, c(228, 228, 231));
+    // egui does not draw a border around a selected row, so the fill alone has
+    // to carry it: at 58,58,64 it measured 1.57 to 1 against the panel, which
+    // is below the 3 to 1 that a UI state needs. This one is 3.3 to 1 and
+    // white on it still reads at 5.35 to 1.
+    v.selection.bg_fill = c(106, 106, 116);
+    v.selection.stroke = Stroke::new(1.0, c(255, 255, 255));
     v.hyperlink_color = c(161, 161, 170);
     v.warn_fg_color = c(161, 161, 170);
     v.error_fg_color = c(229, 72, 77);

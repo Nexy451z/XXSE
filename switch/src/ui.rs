@@ -68,10 +68,12 @@ const TEXT_GOLD: Color = rgb(196, 174, 110);
 
 // Layout constants (1280 x 720)
 //
-// The bars are sized so that every touch target reaches 44 px: the toolbar
-// used to be 42 with 30 px buttons inside it, which is below the smallest
-// size a finger can hit reliably. Header 64 + toolbar 56 leaves 488 px of
-// content, and the footer takes the last 88.
+// The bars are sized so the toolbar buttons reach 44 px: the toolbar used to
+// be 42 with 30 px buttons inside it, which is below the smallest size a
+// finger can hit reliably. Header 64 + toolbar 56 leaves 488 px of content
+// and the footer takes the last 88. Row lists inside the content area are
+// still tighter than that; they were sized for the old 524 px and several
+// overflowed when the bars grew.
 const HEADER_H: i32 = 64;
 const FOOTER_Y: i32 = 632;
 const FOOTER_H: i32 = 88;
@@ -1366,7 +1368,11 @@ impl GuiState {
         let cur_tab = canonical_tab(ed.screen);
         let has_save = ed.save.is_some();
         let mut iy = sy + 42;
-        let item_h = 37;
+        // 14 items have to fit between the header hint and the footer. The
+        // previous 37 + 2 overflowed it by 20px once the bars grew for touch,
+        // which pushed the last label under the footer: invisible but still
+        // clickable. The visual box is 36; the hit box is 44 and centred on it.
+        let item_h = 36;
 
         for &(scr, label, tag_col) in nav_items {
             let active = cur_tab == scr;
@@ -1393,8 +1399,13 @@ impl GuiState {
                 TEXT_MUTED
             };
             c.text_sized(24, iy + 8, label, fg, FontSize::Small);
-            self.add_hit(8, iy, SIDEBAR_W - 16, item_h, UiAction::GotoScreen(scr));
-            iy += item_h + 2;
+            // 44px of reach, centred on the 36px box, clamped to the next row
+            // so two entries never answer the same tap.
+            let reach = 44;
+            let hit_y = (iy - (reach - item_h) / 2).max(sy);
+            let hit_h = (reach).min(FOOTER_Y - hit_y);
+            self.add_hit(8, hit_y, SIDEBAR_W - 16, hit_h, UiAction::GotoScreen(scr));
+            iy += item_h + 1;
         }
     }
 
@@ -1894,7 +1905,9 @@ impl GuiState {
         let total = ed.save_files.len();
         let visible = 7;
         let start = window_start(ed.cursor, total, visible);
-        let row_h = 68;
+        // 7 rows at 68 + 6 ran to 648, sixteen pixels past the footer.
+        let row_h = 62;
+        let row_gap = 4;
         let list_w = MAIN_W - 44;
 
         for row in 0..visible {
@@ -1902,7 +1915,7 @@ impl GuiState {
             let Some(path) = ed.save_files.get(idx) else {
                 break;
             };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 6);
+            let ry = CONTENT_Y + (row as i32) * (row_h + row_gap);
             let selected = idx == ed.cursor;
             let is_nand = path == CONSOLE_SAVE;
 
@@ -4528,7 +4541,8 @@ impl GuiState {
         }
         let visible = 8;
         let start = window_start(ed.check_cursor, total, visible);
-        let row_h = 58;
+        // 8 rows at 58 + 6 reached 642, ten pixels under the footer.
+        let row_h = 56;
         let list_w = MAIN_W - 44;
 
         for row in 0..visible {
@@ -4536,7 +4550,7 @@ impl GuiState {
             let Some(f) = ed.findings.get(idx) else {
                 break;
             };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 6);
+            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
             let selected = idx == ed.check_cursor;
 
             c.round_rect(
