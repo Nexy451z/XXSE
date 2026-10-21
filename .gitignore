@@ -21,3 +21,13 @@ Thumbs.db
 # Scratch files used while reverse engineering
 /tools/_*
 /.re_review*/
+
+# Game data. The repository ships none of it: these files are produced from
+# your own copy of the game by tools/gen_official_dlc.py, and build.rs falls
+# back to the empty stub in dlc_bundle_stub.rs when they are absent.
+/crates/mhnx-core/src/official_dlc.bin
+/crates/mhnx-core/src/dlc_bundle_gen.rs
+/crates/mhnx-core/src/dlc_bundle.rs
+
+# Release archives
+/release

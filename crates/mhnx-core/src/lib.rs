@@ -43,6 +43,13 @@ pub mod charm;
 pub mod check;
 pub mod crc;
 pub mod dlc;
+// The bundle holds quest data taken from the game, so the repository ships an
+// empty stub and build.rs compiles the generated module when one exists.
+#[cfg(official_bundle)]
+#[path = "dlc_bundle_gen.rs"]
+pub mod dlc_bundle;
+#[cfg(not(official_bundle))]
+#[path = "dlc_bundle_stub.rs"]
 pub mod dlc_bundle;
 pub mod dlcats;
 pub mod equip;
