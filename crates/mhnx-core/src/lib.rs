@@ -84,13 +84,45 @@ pub enum Error {
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // These reach the screen through the GUI status bar and the console
+        // message line, so they are written in the language of the interface.
         match self {
-            Error::BadSize { got, want } => write!(f, "bad size: got {} want {}", got, want),
-            Error::BadMagic { context } => write!(f, "bad magic in {}", context),
-            Error::OutOfRange { context, value } => write!(f, "{}: value {} out of range", context, value),
-            Error::Decompress => write!(f, "decompression failed"),
-            Error::Parse(s) => write!(f, "parse error: {}", s),
+            Error::BadSize { got, want } => {
+                write!(f, "サイズが違います: {} バイト（期待 {} バイト）", got, want)
+            }
+            Error::BadMagic { context } => {
+                write!(f, "形式が違います: {}", japanese_context(context))
+            }
+            Error::OutOfRange { context, value } => {
+                write!(f, "{} が範囲外です: {}", japanese_context(context), value)
+            }
+            Error::Decompress => write!(f, "展開に失敗しました"),
+            Error::Parse(s) => write!(f, "読み取りに失敗しました: {}", s),
         }
+    }
+}
+
+/// The contexts written by this crate, in the language of the interface.
+///
+/// An unknown one is passed through unchanged rather than hidden: a wrong
+/// description is worse than an untranslated one.
+fn japanese_context(context: &'static str) -> &'static str {
+    match context {
+        "arc magic" => "クエストファイル (.arc)",
+        "arc entry count" => "エントリ数",
+        "arc name" => "エントリ名",
+        "save size" => "セーブのサイズ",
+        "switch header" => "Switch のヘッダ",
+        "quest payload larger than a slot" => "クエストが枠に入りません",
+        "quest id is not in the DLC catalogue" => "配信クエストの一覧に無いID",
+        "DLC section" => "DLC 領域",
+        "quest slot" => "クエストの枠",
+        "character slot" => "キャラクター枠",
+        "item index" => "アイテムの位置",
+        "item id" => "アイテムID",
+        "charm index" => "お守りの枠",
+        "palico index" => "オトモの枠",
+        other => other,
     }
 }
 

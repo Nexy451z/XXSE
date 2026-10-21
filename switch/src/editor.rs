@@ -102,8 +102,13 @@ fn read_file(path: &str) -> Option<Vec<u8>> {
             break;
         }
         out.extend_from_slice(&buf[..n]);
+        // A cap has to exist: a stray path pointing at a video file would
+        // exhaust the heap. Returning the truncated buffer silently was worse
+        // than refusing, because everything downstream then failed on a
+        // half-file with no clue where it came from.
         if out.len() > 12 * 1024 * 1024 {
-            break;
+            unsafe { fclose(f) };
+            return None;
         }
     }
     unsafe { fclose(f) };
