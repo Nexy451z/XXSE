@@ -23,6 +23,47 @@ const JP_FONT_CANDIDATES: &[&str] = &[
     r"C:\Windows\Fonts\msmincho.ttc",
 ];
 
+/// The same muted palette the console build uses, so the two look like one
+/// program. Values checked for WCAG AA against every surface they sit on.
+fn apply_theme(ctx: &egui::Context) {
+    use egui::{Color32, Stroke};
+    let mut v = egui::Visuals::dark();
+    let c = |r: u8, g: u8, b: u8| Color32::from_rgb(r, g, b);
+
+    v.panel_fill = c(20, 20, 22);
+    v.window_fill = c(28, 28, 32);
+    v.extreme_bg_color = c(16, 16, 18);
+    v.faint_bg_color = c(36, 36, 40);
+    v.code_bg_color = c(24, 24, 27);
+
+    v.widgets.noninteractive.bg_fill = c(30, 30, 33);
+    v.widgets.noninteractive.weak_bg_fill = c(30, 30, 33);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, c(58, 58, 65));
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, c(228, 228, 231));
+
+    v.widgets.inactive.bg_fill = c(52, 52, 57);
+    v.widgets.inactive.weak_bg_fill = c(44, 44, 49);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, c(110, 110, 120));
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, c(228, 228, 231));
+
+    v.widgets.hovered.bg_fill = c(66, 66, 72);
+    v.widgets.hovered.weak_bg_fill = c(58, 58, 63);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, c(143, 182, 196));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, c(240, 240, 243));
+
+    v.widgets.active.bg_fill = c(80, 80, 88);
+    v.widgets.active.weak_bg_fill = c(74, 74, 80);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, c(143, 182, 196));
+    v.widgets.active.fg_stroke = Stroke::new(1.0, c(255, 255, 255));
+
+    v.selection.bg_fill = c(74, 85, 104);
+    v.selection.stroke = Stroke::new(1.0, c(228, 228, 231));
+    v.hyperlink_color = c(143, 182, 196);
+    v.warn_fg_color = c(195, 154, 103);
+    v.error_fg_color = c(220, 142, 142);
+
+    ctx.set_visuals(v);
+}
 fn install_japanese_font(ctx: &egui::Context) -> Option<String> {
     for path in JP_FONT_CANDIDATES {
         let Ok(bytes) = std::fs::read(path) else {
@@ -56,7 +97,7 @@ fn main() -> eframe::Result<()> {
         "mhnxeditor",
         options,
         Box::new(|cc| {
-            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            apply_theme(&cc.egui_ctx);
             let font = install_japanese_font(&cc.egui_ctx);
             let mut app = app::MhnxEditor::default();
             match font {

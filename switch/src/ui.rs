@@ -25,52 +25,57 @@ use mhnx_core::quest::Gmd;
 use mhnx_core::questfields::{self, FieldKind};
 use mhnx_core::save::{Options, SaveKind};
 
-use crate::text::{rgb, Canvas, Color, FontSize};
+use crate::text::{rgb, rgba, Canvas, Color, FontSize};
 
 // ---------------------------------------------------------------------------
 // Theme Palette
 // ---------------------------------------------------------------------------
 
-const BG_MAIN: Color = rgb(14, 17, 24);
-const BG_HEADER_TOP: Color = rgb(26, 33, 48);
-const BG_HEADER_BOT: Color = rgb(18, 23, 34);
-const BG_SIDEBAR: Color = rgb(18, 22, 31);
-const BG_TOOLBAR: Color = rgb(22, 27, 38);
-const BG_CARD: Color = rgb(25, 31, 44);
-const BG_CARD_ALT: Color = rgb(29, 36, 50);
-const BG_SELECTED: Color = rgb(24, 58, 92);
-const BG_VAL_BOX: Color = rgb(15, 19, 27);
-const BG_VAL_ACTIVE: Color = rgb(20, 44, 70);
-const BG_BTN: Color = rgb(38, 48, 66);
-const BG_BTN_PRIMARY: Color = rgb(24, 102, 156);
-const BG_BTN_WARN: Color = rgb(130, 82, 20);
-const BG_FOOTER: Color = rgb(19, 24, 34);
+const BG_MAIN: Color = rgb(20, 20, 22);
+const BG_HEADER_TOP: Color = rgb(33, 33, 36);
+const BG_HEADER_BOT: Color = rgb(26, 26, 29);
+const BG_SIDEBAR: Color = rgb(24, 24, 26);
+const BG_TOOLBAR: Color = rgb(32, 32, 35);
+const BG_CARD: Color = rgb(30, 30, 33);
+const BG_CARD_ALT: Color = rgb(36, 36, 40);
+const BG_SELECTED: Color = rgb(42, 42, 48);
+const BG_VAL_BOX: Color = rgb(20, 20, 22);
+const BG_VAL_ACTIVE: Color = rgb(44, 44, 50);
+const BG_BTN: Color = rgb(52, 52, 57);
+const BG_BTN_PRIMARY: Color = rgb(74, 85, 104);
+const BG_BTN_WARN: Color = rgb(107, 78, 42);
+const BG_FOOTER: Color = rgb(28, 28, 31);
 
-const BORDER_SUBTLE: Color = rgb(42, 52, 72);
-const BORDER_CARD: Color = rgb(52, 64, 88);
-const BORDER_BTN: Color = rgb(72, 88, 118);
-const ACCENT_CYAN: Color = rgb(0, 214, 236);
-const ACCENT_GOLD: Color = rgb(245, 196, 64);
-const ACCENT_GREEN: Color = rgb(46, 198, 126);
-const ACCENT_ORANGE: Color = rgb(245, 158, 42);
-const ACCENT_RED: Color = rgb(236, 84, 84);
-const ACCENT_PURPLE: Color = rgb(168, 122, 245);
+const BORDER_SUBTLE: Color = rgb(58, 58, 65);
+const BORDER_CARD: Color = rgb(78, 78, 87);
+const BORDER_BTN: Color = rgb(110, 110, 120);
+const ACCENT_CYAN: Color = rgb(143, 182, 196);
+const ACCENT_GOLD: Color = rgb(198, 176, 115);
+const ACCENT_GREEN: Color = rgb(146, 181, 140);
+const ACCENT_ORANGE: Color = rgb(195, 154, 103);
+const ACCENT_RED: Color = rgb(220, 142, 142);
+const ACCENT_PURPLE: Color = rgb(174, 159, 199);
 
-const TEXT_PRIMARY: Color = rgb(242, 245, 250);
-const TEXT_SECONDARY: Color = rgb(176, 188, 208);
-const TEXT_MUTED: Color = rgb(118, 132, 156);
-const TEXT_CYAN: Color = rgb(88, 228, 248);
-const TEXT_GOLD: Color = rgb(255, 214, 92);
+const TEXT_PRIMARY: Color = rgb(228, 228, 231);
+const TEXT_SECONDARY: Color = rgb(176, 176, 184);
+const TEXT_MUTED: Color = rgb(156, 156, 165);
+const TEXT_CYAN: Color = rgb(157, 191, 203);
+const TEXT_GOLD: Color = rgb(196, 174, 110);
 
 // Layout constants (1280 x 720)
-const HEADER_H: i32 = 54;
-const FOOTER_Y: i32 = 644;
-const FOOTER_H: i32 = 76;
+//
+// The bars are sized so that every touch target reaches 44 px: the toolbar
+// used to be 42 with 30 px buttons inside it, which is below the smallest
+// size a finger can hit reliably. Header 64 + toolbar 56 leaves 488 px of
+// content, and the footer takes the last 88.
+const HEADER_H: i32 = 64;
+const FOOTER_Y: i32 = 632;
+const FOOTER_H: i32 = 88;
 const SIDEBAR_W: i32 = 236;
 const MAIN_X: i32 = SIDEBAR_W + 12;
 const MAIN_W: i32 = 1280 - MAIN_X - 12;
 const TOOLBAR_Y: i32 = HEADER_H + 8;
-const TOOLBAR_H: i32 = 42;
+const TOOLBAR_H: i32 = 56;
 const CONTENT_Y: i32 = TOOLBAR_Y + TOOLBAR_H + 8;
 const CONTENT_H: i32 = FOOTER_Y - CONTENT_Y - 8;
 
@@ -202,6 +207,8 @@ pub struct GuiState {
     pub osk: Option<OskState>,
     pub osk_result: Option<(usize, String)>,
     pub osk_cancelled: bool,
+    /// A save quest the delete button is waiting for a second tap on.
+    pub pending_delete: Option<i32>,
 }
 
 impl GuiState {
@@ -222,6 +229,7 @@ impl GuiState {
             osk: None,
             osk_result: None,
             osk_cancelled: false,
+            pending_delete: None,
         }
     }
 
@@ -826,7 +834,15 @@ impl GuiState {
                 ed.toggle_bundled_quest(qid);
             }
             UiAction::RemoveSaveQuest(qid) => {
-                ed.remove_save_quest(qid);
+                // Deleting a quest cannot be undone, and the desktop build has
+                // asked before doing it since the confirmation was added. This
+                // side deleted on the first tap; it now needs the second one.
+                if self.pending_delete == Some(qid) {
+                    self.pending_delete = None;
+                    ed.remove_save_quest(qid);
+                } else {
+                    self.pending_delete = Some(qid);
+                }
             }
             UiAction::OpenBundledQuest(qid) => {
                 ed.open_bundled_quest(qid);
@@ -1200,7 +1216,7 @@ impl GuiState {
         c.hline(0, HEADER_H - 1, w, BORDER_CARD);
 
         // App Brand Pill
-        c.round_rect(12, 10, 146, 34, 8, rgb(28, 66, 108));
+        c.round_rect(12, 10, 146, 34, 8, rgb(58, 58, 66));
         c.round_rect_border(12, 10, 146, 34, 8, 1, ACCENT_CYAN);
         c.text_centered(12, 10, 146, 34, "MHXX EDITOR", TEXT_CYAN, FontSize::Small);
 
@@ -1229,7 +1245,7 @@ impl GuiState {
                 let bg = if active {
                     BG_SELECTED
                 } else {
-                    rgb(22, 28, 40)
+                    rgb(32, 32, 36)
                 };
                 let border = if active { ACCENT_CYAN } else { BORDER_SUBTLE };
                 let fg = if active {
@@ -1263,7 +1279,7 @@ impl GuiState {
             );
             self.add_hit(status_x, 10, status_w, 34, UiAction::QuickSave);
         } else if ed.save.is_some() {
-            c.round_rect(status_x, 10, status_w, 34, 8, rgb(18, 46, 36));
+            c.round_rect(status_x, 10, status_w, 34, 8, rgb(40, 46, 40));
             c.round_rect_border(status_x, 10, status_w, 34, 8, 1, ACCENT_GREEN);
             c.circle(status_x + 16, 27, 5, ACCENT_GREEN);
             let src_label = if ed.save_path.as_deref() == Some(CONSOLE_SAVE) {
@@ -1282,9 +1298,9 @@ impl GuiState {
         self.add_hit(rescan_x, 10, 86, 34, UiAction::Rescan);
 
         let quit_x = 1188;
-        c.round_rect(quit_x, 10, 80, 34, 7, rgb(68, 28, 34));
+        c.round_rect(quit_x, 10, 80, 34, 7, rgb(58, 36, 40));
         c.round_rect_border(quit_x, 10, 80, 34, 7, 1, ACCENT_RED);
-        c.text_centered(quit_x, 10, 80, 34, "[+] 終了", rgb(255, 180, 180), FontSize::Small);
+        c.text_centered(quit_x, 10, 80, 34, "[+] 終了", rgb(220, 142, 142), FontSize::Small);
         self.add_hit(quit_x, 10, 80, 34, UiAction::Key(Key::Plus));
     }
 
@@ -1299,7 +1315,7 @@ impl GuiState {
 
         // Sidebar Header Hint (ZL / ZR cycles tabs up / down)
         let half_w = (SIDEBAR_W - 24) / 2;
-        c.round_rect(10, sy + 8, half_w, 28, 6, rgb(26, 34, 48));
+        c.round_rect(10, sy + 8, half_w, 28, 6, rgb(38, 38, 43));
         c.round_rect_border(10, sy + 8, half_w, 28, 6, 1, BORDER_BTN);
         c.text_centered(
             10,
@@ -1313,7 +1329,7 @@ impl GuiState {
         self.add_hit(10, sy + 8, half_w, 28, UiAction::CycleTab(false));
 
         let rx = 10 + half_w + 4;
-        c.round_rect(rx, sy + 8, half_w, 28, 6, rgb(26, 34, 48));
+        c.round_rect(rx, sy + 8, half_w, 28, 6, rgb(38, 38, 43));
         c.round_rect_border(rx, sy + 8, half_w, 28, 6, 1, BORDER_BTN);
         c.text_centered(
             rx,
@@ -1354,9 +1370,9 @@ impl GuiState {
             let bg = if active {
                 BG_SELECTED
             } else if enabled {
-                rgb(23, 29, 41)
+                rgb(34, 34, 38)
             } else {
-                rgb(17, 21, 30)
+                rgb(26, 26, 29)
             };
             c.round_rect(8, iy, SIDEBAR_W - 16, item_h, 6, bg);
             if active {
@@ -1889,7 +1905,7 @@ impl GuiState {
             let bg = if selected {
                 BG_SELECTED
             } else if is_nand {
-                rgb(24, 42, 58)
+                rgb(42, 42, 48)
             } else {
                 BG_CARD
             };
@@ -2126,7 +2142,9 @@ impl GuiState {
             c.text_centered(MAIN_X + 14, ry + 9, 68, 28, cat_txt, cat_col, FontSize::Small);
 
             // Label
-            c.text_sized(MAIN_X + 94, ry + 11, ja, TEXT_PRIMARY, FontSize::Medium);
+            // Labels are the secondary text now: the value next to them is
+            // the primary one, and two things cannot both be primary.
+            c.text_sized(MAIN_X + 94, ry + 11, ja, TEXT_SECONDARY, FontSize::Medium);
             c.text_sized(MAIN_X + 290, ry + 14, key, TEXT_MUTED, FontSize::Small);
 
             self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
@@ -2588,7 +2606,7 @@ impl GuiState {
         let panel_y = CONTENT_Y + 6 * (row_h + 6) + 8;
         let panel_h = CONTENT_Y + CONTENT_H - panel_y;
         if panel_h >= 60 {
-            c.round_rect(MAIN_X, panel_y, MAIN_W, panel_h, 8, rgb(19, 25, 36));
+            c.round_rect(MAIN_X, panel_y, MAIN_W, panel_h, 8, rgb(30, 30, 34));
             c.round_rect_border(MAIN_X, panel_y, MAIN_W, panel_h, 8, 1, BORDER_CARD);
 
             let ty = ed
@@ -2721,7 +2739,7 @@ impl GuiState {
             );
 
             let tname = mhnx_core::equip::type_name(eq.kind);
-            c.round_rect(MAIN_X + 114, ry + 8, 120, 30, 5, rgb(32, 44, 64));
+            c.round_rect(MAIN_X + 114, ry + 8, 120, 30, 5, rgb(44, 44, 50));
             c.text_centered(MAIN_X + 114, ry + 8, 120, 30, tname, TEXT_CYAN, FontSize::Small);
 
             c.text_sized(
@@ -2758,7 +2776,7 @@ impl GuiState {
         let list_w = MAIN_W - 44;
 
         // Column header bar
-        c.round_rect(MAIN_X, CONTENT_Y, list_w, 32, 6, rgb(20, 26, 38));
+        c.round_rect(MAIN_X, CONTENT_Y, list_w, 32, 6, rgb(32, 32, 36));
         c.text_sized(MAIN_X + 16, CONTENT_Y + 6, "モンスター名", TEXT_SECONDARY, FontSize::Small);
         let col_labels = ["討伐数", "捕獲数", "最小サイズ", "最大サイズ"];
         for (f, col_name) in col_labels.iter().enumerate() {
@@ -2972,7 +2990,7 @@ impl GuiState {
         let row_h = 46;
         let list_w = MAIN_W - 44;
 
-        c.round_rect(MAIN_X, CONTENT_Y, list_w, 32, 6, rgb(20, 26, 38));
+        c.round_rect(MAIN_X, CONTENT_Y, list_w, 32, 6, rgb(32, 32, 36));
         c.text_sized(
             MAIN_X + 16,
             CONTENT_Y + 6,
@@ -3628,9 +3646,33 @@ impl GuiState {
                 }
 
                 let bx3 = MAIN_X + list_w - 82;
-                c.round_rect(bx3, ry + 6, 72, 34, 6, rgb(64, 28, 34));
-                c.round_rect_border(bx3, ry + 6, 72, 34, 6, 1, ACCENT_RED);
-                c.text_centered(bx3, ry + 6, 72, 34, "削除", rgb(255, 180, 180), FontSize::Small);
+                let armed = self.pending_delete == Some(q.quest_id);
+                c.round_rect(
+                    bx3,
+                    ry + 6,
+                    72,
+                    34,
+                    6,
+                    if armed { rgb(92, 46, 52) } else { rgb(58, 36, 40) },
+                );
+                c.round_rect_border(
+                    bx3,
+                    ry + 6,
+                    72,
+                    34,
+                    6,
+                    if armed { 2 } else { 1 },
+                    ACCENT_RED,
+                );
+                c.text_centered(
+                    bx3,
+                    ry + 6,
+                    72,
+                    34,
+                    if armed { "本当に?" } else { "削除" },
+                    rgb(220, 142, 142),
+                    FontSize::Small,
+                );
                 self.add_hit(bx3, ry + 6, 72, 34, UiAction::RemoveSaveQuest(q.quest_id));
             }
 
@@ -4200,7 +4242,7 @@ impl GuiState {
         let info_y = CONTENT_Y + visible as i32 * (row_h + 4) + 6;
         let info_h = CONTENT_Y + CONTENT_H - info_y;
         if info_h >= 48 {
-            c.round_rect(MAIN_X, info_y, list_w, info_h, 8, rgb(18, 24, 36));
+            c.round_rect(MAIN_X, info_y, list_w, info_h, 8, rgb(30, 30, 34));
             c.round_rect_border(MAIN_X, info_y, list_w, info_h, 8, 1, ACCENT_GOLD);
             if let Some(cur_f) = fields.get(ed.mib_cursor) {
                 c.text_clipped(
@@ -4594,11 +4636,14 @@ impl GuiState {
             if selected { 2 } else { 1 },
             if selected { ACCENT_GOLD } else { BORDER_SUBTLE },
         );
+        // The number being edited used to be the smallest text on the row
+        // while its label was the largest: the thing you came to change read
+        // as the least important. Values are Medium now.
         let fg = if selected { TEXT_GOLD } else { TEXT_PRIMARY };
-        if c.text_width_sized(val_text, FontSize::Small) > val_w - 14 {
-            c.text_clipped(vx + 8, y + 6, val_w - 16, val_text, fg, FontSize::Small);
+        if c.text_width_sized(val_text, FontSize::Medium) > val_w - 14 {
+            c.text_clipped(vx + 8, y + 4, val_w - 16, val_text, fg, FontSize::Medium);
         } else {
-            c.text_centered(vx, y, val_w, h, val_text, fg, FontSize::Small);
+            c.text_centered(vx, y, val_w, h, val_text, fg, FontSize::Medium);
         }
 
         // [+] button
@@ -4611,7 +4656,7 @@ impl GuiState {
         // Optional [MAX] button
         if show_max {
             let mx = px + btn_w + 6;
-            c.round_rect(mx, y, 56, h, 6, rgb(58, 46, 20));
+            c.round_rect(mx, y, 56, h, 6, rgb(52, 46, 34));
             c.round_rect_border(mx, y, 56, h, 6, 1, ACCENT_GOLD);
             c.text_centered(mx, y, 56, h, "MAX", TEXT_GOLD, FontSize::Small);
             self.add_hit(mx, y, 56, h, UiAction::SetRowMax(row_idx));
@@ -4703,10 +4748,10 @@ impl GuiState {
             let badge_col = match k_str {
                 "A" => ACCENT_GREEN,
                 "B" => ACCENT_RED,
-                "X" => rgb(56, 148, 232),
+                "X" => rgb(143, 182, 196),
                 "Y" => ACCENT_ORANGE,
                 "ZL/ZR" => ACCENT_PURPLE,
-                _ => rgb(88, 106, 138),
+                _ => rgb(120, 120, 130),
             };
             let key_w = (k_str.chars().count() as i32) * 10 + 18;
             let lbl_w = c.text_width_sized(label, FontSize::Small);
@@ -5335,12 +5380,14 @@ impl GuiState {
     fn draw_osk(&mut self, c: &mut Canvas) {
         let Some(osk) = self.osk.clone() else { return };
 
-        // Full-screen darkened backdrop
+        // Full-screen darkened backdrop. Without it the panel sat on the
+        // background at 1.02:1 and only its 2px border said where it started.
+        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 150));
         let mx = 100;
         let my = 44;
         let mw = 1080;
         let mh = 632;
-        c.round_rect(mx, my, mw, mh, 14, rgb(14, 18, 28));
+        c.round_rect(mx, my, mw, mh, 14, rgb(28, 28, 32));
         c.round_rect_border(mx, my, mw, mh, 14, 2, ACCENT_CYAN);
 
         // Title & Applet Mode Note
@@ -5516,11 +5563,13 @@ impl GuiState {
             return;
         };
 
+        // Same reason as the keyboard: the panel needs to sit above the page.
+        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 150));
         let mx = 160;
         let my = 48;
         let mw = 960;
         let mh = 624;
-        c.round_rect(mx, my, mw, mh, 14, rgb(14, 18, 28));
+        c.round_rect(mx, my, mw, mh, 14, rgb(28, 28, 32));
         c.round_rect_border(mx, my, mw, mh, 14, 2, ACCENT_CYAN);
 
         c.text_clipped(
