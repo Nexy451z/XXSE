@@ -834,7 +834,28 @@ impl eframe::App for MhnxEditor {
         self.side_panel(ctx);
         self.bottom_bar(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            // These tabs stack several sections and could grow past the
+            // window with no way to reach the last one. The ones that already
+            // scroll their own lists are left alone so they do not nest.
+            let outer_scroll = matches!(self.tab, Tab::Sets | Tab::Extras | Tab::Guild);
+            if outer_scroll {
+                egui::ScrollArea::vertical()
+                    .id_salt("outer")
+                    .show(ui, |ui| self.draw_tab(ui));
+            } else {
+                self.draw_tab(ui);
+            }
+        });
+
+        self.drive_screenshot(ctx);
+    }
+}
+
+impl MhnxEditor {
+    /// One place that says which tab draws what.
+    fn draw_tab(&mut self, ui: &mut egui::Ui) {
+        match self.tab {
             Tab::Save => self.tab_save(ui),
             Tab::Items => self.tab_items(ui),
             Tab::Quest => self.tab_quest(ui),
@@ -847,9 +868,7 @@ impl eframe::App for MhnxEditor {
             Tab::Sets => self.tab_sets(ui),
             Tab::Extras => self.tab_extras(ui),
             Tab::About => self.tab_about(ui),
-        });
-
-        self.drive_screenshot(ctx);
+        }
     }
 }
 
@@ -1117,7 +1136,11 @@ impl MhnxEditor {
                                 ui.label(format!("{} (0x{:X})", a.version, a.version));
                                 ui.end_row();
                                 ui.label("エントリ数");
-                                ui.label(format!("{}", a.entries.len()));
+                                ui.label(format!(
+                                    "{} 件（表示中 {} 件）",
+                                    a.entries.len(),
+                                    a.entries.len()
+                                ));
                                 ui.end_row();
                                 ui.label("合計 (展開後)");
                                 ui.label(format!("{} B", a.entries.iter().map(|e| e.data.len()).sum::<usize>()));
@@ -2428,9 +2451,13 @@ impl MhnxEditor {
         egui::ScrollArea::vertical()
             .id_salt("palicolist")
             .show(ui, |ui| {
+                // Six headers and six cells per row: the grid used to declare
+                // four columns, which squeezed every column and left the tail
+                // of each row off the right edge.
                 egui::Grid::new("palicogrid")
-                    .num_columns(4)
+                    .num_columns(6)
                     .striped(true)
+                    .spacing([10.0, 4.0])
                     .show(ui, |ui| {
                         for h in ["枠", "名前", "レベル", "なつき", "系統", "修得スキル"] {
                             ui.strong(h);
@@ -2488,7 +2515,9 @@ impl MhnxEditor {
                                 .map(|id| mhnx_core::palico::skill_name(*id))
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            ui.label(names);
+                            // A palico can know eight skills by name and the
+                            // row would otherwise run past the right edge.
+                            ui.add(egui::Label::new(names).truncate());
                             ui.end_row();
                         }
                     });
