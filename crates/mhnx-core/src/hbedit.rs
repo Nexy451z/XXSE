@@ -740,6 +740,10 @@ impl Editor {
                 Key::Down => {
                     self.entry_row_cursor += 1;
                 }
+                // The console could swap the item but not say how many of it
+                // the quest hands out; the count was printed and fixed.
+                Key::Left => self.adjust_entry_count(-1),
+                Key::Right => self.adjust_entry_count(1),
                 // Only the reward and supply tables hold editable records.
                 Key::A => {
                     let ext = self
@@ -754,7 +758,7 @@ impl Editor {
                         self.item_pick_filter.clear();
                         self.screen = Screen::ItemPick;
                         self.message = alloc::format!(
-                            "record {} - pick a new item",
+                            "{} 行目のアイテムを選んでください",
                             self.entry_row_cursor
                         );
                     } else {
@@ -1401,6 +1405,54 @@ impl Editor {
     pub fn apply_item_filter(&mut self, text: String) {
         self.item_pick_filter = text;
         self.item_pick_cursor = 0;
+    }
+
+    /// Change how many of the item one reward record holds.
+    ///
+    /// The desktop build has had a drag value here for a while; this is the
+    /// same edit for the console, where only the item was swappable.
+    fn adjust_entry_count(&mut self, delta: i64) {
+        let row = self.entry_row_cursor;
+        let idx = self.entry;
+        let ext = self
+            .arc
+            .as_ref()
+            .and_then(|a| a.entries.get(idx))
+            .and_then(|e| extension_for(e.type_hash));
+        if !matches!(ext, Some("rem") | Some("sup")) {
+            self.message = String::from("このエントリに編集できる項目はありません");
+            return;
+        }
+        let Some(a) = &mut self.arc else {
+            return;
+        };
+        let Some(e) = a.entries.get_mut(idx) else {
+            return;
+        };
+        let Ok(mut t) = crate::entries::ItemTable::parse(&e.data) else {
+            self.message = String::from("この表を読み取れません");
+            return;
+        };
+        if row >= t.records.len() {
+            self.message = String::from("その記録はありません");
+            return;
+        }
+        if t.records[row].item == 0 {
+            self.message = String::from("空の行です。先に A でアイテムを選んでください");
+            return;
+        }
+        let next = (t.records[row].count as i64 + delta).clamp(0, 99) as u8;
+        if next == t.records[row].count {
+            return;
+        }
+        t.records[row].count = next;
+        e.data = t.to_bytes();
+        self.dirty = true;
+        self.message = alloc::format!(
+            "{} 行目の個数を {} にしました（X で .arc に書き込み）",
+            row,
+            next
+        );
     }
 
     /// Write one item id into the reward record the picker is aimed at.

@@ -4459,17 +4459,26 @@ impl GuiState {
                         c.text_clipped(
                             MAIN_X + 120,
                             ry + 11,
-                            list_w - 280,
-                            &format!(
-                                "{}  (ID: {})   x{}",
-                                item_name_of(r.item),
-                                r.item,
-                                r.count
-                            ),
+                            330,
+                            &format!("{}  (ID: {})", item_name_of(r.item), r.item),
                             TEXT_PRIMARY,
                             FontSize::Medium,
                         );
                         self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
+
+                        // The count was printed and fixed. Left and right on
+                        // the editor change it now, so the row shows a stepper
+                        // like every other editable number.
+                        let cnt_str = format!("x {}", r.count);
+                        self.draw_value_stepper(
+                            c,
+                            MAIN_X + list_w - 470,
+                            ry + 6,
+                            idx,
+                            &cnt_str,
+                            selected,
+                            false,
+                        );
 
                         let bx = MAIN_X + list_w - 134;
                         c.round_rect(bx, ry + 6, 120, 34, 6, BG_BTN_PRIMARY);
