@@ -1879,6 +1879,13 @@ impl Editor {
             Key::Left | Key::Right => {
                 if self.qe_open {
                     if let Some(t) = self.quest_equip_items().get(self.qe_item_cursor).copied() {
+                        // The max button refused an empty entry; this path did
+                        // not, so it could write a count onto nothing.
+                        if t.item == 0 {
+                            self.message =
+                                String::from("空きスロットです。先に A でアイテムを選んでください");
+                            return;
+                        }
                         let slot_index = self.cursor;
                         let step = if key == Key::Right {
                             STEPS[self.step]

@@ -850,7 +850,11 @@ impl eframe::App for MhnxEditor {
             // These tabs stack several sections and could grow past the
             // window with no way to reach the last one. The ones that already
             // scroll their own lists are left alone so they do not nest.
-            let outer_scroll = matches!(self.tab, Tab::Sets | Tab::Extras | Tab::Guild);
+            // Dlc is in the list for the same reason: the supply editor grew
+            // under the equipment list and pushed the quest list itself below
+            // the panel, where a clipped list cannot be reached at all.
+            let outer_scroll =
+                matches!(self.tab, Tab::Sets | Tab::Extras | Tab::Guild | Tab::Dlc);
             if outer_scroll {
                 egui::ScrollArea::vertical()
                     .id_salt("outer")
@@ -2150,7 +2154,10 @@ impl MhnxEditor {
                     if ext == "sup" { "支給品" } else { "報酬" }
                 ));
                 let mut changed = false;
-                let mut sel = self.entry_item_sel;
+                // Drop a selection left over from a bigger table: it matched
+                // no row here, so neither the highlight nor the picker showed
+                // and the table looked read-only again.
+                let mut sel = self.entry_item_sel.filter(|i| *i < table.records.len());
                 egui::ScrollArea::vertical()
                     .id_salt("itemtable")
                     .max_height(320.0)
@@ -3016,12 +3023,15 @@ impl MhnxEditor {
         // set_quest_equipment_item since the CLI gained quest-equip-set; the
         // window never called it, so an event quest's supply box could only
         // be edited from a terminal.
+        // Collapsed by default: open, it takes about 300px and pushes the
+        // quest list below the window, which is the thing most people come to
+        // this tab for. The title says where to look.
         egui::CollapsingHeader::new(match self.qe_slot {
-            Some(s) => format!("枠 {} の支給品・弾ポーチ", s),
-            None => "支給品・弾ポーチ".to_owned(),
+            Some(s) => format!("枠 {} の支給品・弾ポーチ（個数とアイテムを変更）", s),
+            None => "支給品・弾ポーチ（個数とアイテムを変更）".to_owned(),
         })
         .id_salt("qesupply")
-        .default_open(true)
+        .default_open(false)
         .show(ui, |ui| {
             let Some(slot) = self.qe_slot else {
                 ui.label(

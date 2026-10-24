@@ -105,6 +105,12 @@ pub enum UiAction {
     SelectRow(usize),
     /// Select a row and nudge its value with Left or Right.
     AdjustRow(usize, Key),
+    /// Select a row and press a key on it.
+    ///
+    /// The quest-equipment rows each carry a change button, and the button
+    /// did not say which row it belonged to, so pressing it on an unselected
+    /// row edited whichever row the cursor happened to be on.
+    KeyOnRow(usize, Key),
     /// Set the row's value to its natural maximum (or toggle).
     SetRowMax(usize),
     /// On `Items`, select row `idx` and open `ItemPick` (`Key::R`).
@@ -786,6 +792,10 @@ impl GuiState {
                 }
             }
             UiAction::AdjustRow(idx, key) => {
+                set_active_cursor(ed, idx);
+                ed.input(key);
+            }
+            UiAction::KeyOnRow(idx, key) => {
                 set_active_cursor(ed, idx);
                 ed.input(key);
             }
@@ -1645,7 +1655,7 @@ impl GuiState {
                     y,
                     136,
                     h,
-                    "[-] 全件SD抽出",
+                    "[R] 全件SD抽出",
                     false,
                     UiAction::Key(Key::R),
                 );
@@ -3568,7 +3578,7 @@ impl GuiState {
                 let sub_msg = if is_filtered {
                     "[X] キーで検索を解除できます。"
                 } else {
-                    "[L/R] で「公式イベント(189件)」「没データ(34件)」タブに切り替えるか、下のボタンで一括追加できます。"
+                    "[◀/▶] で「公式イベント(189件)」「没データ(34件)」タブに切り替えるか、下のボタンで一括追加できます。"
                 };
                 c.text_sized(
                     MAIN_X + 24,
@@ -3918,7 +3928,7 @@ impl GuiState {
                 let bx = MAIN_X + list_w - 134;
                 c.round_rect(bx, ry + 6, 120, 34, 6, BG_BTN_PRIMARY);
                 c.text_centered(bx, ry + 6, 120, 34, "[A] 変更", TEXT_PRIMARY, FontSize::Small);
-                self.add_hit(bx, ry + 6, 120, 34, UiAction::Key(Key::A));
+                self.add_hit(bx, ry + 6, 120, 34, UiAction::KeyOnRow(idx, Key::A));
             }
             self.draw_scrollbar(c, ed.qe_item_cursor, total, visible);
         } else {
@@ -5004,13 +5014,18 @@ fn ui_footer_chips(ed: &Editor) -> Vec<(&'static str, &'static str, UiAction)> {
             ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
             ("B", "戻る", UiAction::Key(Key::B)),
         ],
+        // L and R used to be swallowed here to switch catalogue tab, which is
+        // why the quest-equipment screen and the extract-all request could not
+        // be reached from a controller at all. The chips said so; they say
+        // what the keys do now.
         SaveQuests => alloc::vec![
-            ("L/R", "タブ切替(公式/没)", UiAction::SetQuestTab(1)),
+            ("L", "クエスト装備", UiAction::Key(Key::L)),
+            ("R", "全件SD抽出", UiAction::Key(Key::R)),
+            ("◀/▶", "タブ切替(公式/没)", UiAction::SetQuestTab(1)),
             ("A", "編集 / 導入", UiAction::Key(Key::A)),
             ("X", "一括追加", UiAction::InstallOfficialDlc),
             ("Y", "検索", UiAction::Key(Key::Y)),
             ("-", "1件抽出", UiAction::Key(Key::Minus)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
             ("B", "戻る", UiAction::Key(Key::B)),
         ],
         QuestEquip => alloc::vec![

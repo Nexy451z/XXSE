@@ -3,8 +3,7 @@ use mhnx_core::save::Save;
 /// The sample save, or None when the machine does not have it.
 fn real_save() -> Option<Save> {
     // Prefer the fixed copy: the Ryujinx save is live and the game writes to it.
-    let stable = std::path::PathBuf::from(r"C:anyWorkspace
-xjksv_readysystem");
+    let stable = std::path::PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
     if stable.exists() {
         return Save::from_bytes(&std::fs::read(&stable).ok()?).ok();
     }
