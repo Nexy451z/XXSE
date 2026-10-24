@@ -3893,7 +3893,7 @@ impl GuiState {
                 c.text_clipped(
                     MAIN_X + 148,
                     ry + 11,
-                    320,
+                    300,
                     &format!("{}  (ID:{})", iname, it.item),
                     TEXT_PRIMARY,
                     FontSize::Medium,
@@ -3903,9 +3903,11 @@ impl GuiState {
                 // The count was printed as text and nothing could change it,
                 // which is what a user hit first when editing a supply box.
                 let cnt_str = format!("x {}", it.count);
+                // 374 wide including MAX; the [A] button starts at -134, so
+                // the stepper starts far enough left not to sit under it.
                 self.draw_value_stepper(
                     c,
-                    MAIN_X + list_w - 470,
+                    MAIN_X + list_w - 514,
                     ry + 6,
                     idx,
                     &cnt_str,
@@ -4470,9 +4472,10 @@ impl GuiState {
                         // the editor change it now, so the row shows a stepper
                         // like every other editable number.
                         let cnt_str = format!("x {}", r.count);
+                        // 342 wide without a MAX button; [A] starts at -134.
                         self.draw_value_stepper(
                             c,
-                            MAIN_X + list_w - 470,
+                            MAIN_X + list_w - 482,
                             ry + 6,
                             idx,
                             &cnt_str,

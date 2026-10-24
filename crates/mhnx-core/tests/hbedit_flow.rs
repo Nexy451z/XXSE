@@ -1466,6 +1466,40 @@ fn the_quest_filter_survives_an_empty_result() {
     let lines = ed.lines();
     assert!(lines[0].text.contains("QUESTS INSIDE THIS SAVE"));
 }
+
+#[test]
+fn a_reward_count_can_be_changed_from_the_console() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    ed.cursor = 5; // rem_620114
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::EntryView);
+    ed.entry_row_cursor = 0;
+    let before = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        let t = mhnx_core::entries::ItemTable::parse(&e.data).unwrap();
+        (t.records[0].item, t.records[0].count)
+    };
+    assert_ne!(before.0, 0, "the row under test must hold an item");
+    ed.input(Key::Right);
+    let after = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        let t = mhnx_core::entries::ItemTable::parse(&e.data).unwrap();
+        (t.records[0].item, t.records[0].count)
+    };
+    assert_eq!(after.0, before.0, "the item must not move");
+    assert_eq!(after.1, (before.1 as i64 + 1).min(99) as u8, "right adds one");
+    assert!(ed.dirty, "the archive must be marked changed");
+    ed.input(Key::Left);
+    let back = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].count
+    };
+    assert_eq!(back, before.1, "left takes it back");
+}
+
 #[test]
 fn a_reward_item_can_be_changed_from_the_console() {
     let Some(p) = sample_arc() else { return };
