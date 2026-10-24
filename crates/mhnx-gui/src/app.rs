@@ -73,6 +73,13 @@ pub struct MhnxEditor {
     pub charm_confirm: CharmConfirm,
     /// Row of the item table to scroll into view once.
     pub scroll_to_item: Option<usize>,
+    /// Quest-equipment slot whose supply and ammo lists are on screen.
+    pub qe_slot: Option<usize>,
+    /// Supply or ammo entry the item picker is choosing for:
+    /// (slot, 0 supply / 1 ammo, record, entry). The record matters: the five
+    /// loadouts all have an entry 0, so without it the picker wrote to the
+    /// first loadout whichever row was clicked.
+    pub qe_pick: Option<(usize, u8, usize, usize)>,
     /// A destructive action waiting for the user to say yes.
     pub confirm: Confirm,
     /// Set when the user has just agreed to drop unsaved edits.
@@ -163,6 +170,8 @@ impl Default for MhnxEditor {
             item_selected: None,
         charm_confirm: CharmConfirm::default(),
         scroll_to_item: None,
+        qe_slot: None,
+        qe_pick: None,
         confirm: Confirm::default(),
         discard_ok: false,
         pending_dlc_slot: None,
@@ -2093,7 +2102,10 @@ impl MhnxEditor {
         }
     }
 
-    /// Read-only views for .rem / .sup / .sem / .esl / .qdp / .qdl.
+    /// Editors for .rem / .sup / .sem / .esl / .qdp / .qdl.
+///
+/// Every table here can be written back: seeds, counts, slots and the items
+/// themselves. It said "read-only" long after that stopped being true.
     ///
     /// The layouts come from measuring real quests; the .rem and .sup record
     /// lists are editable, the rest are shown as they are.
@@ -2177,14 +2189,39 @@ impl MhnxEditor {
                                         r.slot = s as u8;
                                         changed = true;
                                     }
-                                    ui.label(format!("{:<6} {}", r.item, item_name(r.item)));
+                                    // The name is the thing people click to
+                                    // mean "change this one", so it selects the
+                                    // row that the picker below acts on.
+                                    if ui
+                                        .selectable_label(
+                                            sel == Some(i),
+                                            format!("{:<6} {}", r.item, item_name(r.item)),
+                                        )
+                                        .clicked()
+                                    {
+                                        sel = Some(i);
+                                    }
                                     ui.end_row();
                                 }
                             });
                     });
                 // Changing the item itself is the point of a reward table;
                 // only the count and the slot were editable before.
+                //
+                // This whole block used to hang off "a row is selected", and
+                // nothing said so, so the table looked like it could only edit
+                // counts. It now always says what it does.
                 self.entry_item_sel = sel;
+                ui.add_space(4.0);
+                if sel.is_none() {
+                    ui.label(
+                        egui::RichText::new(
+                            "アイテムを差し替えるには、上の一覧でアイテム名を押してください",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                }
                 if let Some(i) = sel {
                     if i < table.records.len() {
                         ui.add_space(4.0);
@@ -2214,9 +2251,16 @@ impl MhnxEditor {
                                 if name.to_lowercase().contains(&needle) {
                                     hits.push((id as u16, name));
                                 }
-                                if hits.len() >= 30 {
+                                if hits.len() >= 400 {
                                     break;
                                 }
+                            }
+                            if hits.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("その名前のアイテムはありません")
+                                        .weak()
+                                        .small(),
+                                );
                             }
                             egui::ScrollArea::vertical()
                                 .id_salt("entryitempick")
@@ -2883,6 +2927,15 @@ impl MhnxEditor {
         let titles = Self::quest_titles(&quests);
         let equipment = dlc::quest_equipment(save);
         let used = equipment.iter().filter(|e| e.occupied).count();
+        // Land on a real loadout instead of an empty panel: the supply editor
+        // is the reason most people open this tab.
+        if self.qe_slot.is_none() {
+            self.qe_slot = equipment
+                .iter()
+                .find(|e| e.occupied)
+                .map(|e| e.index)
+                .or_else(|| equipment.first().map(|e| e.index));
+        }
         ui.horizontal(|ui| {
             ui.label(format!("導入済み {} 件", quests.len()));
             ui.label("絞り込み");
@@ -2928,7 +2981,20 @@ impl MhnxEditor {
                             ui.strong("タイトル");
                             ui.end_row();
                             for e in &equipment {
-                                ui.label(format!("{}", e.index));
+                                // The slot used to be a plain label, and the
+                                // supply box inside it could not be reached
+                                // from this side at all: only the CLI could
+                                // rewrite those entries.
+                                if ui
+                                    .selectable_label(
+                                        self.qe_slot == Some(e.index),
+                                        format!("{}", e.index),
+                                    )
+                                    .clicked()
+                                {
+                                    self.qe_slot = Some(e.index);
+                                    self.qe_pick = None;
+                                }
                                 if e.occupied {
                                     ui.label(format!("{}", e.quest_id));
                                     ui.label(
@@ -2945,6 +3011,173 @@ impl MhnxEditor {
                             }
                         });
                 });
+        });
+        // Supply and ammo inside the chosen loadout. The core has had
+        // set_quest_equipment_item since the CLI gained quest-equip-set; the
+        // window never called it, so an event quest's supply box could only
+        // be edited from a terminal.
+        egui::CollapsingHeader::new(match self.qe_slot {
+            Some(s) => format!("枠 {} の支給品・弾ポーチ", s),
+            None => "支給品・弾ポーチ".to_owned(),
+        })
+        .id_salt("qesupply")
+        .default_open(true)
+        .show(ui, |ui| {
+            let Some(slot) = self.qe_slot else {
+                ui.label(
+                    egui::RichText::new("上の一覧で枠を選ぶと、その中身を編集できます")
+                        .weak()
+                        .small(),
+                );
+                return;
+            };
+            let items = self
+                .save
+                .as_ref()
+                .map(|s| dlc::quest_equipment_items(s, slot))
+                .unwrap_or_default();
+            ui.label(
+                egui::RichText::new(
+                    "個数はその場で書き換わります。アイテム名を押すと差し替えられます。",
+                )
+                .weak()
+                .small(),
+            );
+            // Writes are collected and applied after the widgets are drawn,
+            // because the table above borrows the save to read.
+            let mut write: Option<(dlc::QuestEquipList, usize, usize, u16, u8)> = None;
+            egui::ScrollArea::vertical()
+                .id_salt("qesupplylist")
+                .max_height(190.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("qesupplygrid")
+                        .striped(true)
+                        .num_columns(5)
+                        .show(ui, |ui| {
+                            ui.strong("種別");
+                            ui.strong("レコード");
+                            ui.strong("位置");
+                            ui.strong("アイテム");
+                            ui.strong("個数");
+                            ui.end_row();
+                            for it in &items {
+                                let code: u8 = if matches!(
+                                    it.list,
+                                    dlc::QuestEquipList::Supply
+                                ) {
+                                    0
+                                } else {
+                                    1
+                                };
+                                ui.label(if code == 0 { "支給品" } else { "弾ポーチ" });
+                                ui.label(format!("{}", it.record));
+                                ui.label(format!("{}", it.index));
+                                let picked = matches!(
+                                    self.qe_pick,
+                                    Some((ps, pl, pr, pi))
+                                        if ps == slot && pl == code && pr == it.record && pi == it.index
+                                );
+                                if ui
+                                    .selectable_label(
+                                        picked,
+                                        format!("{:<5} {}", it.item, item_name(it.item)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.qe_pick = if picked {
+                                        None
+                                    } else {
+                                        Some((slot, code, it.record, it.index))
+                                    };
+                                }
+                                let mut c = it.count as i32;
+                                if ui
+                                    .add(egui::DragValue::new(&mut c).range(0..=99))
+                                    .changed()
+                                {
+                                    write = Some((it.list, it.index, it.record, it.item, c as u8));
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+            if let Some((list, index, record, item, count)) = write {
+                if let Some(save) = &mut self.save {
+                    match dlc::set_quest_equipment_item(
+                        save, slot, record, list, index, item, count,
+                    ) {
+                        Ok(()) => {
+                            self.dirty = true;
+                            self.message = format!("枠 {} の {} を x{} にしました", slot, item_name(item), count);
+                        }
+                        Err(e) => self.message = format!("書き換えできません: {}", e),
+                    }
+                }
+            }
+            // Item picker for the entry that was clicked.
+            if let Some((ps, pl, pr, pi)) = self.qe_pick {
+                if ps == slot {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label(format!("レコード {} 位置 {} のアイテムを差し替え", pr, pi));
+                        ui.text_edit_singleline(&mut self.item_pick_filter);
+                    });
+                    let needle = self.item_pick_filter.trim().to_lowercase();
+                    if !needle.is_empty() {
+                        let target = items
+                            .iter()
+                            .find(|i| {
+                                let c2: u8 = if matches!(i.list, dlc::QuestEquipList::Supply) { 0 } else { 1 };
+                                // Match the record too: every loadout has an
+                                // entry 0, so index alone always hit record 0.
+                                c2 == pl && i.record == pr && i.index == pi
+                            })
+                            .copied();
+                        let mut hit: Option<u16> = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("qepicklist")
+                            .max_height(120.0)
+                            .show(ui, |ui| {
+                                let mut shown = 0;
+                                for (id, name) in
+                                    mhnx_core::gamedata::ITEM_NAME_LIST.iter().enumerate()
+                                {
+                                    if id == 0 || id > LAST_ITEM_ID {
+                                        continue;
+                                    }
+                                    if !name.to_lowercase().contains(&needle) {
+                                        continue;
+                                    }
+                                    if ui
+                                        .selectable_label(false, format!("{:<5} {}", id, name))
+                                        .clicked()
+                                    {
+                                        hit = Some(id as u16);
+                                    }
+                                    shown += 1;
+                                    if shown >= 30 {
+                                        break;
+                                    }
+                                }
+                            });
+                        if let (Some(id), Some(t)) = (hit, target) {
+                            if let Some(save) = &mut self.save {
+                                let count = if t.count == 0 { 1 } else { t.count };
+                                match dlc::set_quest_equipment_item(
+                                    save, slot, t.record, t.list, t.index, id, count,
+                                ) {
+                                    Ok(()) => {
+                                        self.dirty = true;
+                                        self.message = format!("位置 {} を {} にしました", pi, item_name(id));
+                                        self.qe_pick = None;
+                                    }
+                                    Err(e) => self.message = format!("書き換えできません: {}", e),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         });
         ui.horizontal(|ui| {
             ui.label("抽出先");

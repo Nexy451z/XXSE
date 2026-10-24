@@ -1361,7 +1361,7 @@ impl Editor {
                     self.item_pick_cursor = 0;
                     self.item_pick_filter.clear();
                     self.screen = Screen::ItemPick;
-                    self.message = format!("box #{} - pick a new item", idx + 1);
+                    self.message = format!("枠 #{} のアイテムを選んでください", idx + 1);
                 }
             }
             Key::A => self.request_write_save(),
@@ -1820,6 +1820,48 @@ impl Editor {
                     }
                 } else if n > 0 {
                     self.cursor = (self.cursor + 1).min(n - 1);
+                }
+            }
+            // Left and right change how many of the entry the hunt hands out.
+            // The screen showed the count and nothing edited it.
+            Key::Left | Key::Right => {
+                if self.qe_open {
+                    if let Some(t) = self.quest_equip_items().get(self.qe_item_cursor).copied() {
+                        let slot_index = self.cursor;
+                        let step = if key == Key::Right {
+                            STEPS[self.step]
+                        } else {
+                            -STEPS[self.step]
+                        };
+                        let next = (t.count as i64 + step).clamp(0, 99) as u8;
+                        if next != t.count {
+                            if let Some(s) = &mut self.save {
+                                if crate::dlc::set_quest_equipment_item(
+                                    s,
+                                    slot_index,
+                                    t.record,
+                                    t.list,
+                                    t.index,
+                                    t.item,
+                                    next,
+                                )
+                                .is_ok()
+                                {
+                                    self.dirty = true;
+                                    self.message = alloc::format!(
+                                        "rec{} {}[{}] の個数を {} にしました",
+                                        t.record,
+                                        match t.list {
+                                            crate::dlc::QuestEquipList::Supply => "支給品",
+                                            crate::dlc::QuestEquipList::Ammo => "弾ポーチ",
+                                        },
+                                        t.index,
+                                        next
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             // A opens the slot, then asks for a new item for the chosen entry.

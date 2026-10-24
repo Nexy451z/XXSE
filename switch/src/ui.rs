@@ -525,10 +525,14 @@ impl GuiState {
                 other => ed.input(other),
             },
             Screen::SaveQuests => match key {
-                Key::L => {
+                // Left and right switch catalogue tab. L and R used to do it,
+                // which swallowed the two keys that open the quest-equipment
+                // screen and extract every quest: neither was reachable from
+                // a controller at all.
+                Key::Left => {
                     self.quest_tab = (self.quest_tab + 2) % 3;
                 }
-                Key::R => {
+                Key::Right => {
                     self.quest_tab = (self.quest_tab + 1) % 3;
                 }
                 Key::Up if self.quest_tab > 0 => {
@@ -1148,12 +1152,51 @@ fn apply_row_max(ed: &mut Editor, idx: usize) {
             let vis = ed.visible_items();
             if let Some(&box_idx) = vis.get(idx) {
                 if let Some(mut items) = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot)) {
+                    // An empty slot has nothing to make 99 of. The desktop
+                    // build refused this; here it wrote an id of 0 with a
+                    // count of 99 and the game showed a broken slot.
+                    if items[box_idx].id == 0 {
+                        ed.message = String::from("空きスロットです。先にアイテムを入れてください");
+                        return;
+                    }
                     items[box_idx].count = 99;
                     if let Some(s) = &mut ed.save {
                         let _ = s.write_item_box(ed.slot, &items);
                         ed.dirty = true;
                         ed.message = format!("枠 #{} の個数を 99 に設定しました", box_idx + 1);
                     }
+                }
+            }
+        }
+        // The max button was drawn on the quest-equipment screen too, and did
+        // nothing there: AdjustRow was answered for the count stepper but this
+        // path had no arm for the screen at all.
+        Screen::QuestEquip => {
+            if !ed.qe_open {
+                return;
+            }
+            let Some(t) = ed.quest_equip_items().get(idx).copied() else {
+                return;
+            };
+            if t.item == 0 {
+                ed.message = String::from("空きスロットです。先にアイテムを入れてください");
+                return;
+            }
+            let slot_index = ed.cursor;
+            if let Some(s) = &mut ed.save {
+                if mhnx_core::dlc::set_quest_equipment_item(
+                    s,
+                    slot_index,
+                    t.record,
+                    t.list,
+                    t.index,
+                    t.item,
+                    99,
+                )
+                .is_ok()
+                {
+                    ed.dirty = true;
+                    ed.message = format!("レコード {} 位置 {} の個数を 99 にしました", t.record, t.index);
                 }
             }
         }
@@ -3850,12 +3893,25 @@ impl GuiState {
                 c.text_clipped(
                     MAIN_X + 148,
                     ry + 11,
-                    list_w - 340,
-                    &format!("{}  (ID:{})   x{}", iname, it.item, it.count),
+                    320,
+                    &format!("{}  (ID:{})", iname, it.item),
                     TEXT_PRIMARY,
                     FontSize::Medium,
                 );
                 self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
+
+                // The count was printed as text and nothing could change it,
+                // which is what a user hit first when editing a supply box.
+                let cnt_str = format!("x {}", it.count);
+                self.draw_value_stepper(
+                    c,
+                    MAIN_X + list_w - 470,
+                    ry + 6,
+                    idx,
+                    &cnt_str,
+                    selected,
+                    true,
+                );
 
                 let bx = MAIN_X + list_w - 134;
                 c.round_rect(bx, ry + 6, 120, 34, 6, BG_BTN_PRIMARY);

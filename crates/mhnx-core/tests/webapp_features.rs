@@ -10,6 +10,12 @@ use mhnx_core::charm::{self, Charm};
 use mhnx_core::save::Save;
 
 fn real_save() -> PathBuf {
+    // Prefer the fixed copy: the Ryujinx save is live and the game writes to
+    // it, so assertions pinned to its contents fail the next time it changes.
+    let stable = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
+    if stable.exists() {
+        return stable;
+    }
     PathBuf::from(r"C:\Users\haruk\AppData\Roaming\Ryujinx\bis\user\save\0000000000000001\0\system")
 }
 

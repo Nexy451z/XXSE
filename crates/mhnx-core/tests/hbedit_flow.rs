@@ -14,6 +14,12 @@ use mhnx_core::questfields;
 use mhnx_core::save::Save;
 
 fn real_save() -> PathBuf {
+    // Prefer the fixed copy: the Ryujinx save is live and the game writes to
+    // it, so assertions pinned to its contents fail the next time it changes.
+    let stable = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
+    if stable.exists() {
+        return stable;
+    }
     PathBuf::from(r"C:\Users\haruk\AppData\Roaming\Ryujinx\bis\user\save\0000000000000001\0\system")
 }
 fn real_arc() -> PathBuf {
@@ -2395,6 +2401,58 @@ fn the_quest_equipment_items_read_back_exactly() {
     for it in items.iter().filter(|i| i.item != 0) {
         assert!((it.item as usize) <= mhnx_core::gamedata::LAST_ITEM_ID);
     }
+}
+
+
+#[test]
+fn the_console_can_change_a_supply_count() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    // Straight to the screen: the navigation that reaches it is covered by
+    // the screen-reachability test, this one is about the count.
+    ed.screen = Screen::QuestEquip;
+    ed.cursor = 0;
+    ed.qe_open = false;
+    ed.input(Key::A); // open the loadout
+    assert!(ed.qe_open, "the loadout should be open");
+    ed.qe_item_cursor = 0;
+
+    let before = ed.quest_equip_items()[0];
+    let save_before = ed.save.as_ref().unwrap().to_bytes();
+    ed.input(Key::Right);
+    let after = ed.quest_equip_items()[0];
+    assert_eq!(
+        after.count,
+        (before.count as i64 + 1).min(99) as u8,
+        "right should add one"
+    );
+    assert_eq!(after.item, before.item, "the item must not change");
+    assert!(ed.dirty, "a changed count is an unsaved change");
+
+    // Only the count byte of that one entry may differ.
+    let save_after = ed.save.as_ref().unwrap().to_bytes();
+    let diff: Vec<usize> = (0..save_after.len())
+        .filter(|i| save_after[*i] != save_before[*i])
+        .collect();
+    assert!(!diff.is_empty(), "the write did nothing");
+    // Same base the core test uses: the loadout stride is 8, then the block
+    // header, the entry header and the supply box offset inside it.
+    let entry = 36 + 0xB280 + 0x1049F4 + before.record * 8 + 8 + 0x1D + 3 + 0x53;
+    for at in &diff {
+        assert!(
+            *at >= entry && *at < entry + 3,
+            "byte 0x{:X} changed outside the entry at 0x{:X}",
+            at,
+            entry
+        );
+    }
+
+    // And left takes it back.
+    ed.input(Key::Left);
+    assert_eq!(ed.quest_equip_items()[0].count, before.count);
 }
 
 #[test]

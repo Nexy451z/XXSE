@@ -12,6 +12,12 @@ fn quest_dir() -> PathBuf {
     PathBuf::from(r"C:\anyWorkspace\nx\mhxx\save_editor\mhxx_quetool\quest")
 }
 fn real_save() -> PathBuf {
+    // Prefer the fixed copy: the Ryujinx save is live and the game writes to
+    // it, so assertions pinned to its contents fail the next time it changes.
+    let stable = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
+    if stable.exists() {
+        return stable;
+    }
     PathBuf::from(r"C:\Users\haruk\AppData\Roaming\Ryujinx\bis\user\save\0000000000000001\0\system")
 }
 

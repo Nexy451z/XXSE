@@ -13,9 +13,18 @@ const DEFAULT_SAVE: &str =
     r"C:\Users\haruk\AppData\Roaming\Ryujinx\bis\user\save\0000000000000001\0\system";
 
 fn real_save() -> Option<PathBuf> {
+    // Prefer the fixed copy: the Ryujinx save is live and the game writes to
+    // it, so assertions pinned to its contents fail next time it changes.
+    let stable = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
     let p = std::env::var("MHNX_REAL_SAVE")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_SAVE));
+        .unwrap_or_else(|_| {
+            if stable.exists() {
+                stable
+            } else {
+                PathBuf::from(DEFAULT_SAVE)
+            }
+        });
     if p.exists() {
         return Some(p);
     }

@@ -16,9 +16,18 @@ const DEFAULT_SAVE: &str = r"C:\Users\haruk\AppData\Roaming\Ryujinx\bis\user\sav
 /// A missing save is a hard failure rather than a quiet pass: six tests used
 /// to go green on a machine that had no dump at all.
 fn real_save() -> Option<Save> {
+    // Prefer the fixed copy: the Ryujinx save is live and the game writes to
+    // it, so assertions pinned to its contents fail next time it changes.
+    let stable = std::path::PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
     let p = std::env::var("MHNX_REAL_SAVE")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_SAVE));
+        .unwrap_or_else(|_| {
+            if stable.exists() {
+                stable
+            } else {
+                std::path::PathBuf::from(DEFAULT_SAVE)
+            }
+        });
     if p.exists() {
         let bytes = std::fs::read(&p).expect("read the save");
         return Some(Save::from_bytes(&bytes).expect("parse the save"));
