@@ -14,6 +14,7 @@ fn main() {
     println!("cargo::rerun-if-changed=tools/font_shim.c");
     println!("cargo::rerun-if-changed=tools/stb_truetype.h");
     println!("cargo::rerun-if-env-changed=DEVKITPRO");
+    println!("cargo::rerun-if-env-changed=XXSE_UI_VARIANT");
 
     let devkitpro = env::var("DEVKITPRO").unwrap_or_else(|_| "C:/devkitPro".to_string());
     let devkitpro = devkitpro.replace('\\', "/");

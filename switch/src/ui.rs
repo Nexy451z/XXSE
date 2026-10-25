@@ -1,159 +1,275 @@
-//! Rich 2D Graphical User Interface and Touch/Controller engine for Switch (.nro).
+//! Redesigned Switch UI/UX Engine for XXSE (`XXSE-1.nro` & `XXSE-2.nro`).
 //!
-//! Renders `mhnx_core::hbedit::Editor` onto `crate::text::Canvas` (1280x720)
-//! with a 2-pane Horizon-OS / JKSV-inspired layout:
-//!   - Top Header Bar (Title, Character Slot Tabs, Save Dirty Indicator, Quick Save)
-//!   - Left Navigation Sidebar (One-tap screen switching + ZL tab cycling)
-//!   - Context Toolbar (Interactive Step Selector `±1..±10000`, Search/Filter Bar, Quick Actions)
-//!   - Tailored Screen Views (Cards, Value Steppers `[-] val [+]`, `[MAX]`, Japanese Names, Notes)
-//!   - Proportional Scrollbar + Page Up/Down Touch Controls
-//!   - Interactive Footer Action Chips
+//! Architecture & Ergonomics:
+//!   - `ZL / ZR`: Cycle the 6 top-level Sections (`ファイル`, `ハンター`, `アイテム`, `護石・装備`, `オトモ・記録`, `クエスト`).
+//!   - `L / R`: Cycle the Sub-Tabs of the current Section (NEVER switches character slot unexpectedly!).
+//!   - `A`: Always Open / Edit / Choose from list (unified across every screen, never deletes!).
+//!   - `◀ / ▶`: Always adjust numeric values (`±step`).
+//!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `お守り反映`).
+//!   - `Y`: Secondary tool action (`刻み幅切替` / `検索` / `合法MAX` / `2段階確認削除`).
+//!   - `B`: Back / Cancel.
+//!
+//! Two Distinct Visual Architectures (controlled by `XXSE_UI_VARIANT`):
+//!   - Variant 1 (`XXSE-1.nro`): **Horizon Split-Studio**
+//!     2-tier flat top navigation + borderless clean left list (`780px`, zero inline button spam)
+//!     + permanent right-hand Context Inspector & Cheat Deck (`436px`).
+//!   - Variant 2 (`XXSE-2.nro`): **Guild Wide Bento Grid**
+//!     Floating top guild ribbon + sub-tab/cheat bar + full-width `1240px` 2-Column Bento Card Grid
+//!     where unselected cards are ultra-clean and only the focused card reveals inline controls.
 
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use mhnx_core::arc::extension_for;
-use mhnx_core::check::Severity;
 use mhnx_core::charm;
+use mhnx_core::check::Severity;
 use mhnx_core::dlcats::{self, Lang};
-use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink, SemEntry};
+use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
     item_name_of, monster_name, Editor, Key, Screen, CHAR_FIELDS, CONSOLE_SAVE, STEPS,
 };
-use mhnx_core::quest::Gmd;
-use mhnx_core::questfields::{self, FieldKind};
+use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
 
 use crate::text::{rgb, rgba, Canvas, Color, FontSize};
 
-// ---------------------------------------------------------------------------
-// Theme Palette
-// ---------------------------------------------------------------------------
-
-const BG_MAIN: Color = rgb(20, 20, 22);
-const BG_HEADER_TOP: Color = rgb(33, 33, 36);
-const BG_HEADER_BOT: Color = rgb(26, 26, 29);
-const BG_SIDEBAR: Color = rgb(24, 24, 26);
-const BG_TOOLBAR: Color = rgb(32, 32, 35);
-const BG_CARD: Color = rgb(30, 30, 33);
-const BG_CARD_ALT: Color = rgb(36, 36, 40);
-const BG_SELECTED: Color = rgb(42, 42, 48);
-const BG_VAL_BOX: Color = rgb(20, 20, 22);
-const BG_VAL_ACTIVE: Color = rgb(44, 44, 50);
-const BG_BTN: Color = rgb(52, 52, 57);
-const BG_BTN_PRIMARY: Color = rgb(74, 85, 104);
-const BG_BTN_WARN: Color = rgb(107, 78, 42);
-/// Fill for a button that destroys something. The accent red is a text
-/// colour and reads as pale pink as a fill; this one is a surface, and white
-/// on it measures 6.6 to 1.
-const BG_DANGER: Color = rgb(160, 58, 68);
-const BG_FOOTER: Color = rgb(28, 28, 31);
-
-const BORDER_SUBTLE: Color = rgb(58, 58, 65);
-const BORDER_CARD: Color = rgb(78, 78, 87);
-const BORDER_BTN: Color = rgb(110, 110, 120);
-const ACCENT_CYAN: Color = rgb(143, 182, 196);
-const ACCENT_GOLD: Color = rgb(198, 176, 115);
-const ACCENT_GREEN: Color = rgb(146, 181, 140);
-const ACCENT_ORANGE: Color = rgb(195, 154, 103);
-const ACCENT_RED: Color = rgb(220, 142, 142);
-const ACCENT_PURPLE: Color = rgb(174, 159, 199);
-
-const TEXT_PRIMARY: Color = rgb(228, 228, 231);
-const TEXT_SECONDARY: Color = rgb(176, 176, 184);
-const TEXT_MUTED: Color = rgb(156, 156, 165);
-const TEXT_CYAN: Color = rgb(157, 191, 203);
-const TEXT_GOLD: Color = rgb(196, 174, 110);
-
-// Layout constants (1280 x 720)
-//
-// The bars are sized so the toolbar buttons reach 44 px: the toolbar used to
-// be 42 with 30 px buttons inside it, which is below the smallest size a
-// finger can hit reliably. Header 64 + toolbar 56 leaves 488 px of content
-// and the footer takes the last 88. Row lists inside the content area are
-// still tighter than that; they were sized for the old 524 px and several
-// overflowed when the bars grew.
-const HEADER_H: i32 = 64;
-const FOOTER_Y: i32 = 632;
-const FOOTER_H: i32 = 88;
-const SIDEBAR_W: i32 = 236;
-const MAIN_X: i32 = SIDEBAR_W + 12;
-const MAIN_W: i32 = 1280 - MAIN_X - 12;
-const TOOLBAR_Y: i32 = HEADER_H + 8;
-const TOOLBAR_H: i32 = 56;
-const CONTENT_Y: i32 = TOOLBAR_Y + TOOLBAR_H + 8;
-const CONTENT_H: i32 = FOOTER_Y - CONTENT_Y - 8;
-
 const HUNT_STEPS: [i64; 5] = [1, 10, 100, 1000, -1];
 
+/// Returns `true` when building `XXSE-2.nro` (Wide 2-Column Bento Grid UI).
+/// Defaults to `false` (`XXSE-1.nro`: Horizon Split-Studio UI).
+#[inline]
+pub const fn is_bento_variant() -> bool {
+    match option_env!("XXSE_UI_VARIANT") {
+        Some(s) => s.as_bytes().len() == 1 && s.as_bytes()[0] == b'2',
+        None => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Interactive HitBoxes & Touch Actions
+// Theme Palette (Variant 1: Horizon Split-Studio vs Variant 2: Guild Bento)
+// ---------------------------------------------------------------------------
+
+struct Theme {
+    bg_canvas: Color,
+    bg_header: Color,
+    bg_subbar: Color,
+    bg_panel: Color,
+    bg_row_even: Color,
+    bg_row_odd: Color,
+    bg_selected: Color,
+    bg_val_box: Color,
+    bg_btn: Color,
+    bg_btn_primary: Color,
+    bg_btn_cheat: Color,
+    bg_danger: Color,
+    bg_footer: Color,
+    border_subtle: Color,
+    border_focus: Color,
+    accent_primary: Color,
+    accent_secondary: Color,
+    accent_ok: Color,
+    accent_warn: Color,
+    accent_danger: Color,
+    text_primary: Color,
+    text_secondary: Color,
+    text_muted: Color,
+    corner_r: i32,
+}
+
+const THEME_V1_HORIZON: Theme = Theme {
+    bg_canvas: rgb(14, 17, 23),
+    bg_header: rgb(20, 25, 34),
+    bg_subbar: rgb(17, 21, 29),
+    bg_panel: rgb(21, 26, 35),
+    bg_row_even: rgb(22, 27, 36),
+    bg_row_odd: rgb(18, 23, 31),
+    bg_selected: rgb(24, 54, 78),
+    bg_val_box: rgb(12, 15, 20),
+    bg_btn: rgb(36, 44, 58),
+    bg_btn_primary: rgb(22, 96, 136),
+    bg_btn_cheat: rgb(68, 52, 24),
+    bg_danger: rgb(156, 46, 58),
+    bg_footer: rgb(18, 22, 30),
+    border_subtle: rgb(44, 54, 70),
+    border_focus: rgb(0, 212, 245),
+    accent_primary: rgb(0, 212, 245),
+    accent_secondary: rgb(246, 194, 78),
+    accent_ok: rgb(62, 214, 146),
+    accent_warn: rgb(242, 154, 68),
+    accent_danger: rgb(238, 108, 116),
+    text_primary: rgb(240, 244, 250),
+    text_secondary: rgb(156, 170, 188),
+    text_muted: rgb(106, 118, 136),
+    corner_r: 7,
+};
+
+const THEME_V2_BENTO: Theme = Theme {
+    bg_canvas: rgb(17, 15, 14),
+    bg_header: rgb(28, 24, 22),
+    bg_subbar: rgb(24, 20, 18),
+    bg_panel: rgb(26, 22, 20),
+    bg_row_even: rgb(31, 27, 24),
+    bg_row_odd: rgb(26, 22, 20),
+    bg_selected: rgb(56, 42, 28),
+    bg_val_box: rgb(16, 14, 13),
+    bg_btn: rgb(48, 41, 36),
+    bg_btn_primary: rgb(138, 56, 38),
+    bg_btn_cheat: rgb(78, 58, 24),
+    bg_danger: rgb(164, 48, 48),
+    bg_footer: rgb(25, 21, 19),
+    border_subtle: rgb(62, 53, 46),
+    border_focus: rgb(232, 188, 92),
+    accent_primary: rgb(232, 188, 92),
+    accent_secondary: rgb(224, 92, 64),
+    accent_ok: rgb(104, 202, 136),
+    accent_warn: rgb(236, 158, 76),
+    accent_danger: rgb(236, 112, 104),
+    text_primary: rgb(245, 239, 230),
+    text_secondary: rgb(182, 170, 154),
+    text_muted: rgb(128, 116, 104),
+    corner_r: 10,
+};
+
+#[inline]
+const fn theme() -> &'static Theme {
+    if is_bento_variant() {
+        &THEME_V2_BENTO
+    } else {
+        &THEME_V1_HORIZON
+    }
+}
+
+#[inline]
+const fn white_or_dark(c: Color) -> Color {
+    let r = (c & 0xFF) as u32;
+    let g = ((c >> 8) & 0xFF) as u32;
+    let b = ((c >> 16) & 0xFF) as u32;
+    let luma = (r * 299 + g * 587 + b * 114) / 1000;
+    if luma >= 125 {
+        rgb(14, 16, 20)
+    } else {
+        rgb(255, 255, 255)
+    }
+}
+
+// Layout geometry (1280 x 720) — Full-width 2-tier header + body + footer
+const TOP_SEC_H: i32 = 48;
+const SUB_TAB_Y: i32 = TOP_SEC_H;
+const SUB_TAB_H: i32 = 44;
+const CONTENT_Y: i32 = TOP_SEC_H + SUB_TAB_H + 10; // 102
+const FOOTER_Y: i32 = 668;
+const FOOTER_H: i32 = 52;
+const CONTENT_H: i32 = FOOTER_Y - CONTENT_Y - 8; // 558
+const MAIN_X: i32 = 20;
+const MAIN_W: i32 = 1240;
+
+// Split-Studio geometry for Variant 1 (`XXSE-1.nro`)
+const V1_LIST_W: i32 = 796;
+const V1_INSP_X: i32 = MAIN_X + V1_LIST_W + 16; // 832
+const V1_INSP_W: i32 = 1280 - V1_INSP_X - 20; // 428
+
+// ---------------------------------------------------------------------------
+// 6 Top-Level Sections (ZL / ZR) & In-Section Sub-Tabs (L / R)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MainSection {
+    File = 0,
+    Hunter = 1,
+    Items = 2,
+    Gear = 3,
+    PalicoRecord = 4,
+    Quest = 5,
+}
+
+const MAIN_SECTIONS: [(MainSection, &str); 6] = [
+    (MainSection::File, "ファイル"),
+    (MainSection::Hunter, "ハンター"),
+    (MainSection::Items, "アイテム"),
+    (MainSection::Gear, "護石・装備"),
+    (MainSection::PalicoRecord, "オトモ・記録"),
+    (MainSection::Quest, "クエスト"),
+];
+
+pub fn section_of(screen: Screen) -> MainSection {
+    match screen {
+        Screen::SaveList | Screen::Convert | Screen::Options => MainSection::File,
+        Screen::Slots | Screen::Char => MainSection::Hunter,
+        Screen::Items | Screen::ItemPick => MainSection::Items,
+        Screen::Charms | Screen::CharmEdit | Screen::SkillPick | Screen::Equip | Screen::Sets => {
+            MainSection::Gear
+        }
+        Screen::Roster | Screen::Palico | Screen::Hunts | Screen::Guild => {
+            MainSection::PalicoRecord
+        }
+        Screen::SaveQuests
+        | Screen::QuestEquip
+        | Screen::ArcList
+        | Screen::ArcEntries
+        | Screen::Mib
+        | Screen::Gmd
+        | Screen::EntryView
+        | Screen::Check => MainSection::Quest,
+    }
+}
+
+fn is_quest_inner(screen: Screen) -> bool {
+    matches!(
+        screen,
+        Screen::ArcEntries | Screen::Mib | Screen::Gmd | Screen::EntryView | Screen::Check
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Interactive HitBoxes & Actions
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 pub enum UiAction {
-    /// Send a virtual button press to Editor::input().
     Key(Key),
-    /// Switch active character slot (0..2).
     SelectSlot(usize),
-    /// Navigate directly to a screen from the sidebar or quick card buttons.
-    GotoScreen(Screen),
-    /// Set `ed.step` index (0..5).
+    GotoSection(MainSection),
+    SelectSubTab(usize),
+    CycleSection(bool),
+    CycleSubTab(bool),
     SetStep(usize),
-    /// Select a row in the current screen's list. ` immediate == false ` means list body tap.
     SelectRow(usize),
-    /// Select a row and nudge its value with Left or Right.
+    ActivateRow(usize),
     AdjustRow(usize, Key),
-    /// Select a row and press a key on it.
-    ///
-    /// The quest-equipment rows each carry a change button, and the button
-    /// did not say which row it belonged to, so pressing it on an unselected
-    /// row edited whichever row the cursor happened to be on.
-    KeyOnRow(usize, Key),
-    /// Set the row's value to its natural maximum (or toggle).
+    AdjustBy(i64),
     SetRowMax(usize),
-    /// On `Items`, select row `idx` and open `ItemPick` (`Key::R`).
     OpenItemPicker(usize),
-    /// On `Hunts` / `Roster` / `Guild`, select `(row, sub_field)`.
     SelectSubField(usize, usize),
-    /// On `CharmEdit`, open skill picker for field `2` or `4`.
     OpenCharmSkill(usize),
-    /// Scroll the active cursor by `delta` rows (`-10` / `+10`).
     PageScroll(i32),
-    /// Trigger SD card rescan.
     Rescan,
-    /// Save changes immediately (Save or Arc).
     QuickSave,
-    /// Cycle sidebar tab (`false` = up/prev, `true` = down/next).
-    CycleTab(bool),
-    /// Install all 175 bundled official event/challenge quests + 40 arena equips into the open save.
+    // One-tap Bulk Cheats & Presets
+    CharMaxAll,
+    ItemsMaxAll,
+    CharmLegalMax,
+    CharmPreset(u8),
+    NewCharm,
+    DeleteCharmConfirm,
+    RosterMaxAll,
     InstallOfficialDlc,
-    /// Install bundled quests by category (`0` = Official 175, `1` = ExtraPlayable 14, `2` = All 189 Playable, `3` = Dead 34).
     InstallDlcCategory(u8),
-    /// Switch active category tab on `SaveQuests` (`0` = Save, `1` = Official 175, `2` = ExtraPlayable 14, `3` = Dead 34).
     SetQuestTab(usize),
-    /// Toggle (install or remove) one bundled quest by `quest_id`.
     ToggleBundledQuest(i32),
-    /// Remove an installed quest from the save by `quest_id`.
     RemoveSaveQuest(i32),
-    /// Open a bundled quest in the `.arc` / `.mib` editor.
     OpenBundledQuest(i32),
-    /// Open the list picker modal for `.mib` field `field_idx`.
     OpenMibPicker(usize),
-    /// Choose row `idx` in the open `.mib` list picker modal.
     MibPickerSelect(usize),
-    /// Scroll the open `.mib` list picker modal by `delta` rows.
     MibPickerScroll(i32),
-    /// Close the `.mib` list picker modal.
     MibPickerClose,
-    /// Install all downloadable Palicoes of the current language into the open save.
+    MibPreset(u8),
+    SemPreset(u8),
     InstallAllPalicoes,
-    /// Unpack all 175 bundled official `.arc` files to SD card (`/switch/XXSE/mhxx/questt/arc`).
+    TogglePalicoLang,
     ExtractOfficialArcs,
-    /// Install the `.arc` file at `idx` in `ArcList` directly into the open save.
     InstallArcRow(usize),
-    /// Built-in On-Screen Keyboard actions (used when swkbd is unavailable in Applet mode).
+    // Built-in OSK
     OskTab(usize),
     OskCell(usize, usize),
     OskBackspace,
@@ -164,7 +280,6 @@ pub enum UiAction {
     OskCancel,
 }
 
-/// Modal list picker for `.mib` fields (Monsters, Maps, Quest Levels, Icons, Conditions, etc.).
 #[derive(Clone)]
 pub struct MibPickerState {
     pub field_idx: usize,
@@ -173,7 +288,6 @@ pub struct MibPickerState {
     pub cursor: usize,
 }
 
-/// Built-in On-Screen Keyboard state for Applet mode (where Horizon OS blocks library applets).
 #[derive(Clone)]
 pub struct OskState {
     pub req_idx: usize,
@@ -202,7 +316,6 @@ impl HitBox {
     }
 }
 
-/// Persistent GUI state (touch tracking + hitboxes from the last rendered frame).
 pub struct GuiState {
     hits: Vec<HitBox>,
     was_touching: bool,
@@ -216,11 +329,14 @@ pub struct GuiState {
     pub quest_tab: usize,
     pub quest_cat_cursor: [usize; 4],
     pub mib_picker: Option<MibPickerState>,
+    pub mib_mob_sub: usize,
     pub osk: Option<OskState>,
     pub osk_result: Option<(usize, String)>,
     pub osk_cancelled: bool,
-    /// A save quest the delete button is waiting for a second tap on.
     pub pending_delete: Option<i32>,
+    pub pending_delete_charm: Option<usize>,
+    pub sets_cursor: usize,
+    pub sets_tab: usize,
 }
 
 impl GuiState {
@@ -229,8 +345,8 @@ impl GuiState {
             hits: Vec::with_capacity(96),
             was_touching: false,
             drag_start_y: 0,
-            last_drag_y: 0,
             dragged: false,
+            last_drag_y: 0,
             pending_activate_row: None,
             wants_rescan: false,
             wants_extract_official_arcs: false,
@@ -238,14 +354,17 @@ impl GuiState {
             quest_tab: 0,
             quest_cat_cursor: [0; 4],
             mib_picker: None,
+            mib_mob_sub: 0,
             osk: None,
             osk_result: None,
             osk_cancelled: false,
             pending_delete: None,
+            pending_delete_charm: None,
+            sets_cursor: 0,
+            sets_tab: 0,
         }
     }
 
-    /// Open the built-in On-Screen Keyboard (fallback for Applet mode).
     pub fn open_osk(&mut self, req_idx: usize, header: &str, initial: &str, max_bytes: usize) {
         self.osk = Some(OskState {
             req_idx,
@@ -258,7 +377,6 @@ impl GuiState {
         });
     }
 
-    /// Handle controller key press while the built-in OSK is open.
     pub fn handle_osk_key(&mut self, key: Key) -> bool {
         let Some(mut osk) = self.osk.take() else {
             return false;
@@ -340,38 +458,421 @@ impl GuiState {
         });
     }
 
-    /// Cycle through main sidebar tabs when `ZL` is pressed.
+    // -----------------------------------------------------------------------
+    // ZL / ZR: Main Section Cycling (6 Top-Level Categories)
+    // -----------------------------------------------------------------------
     pub fn cycle_sidebar_tab(&mut self, ed: &mut Editor, forward: bool) {
-        let tabs: &[Screen] = if ed.save.is_some() {
+        let allowed: &[MainSection] = if ed.save.is_some() {
             &[
-                Screen::Slots,
-                Screen::Char,
-                Screen::Items,
-                Screen::Equip,
-                Screen::Charms,
-                Screen::Roster,
-                Screen::Palico,
-                Screen::Hunts,
-                Screen::Guild,
-                Screen::Sets,
-                Screen::SaveQuests,
-                Screen::ArcList,
-                Screen::Options,
+                MainSection::File,
+                MainSection::Hunter,
+                MainSection::Items,
+                MainSection::Gear,
+                MainSection::PalicoRecord,
+                MainSection::Quest,
             ]
         } else {
-            &[Screen::SaveList, Screen::ArcList]
+            &[MainSection::File, MainSection::Quest]
         };
-        let cur_group = canonical_tab(ed.screen);
-        let pos = tabs.iter().position(|&s| s == cur_group).unwrap_or(0);
+        let cur = section_of(ed.screen);
+        let pos = allowed.iter().position(|&s| s == cur).unwrap_or(0);
         let next = if forward {
-            (pos + 1) % tabs.len()
+            (pos + 1) % allowed.len()
         } else {
-            (pos + tabs.len() - 1) % tabs.len()
+            (pos + allowed.len() - 1) % allowed.len()
         };
-        self.apply_action(ed, UiAction::GotoScreen(tabs[next]));
+        self.goto_section(ed, allowed[next]);
     }
 
-    /// Scroll the active list by `delta` rows (used by Right Stick and L/R page scroll).
+    fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
+        self.pending_delete = None;
+        self.pending_delete_charm = None;
+        if sec != MainSection::File && sec != MainSection::Quest && ed.save.is_none() {
+            ed.message = String::from("先にセーブデータを開いてください");
+            return;
+        }
+        match sec {
+            MainSection::File => {
+                ed.screen = Screen::SaveList;
+                ed.cursor = 0;
+            }
+            MainSection::Hunter => {
+                ed.screen = Screen::Char;
+                if ed.field > 9 {
+                    ed.field = 0;
+                }
+                ed.cursor = ed.field;
+            }
+            MainSection::Items => {
+                ed.screen = Screen::Items;
+                ed.cursor = 0;
+            }
+            MainSection::Gear => {
+                ed.open_charms();
+            }
+            MainSection::PalicoRecord => {
+                ed.screen = Screen::Roster;
+                ed.roster_cursor = 0;
+            }
+            MainSection::Quest => {
+                if ed.save.is_some() {
+                    ed.refresh_quest_titles();
+                    ed.screen = Screen::SaveQuests;
+                    let n = ed.filtered_quests().len();
+                    ed.save_quest_cursor = ed.save_quest_cursor.min(n.saturating_sub(1));
+                    ed.cursor = ed.save_quest_cursor;
+                } else {
+                    ed.screen = Screen::ArcList;
+                    ed.cursor = 0;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // L / R: Sub-Tab System Inside the Current Section!
+    // -----------------------------------------------------------------------
+    fn sub_tabs_for(&self, ed: &Editor) -> (&'static [&'static str], usize) {
+        if is_quest_inner(ed.screen) {
+            let labels: &'static [&'static str] = &[
+                "条件(.mib)",
+                "初期配置(.sem)",
+                "文章(.gmd)",
+                "構成(.arc)",
+                "検査",
+            ];
+            let active = match ed.screen {
+                Screen::Mib => 0,
+                Screen::EntryView
+                    if ed
+                        .arc
+                        .as_ref()
+                        .and_then(|a| a.entries.get(ed.entry))
+                        .and_then(|e| extension_for(e.type_hash))
+                        == Some("sem") =>
+                {
+                    1
+                }
+                Screen::Gmd => 2,
+                Screen::ArcEntries | Screen::EntryView => 3,
+                Screen::Check => 4,
+                _ => 0,
+            };
+            return (labels, active);
+        }
+
+        match section_of(ed.screen) {
+            MainSection::File => {
+                let labels: &'static [&'static str] =
+                    &["セーブ一覧", "形式変換", "環境設定"];
+                let active = match ed.screen {
+                    Screen::SaveList => 0,
+                    Screen::Convert => 1,
+                    Screen::Options => 2,
+                    _ => 0,
+                };
+                (labels, active)
+            }
+            MainSection::Hunter => {
+                let labels: &'static [&'static str] = &[
+                    "基本ステータス",
+                    "外見・性別",
+                    "スロット",
+                ];
+                let active = match ed.screen {
+                    Screen::Char if ed.field <= 9 => 0,
+                    Screen::Char => 1,
+                    Screen::Slots => 2,
+                    _ => 0,
+                };
+                (labels, active)
+            }
+            MainSection::Items => {
+                let labels: &'static [&'static str] = &[
+                    "所持品",
+                    "BOX 1-5",
+                    "BOX 6-10",
+                    "BOX 11-15",
+                    "BOX 16-23",
+                ];
+                let active = if !ed.show_empty {
+                    0
+                } else if ed.cursor < 500 {
+                    1
+                } else if ed.cursor < 1000 {
+                    2
+                } else if ed.cursor < 1500 {
+                    3
+                } else {
+                    4
+                };
+                (labels, active)
+            }
+            MainSection::Gear => {
+                let labels: &'static [&'static str] = &[
+                    "護石一覧",
+                    "護石編集",
+                    "装備BOX",
+                    "マイセット",
+                ];
+                let active = match ed.screen {
+                    Screen::Charms => 0,
+                    Screen::CharmEdit | Screen::SkillPick => 1,
+                    Screen::Equip => 2,
+                    Screen::Sets => 3,
+                    _ => 0,
+                };
+                (labels, active)
+            }
+            MainSection::PalicoRecord => {
+                let labels: &'static [&'static str] = &[
+                    "所持オトモ",
+                    "配信オトモ",
+                    "狩猟記録",
+                    "ギルドカード",
+                ];
+                let active = match ed.screen {
+                    Screen::Roster => 0,
+                    Screen::Palico => 1,
+                    Screen::Hunts => 2,
+                    Screen::Guild => 3,
+                    _ => 0,
+                };
+                (labels, active)
+            }
+            MainSection::Quest => {
+                let labels: &'static [&'static str] = &[
+                    "セーブ内",
+                    "公式(189)",
+                    "没クエ(34)",
+                    "SD(.arc)",
+                    "固定装備",
+                ];
+                let active = match ed.screen {
+                    Screen::SaveQuests => self.quest_tab.min(2),
+                    Screen::ArcList => 3,
+                    Screen::QuestEquip => 4,
+                    _ => 0,
+                };
+                (labels, active)
+            }
+        }
+    }
+
+    pub fn cycle_sub_tab(&mut self, ed: &mut Editor, forward: bool) {
+        let (labels, cur) = self.sub_tabs_for(ed);
+        let len = labels.len();
+        if len == 0 {
+            return;
+        }
+        let next = if forward {
+            (cur + 1) % len
+        } else {
+            (cur + len - 1) % len
+        };
+        self.select_sub_tab(ed, next);
+    }
+
+    pub fn select_sub_tab(&mut self, ed: &mut Editor, idx: usize) {
+        self.pending_delete = None;
+        self.pending_delete_charm = None;
+
+        if is_quest_inner(ed.screen) {
+            safe_flush_quest_entry(ed);
+            match idx {
+                0 => {
+                    if let Some(pos) = ed
+                        .arc
+                        .as_ref()
+                        .and_then(|a| a.entries.iter().position(|e| extension_for(e.type_hash) == Some("mib")))
+                    {
+                        ed.gmd = None;
+                        ed.screen = Screen::ArcEntries;
+                        ed.cursor = pos;
+                        ed.input(Key::A);
+                    } else {
+                        ed.message = String::from("この .arc には .mib が含まれていません");
+                    }
+                }
+                1 => {
+                    let sems = sem_entry_indices(ed);
+                    if let Some(&pos) = sems.first() {
+                        ed.gmd = None;
+                        ed.entry = pos;
+                        ed.cursor = pos;
+                        ed.entry_row_cursor = 0;
+                        ed.screen = Screen::EntryView;
+                        ed.message = String::from("初期配置座標 (.sem): [◀/▶]でエリア・X/Y/Z座標を変更 ([Y]で刻み幅)");
+                    } else {
+                        ed.message = String::from("この .arc には .sem (初期配置) が含まれていません");
+                    }
+                }
+                2 => {
+                    if let Some(pos) = ed
+                        .arc
+                        .as_ref()
+                        .and_then(|a| a.entries.iter().position(|e| extension_for(e.type_hash) == Some("gmd")))
+                    {
+                        ed.screen = Screen::ArcEntries;
+                        ed.cursor = pos;
+                        ed.input(Key::A);
+                    } else {
+                        ed.message = String::from("この .arc には .gmd が含まれていません");
+                    }
+                }
+                3 => {
+                    ed.gmd = None;
+                    ed.screen = Screen::ArcEntries;
+                    ed.cursor = ed.entry;
+                }
+                _ => {
+                    ed.gmd = None;
+                    ed.run_check();
+                }
+            }
+            return;
+        }
+
+        match section_of(ed.screen) {
+            MainSection::File => match idx {
+                0 => {
+                    ed.screen = Screen::SaveList;
+                    ed.cursor = 0;
+                }
+                1 => {
+                    if ed.save.is_none() {
+                        ed.message = String::from("変換するには先にセーブデータを開いてください");
+                    } else {
+                        ed.screen = Screen::Convert;
+                    }
+                }
+                _ => {
+                    if ed.save.is_none() {
+                        ed.message = String::from("設定を開くには先にセーブデータを開いてください");
+                    } else {
+                        ed.screen = Screen::Options;
+                        ed.option_cursor = 0;
+                    }
+                }
+            },
+            MainSection::Hunter => match idx {
+                0 => {
+                    ed.screen = Screen::Char;
+                    if ed.field > 9 {
+                        ed.field = 0;
+                    }
+                    ed.cursor = ed.field;
+                }
+                1 => {
+                    ed.screen = Screen::Char;
+                    if ed.field < 10 {
+                        ed.field = 10;
+                    }
+                    ed.cursor = ed.field;
+                }
+                _ => {
+                    ed.screen = Screen::Slots;
+                    ed.cursor = ed.slot;
+                }
+            },
+            MainSection::Items => {
+                ed.screen = Screen::Items;
+                match idx {
+                    0 => {
+                        ed.show_empty = false;
+                        ed.cursor = 0;
+                        ed.message = String::from("所持アイテムのみ表示中 ([A]でアイテム変更 / [◀▶]で個数)");
+                    }
+                    1 => {
+                        ed.show_empty = true;
+                        ed.cursor = 0;
+                        ed.message = String::from("全枠表示: BOX 1〜5 (#1〜#500) — 空き枠にも[A]で追加可能");
+                    }
+                    2 => {
+                        ed.show_empty = true;
+                        ed.cursor = 500.min(ed.visible_items().len().saturating_sub(1));
+                        ed.message = String::from("全枠表示: BOX 6〜10 (#501〜#1000)");
+                    }
+                    3 => {
+                        ed.show_empty = true;
+                        ed.cursor = 1000.min(ed.visible_items().len().saturating_sub(1));
+                        ed.message = String::from("全枠表示: BOX 11〜15 (#1001〜#1500)");
+                    }
+                    _ => {
+                        ed.show_empty = true;
+                        ed.cursor = 1500.min(ed.visible_items().len().saturating_sub(1));
+                        ed.message = String::from("全枠表示: BOX 16〜23 (#1501〜#2300)");
+                    }
+                }
+            }
+            MainSection::Gear => match idx {
+                0 => ed.open_charms(),
+                1 => {
+                    if ed.screen != Screen::CharmEdit {
+                        ed.open_charms();
+                        if ed.charms().is_empty() {
+                            ed.input(Key::L);
+                        } else {
+                            ed.input(Key::Y);
+                        }
+                    }
+                }
+                2 => {
+                    ed.screen = Screen::Equip;
+                    ed.equip_cursor = 0;
+                }
+                _ => {
+                    ed.screen = Screen::Sets;
+                    self.sets_cursor = 0;
+                }
+            },
+            MainSection::PalicoRecord => match idx {
+                0 => {
+                    ed.screen = Screen::Roster;
+                    ed.roster_cursor = 0;
+                }
+                1 => {
+                    ed.screen = Screen::Palico;
+                    ed.cursor = ed.palico_cursor;
+                }
+                2 => {
+                    ed.screen = Screen::Hunts;
+                    ed.hunt_cursor = 0;
+                }
+                _ => {
+                    ed.screen = Screen::Guild;
+                }
+            },
+            MainSection::Quest => match idx {
+                0..=2 => {
+                    if ed.save.is_none() {
+                        ed.message = String::from("先にセーブデータを開いてください");
+                        return;
+                    }
+                    self.quest_tab = idx;
+                    ed.refresh_quest_titles();
+                    ed.screen = Screen::SaveQuests;
+                }
+                3 => {
+                    ed.screen = Screen::ArcList;
+                    ed.cursor = 0;
+                }
+                _ => {
+                    if ed.save.is_none() {
+                        ed.message = String::from("先にセーブデータを開いてください");
+                        return;
+                    }
+                    ed.screen = Screen::QuestEquip;
+                    ed.qe_open = false;
+                    ed.cursor = 0;
+                }
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Page Scroll & MIB Picker Modal
+    // -----------------------------------------------------------------------
     pub fn page_scroll(&mut self, ed: &mut Editor, delta: i32) {
         if ed.screen == Screen::SaveQuests && self.quest_tab > 0 {
             let len = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter).len();
@@ -382,10 +883,17 @@ impl GuiState {
             }
             return;
         }
+        if ed.screen == Screen::Sets {
+            let len = sets_len(ed, self.sets_tab);
+            if len > 0 {
+                let next = (self.sets_cursor as i32 + delta).clamp(0, len as i32 - 1) as usize;
+                self.sets_cursor = next;
+            }
+            return;
+        }
         scroll_active_cursor(ed, delta);
     }
 
-    /// Scroll the MIB list picker modal by `delta` rows.
     pub fn scroll_mib_picker(&mut self, delta: i32) {
         if let Some(picker) = &mut self.mib_picker {
             let len = picker.items.len();
@@ -396,7 +904,6 @@ impl GuiState {
         }
     }
 
-    /// Open the MIB list picker modal for field `field_idx` if it has a choice list.
     pub fn open_mib_picker(&mut self, ed: &mut Editor, field_idx: usize) -> bool {
         let Some((title, items, cur_val)) = mib_field_choices(ed.mib_bytes(), field_idx) else {
             return false;
@@ -416,7 +923,6 @@ impl GuiState {
         true
     }
 
-    /// Handle controller keys while the MIB list picker modal is open.
     pub fn handle_mib_picker_key(&mut self, ed: &mut Editor, key: Key) -> bool {
         let Some(mut picker) = self.mib_picker.take() else {
             return false;
@@ -447,9 +953,7 @@ impl GuiState {
                     apply_mib_choice(ed, picker.field_idx, raw_val, &label);
                 }
             }
-            Key::B | Key::Minus => {
-                // Close modal without applying
-            }
+            Key::B | Key::Minus => {}
             _ => {
                 self.mib_picker = Some(picker);
             }
@@ -457,90 +961,196 @@ impl GuiState {
         true
     }
 
-    /// Handle a physical controller button press with Switch-native UX rules.
-    pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, cur_buttons: u64) {
-        // L + R held together on any screen cycles the active character slot (1 -> 2 -> 3)
-        const BTN_L_R: u64 = (1 << 6) | (1 << 7);
-        if (cur_buttons & BTN_L_R) == BTN_L_R && matches!(key, Key::L | Key::R) && ed.save.is_some() {
-            let next_slot = (ed.slot + 1) % 3;
-            self.apply_action(ed, UiAction::SelectSlot(next_slot));
+    // -----------------------------------------------------------------------
+    // Unified Controller Key Handler (A=Open/Edit, L/R=SubTab, X=Save, Y=Tool)
+    // -----------------------------------------------------------------------
+    pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
+        // Picker screens use L/R for fast ±10 page jump; EVERY other screen uses L/R for Sub-Tab switching!
+        if matches!(key, Key::L | Key::R) {
+            if matches!(ed.screen, Screen::ItemPick | Screen::SkillPick) {
+                let d = if key == Key::Right || key == Key::R { 10 } else { -10 };
+                scroll_active_cursor(ed, d);
+                return;
+            }
+            self.cycle_sub_tab(ed, key == Key::R);
+            return;
+        }
+
+        // Global X = QuickSave (except on ItemPick / SkillPick where X clears search filter)
+        if key == Key::X && !matches!(ed.screen, Screen::ItemPick | Screen::SkillPick) {
+            self.apply_action(ed, UiAction::QuickSave);
             return;
         }
 
         match ed.screen {
+            Screen::SaveList => match key {
+                Key::Y => self.apply_action(ed, UiAction::Rescan),
+                other => ed.input(other),
+            },
             Screen::Slots => match key {
-                Key::Up | Key::Left | Key::L => {
+                Key::Up | Key::Left => {
                     let prev = (ed.slot + 2) % 3;
                     self.apply_action(ed, UiAction::SelectSlot(prev));
                 }
-                Key::Down | Key::Right | Key::R => {
+                Key::Down | Key::Right => {
                     let next = (ed.slot + 1) % 3;
                     self.apply_action(ed, UiAction::SelectSlot(next));
                 }
+                Key::A => {
+                    ed.screen = Screen::Char;
+                    ed.field = 0;
+                    ed.cursor = 0;
+                }
+                Key::Y => self.apply_action(ed, UiAction::CharMaxAll),
+                Key::B => {
+                    ed.screen = Screen::SaveList;
+                    ed.cursor = 0;
+                }
+                _ => {}
+            },
+            Screen::Char => {
+                let (lo, hi) = if ed.field <= 9 { (0usize, 9usize) } else { (10usize, 16usize) };
+                match key {
+                    Key::Up => {
+                        ed.field = if ed.field <= lo { hi } else { ed.field - 1 };
+                        ed.cursor = ed.field;
+                    }
+                    Key::Down => {
+                        ed.field = if ed.field >= hi { lo } else { ed.field + 1 };
+                        ed.cursor = ed.field;
+                    }
+                    Key::A => {
+                        if ed.field == 0 {
+                            ed.input(Key::Right); // Open Name OSK
+                        } else if ed.field == 13 {
+                            let cur = ed.char_value(13);
+                            ed.set_char_value(13, if cur == 0 { 1 } else { 0 });
+                        } else {
+                            self.apply_action(ed, UiAction::SetRowMax(ed.field));
+                        }
+                    }
+                    Key::Y => {
+                        ed.step = (ed.step + 1) % STEPS.len();
+                        ed.message = format!("刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                    }
+                    other => ed.input(other),
+                }
+            }
+            Screen::Items => match key {
+                Key::A => {
+                    // A opens the Item Picker for the selected slot!
+                    ed.input(Key::R);
+                }
                 Key::Y => {
-                    self.apply_action(ed, UiAction::GotoScreen(Screen::SaveQuests));
+                    ed.step = (ed.step + 1) % STEPS.len();
+                    ed.message = format!("個数の刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                }
+                Key::Minus => {
+                    ed.input(Key::L); // Undo last item change
                 }
                 other => ed.input(other),
             },
-            Screen::Char => match key {
-                // Pressing A on row 0 ("名前") opens the name keyboard instead of saving
-                Key::A if ed.field == 0 => {
-                    ed.input(Key::Right);
-                }
-                Key::L => {
-                    let prev = (ed.slot + 2) % 3;
-                    self.apply_action(ed, UiAction::SelectSlot(prev));
-                }
-                Key::R => {
-                    let next = (ed.slot + 1) % 3;
-                    self.apply_action(ed, UiAction::SelectSlot(next));
-                }
-                other => ed.input(other),
-            },
-            Screen::Mib => match key {
-                Key::L => scroll_active_cursor(ed, -10),
-                Key::R => scroll_active_cursor(ed, 10),
-                Key::Y => {
-                    if !self.open_mib_picker(ed, ed.mib_cursor) {
-                        ed.message = String::from("この項目には選択リストがありません（左右キーで数値を変更してください）");
+            Screen::ItemPick => match key {
+                Key::A => {
+                    let target_box = ed.item_pick_target;
+                    let mode = ed.item_pick_mode;
+                    ed.input(Key::A);
+                    if mode == 0 && ed.screen == Screen::Items {
+                        if let Some(pos) = ed.visible_items().iter().position(|&b| b == target_box) {
+                            ed.cursor = pos;
+                        }
                     }
                 }
                 other => ed.input(other),
             },
-            // List screens where L / R intuitively act as Page Up (-10) / Page Down (+10)
-            Screen::Equip
-            | Screen::ItemPick
-            | Screen::SkillPick
-            | Screen::Gmd
-            | Screen::EntryView
-            | Screen::Check
-            | Screen::QuestEquip => match key {
-                Key::L => scroll_active_cursor(ed, -10),
-                Key::R => scroll_active_cursor(ed, 10),
+            Screen::Charms => match key {
+                Key::Up | Key::Down => {
+                    self.pending_delete_charm = None;
+                    ed.input(key);
+                }
+                Key::A => {
+                    // A safely opens the Charm Editor!
+                    if ed.charms().is_empty() {
+                        ed.input(Key::L);
+                    } else {
+                        ed.input(Key::Y);
+                    }
+                }
+                Key::Y => {
+                    self.apply_action(ed, UiAction::DeleteCharmConfirm);
+                }
+                Key::Minus => {
+                    ed.input(Key::L); // Create new charm in free slot
+                }
                 other => ed.input(other),
             },
-            Screen::Guild | Screen::Sets => match key {
-                Key::L => {
-                    let prev = (ed.slot + 2) % 3;
-                    self.apply_action(ed, UiAction::SelectSlot(prev));
+            Screen::CharmEdit => match key {
+                Key::A => {
+                    let field = ed.charm_edit.map(|c| c.field).unwrap_or(0);
+                    if field == 2 || field == 4 {
+                        ed.input(Key::Y); // Open Skill Picker
+                    } else if field == 1 {
+                        ed.input(Key::Right); // Cycle slots 0..3
+                    } else {
+                        ed.input(Key::A); // Apply charm to box
+                    }
                 }
-                Key::R => {
-                    let next = (ed.slot + 1) % 3;
-                    self.apply_action(ed, UiAction::SelectSlot(next));
+                Key::Y => {
+                    self.apply_action(ed, UiAction::CharmLegalMax);
                 }
                 other => ed.input(other),
+            },
+            Screen::Roster => match key {
+                Key::Y => {
+                    ed.roster_field = (ed.roster_field + 1) % 3;
+                }
+                other => ed.input(other),
+            },
+            Screen::Palico => match key {
+                Key::Y => {
+                    self.apply_action(ed, UiAction::InstallAllPalicoes);
+                }
+                Key::Left | Key::Right => {
+                    self.apply_action(ed, UiAction::TogglePalicoLang);
+                }
+                other => ed.input(other),
+            },
+            Screen::Hunts => match key {
+                Key::Y => {
+                    ed.hunt_field = (ed.hunt_field + 1) % 4;
+                }
+                Key::A => {
+                    ed.step = (ed.step + 1) % STEPS.len();
+                    ed.message = format!("狩猟記録の刻み幅を {} に切り替えました", HUNT_STEPS[ed.step]);
+                }
+                other => ed.input(other),
+            },
+            Screen::Guild => match key {
+                Key::Y => {
+                    ed.step = (ed.step + 1) % STEPS.len();
+                }
+                other => ed.input(other),
+            },
+            Screen::Sets => match key {
+                Key::Up => {
+                    self.sets_cursor = self.sets_cursor.saturating_sub(1);
+                }
+                Key::Down => {
+                    let len = sets_len(ed, self.sets_tab);
+                    if len > 0 {
+                        self.sets_cursor = (self.sets_cursor + 1).min(len - 1);
+                    }
+                }
+                Key::Left | Key::Right | Key::Y => {
+                    self.sets_tab = 1 - self.sets_tab;
+                    self.sets_cursor = 0;
+                }
+                Key::B => {
+                    ed.open_charms();
+                }
+                _ => {}
             },
             Screen::SaveQuests => match key {
-                // Left and right switch catalogue tab. L and R used to do it,
-                // which swallowed the two keys that open the quest-equipment
-                // screen and extract every quest: neither was reachable from
-                // a controller at all.
-                Key::Left => {
-                    self.quest_tab = (self.quest_tab + 2) % 3;
-                }
-                Key::Right => {
-                    self.quest_tab = (self.quest_tab + 1) % 3;
-                }
                 Key::Up if self.quest_tab > 0 => {
                     let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
                     let n = list.len();
@@ -567,50 +1177,147 @@ impl GuiState {
                 Key::A if ed.save_quests().is_empty() => {
                     ed.install_official_dlc();
                 }
-                Key::X => {
-                    if !ed.quest_filter.is_empty() {
-                        ed.quest_filter.clear();
-                        ed.save_quest_cursor = 0;
-                        self.quest_cat_cursor = [0; 4];
-                    } else {
-                        let cat_idx = if self.quest_tab == 2 { 1 } else { 0 };
-                        self.apply_action(ed, UiAction::InstallDlcCategory(cat_idx));
-                    }
+                Key::Y => {
+                    ed.input(Key::Y); // Search filter
+                }
+                Key::Left | Key::Right => {
+                    // Do NOT switch tab on Left/Right; L/R handles tab switching!
                 }
                 other => ed.input(other),
             },
             Screen::ArcList => match key {
-                Key::L => {
+                Key::Y => {
                     self.wants_install_arc_idx = Some(ed.cursor);
                 }
-                Key::R => {
+                Key::Minus => {
                     self.wants_extract_official_arcs = true;
                 }
                 Key::B => {
                     if ed.save.is_some() {
-                        self.apply_action(ed, UiAction::GotoScreen(Screen::SaveQuests));
+                        self.quest_tab = 0;
+                        ed.screen = Screen::SaveQuests;
                     } else {
-                        self.apply_action(ed, UiAction::GotoScreen(Screen::SaveList));
+                        ed.screen = Screen::SaveList;
                     }
                 }
                 other => ed.input(other),
             },
+            Screen::ArcEntries => match key {
+                Key::A => {
+                    safe_flush_quest_entry(ed);
+                    let ext = ed
+                        .arc
+                        .as_ref()
+                        .and_then(|a| a.entries.get(ed.cursor))
+                        .and_then(|e| extension_for(e.type_hash));
+                    if matches!(ext, Some("mib") | Some("gmd")) {
+                        if ext == Some("mib") {
+                            ed.gmd = None;
+                        }
+                        ed.input(Key::A);
+                    } else {
+                        ed.gmd = None;
+                        ed.input(Key::Y);
+                    }
+                }
+                Key::Y => {
+                    safe_flush_quest_entry(ed);
+                    ed.gmd = None;
+                    ed.run_check();
+                }
+                other => ed.input(other),
+            },
+            Screen::Mib => {
+                let is_mob = questfields::MIB_FIELDS
+                    .get(ed.mib_cursor)
+                    .map(|f| f.key.starts_with("mob_slot["))
+                    .unwrap_or(false);
+                match key {
+                    Key::A => {
+                        if !self.open_mib_picker(ed, ed.mib_cursor) {
+                            ed.message = String::from("この項目は [◀ / ▶] キーで数値を直接変更できます");
+                        }
+                    }
+                    Key::Minus if is_mob => {
+                        self.mib_mob_sub = (self.mib_mob_sub + 1) % 8;
+                        ed.message = format!(
+                            "モンスター編集項目を [{}] に切り替えました ([◀/▶]で増減)",
+                            MIB_MOB_SUB_LABELS[self.mib_mob_sub]
+                        );
+                    }
+                    Key::Left | Key::Right if is_mob => {
+                        let sign = if key == Key::Right { 1 } else { -1 };
+                        adjust_mib_mob_sub(ed, ed.mib_cursor, self.mib_mob_sub, sign * (STEPS[ed.step] as i32));
+                    }
+                    Key::Y => {
+                        ed.step = (ed.step + 1) % STEPS.len();
+                        ed.message = format!("刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                    }
+                    Key::B => {
+                        safe_flush_quest_entry(ed);
+                        ed.screen = Screen::ArcEntries;
+                    }
+                    other => ed.input(other),
+                }
+            }
+            Screen::Gmd => match key {
+                Key::B => {
+                    safe_flush_quest_entry(ed);
+                    ed.gmd = None;
+                    ed.screen = Screen::ArcEntries;
+                }
+                other => ed.input(other),
+            },
+            Screen::EntryView => {
+                let ext = ed
+                    .arc
+                    .as_ref()
+                    .and_then(|a| a.entries.get(ed.entry))
+                    .and_then(|e| extension_for(e.type_hash));
+                let len = list_len_of(ed, self);
+                match key {
+                    Key::Up => {
+                        if len > 0 {
+                            ed.entry_row_cursor = (ed.entry_row_cursor + len - 1) % len;
+                        }
+                    }
+                    Key::Down => {
+                        if len > 0 {
+                            ed.entry_row_cursor = (ed.entry_row_cursor + 1) % len;
+                        }
+                    }
+                    Key::Y => {
+                        ed.step = (ed.step + 1) % STEPS.len();
+                        ed.message = format!("刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                    }
+                    Key::Left | Key::Right
+                        if matches!(ext, Some("sem") | Some("esl") | Some("qdp")) =>
+                    {
+                        let sign = if key == Key::Right { 1 } else { -1 };
+                        adjust_entry_view_row(ed, ed.entry_row_cursor, sign * (STEPS[ed.step] as i32));
+                    }
+                    Key::A if matches!(ext, Some("sem") | Some("esl") | Some("qdp")) => {
+                        adjust_entry_view_row(ed, ed.entry_row_cursor, STEPS[ed.step] as i32);
+                    }
+                    other => ed.input(other),
+                }
+            }
             _ => ed.input(key),
         }
     }
 
-    /// Process touch screen state for one frame. Returns `true` if `ed` changed and needs redraw.
+    // -----------------------------------------------------------------------
+    // Touch Screen Handler
+    // -----------------------------------------------------------------------
     pub fn handle_touch(&mut self, ed: &mut Editor, touching: bool, tx: i32, ty: i32) -> bool {
         let mut changed = false;
 
         if touching && !self.was_touching {
-            // Touch Down edge
             self.drag_start_y = ty;
             self.last_drag_y = ty;
             self.dragged = false;
             self.pending_activate_row = None;
 
-            // Search in reverse order so buttons drawn on top of rows win over the row body!
             let hit = self.hits.iter().rev().find(|h| h.contains(tx, ty)).copied();
             if let Some(h) = hit {
                 if h.is_row_body {
@@ -622,11 +1329,10 @@ impl GuiState {
                                 self.quest_cat_cursor[self.quest_tab] = idx;
                                 changed = true;
                             }
-                        } else if active_cursor_of(ed) == idx {
-                            // Already selected: activate on release if the user doesn't drag
+                        } else if active_cursor_of(ed, self) == idx {
                             self.pending_activate_row = Some(idx);
                         } else {
-                            set_active_cursor(ed, idx);
+                            set_active_cursor(ed, self, idx);
                             changed = true;
                         }
                     }
@@ -636,7 +1342,6 @@ impl GuiState {
                 }
             }
         } else if touching && self.was_touching {
-            // Dragging inside the main content area scrolls lists smoothly
             if self.mib_picker.is_some() {
                 let dy = ty - self.last_drag_y;
                 if (ty - self.drag_start_y).abs() > 18 {
@@ -650,7 +1355,7 @@ impl GuiState {
                     self.scroll_mib_picker(rows);
                     changed = true;
                 }
-            } else if tx >= MAIN_X && ty >= CONTENT_Y && ty < FOOTER_Y {
+            } else if ty >= CONTENT_Y && ty < FOOTER_Y {
                 let dy = ty - self.last_drag_y;
                 if (ty - self.drag_start_y).abs() > 18 {
                     self.dragged = true;
@@ -665,19 +1370,9 @@ impl GuiState {
                 }
             }
         } else if !touching && self.was_touching {
-            // Touch Up edge
             if !self.dragged {
                 if let Some(idx) = self.pending_activate_row.take() {
-                    if ed.screen == Screen::SaveQuests && self.quest_tab > 0 {
-                        let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
-                        if let Some(q) = list.get(idx) {
-                            ed.toggle_bundled_quest(q.quest_id);
-                        }
-                    } else if ed.screen == Screen::Mib {
-                        let _ = self.open_mib_picker(ed, idx);
-                    } else {
-                        activate_selected_row(ed, idx);
-                    }
+                    self.apply_action(ed, UiAction::ActivateRow(idx));
                     changed = true;
                 }
             }
@@ -688,127 +1383,66 @@ impl GuiState {
         changed
     }
 
+    // -----------------------------------------------------------------------
+    // Action Execution & One-Tap Bulk Cheat Implementations
+    // -----------------------------------------------------------------------
     fn apply_action(&mut self, ed: &mut Editor, action: UiAction) {
         match action {
-            UiAction::Key(k) => ed.input(k),
+            UiAction::Key(k) => self.handle_pad_key(ed, k, 0),
             UiAction::SelectSlot(s) => {
                 if s < 3 {
                     ed.slot = s;
                     if ed.screen == Screen::Slots {
                         ed.cursor = s;
                     }
-                    ed.message = format!("スロット {} に切り替えました", s + 1);
+                    ed.message = format!("ハンター枠 Slot {} に切り替えました", s + 1);
                 }
             }
-            UiAction::GotoScreen(target) => {
-                if target != Screen::SaveList && target != Screen::ArcList && ed.save.is_none() {
-                    ed.message = String::from("先にセーブデータを開いてください");
-                    return;
-                }
-                match target {
-                    Screen::SaveList => {
-                        ed.screen = Screen::SaveList;
-                        ed.cursor = 0;
-                    }
-                    Screen::Slots => {
-                        ed.screen = Screen::Slots;
-                        ed.cursor = ed.slot;
-                    }
-                    Screen::Char => {
-                        ed.screen = Screen::Char;
-                        ed.cursor = ed.field;
-                    }
-                    Screen::Items => {
-                        ed.screen = Screen::Items;
-                        ed.cursor = 0;
-                    }
-                    Screen::Equip => {
-                        ed.screen = Screen::Equip;
-                        ed.equip_cursor = 0;
-                    }
-                    Screen::Charms => {
-                        ed.open_charms();
-                    }
-                    Screen::Roster => {
-                        ed.screen = Screen::Roster;
-                        ed.roster_cursor = 0;
-                    }
-                    Screen::Palico => {
-                        ed.screen = Screen::Palico;
-                        ed.cursor = ed.palico_cursor;
-                    }
-                    Screen::Hunts => {
-                        ed.screen = Screen::Hunts;
-                        ed.hunt_cursor = 0;
-                    }
-                    Screen::Guild => {
-                        ed.screen = Screen::Guild;
-                    }
-                    Screen::Sets => {
-                        ed.screen = Screen::Sets;
-                    }
-                    Screen::SaveQuests => {
-                        ed.refresh_quest_titles();
-                        ed.screen = Screen::SaveQuests;
-                        let n = ed.filtered_quests().len();
-                        ed.save_quest_cursor = ed.save_quest_cursor.min(n.saturating_sub(1));
-                        ed.cursor = ed.save_quest_cursor;
-                    }
-                    Screen::QuestEquip => {
-                        ed.screen = Screen::QuestEquip;
-                        ed.qe_open = false;
-                        ed.cursor = 0;
-                    }
-                    Screen::ArcList => {
-                        ed.screen = Screen::ArcList;
-                        ed.cursor = 0;
-                    }
-                    Screen::Options => {
-                        ed.screen = Screen::Options;
-                        ed.option_cursor = 0;
-                    }
-                    Screen::Convert => {
-                        ed.screen = Screen::Convert;
-                    }
-                    other => {
-                        ed.screen = other;
-                    }
-                }
-            }
+            UiAction::GotoSection(sec) => self.goto_section(ed, sec),
+            UiAction::SelectSubTab(idx) => self.select_sub_tab(ed, idx),
+            UiAction::CycleSection(fwd) => self.cycle_sidebar_tab(ed, fwd),
+            UiAction::CycleSubTab(fwd) => self.cycle_sub_tab(ed, fwd),
             UiAction::SetStep(s) => {
                 if s < STEPS.len() {
                     ed.step = s;
-                    ed.message = format!("変更の刻み幅を ±{} に設定しました", STEPS[s]);
+                    ed.message = format!("刻み幅を ±{} に設定しました", STEPS[s]);
                 }
             }
             UiAction::SelectRow(idx) => {
+                set_active_cursor(ed, self, idx);
+            }
+            UiAction::ActivateRow(idx) => {
+                set_active_cursor(ed, self, idx);
                 if ed.screen == Screen::SaveQuests && self.quest_tab > 0 {
-                    let n = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter).len();
-                    if n > 0 {
-                        self.quest_cat_cursor[self.quest_tab] = idx.min(n - 1);
+                    let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
+                    if let Some(q) = list.get(idx) {
+                        ed.toggle_bundled_quest(q.quest_id);
                     }
                 } else {
-                    set_active_cursor(ed, idx);
+                    self.handle_pad_key(ed, Key::A, 0);
                 }
             }
             UiAction::AdjustRow(idx, key) => {
-                set_active_cursor(ed, idx);
-                ed.input(key);
+                set_active_cursor(ed, self, idx);
+                self.handle_pad_key(ed, key, 0);
             }
-            UiAction::KeyOnRow(idx, key) => {
-                set_active_cursor(ed, idx);
-                ed.input(key);
+            UiAction::AdjustBy(delta) => {
+                let prev_step = ed.step;
+                let abs_d = delta.abs();
+                ed.step = STEPS.iter().position(|&s| s == abs_d).unwrap_or(0);
+                self.handle_pad_key(ed, if delta >= 0 { Key::Right } else { Key::Left }, 0);
+                ed.step = prev_step;
             }
             UiAction::SetRowMax(idx) => {
-                set_active_cursor(ed, idx);
-                apply_row_max(ed, idx);
+                set_active_cursor(ed, self, idx);
+                apply_row_max(ed, self.mib_mob_sub, idx);
             }
             UiAction::OpenItemPicker(idx) => {
-                set_active_cursor(ed, idx);
+                set_active_cursor(ed, self, idx);
                 ed.input(Key::R);
             }
             UiAction::SelectSubField(row_idx, sub) => {
-                set_active_cursor(ed, row_idx);
+                set_active_cursor(ed, self, row_idx);
                 match ed.screen {
                     Screen::Hunts => ed.hunt_field = sub.min(3),
                     Screen::Roster => ed.roster_field = sub.min(2),
@@ -817,6 +1451,13 @@ impl GuiState {
                         if sub == 2 {
                             ed.input(Key::A);
                         }
+                    }
+                    Screen::Mib => {
+                        self.mib_mob_sub = sub.min(7);
+                        ed.message = format!(
+                            "モンスター編集項目を [{}] に切り替えました ([◀/▶]で増減)",
+                            MIB_MOB_SUB_LABELS[self.mib_mob_sub]
+                        );
                     }
                     _ => {}
                 }
@@ -828,35 +1469,140 @@ impl GuiState {
                     ed.input(Key::Y);
                 }
             }
-            UiAction::PageScroll(delta) => {
-                self.page_scroll(ed, delta);
+            UiAction::PageScroll(delta) => self.page_scroll(ed, delta),
+            UiAction::Rescan => self.wants_rescan = true,
+            UiAction::QuickSave => trigger_quick_save(ed),
+            UiAction::CharMaxAll => {
+                if ed.save.is_some() {
+                    ed.set_char_value(1, 9_999_999);
+                    ed.set_char_value(3, 999);
+                    ed.set_char_value(4, 99_999_999);
+                    for f in 5..=9 {
+                        ed.set_char_value(f, 9_999_999);
+                    }
+                    ed.dirty = true;
+                    ed.message = String::from("所持金・HR・全ポイントを最大値に設定しました");
+                }
             }
-            UiAction::Rescan => {
-                self.wants_rescan = true;
+            UiAction::ItemsMaxAll => {
+                if let Some(mut items) = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot)) {
+                    let mut count = 0usize;
+                    for slot in items.iter_mut() {
+                        if slot.id != 0 && slot.count < 99 {
+                            slot.count = 99;
+                            count += 1;
+                        }
+                    }
+                    if let Some(s) = &mut ed.save {
+                        let _ = s.write_item_box(ed.slot, &items);
+                        ed.dirty = true;
+                        ed.message = format!("所持アイテム {} 枠を×99に設定しました", count);
+                    }
+                }
             }
-            UiAction::QuickSave => {
-                trigger_quick_save(ed);
+            UiAction::CharmLegalMax => {
+                if let Some(mut ce) = ed.charm_edit {
+                    let ty = ed
+                        .save
+                        .as_ref()
+                        .and_then(|s| s.equipment_box(ed.slot))
+                        .and_then(|b| b.get(ce.index * charm::CHARM_RECORD + 2).copied())
+                        .unwrap_or(4);
+                    ce.slots = 3;
+                    if ce.skill1 != 0 {
+                        if let Some(r) = charm::allowed_points(ty, ce.skill1, false) {
+                            if r.max > 0 {
+                                ce.points1 = r.max;
+                            }
+                        } else {
+                            ce.points1 = 10;
+                        }
+                    }
+                    if ce.skill2 != 0 {
+                        if let Some(r) = charm::allowed_points(ty, ce.skill2, true) {
+                            if r.max > 0 {
+                                ce.points2 = r.max;
+                            }
+                        } else {
+                            ce.points2 = 10;
+                        }
+                    }
+                    ed.charm_edit = Some(ce);
+                    ed.message = String::from("護石を合法最大値・スロ3に設定しました");
+                }
             }
-            UiAction::CycleTab(forward) => {
-                self.cycle_sidebar_tab(ed, forward);
+            UiAction::CharmPreset(preset_id) => {
+                if let Some(mut ce) = ed.charm_edit {
+                    let find_skill = |target: &str| -> u8 {
+                        mhnx_core::skills::SKILL_NAMES
+                            .iter()
+                            .position(|&n| n == target)
+                            .map(|i| (i + 1) as u8)
+                            .unwrap_or(0)
+                    };
+                    let (s1_name, p1, s2_name, p2) = match preset_id {
+                        0 => ("痛撃", 6i8, "達人", 10i8),
+                        1 => ("斬れ味", 6, "達人", 10),
+                        2 => ("溜め短縮", 6, "達人", 10),
+                        3 => ("通常弾強化", 6, "達人", 10),
+                        _ => ("貫通弾強化", 6, "達人", 10),
+                    };
+                    ce.skill1 = find_skill(s1_name);
+                    ce.points1 = p1;
+                    ce.skill2 = find_skill(s2_name);
+                    ce.points2 = p2;
+                    ce.slots = 3;
+                    ed.charm_edit = Some(ce);
+                    ed.message = format!("プリセット ({}+{} / {}+{} / S3) を適用しました", s1_name, p1, s2_name, p2);
+                }
             }
-            UiAction::InstallOfficialDlc => {
-                ed.install_official_dlc();
+            UiAction::NewCharm => {
+                ed.open_charms();
+                ed.input(Key::L);
             }
+            UiAction::DeleteCharmConfirm => {
+                let list = ed.charms();
+                if let Some(chm) = list.get(ed.cursor) {
+                    if self.pending_delete_charm == Some(chm.index) {
+                        self.pending_delete_charm = None;
+                        ed.input(Key::A);
+                    } else {
+                        self.pending_delete_charm = Some(chm.index);
+                        ed.message = format!(
+                            "枠 #{:04} を削除しますか？ もう一度 [Y] で削除確定",
+                            chm.index
+                        );
+                    }
+                }
+            }
+            UiAction::RosterMaxAll => {
+                let list = ed.palicos();
+                let slot = ed.slot;
+                if let Some(save) = &mut ed.save {
+                    let mut cnt = 0usize;
+                    for p in &list {
+                        let _ = mhnx_core::palico::set_level(save, slot, p.index, 99);
+                        let _ = mhnx_core::palico::set_enthusiasm(save, slot, p.index, 100);
+                        let _ = mhnx_core::palico::set_exp(save, slot, p.index, 999_999);
+                        cnt += 1;
+                    }
+                    if cnt > 0 {
+                        ed.dirty = true;
+                        ed.message = format!("オトモ {} 匹を Lv99・最大に設定しました", cnt);
+                    }
+                }
+            }
+            UiAction::InstallOfficialDlc => ed.install_official_dlc(),
             UiAction::InstallDlcCategory(cat) => match cat {
                 1 => ed.install_dlc_category(false, true, "没データ(34件)"),
                 _ => ed.install_dlc_category(true, false, "公式イベント(189件)"),
             },
             UiAction::SetQuestTab(tab) => {
                 self.quest_tab = tab.min(2);
+                ed.screen = Screen::SaveQuests;
             }
-            UiAction::ToggleBundledQuest(qid) => {
-                ed.toggle_bundled_quest(qid);
-            }
+            UiAction::ToggleBundledQuest(qid) => ed.toggle_bundled_quest(qid),
             UiAction::RemoveSaveQuest(qid) => {
-                // Deleting a quest cannot be undone, and the desktop build has
-                // asked before doing it since the confirmation was added. This
-                // side deleted on the first tap; it now needs the second one.
                 if self.pending_delete == Some(qid) {
                     self.pending_delete = None;
                     ed.remove_save_quest(qid);
@@ -864,9 +1610,7 @@ impl GuiState {
                     self.pending_delete = Some(qid);
                 }
             }
-            UiAction::OpenBundledQuest(qid) => {
-                ed.open_bundled_quest(qid);
-            }
+            UiAction::OpenBundledQuest(qid) => ed.open_bundled_quest(qid),
             UiAction::OpenMibPicker(field_idx) => {
                 let _ = self.open_mib_picker(ed, field_idx);
             }
@@ -882,18 +1626,20 @@ impl GuiState {
                     }
                 }
             }
-            UiAction::MibPickerScroll(delta) => {
-                self.scroll_mib_picker(delta);
+            UiAction::MibPickerScroll(delta) => self.scroll_mib_picker(delta),
+            UiAction::MibPickerClose => self.mib_picker = None,
+            UiAction::MibPreset(preset) => apply_mib_preset(ed, preset),
+            UiAction::SemPreset(preset) => apply_sem_preset(ed, preset),
+            UiAction::InstallAllPalicoes => ed.install_all_dlc_palicoes(),
+            UiAction::TogglePalicoLang => {
+                ed.palico_lang = 1 - ed.palico_lang;
+                ed.message = if ed.palico_lang == 0 {
+                    String::from("配信オトモ言語: 日本語に切り替えました")
+                } else {
+                    String::from("配信オトモ言語: 英語 (English) に切り替えました")
+                };
             }
-            UiAction::MibPickerClose => {
-                self.mib_picker = None;
-            }
-            UiAction::InstallAllPalicoes => {
-                ed.install_all_dlc_palicoes();
-            }
-            UiAction::ExtractOfficialArcs => {
-                self.wants_extract_official_arcs = true;
-            }
+            UiAction::ExtractOfficialArcs => self.wants_extract_official_arcs = true,
             UiAction::InstallArcRow(idx) => {
                 ed.cursor = idx;
                 self.wants_install_arc_idx = Some(idx);
@@ -945,22 +1691,306 @@ impl GuiState {
     }
 }
 
-fn canonical_tab(screen: Screen) -> Screen {
-    match screen {
-        Screen::ItemPick => match Screen::Items {
-            s => s,
-        },
-        Screen::CharmEdit | Screen::SkillPick => Screen::Charms,
-        Screen::QuestEquip => Screen::SaveQuests,
-        Screen::ArcEntries | Screen::EntryView | Screen::Mib | Screen::Gmd | Screen::Check => {
-            Screen::ArcList
+const MIB_MOB_SUB_LABELS: [&str; 8] = [
+    "体力(HP)",
+    "攻撃力",
+    "防御力",
+    "サイズ%",
+    "出現数",
+    "スタミナ",
+    "変動幅",
+    "獰猛/特殊",
+];
+
+fn safe_flush_quest_entry(ed: &mut Editor) {
+    let ext = ed
+        .arc
+        .as_ref()
+        .and_then(|a| a.entries.get(ed.entry))
+        .and_then(|e| extension_for(e.type_hash));
+    match ext {
+        Some("mib") => {
+            if !ed.mib_bytes.is_empty() {
+                if let Some(arc) = &mut ed.arc {
+                    if let Some(e) = arc.entries.get_mut(ed.entry) {
+                        e.data = ed.mib_bytes.clone();
+                    }
+                }
+            }
         }
-        Screen::Convert => Screen::Options,
-        other => other,
+        Some("gmd") => {
+            if let Some(g) = &ed.gmd {
+                if let Some(arc) = &mut ed.arc {
+                    if let Some(e) = arc.entries.get_mut(ed.entry) {
+                        e.data = g.to_bytes();
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 
-fn active_cursor_of(ed: &Editor) -> usize {
+fn sem_entry_indices(ed: &Editor) -> Vec<usize> {
+    let Some(arc) = &ed.arc else {
+        return Vec::new();
+    };
+    let mut active = Vec::new();
+    let mut dummy = Vec::new();
+    for (i, e) in arc.entries.iter().enumerate() {
+        if extension_for(e.type_hash) == Some("sem") && e.data.len() >= 0x20 {
+            let area = u32::from_le_bytes([e.data[0x0C], e.data[0x0D], e.data[0x0E], e.data[0x0F]]);
+            if e.name.contains("em000") && area == 0 {
+                dummy.push(i);
+            } else {
+                active.push(i);
+            }
+        }
+    }
+    active.extend(dummy);
+    active
+}
+
+fn adjust_mib_mob_sub(ed: &mut Editor, field_idx: usize, sub: usize, delta: i32) {
+    let Some(f) = questfields::MIB_FIELDS.get(field_idx) else {
+        return;
+    };
+    if !f.key.starts_with("mob_slot[") || f.offset + 13 > ed.mib_bytes.len() {
+        return;
+    }
+    let off = f.offset;
+    let label = MIB_MOB_SUB_LABELS.get(sub).copied().unwrap_or("値");
+    match sub {
+        0 => {
+            let cur = ed.mib_bytes[off + 5] as i32;
+            let next = (cur + delta).clamp(1, 255) as u8;
+            ed.mib_bytes[off + 5] = next;
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+        }
+        1 => {
+            let cur = ed.mib_bytes[off + 6] as i32;
+            let next = (cur + delta).clamp(1, 255) as u8;
+            ed.mib_bytes[off + 6] = next;
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+        }
+        2 => {
+            let cur = ed.mib_bytes[off + 7] as i32;
+            let next = (cur + delta).clamp(1, 255) as u8;
+            ed.mib_bytes[off + 7] = next;
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+        }
+        3 => {
+            let cur = u16::from_le_bytes([ed.mib_bytes[off + 9], ed.mib_bytes[off + 10]]) as i32;
+            let next = (cur + delta).clamp(10, 500) as u16;
+            ed.mib_bytes[off + 9..off + 11].copy_from_slice(&next.to_le_bytes());
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {}% に変更しました", f.ja, label, next);
+        }
+        4 => {
+            let cur = ed.mib_bytes[off + 4] as i32;
+            let next = (cur + delta).clamp(0, 99) as u8;
+            ed.mib_bytes[off + 4] = next;
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+        }
+        5 => {
+            let cur = ed.mib_bytes[off + 8] as i32;
+            let next = (cur + delta).clamp(0, 255) as u8;
+            ed.mib_bytes[off + 8] = next;
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+        }
+        6 => {
+            let cur = ed.mib_bytes[off + 11] as i32;
+            let next = (cur + delta).clamp(0, 255) as u8;
+            ed.mib_bytes[off + 11] = next;
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+        }
+        _ => {
+            let cur = ed.mib_bytes[off + 3] as i32;
+            let next = (cur + delta).clamp(0, 255) as u8;
+            ed.mib_bytes[off + 3] = next;
+            ed.dirty = true;
+            ed.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+        }
+    }
+}
+
+fn adjust_entry_view_row(ed: &mut Editor, row_idx: usize, delta: i32) {
+    let ext = ed
+        .arc
+        .as_ref()
+        .and_then(|a| a.entries.get(ed.entry))
+        .and_then(|e| extension_for(e.type_hash));
+    match ext {
+        Some("sem") => {
+            let sems = sem_entry_indices(ed);
+            let sem_k = row_idx / 6;
+            let field = row_idx % 6;
+            let Some(&entry_idx) = sems.get(sem_k) else {
+                return;
+            };
+            let Some(arc) = &mut ed.arc else {
+                return;
+            };
+            let Some(e) = arc.entries.get_mut(entry_idx) else {
+                return;
+            };
+            if e.data.len() < 0x20 {
+                return;
+            }
+            match field {
+                0 => {
+                    let cur = u32::from_le_bytes([e.data[0x0C], e.data[0x0D], e.data[0x0E], e.data[0x0F]]) as i32;
+                    let step_a = if delta >= 0 { 1 } else { -1 };
+                    let next = (cur + step_a).clamp(0, 20) as u32;
+                    e.data[0x0C..0x10].copy_from_slice(&next.to_le_bytes());
+                    if next > 0 {
+                        let w0 = f32::from_le_bytes([e.data[0], e.data[1], e.data[2], e.data[3]]);
+                        if w0 == 0.0 {
+                            e.data[0x00..0x04].copy_from_slice(&1.0f32.to_le_bytes());
+                            e.data[0x04..0x08].copy_from_slice(&1u32.to_le_bytes());
+                        }
+                    }
+                    ed.dirty = true;
+                    ed.message = format!("配置{} ({}) の初期エリア番号を {} に変更しました", sem_k + 1, e.name, next);
+                }
+                1..=4 => {
+                    let off = 0x10 + (field - 1) * 4;
+                    let cur = f32::from_le_bytes([e.data[off], e.data[off + 1], e.data[off + 2], e.data[off + 3]]);
+                    let next = cur + delta as f32;
+                    let clamped = if field == 4 {
+                        next.clamp(-360.0, 360.0)
+                    } else {
+                        next.clamp(-99999.0, 99999.0)
+                    };
+                    e.data[off..off + 4].copy_from_slice(&clamped.to_le_bytes());
+                    let axis = match field {
+                        1 => "X座標",
+                        2 => "Y座標(高さ)",
+                        3 => "Z座標",
+                        _ => "向き角度(W)",
+                    };
+                    ed.dirty = true;
+                    ed.message = format!("配置{} ({}) の {} を {:.1} に変更しました", sem_k + 1, e.name, axis, clamped);
+                }
+                _ => {
+                    let cur = u32::from_le_bytes([e.data[0x08], e.data[0x09], e.data[0x0A], e.data[0x0B]]) as i32;
+                    let step_w = if delta >= 0 { 1 } else { -1 };
+                    let next = (cur + step_w).clamp(0, 10) as u32;
+                    e.data[0x08..0x0C].copy_from_slice(&next.to_le_bytes());
+                    ed.dirty = true;
+                    ed.message = format!("配置{} ({}) の出現ウェーブを {} に変更しました", sem_k + 1, e.name, next);
+                }
+            }
+        }
+        Some("esl") => {
+            if let Some(arc) = &mut ed.arc {
+                if let Some(e) = arc.entries.get_mut(ed.entry) {
+                    if e.data.len() >= 8 {
+                        let cur = u32::from_le_bytes([e.data[4], e.data[5], e.data[6], e.data[7]]) as i32;
+                        let step_w = if delta >= 0 { 1 } else { -1 };
+                        let next = (cur + step_w).clamp(0, 99) as u32;
+                        e.data[4..8].copy_from_slice(&next.to_le_bytes());
+                        ed.dirty = true;
+                        ed.message = format!("小型モンスター Wave数を {} に変更しました", next);
+                    }
+                }
+            }
+        }
+        Some("qdp") => {
+            if let Some(arc) = &mut ed.arc {
+                if let Some(e) = arc.entries.get_mut(ed.entry) {
+                    let off = 8 + row_idx;
+                    if off < e.data.len() {
+                        let cur = e.data[off] as i32;
+                        let next = (cur + delta).clamp(0, 255) as u8;
+                        e.data[off] = next;
+                        ed.dirty = true;
+                        ed.message = format!("QDP Flag +0x{:02X} を 0x{:02X} に変更しました", off, next);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_sem_preset(ed: &mut Editor, preset: u8) {
+    let sems = sem_entry_indices(ed);
+    if sems.is_empty() {
+        return;
+    }
+    match preset {
+        0 => {
+            let first_idx = sems[0];
+            let Some(arc) = &mut ed.arc else { return };
+            let Some(src) = arc.entries.get(first_idx).map(|e| e.data.clone()) else {
+                return;
+            };
+            if src.len() < 0x20 {
+                return;
+            }
+            let mut count = 0usize;
+            for &idx in sems.iter().skip(1) {
+                if let Some(e) = arc.entries.get_mut(idx) {
+                    if !e.name.contains("em000") && e.data.len() >= 0x20 {
+                        e.data[0x0C..0x20].copy_from_slice(&src[0x0C..0x20]);
+                        count += 1;
+                    }
+                }
+            }
+            ed.dirty = true;
+            if count > 0 {
+                ed.message = format!("配置1のエリア・座標を他 {} 体の初期配置へコピーしました", count);
+            } else {
+                ed.message = String::from("コピー対象の2体目以降の初期配置がありません");
+            }
+        }
+        _ => {
+            let row_idx = ed.entry_row_cursor;
+            let sem_k = row_idx / 6;
+            let field = row_idx % 6;
+            let Some(&entry_idx) = sems.get(sem_k) else { return };
+            let Some(arc) = &mut ed.arc else { return };
+            let Some(e) = arc.entries.get_mut(entry_idx) else { return };
+            if e.data.len() < 0x20 {
+                return;
+            }
+            if (1..=4).contains(&field) {
+                let off = 0x10 + (field - 1) * 4;
+                e.data[off..off + 4].copy_from_slice(&0.0f32.to_le_bytes());
+                ed.dirty = true;
+                ed.message = format!("配置{} ({}) の選択座標を 0.0 にリセットしました", sem_k + 1, e.name);
+            } else {
+                e.data[0x10..0x20].fill(0);
+                ed.dirty = true;
+                ed.message = format!("配置{} ({}) の X/Y/Z/W をすべて 0.0 にリセットしました", sem_k + 1, e.name);
+            }
+        }
+    }
+}
+
+fn sets_len(ed: &Editor, tab: usize) -> usize {
+    let Some(save) = &ed.save else { return 0 };
+    if tab == 0 {
+        mhnx_core::myset::item_sets(save, ed.slot)
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .count()
+    } else {
+        mhnx_core::myset::equip_sets(save, ed.slot)
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .count()
+    }
+}
+
+fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
     match ed.screen {
         Screen::Slots => ed.slot,
         Screen::Char => ed.field,
@@ -971,7 +2001,14 @@ fn active_cursor_of(ed: &Editor) -> usize {
         Screen::Hunts => ed.hunt_cursor,
         Screen::Guild => ed.guild_field,
         Screen::Roster => ed.roster_cursor,
-        Screen::SaveQuests => ed.save_quest_cursor,
+        Screen::Sets => gui.sets_cursor,
+        Screen::SaveQuests => {
+            if gui.quest_tab > 0 {
+                gui.quest_cat_cursor[gui.quest_tab]
+            } else {
+                ed.save_quest_cursor
+            }
+        }
         Screen::QuestEquip => {
             if ed.qe_open {
                 ed.qe_item_cursor
@@ -989,7 +2026,7 @@ fn active_cursor_of(ed: &Editor) -> usize {
     }
 }
 
-fn list_len_of(ed: &Editor) -> usize {
+fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
     match ed.screen {
         Screen::SaveList => ed.save_files.len(),
         Screen::Slots => 3,
@@ -1003,7 +2040,14 @@ fn list_len_of(ed: &Editor) -> usize {
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => 3,
         Screen::Roster => ed.palicos().len(),
-        Screen::SaveQuests => ed.filtered_quests().len(),
+        Screen::Sets => sets_len(ed, gui.sets_tab),
+        Screen::SaveQuests => {
+            if gui.quest_tab > 0 {
+                bundled_quests_for_tab(gui.quest_tab, &ed.quest_filter).len()
+            } else {
+                ed.filtered_quests().len()
+            }
+        }
         Screen::QuestEquip => {
             if ed.qe_open {
                 ed.quest_equip_items().len()
@@ -1020,6 +2064,12 @@ fn list_len_of(ed: &Editor) -> usize {
                     Some("rem") | Some("sup") => {
                         ItemTable::parse(&e.data).map(|t| t.records.len()).unwrap_or(0)
                     }
+                    Some("sem") => sem_entry_indices(ed).len() * 6,
+                    Some("esl") => 1,
+                    Some("qdp") => Qdp::parse(&e.data).map(|q| q.flags().len()).unwrap_or(0),
+                    Some("qdl") | Some("qlv") => {
+                        QuestLink::parse(&e.data).map(|q| q.refs.len()).unwrap_or(0)
+                    }
                     _ => 0,
                 },
                 None => 0,
@@ -1030,12 +2080,26 @@ fn list_len_of(ed: &Editor) -> usize {
         Screen::Check => ed.findings.len(),
         Screen::Palico => dlcats::all_ids().len(),
         Screen::Options => 4,
-        Screen::Sets | Screen::Convert => 0,
+        Screen::Convert => 0,
     }
 }
 
-fn set_active_cursor(ed: &mut Editor, idx: usize) {
-    let len = list_len_of(ed);
+fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
+    if ed.screen == Screen::SaveQuests && gui.quest_tab > 0 {
+        let n = bundled_quests_for_tab(gui.quest_tab, &ed.quest_filter).len();
+        if n > 0 {
+            gui.quest_cat_cursor[gui.quest_tab] = idx.min(n - 1);
+        }
+        return;
+    }
+    if ed.screen == Screen::Sets {
+        let n = sets_len(ed, gui.sets_tab);
+        if n > 0 {
+            gui.sets_cursor = idx.min(n - 1);
+        }
+        return;
+    }
+    let len = list_len_of(ed, gui);
     if len == 0 {
         return;
     }
@@ -1095,57 +2159,18 @@ fn set_active_cursor(ed: &mut Editor, idx: usize) {
 }
 
 fn scroll_active_cursor(ed: &mut Editor, delta: i32) {
-    let len = list_len_of(ed);
+    let dummy = GuiState::new();
+    let len = list_len_of(ed, &dummy);
     if len == 0 {
         return;
     }
-    let cur = active_cursor_of(ed) as i32;
+    let cur = active_cursor_of(ed, &dummy) as i32;
     let next = (cur + delta).clamp(0, len as i32 - 1) as usize;
-    set_active_cursor(ed, next);
+    let mut dummy_mut = GuiState::new();
+    set_active_cursor(ed, &mut dummy_mut, next);
 }
 
-fn activate_selected_row(ed: &mut Editor, idx: usize) {
-    set_active_cursor(ed, idx);
-    match ed.screen {
-        Screen::SaveList
-        | Screen::Slots
-        | Screen::ItemPick
-        | Screen::SkillPick
-        | Screen::SaveQuests
-        | Screen::QuestEquip
-        | Screen::ArcList
-        | Screen::ArcEntries
-        | Screen::EntryView
-        | Screen::Gmd
-        | Screen::Check
-        | Screen::Palico
-        | Screen::Roster => {
-            ed.input(Key::A);
-        }
-        Screen::Char => {
-            if idx == 0 {
-                // Name row -> open software keyboard
-                ed.input(Key::Right);
-            }
-        }
-        Screen::Items => {
-            // Tapping selected item row opens item picker
-            ed.input(Key::R);
-        }
-        Screen::Charms => {
-            // Tapping selected charm row edits that charm
-            ed.input(Key::Y);
-        }
-        Screen::CharmEdit => {
-            if idx == 2 || idx == 4 {
-                ed.input(Key::Y);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn apply_row_max(ed: &mut Editor, idx: usize) {
+fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
     match ed.screen {
         Screen::Char => {
             let max_val = match idx {
@@ -1162,11 +2187,8 @@ fn apply_row_max(ed: &mut Editor, idx: usize) {
             let vis = ed.visible_items();
             if let Some(&box_idx) = vis.get(idx) {
                 if let Some(mut items) = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot)) {
-                    // An empty slot has nothing to make 99 of. The desktop
-                    // build refused this; here it wrote an id of 0 with a
-                    // count of 99 and the game showed a broken slot.
                     if items[box_idx].id == 0 {
-                        ed.message = String::from("空きスロットです。先にアイテムを入れてください");
+                        ed.message = String::from("空きスロットです。[A] で先にアイテムを選んでください");
                         return;
                     }
                     items[box_idx].count = 99;
@@ -1178,9 +2200,6 @@ fn apply_row_max(ed: &mut Editor, idx: usize) {
                 }
             }
         }
-        // The max button was drawn on the quest-equipment screen too, and did
-        // nothing there: AdjustRow was answered for the count stepper but this
-        // path had no arm for the screen at all.
         Screen::QuestEquip => {
             if !ed.qe_open {
                 return;
@@ -1189,7 +2208,7 @@ fn apply_row_max(ed: &mut Editor, idx: usize) {
                 return;
             };
             if t.item == 0 {
-                ed.message = String::from("空きスロットです。先にアイテムを入れてください");
+                ed.message = String::from("空きスロットです。[A] で先にアイテムを選んでください");
                 return;
             }
             let slot_index = ed.cursor;
@@ -1210,23 +2229,118 @@ fn apply_row_max(ed: &mut Editor, idx: usize) {
                 }
             }
         }
+        Screen::Mib => {
+            if let Some(f) = questfields::MIB_FIELDS.get(idx) {
+                if f.key.starts_with("mob_slot[") {
+                    let target = match mib_mob_sub {
+                        3 => 200,
+                        4 => 10,
+                        _ => 255,
+                    };
+                    adjust_mib_mob_sub(ed, idx, mib_mob_sub, target);
+                }
+            }
+        }
+        Screen::EntryView => {
+            let ext = ed
+                .arc
+                .as_ref()
+                .and_then(|a| a.entries.get(ed.entry))
+                .and_then(|e| extension_for(e.type_hash));
+            if ext == Some("sem") {
+                ed.entry_row_cursor = idx;
+                apply_sem_preset(ed, 1);
+            } else {
+                let prev = ed.entry_row_cursor;
+                ed.entry_row_cursor = idx;
+                for _ in 0..99 {
+                    ed.input(Key::Right);
+                }
+                ed.entry_row_cursor = prev;
+            }
+        }
         _ => {}
+    }
+}
+
+fn apply_mib_preset(ed: &mut Editor, preset: u8) {
+    let mib = &mut ed.mib_bytes;
+    if mib.len() < 0x180 {
+        return;
+    }
+    match preset {
+        0 => {
+            for f in questfields::MIB_FIELDS.iter() {
+                if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
+                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
+                    if mid != 0 {
+                        mib[f.offset + 5] = 1;
+                    }
+                }
+            }
+            ed.dirty = true;
+            ed.message = String::from("全モンスターの体力を最小(1)に設定しました");
+        }
+        1 => {
+            for f in questfields::MIB_FIELDS.iter() {
+                if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
+                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
+                    if mid != 0 {
+                        mib[f.offset + 9..f.offset + 11].copy_from_slice(&200u16.to_le_bytes());
+                    }
+                }
+            }
+            ed.dirty = true;
+            ed.message = String::from("全モンスターのサイズを 200% (最大金冠) に設定しました");
+        }
+        _ => {
+            for f in questfields::MIB_FIELDS.iter() {
+                if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
+                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
+                    if mid != 0 {
+                        mib[f.offset + 9..f.offset + 11].copy_from_slice(&50u16.to_le_bytes());
+                    }
+                }
+            }
+            ed.dirty = true;
+            ed.message = String::from("全モンスターのサイズを 50% (最小金冠) に設定しました");
+        }
     }
 }
 
 fn trigger_quick_save(ed: &mut Editor) {
     match ed.screen {
+        Screen::CharmEdit => {
+            ed.input(Key::A);
+            if ed.save.is_some() {
+                ed.input(Key::X);
+            }
+        }
+        Screen::Mib | Screen::Gmd | Screen::EntryView | Screen::Check | Screen::ArcEntries => {
+            safe_flush_quest_entry(ed);
+            if ed.arc_path.is_some() {
+                if ed.screen == Screen::Mib {
+                    ed.input(Key::A);
+                } else {
+                    let prev = ed.gmd.take();
+                    ed.input(Key::X);
+                    if ed.screen == Screen::Gmd {
+                        ed.gmd = prev;
+                    }
+                }
+            } else if ed.save.is_some() {
+                ed.install_into_save();
+                let prev_screen = ed.screen;
+                let prev_cursor = ed.cursor;
+                ed.screen = Screen::Char;
+                ed.input(Key::A);
+                ed.screen = prev_screen;
+                ed.cursor = prev_cursor;
+            }
+        }
         Screen::Char | Screen::Items | Screen::Options => ed.input(Key::A),
         Screen::Charms | Screen::Palico => ed.input(Key::X),
-        Screen::CharmEdit => {
-            // Apply charm edit then write save
-            ed.input(Key::A);
-            ed.input(Key::X);
-        }
-        Screen::Mib => ed.input(Key::A),
-        Screen::Gmd | Screen::EntryView | Screen::Check | Screen::ArcEntries => ed.input(Key::X),
         _ => {
-            // Switch to Char temporarily to invoke request_write_save, then restore screen
             if ed.save.is_some() {
                 let prev_screen = ed.screen;
                 let prev_cursor = ed.cursor;
@@ -1238,710 +2352,320 @@ fn trigger_quick_save(ed: &mut Editor) {
         }
     }
 }
+// ---------------------------------------------------------------------------
+// Drawing & Rendering Engine (Horizon Split-Studio UI)
+// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Main Drawing Entry Point
-// ---------------------------------------------------------------------------
+/// Safely draws centered text inside `(x, y, w, h)` and clips it if wider than `w - 12`
+/// so button/pill labels can NEVER overflow their box or overlap neighbors.
+#[inline]
+fn btn_text(
+    c: &mut Canvas,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    s: &str,
+    color: Color,
+    size: FontSize,
+) {
+    let max_w = (w - 12).max(8);
+    let tw = c.text_width_sized(s, size);
+    if tw <= max_w {
+        c.text_centered(x, y, w, h, s, color, size);
+    } else {
+        let th = c.line_height_sized(size);
+        let ty = y + (h - th) / 2;
+        c.text_clipped(x + 6, ty, max_w, s, color, size);
+    }
+}
 
 impl GuiState {
     pub fn draw(&mut self, c: &mut Canvas, ed: &Editor) {
         self.hits.clear();
+        let t = theme();
+        c.clear(t.bg_canvas);
 
-        c.clear(BG_MAIN);
-        self.draw_header(c, ed);
-        self.draw_sidebar(c, ed);
-        self.draw_toolbar(c, ed);
+        // 1. Top 2-Tier Navigation Header (y = 0..92)
+        self.draw_top_nav(c, ed);
+
+        // 2. Main Content Workspace (y = CONTENT_Y..FOOTER_Y)
         self.draw_content(c, ed);
+
+        // 3. Minimal Unified Footer Bar (y = FOOTER_Y..720)
         self.draw_footer(c, ed);
 
-        if self.osk.is_some() {
-            // Replace background hitboxes so touches only interact with the keyboard modal
-            self.hits.clear();
-            self.draw_osk(c);
-        } else if self.mib_picker.is_some() {
-            self.hits.clear();
+        // 4. Modal Overlays (MIB Picker / Built-in OSK)
+        if self.mib_picker.is_some() {
             self.draw_mib_picker(c);
+        }
+        if self.osk.is_some() {
+            self.draw_osk(c);
         }
 
         c.present();
     }
 
-    // -----------------------------------------------------------------------
-    // 1. Top Header Bar
-    // -----------------------------------------------------------------------
-    fn draw_header(&mut self, c: &mut Canvas, ed: &Editor) {
-        let w = c.width();
-        c.rect_gradient_v(0, 0, w, HEADER_H, BG_HEADER_TOP, BG_HEADER_BOT);
-        c.hline(0, HEADER_H - 1, w, BORDER_CARD);
+    fn draw_top_nav(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        let active_sec = section_of(ed.screen);
 
-        // App Brand Pill
-        c.round_rect(12, 10, 146, 34, 8, rgb(58, 58, 66));
-        c.round_rect_border(12, 10, 146, 34, 8, 1, ACCENT_CYAN);
-        c.text_centered(12, 10, 146, 34, "MHXX EDITOR", TEXT_CYAN, FontSize::Small);
+        // Tier 1: Main Sections [ZL] ... [ZR] + Active Slot + [X] Save (y = 0..48)
+        c.rect_gradient_v(0, 0, 1280, TOP_SEC_H, t.bg_header, t.bg_canvas);
+        c.hline(0, TOP_SEC_H - 1, 1280, t.border_subtle);
 
-        // Screen Title
-        let title_str = crate::editor::title(ed.screen);
-        c.text_sized(172, 12, title_str, TEXT_PRIMARY, FontSize::Large);
+        // [ZL] button
+        c.round_rect(14, 8, 44, 32, t.corner_r, t.bg_btn);
+        c.round_rect_border(14, 8, 44, 32, t.corner_r, 1, t.border_subtle);
+        btn_text(c, 14, 8, 44, 32, "ZL", t.accent_primary, FontSize::Small);
+        self.add_hit(14, 8, 44, 32, UiAction::CycleSection(false));
 
-        // Character Slot Switcher Tabs (when a save is loaded)
-        if let Some(save) = &ed.save {
-            let mut sx = 436;
-            for i in 0..3 {
-                let active = ed.slot == i;
-                let used = save.slot_used(i);
-                let cname = save
-                    .read_character(i)
-                    .map(|ch| ch.name)
-                    .unwrap_or_default();
-                let label = if !used && cname.is_empty() {
-                    format!("枠{}: 空き", i + 1)
-                } else if cname.is_empty() {
-                    format!("枠{}: ---", i + 1)
-                } else {
-                    format!("枠{}: {}", i + 1, cname)
-                };
-                let pw = 132;
-                let bg = if active {
-                    BG_SELECTED
-                } else {
-                    rgb(32, 32, 36)
-                };
-                let border = if active { ACCENT_CYAN } else { BORDER_SUBTLE };
-                let fg = if active {
-                    TEXT_CYAN
-                } else if used {
-                    TEXT_SECONDARY
-                } else {
-                    TEXT_MUTED
-                };
-                c.round_rect(sx, 10, pw, 34, 7, bg);
-                c.round_rect_border(sx, 10, pw, 34, 7, if active { 2 } else { 1 }, border);
-                c.text_clipped(sx + 10, 16, pw - 16, &label, fg, FontSize::Small);
-                self.add_hit(sx, 10, pw, 34, UiAction::SelectSlot(i));
-                sx += pw + 6;
+        // 6 Main Sections (x = 66..894)
+        let mut sx = 66i32;
+        let sec_w = 132i32;
+        for &(sec, label) in MAIN_SECTIONS.iter() {
+            let is_active = sec == active_sec;
+            if is_active {
+                c.round_rect(sx, 6, sec_w, 36, 6, t.bg_selected);
+                c.rect(sx + 12, TOP_SEC_H - 3, sec_w - 24, 3, t.accent_primary);
             }
+            let fg = if is_active { t.text_primary } else { t.text_secondary };
+            btn_text(c, sx, 6, sec_w, 36, label, fg, FontSize::Small);
+            self.add_hit(sx, 6, sec_w, 36, UiAction::GotoSection(sec));
+            sx += sec_w + 6;
         }
 
-        // Dirty / Save Status Pill
-        let status_x = 856;
-        let status_w = 228;
-        if ed.dirty {
-            c.round_rect(status_x, 10, status_w, 34, 8, BG_BTN_WARN);
-            c.round_rect_border(status_x, 10, status_w, 34, 8, 2, ACCENT_ORANGE);
-            c.circle(status_x + 16, 27, 5, ACCENT_GOLD);
-            c.text_sized(
-                status_x + 28,
-                16,
-                "未保存 (タップで保存)",
-                TEXT_GOLD,
-                FontSize::Small,
-            );
-            self.add_hit(status_x, 10, status_w, 34, UiAction::QuickSave);
-        } else if ed.save.is_some() {
-            c.round_rect(status_x, 10, status_w, 34, 8, rgb(40, 46, 40));
-            c.round_rect_border(status_x, 10, status_w, 34, 8, 1, ACCENT_GREEN);
-            c.circle(status_x + 16, 27, 5, ACCENT_GREEN);
-            let src_label = if ed.save_path.as_deref() == Some(CONSOLE_SAVE) {
-                "本体セーブ (保存済)"
-            } else {
-                "SDセーブ (保存済)"
-            };
-            c.text_sized(status_x + 28, 16, src_label, ACCENT_GREEN, FontSize::Small);
-        }
+        // [ZR] button
+        c.round_rect(sx, 8, 44, 32, t.corner_r, t.bg_btn);
+        c.round_rect_border(sx, 8, 44, 32, t.corner_r, 1, t.border_subtle);
+        btn_text(c, sx, 8, 44, 32, "ZR", t.accent_primary, FontSize::Small);
+        self.add_hit(sx, 8, 44, 32, UiAction::CycleSection(true));
 
-        // Rescan & Quit quick buttons
-        let rescan_x = 1094;
-        c.round_rect(rescan_x, 10, 86, 34, 7, BG_BTN);
-        c.round_rect_border(rescan_x, 10, 86, 34, 7, 1, BORDER_BTN);
-        c.text_centered(rescan_x, 10, 86, 34, "[-] 再読込", TEXT_SECONDARY, FontSize::Small);
-        self.add_hit(rescan_x, 10, 86, 34, UiAction::Rescan);
+        // Right Status Area: Active Slot badge + [X] Save Pill
+        let slot_x = 964;
+        let slot_w = 144;
+        let slot_label = if let Some(save) = &ed.save {
+            let sname = save
+                .read_character(ed.slot)
+                .map(|ch| ch.name)
+                .unwrap_or_else(|| String::from("-"));
+            format!("Slot {}: {}", ed.slot + 1, sname)
+        } else {
+            String::from("未読込")
+        };
+        c.round_rect(slot_x, 8, slot_w, 32, t.corner_r, t.bg_panel);
+        c.round_rect_border(slot_x, 8, slot_w, 32, t.corner_r, 1, t.border_subtle);
+        btn_text(c, slot_x, 8, slot_w, 32, &slot_label, t.text_secondary, FontSize::Small);
+        self.add_hit(slot_x, 8, slot_w, 32, UiAction::SelectSlot((ed.slot + 1) % 3));
 
-        let quit_x = 1188;
-        c.round_rect(quit_x, 10, 80, 34, 7, rgb(58, 36, 40));
-        c.round_rect_border(quit_x, 10, 80, 34, 7, 1, ACCENT_RED);
-        c.text_centered(quit_x, 10, 80, 34, "[+] 終了", rgb(220, 142, 142), FontSize::Small);
-        self.add_hit(quit_x, 10, 80, 34, UiAction::Key(Key::Plus));
-    }
-
-    // -----------------------------------------------------------------------
-    // 2. Left Sidebar Navigation
-    // -----------------------------------------------------------------------
-    fn draw_sidebar(&mut self, c: &mut Canvas, ed: &Editor) {
-        let sy = HEADER_H;
-        let sh = FOOTER_Y - HEADER_H;
-        c.rect(0, sy, SIDEBAR_W, sh, BG_SIDEBAR);
-        c.vline(SIDEBAR_W - 1, sy, sh, BORDER_SUBTLE);
-
-        // Sidebar Header Hint (ZL / ZR cycles tabs up / down)
-        let half_w = (SIDEBAR_W - 24) / 2;
-        c.round_rect(10, sy + 8, half_w, 28, 6, rgb(38, 38, 43));
-        c.round_rect_border(10, sy + 8, half_w, 28, 6, 1, BORDER_BTN);
-        c.text_centered(
-            10,
-            sy + 8,
-            half_w,
-            28,
-            "[ZL] ▲ 前タブ",
-            TEXT_CYAN,
+        // [X] Save Button
+        let save_x = 1116;
+        let save_w = 150;
+        let (save_bg, save_bd, save_txt) = if ed.dirty {
+            (t.accent_warn, t.text_primary, "[X] 未保存")
+        } else {
+            (t.accent_ok, t.border_subtle, "[X] 保存")
+        };
+        c.round_rect(save_x, 8, save_w, 32, t.corner_r, save_bg);
+        c.round_rect_border(save_x, 8, save_w, 32, t.corner_r, 1, save_bd);
+        btn_text(
+            c,
+            save_x,
+            8,
+            save_w,
+            32,
+            save_txt,
+            white_or_dark(save_bg),
             FontSize::Small,
         );
-        self.add_hit(10, sy + 8, half_w, 28, UiAction::CycleTab(false));
+        self.add_hit(save_x, 8, save_w, 32, UiAction::QuickSave);
 
-        let rx = 10 + half_w + 4;
-        c.round_rect(rx, sy + 8, half_w, 28, 6, rgb(38, 38, 43));
-        c.round_rect_border(rx, sy + 8, half_w, 28, 6, 1, BORDER_BTN);
-        c.text_centered(
-            rx,
-            sy + 8,
-            half_w,
-            28,
-            "[ZR] ▼ 次タブ",
-            TEXT_CYAN,
-            FontSize::Small,
-        );
-        self.add_hit(rx, sy + 8, half_w, 28, UiAction::CycleTab(true));
+        // Tier 2: Sub-Tabs [L] ... [R] (y = SUB_TAB_Y..SUB_TAB_Y + SUB_TAB_H)
+        c.rect(0, SUB_TAB_Y, 1280, SUB_TAB_H, t.bg_subbar);
+        c.hline(0, SUB_TAB_Y + SUB_TAB_H - 1, 1280, t.border_subtle);
 
-        let nav_items: &[(Screen, &str, Color)] = &[
-            (Screen::SaveList, "セーブデータ選択", ACCENT_CYAN),
-            (Screen::Slots, "キャラクター枠選択", ACCENT_CYAN),
-            (Screen::Char, "ステータス・外見", ACCENT_GOLD),
-            (Screen::Items, "アイテムボックス", ACCENT_GREEN),
-            (Screen::Equip, "装備ボックス一覧", ACCENT_GOLD),
-            (Screen::Charms, "お守り (護石) 編集", ACCENT_PURPLE),
-            (Screen::Roster, "オトモ一覧・育成", ACCENT_ORANGE),
-            (Screen::Palico, "配信オトモ導入", ACCENT_ORANGE),
-            (Screen::Hunts, "狩猟数・サイズ記録", ACCENT_RED),
-            (Screen::Guild, "ギルドカード・闘技", ACCENT_CYAN),
-            (Screen::Sets, "マイセット一覧", TEXT_SECONDARY),
-            (Screen::SaveQuests, "イベント・DLクエスト", ACCENT_PURPLE),
-            (Screen::ArcList, "SDクエスト (.arc)", ACCENT_PURPLE),
-            (Screen::Options, "環境設定・3DS変換", TEXT_SECONDARY),
-        ];
+        let sy = SUB_TAB_Y + 6;
+        let sh = 32;
 
-        let cur_tab = canonical_tab(ed.screen);
-        let has_save = ed.save.is_some();
-        let mut iy = sy + 42;
-        // 14 items have to fit between the header hint and the footer. The
-        // previous 37 + 2 overflowed it by 20px once the bars grew for touch,
-        // which pushed the last label under the footer: invisible but still
-        // clickable. The visual box is 36; the hit box is 44 and centred on it.
-        let item_h = 36;
+        // [L] Sub-Tab Prev
+        c.round_rect(14, sy, 40, sh, 6, t.bg_btn);
+        c.round_rect_border(14, sy, 40, sh, 6, 1, t.border_subtle);
+        btn_text(c, 14, sy, 40, sh, "L", t.accent_primary, FontSize::Small);
+        self.add_hit(14, sy, 40, sh, UiAction::CycleSubTab(false));
 
-        for &(scr, label, tag_col) in nav_items {
-            let active = cur_tab == scr;
-            let enabled = has_save || scr == Screen::SaveList || scr == Screen::ArcList;
-            let bg = if active {
-                BG_SELECTED
-            } else if enabled {
-                rgb(34, 34, 38)
-            } else {
-                rgb(26, 26, 29)
-            };
-            c.round_rect(8, iy, SIDEBAR_W - 16, item_h, 6, bg);
-            if active {
-                c.round_rect_border(8, iy, SIDEBAR_W - 16, item_h, 6, 2, ACCENT_CYAN);
-                c.round_rect(10, iy + 5, 5, item_h - 10, 2, ACCENT_CYAN);
-            } else {
-                c.round_rect(12, iy + 11, 4, item_h - 22, 2, if enabled { tag_col } else { BORDER_SUBTLE });
+        let (subs, active_sub) = self.sub_tabs_for(ed);
+        let mut sub_x = 60i32;
+        for (idx, &label) in subs.iter().enumerate() {
+            let is_active = idx == active_sub;
+            let tw = c.text_width_sized(label, FontSize::Small) + 24;
+            let w = tw.clamp(84, 156);
+            if sub_x + w > 880 {
+                break;
             }
-            let fg = if active {
-                TEXT_PRIMARY
-            } else if enabled {
-                TEXT_SECONDARY
-            } else {
-                TEXT_MUTED
-            };
-            c.text_sized(24, iy + 8, label, fg, FontSize::Small);
-            // 44px of reach, centred on the 36px box, clamped to the next row
-            // so two entries never answer the same tap.
-            let reach = 44;
-            let hit_y = (iy - (reach - item_h) / 2).max(sy);
-            let hit_h = (reach).min(FOOTER_Y - hit_y);
-            self.add_hit(8, hit_y, SIDEBAR_W - 16, hit_h, UiAction::GotoScreen(scr));
-            iy += item_h + 1;
+            let bg = if is_active { t.bg_selected } else { t.bg_subbar };
+            let fg = if is_active { t.accent_primary } else { t.text_secondary };
+            c.round_rect(sub_x, sy, w, sh, 5, bg);
+            if is_active {
+                c.rect(sub_x + 8, sy + sh - 3, w - 16, 3, t.accent_secondary);
+            }
+            btn_text(c, sub_x, sy, w, sh, label, fg, FontSize::Small);
+            self.add_hit(sub_x, sy, w, sh, UiAction::SelectSubTab(idx));
+            sub_x += w + 6;
         }
+
+        // [R] Sub-Tab Next
+        c.round_rect(sub_x + 2, sy, 40, sh, 6, t.bg_btn);
+        c.round_rect_border(sub_x + 2, sy, 40, sh, 6, 1, t.border_subtle);
+        btn_text(c, sub_x + 2, sy, 40, sh, "R", t.accent_primary, FontSize::Small);
+        self.add_hit(sub_x + 2, sy, 40, sh, UiAction::CycleSubTab(true));
+
+        // Right side of Sub-Tab Bar: Concise Tool Pills (x = 964..1266)
+        self.draw_sub_bar_quick_tools(c, ed, sy, sh);
     }
 
-    // -----------------------------------------------------------------------
-    // 3. Context Toolbar (Step Selector, Search Bar, Screen Toggles)
-    // -----------------------------------------------------------------------
-    fn draw_toolbar(&mut self, c: &mut Canvas, ed: &Editor) {
-        c.round_rect(MAIN_X, TOOLBAR_Y, MAIN_W, TOOLBAR_H, 8, BG_TOOLBAR);
-        c.round_rect_border(MAIN_X, TOOLBAR_Y, MAIN_W, TOOLBAR_H, 8, 1, BORDER_SUBTLE);
-
-        let uses_step = matches!(
-            ed.screen,
-            Screen::Char
-                | Screen::Items
-                | Screen::CharmEdit
-                | Screen::Mib
-                | Screen::Hunts
-                | Screen::Guild
-        );
-
-        let mut x = MAIN_X + 12;
-        let y = TOOLBAR_Y + 6;
-        let h = TOOLBAR_H - 12;
-
-        if uses_step {
-            let step_key_lbl = if ed.screen == Screen::Hunts {
-                "刻み幅 [Y]:"
-            } else {
-                "刻み幅 [X]:"
-            };
-            c.text_sized(x, y + 5, step_key_lbl, TEXT_SECONDARY, FontSize::Small);
-            x += 92;
-            for (idx, &st) in STEPS.iter().enumerate() {
-                let disp = if ed.screen == Screen::Hunts {
-                    HUNT_STEPS[idx]
-                } else {
-                    st
-                };
-                let label = if disp < 0 {
-                    format!("{}", disp)
-                } else {
-                    format!("±{}", disp)
-                };
-                let pw = (label.chars().count() as i32) * 10 + 22;
-                let active = ed.step == idx;
-                let bg = if active { BG_BTN_PRIMARY } else { BG_BTN };
-                let border = if active { ACCENT_CYAN } else { BORDER_BTN };
-                let fg = if active { TEXT_PRIMARY } else { TEXT_SECONDARY };
-                c.round_rect(x, y, pw, h, 6, bg);
-                c.round_rect_border(x, y, pw, h, 6, if active { 2 } else { 1 }, border);
-                c.text_centered(x, y, pw, h, &label, fg, FontSize::Small);
-                self.add_hit(x, y, pw, h, UiAction::SetStep(idx));
-                x += pw + 6;
-            }
-        }
-
-        // Screen-specific toolbar buttons on the right side
+    fn draw_sub_bar_quick_tools(&mut self, c: &mut Canvas, ed: &Editor, sy: i32, sh: i32) {
+        let t = theme();
+        let next_step = (ed.step + 1) % STEPS.len();
         match ed.screen {
+            Screen::Char => {
+                let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::SetStep(next_step));
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "資金・P 一括MAX", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::CharMaxAll);
+            }
             Screen::Items => {
-                // Toggle show empty (Y), Undo (L), Change Item (R), Save (A)
-                let emp_label = if ed.show_empty {
-                    "[Y] 空き枠: 表示中"
-                } else {
-                    "[Y] 空き枠: 非表示"
-                };
-                self.draw_toolbar_btn(
-                    c,
-                    x + 8,
-                    y,
-                    148,
-                    h,
-                    emp_label,
-                    ed.show_empty,
-                    UiAction::Key(Key::Y),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 162,
-                    y,
-                    116,
-                    h,
-                    "[L] 元に戻す",
-                    false,
-                    UiAction::Key(Key::L),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 284,
-                    y,
-                    136,
-                    h,
-                    "[R] 種類変更",
-                    true,
-                    UiAction::Key(Key::R),
-                );
-            }
-            Screen::ItemPick | Screen::SkillPick | Screen::Equip => {
-                let filter_str = match ed.screen {
-                    Screen::ItemPick => &ed.item_pick_filter,
-                    Screen::SkillPick => &ed.skill_pick_filter,
-                    Screen::Equip => &ed.equip_filter,
-                    _ => "",
-                };
-                let box_w = 380;
-                c.round_rect(x, y, box_w, h, 6, BG_VAL_BOX);
-                c.round_rect_border(x, y, box_w, h, 6, 1, ACCENT_CYAN);
-                let disp = if filter_str.is_empty() {
-                    String::from("[Y] 検索: すべて (タップで入力)")
-                } else {
-                    format!("[Y] 検索: 「{}」", filter_str)
-                };
-                c.text_clipped(
-                    x + 10,
-                    y + 5,
-                    box_w - 20,
-                    &disp,
-                    if filter_str.is_empty() {
-                        TEXT_SECONDARY
-                    } else {
-                        TEXT_GOLD
-                    },
-                    FontSize::Small,
-                );
-                self.add_hit(x, y, box_w, h, UiAction::Key(Key::Y));
+                let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::SetStep(next_step));
 
-                self.draw_toolbar_btn(
-                    c,
-                    x + box_w + 8,
-                    y,
-                    118,
-                    h,
-                    "[X] クリア",
-                    false,
-                    UiAction::Key(Key::X),
-                );
-            }
-            Screen::SaveQuests => {
-                let filter_str = &ed.quest_filter;
-                let box_w = 260;
-                c.round_rect(x, y, box_w, h, 6, BG_VAL_BOX);
-                c.round_rect_border(x, y, box_w, h, 6, 1, ACCENT_CYAN);
-                let disp = if filter_str.is_empty() {
-                    String::from("[Y] 検索: すべて")
-                } else {
-                    format!("[Y] 検索: 「{}」", filter_str)
-                };
-                c.text_clipped(
-                    x + 10,
-                    y + 5,
-                    box_w - 16,
-                    &disp,
-                    if filter_str.is_empty() {
-                        TEXT_SECONDARY
-                    } else {
-                        TEXT_GOLD
-                    },
-                    FontSize::Small,
-                );
-                self.add_hit(x, y, box_w, h, UiAction::Key(Key::Y));
-
-                let mut bx = x + box_w + 8;
-                if !filter_str.is_empty() {
-                    self.draw_toolbar_btn(
-                        c,
-                        bx,
-                        y,
-                        96,
-                        h,
-                        "[X] 解除",
-                        false,
-                        UiAction::Key(Key::X),
-                    );
-                    bx += 104;
-                }
-                let (bulk_lbl, bulk_cat) = if self.quest_tab == 2 {
-                    ("[X] 没34件を追加", 1u8)
-                } else {
-                    ("[X] 公式189件を追加", 0u8)
-                };
-                self.draw_toolbar_btn(
-                    c,
-                    bx,
-                    y,
-                    196,
-                    h,
-                    bulk_lbl,
-                    true,
-                    UiAction::InstallDlcCategory(bulk_cat),
-                );
-                bx += 204;
-                self.draw_toolbar_btn(
-                    c,
-                    bx,
-                    y,
-                    136,
-                    h,
-                    "[R] 全件SD抽出",
-                    false,
-                    UiAction::Key(Key::R),
-                );
-                bx += 144;
-                self.draw_toolbar_btn(
-                    c,
-                    bx,
-                    y,
-                    112,
-                    h,
-                    "クエ装備",
-                    false,
-                    UiAction::GotoScreen(Screen::QuestEquip),
-                );
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "所持品 全枠×99", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::ItemsMaxAll);
             }
             Screen::Charms => {
-                self.draw_toolbar_btn(
-                    c,
-                    x,
-                    y,
-                    148,
-                    h,
-                    "[L] 新規作成",
-                    true,
-                    UiAction::Key(Key::L),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 156,
-                    y,
-                    140,
-                    h,
-                    "[Y] 編集",
-                    false,
-                    UiAction::Key(Key::Y),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 304,
-                    y,
-                    132,
-                    h,
-                    "[A] 削除",
-                    false,
-                    UiAction::Key(Key::A),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 444,
-                    y,
-                    140,
-                    h,
-                    "[X] 保存",
-                    true,
-                    UiAction::Key(Key::X),
-                );
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "新規護石作成", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::NewCharm);
+            }
+            Screen::CharmEdit => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[Y] 合法最大値", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::CharmLegalMax);
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "痛撃6 達人10 S3", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::CharmPreset(0));
+            }
+            Screen::Roster => {
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "全オトモ Lv99", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::RosterMaxAll);
             }
             Screen::Palico => {
-                let lang_str = if ed.palico_lang == 0 {
-                    "[L/R] 言語: 日本語"
-                } else {
-                    "[L/R] 言語: 英語"
-                };
-                self.draw_toolbar_btn(
-                    c,
-                    x,
-                    y,
-                    180,
-                    h,
-                    lang_str,
-                    false,
-                    UiAction::Key(Key::L),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 188,
-                    y,
-                    188,
-                    h,
-                    "[Y] 全28匹一括導入",
-                    true,
-                    UiAction::InstallAllPalicoes,
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 384,
-                    y,
-                    150,
-                    h,
-                    "[A] 導入/解除",
-                    false,
-                    UiAction::Key(Key::A),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 542,
-                    y,
-                    136,
-                    h,
-                    "[X] 保存",
-                    true,
-                    UiAction::Key(Key::X),
-                );
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "全28匹 一括導入", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::InstallAllPalicoes);
             }
-            Screen::ArcList => {
-                self.draw_toolbar_btn(
-                    c,
-                    x,
-                    y,
-                    136,
-                    h,
-                    "[A] 開く",
-                    true,
-                    UiAction::Key(Key::A),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 144,
-                    y,
-                    168,
-                    h,
-                    "[L] セーブへ追加",
-                    false,
-                    UiAction::InstallArcRow(ed.cursor),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 320,
-                    y,
-                    188,
-                    h,
-                    "[R] 公式SD展開",
-                    true,
-                    UiAction::ExtractOfficialArcs,
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 516,
-                    y,
-                    164,
-                    h,
-                    "[X] セーブ内一覧",
-                    false,
-                    UiAction::Key(Key::X),
-                );
+            Screen::Mib => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "大型体力=1", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::MibPreset(0));
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "最大金冠 200%", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::MibPreset(1));
             }
-            Screen::ArcEntries => {
-                self.draw_toolbar_btn(
-                    c,
-                    x,
-                    y,
-                    140,
-                    h,
-                    "[A] 条件/文編集",
-                    true,
-                    UiAction::Key(Key::A),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 148,
-                    y,
-                    140,
-                    h,
-                    "[Y] 中身を表示",
-                    false,
-                    UiAction::Key(Key::Y),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 296,
-                    y,
-                    170,
-                    h,
-                    "[X] セーブへ書込",
-                    true,
-                    UiAction::Key(Key::X),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 474,
-                    y,
-                    140,
-                    h,
-                    "[L] クエ検査",
-                    false,
-                    UiAction::Key(Key::L),
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    x + 622,
-                    y,
-                    140,
-                    h,
-                    "[-] .arc抽出",
-                    false,
-                    UiAction::Key(Key::Minus),
-                );
-            }
-            Screen::SaveList => {
-                c.text_sized(
-                    x,
-                    y + 5,
-                    "編集するセーブデータを選択してください（先頭がSwitch本体のセーブデータです）",
-                    TEXT_SECONDARY,
-                    FontSize::Small,
-                );
-                self.draw_toolbar_btn(
-                    c,
-                    MAIN_X + MAIN_W - 180,
-                    y,
-                    168,
-                    h,
-                    "[L] 3DS/Switch変換",
-                    false,
-                    UiAction::Key(Key::L),
-                );
-            }
-            Screen::Slots => {
-                c.text_sized(
-                    x,
-                    y + 5,
-                    "編集するハンターを選択し、下の各ボタンまたは左メニューをタップしてください",
-                    TEXT_SECONDARY,
-                    FontSize::Small,
-                );
+            Screen::EntryView => {
+                let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::SetStep(next_step));
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "配置1座標コピー", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::SemPreset(0));
             }
             _ => {}
         }
-
-        // Item count / Position counter on the far right of toolbar if applicable
-        let total = list_len_of(ed);
-        if total > 0 {
-            let cur = active_cursor_of(ed).min(total.saturating_sub(1)) + 1;
-            let pos_str = format!("{} / {}", cur, total);
-            c.text_right(
-                MAIN_X + MAIN_W - 14,
-                y + 5,
-                &pos_str,
-                TEXT_CYAN,
-                FontSize::Small,
-            );
-        }
     }
 
-    fn draw_toolbar_btn(
-        &mut self,
-        c: &mut Canvas,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        label: &str,
-        primary: bool,
-        action: UiAction,
-    ) {
-        let min_w = c.text_width_sized(label, FontSize::Small) + 20;
-        let w = w.max(min_w);
-        let bg = if primary { BG_BTN_PRIMARY } else { BG_BTN };
-        let border = if primary { ACCENT_CYAN } else { BORDER_BTN };
-        c.round_rect(x, y, w, h, 6, bg);
-        c.round_rect_border(x, y, w, h, 6, 1, border);
-        c.text_centered(x, y, w, h, label, TEXT_PRIMARY, FontSize::Small);
-        self.add_hit(x, y, w, h, action);
+    fn draw_footer(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        c.rect(0, FOOTER_Y, 1280, FOOTER_H, t.bg_footer);
+        c.hline(0, FOOTER_Y, 1280, t.border_subtle);
+
+        // Right: Concise, non-redundant key guide
+        let hint = match ed.screen {
+            Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
+            Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
+            Screen::Char => "[◀/▶] 増減  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
+            Screen::Items => "[A] 変更  [◀/▶] 個数  [Y] 刻み  [L/R] ページ  [X] 保存",
+            Screen::ItemPick | Screen::SkillPick => "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る",
+            Screen::Charms => "[A] 編集  [Y×2] 削除  [-] 新規  [L/R] サブタブ  [X] 保存",
+            Screen::CharmEdit => "[A] 選択/反映  [◀/▶] 増減  [Y] 合法最大  [X] 保存  [B] 戻る",
+            Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [L/R] サブタブ  [X] 保存",
+            Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [L/R] サブタブ  [X] 保存",
+            Screen::Hunts => "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [L/R] サブタブ  [X] 保存",
+            Screen::SaveQuests => "[A] 編集/導入  [Y] 検索  [L/R] サブタブ  [X] 保存",
+            Screen::ArcEntries => "[A] 開く  [Y] 検査  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            Screen::Mib => "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存",
+            Screen::Gmd => "[A] 文章編集  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            Screen::EntryView => "[◀/▶] 座標・数値変更  [Y] 刻み  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            _ => "[A] 決定  [◀/▶] 調整  [L/R] サブタブ  [ZL/ZR] セクション  [X] 保存",
+        };
+        let hint_w = c.text_width_sized(hint, FontSize::Small);
+        c.text_right(1262, FOOTER_Y + 17, hint, t.text_secondary, FontSize::Small);
+
+        // Left: Status message dynamically clipped so it NEVER collides with `hint`
+        let msg = if ed.message.is_empty() {
+            "Ready"
+        } else {
+            &ed.message
+        };
+        c.circle(22, FOOTER_Y + 26, 4, if ed.dirty { t.accent_warn } else { t.accent_primary });
+        let max_msg_w = (1262 - hint_w - 60).max(180);
+        c.text_clipped(36, FOOTER_Y + 17, max_msg_w, msg, t.text_primary, FontSize::Small);
     }
 
     // -----------------------------------------------------------------------
-    // 4. Tailored Main Content Area per Screen
+    // Main Content Dispatcher
     // -----------------------------------------------------------------------
     fn draw_content(&mut self, c: &mut Canvas, ed: &Editor) {
         match ed.screen {
             Screen::SaveList => self.draw_save_list(c, ed),
             Screen::Slots => self.draw_slots(c, ed),
+            Screen::Convert => self.draw_convert(c, ed),
+            Screen::Options => self.draw_options(c, ed),
             Screen::Char => self.draw_char(c, ed),
             Screen::Items => self.draw_items(c, ed),
             Screen::ItemPick => self.draw_item_pick(c, ed),
+            Screen::SkillPick => self.draw_skill_pick(c, ed),
             Screen::Charms => self.draw_charms(c, ed),
             Screen::CharmEdit => self.draw_charm_edit(c, ed),
-            Screen::SkillPick => self.draw_skill_pick(c, ed),
             Screen::Equip => self.draw_equip(c, ed),
+            Screen::Sets => self.draw_sets(c, ed),
+            Screen::Roster => self.draw_roster(c, ed),
+            Screen::Palico => self.draw_palico(c, ed),
             Screen::Hunts => self.draw_hunts(c, ed),
             Screen::Guild => self.draw_guild(c, ed),
-            Screen::Roster => self.draw_roster(c, ed),
-            Screen::Sets => self.draw_sets(c, ed),
-            Screen::Palico => self.draw_palico(c, ed),
-            Screen::Options => self.draw_options(c, ed),
-            Screen::Convert => self.draw_convert(c, ed),
             Screen::SaveQuests => self.draw_save_quests(c, ed),
             Screen::QuestEquip => self.draw_quest_equip(c, ed),
             Screen::ArcList => self.draw_arc_list(c, ed),
@@ -1953,1008 +2677,1323 @@ impl GuiState {
         }
     }
 
-    // --- Screen: SaveList --------------------------------------------------
-    fn draw_save_list(&mut self, c: &mut Canvas, ed: &Editor) {
-        let total = ed.save_files.len();
-        let visible = 7;
-        let start = window_start(ed.cursor, total, visible);
-        // 7 rows at 68 + 6 ran to 648, sixteen pixels past the footer.
-        let row_h = 62;
-        let row_gap = 4;
-        let list_w = MAIN_W - 44;
+    // -----------------------------------------------------------------------
+    // Clean Split-Studio List + Inspector Renderer (Zero Text Overlap)
+    // -----------------------------------------------------------------------
+    /// Renders rows of `(row_idx, title, meta_info, value_text, badge_text)`.
+    /// - Left Panel (`x = 20, w = 796`): Shows ONLY `[Badge] Title` on the left and `Value` on the right.
+    ///   `Title` is dynamically clipped to `val_left_x - title_x - 16`, guaranteeing zero collision!
+    /// - Right Panel (`x = 832, w = 428`): Shows full details (`badge`, `title`, `meta_info`, `value`),
+    ///   `[A]` action button, numeric stepper, and concise tool buttons.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_adaptive_rows(
+        &mut self,
+        c: &mut Canvas,
+        ed: &Editor,
+        header_title: &str,
+        _unused_sub: &str,
+        rows: &[(usize, String, String, String, String)],
+        active_row_idx: usize,
+        has_stepper: bool,
+        primary_a_label: &str,
+    ) {
+        let t = theme();
+        let total = rows.len();
 
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(path) = ed.save_files.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + row_gap);
-            let selected = idx == ed.cursor;
-            let is_nand = path == CONSOLE_SAVE;
+        // Compact Section Title Line (y = 100..130) — No redundant explanation string!
+        c.text_clipped(
+            MAIN_X + 4,
+            CONTENT_Y,
+            620,
+            header_title,
+            t.text_primary,
+            FontSize::Medium,
+        );
 
-            let bg = if selected {
-                BG_SELECTED
-            } else if is_nand {
-                rgb(42, 42, 48)
-            } else {
-                BG_CARD
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 8, bg);
-            c.round_rect_border(
-                MAIN_X,
-                ry,
-                list_w,
-                row_h,
-                8,
-                if selected { 2 } else { 1 },
-                if selected {
-                    ACCENT_CYAN
-                } else if is_nand {
-                    ACCENT_GREEN
-                } else {
-                    BORDER_CARD
-                },
-            );
-            if selected {
-                c.round_rect(MAIN_X + 3, ry + 6, 5, row_h - 12, 2, ACCENT_CYAN);
-            }
+        let cur_pos = rows
+            .iter()
+            .position(|r| r.0 == active_row_idx)
+            .unwrap_or(0);
 
-            // Badge
-            let (badge_txt, badge_col) = if is_nand {
-                ("NAND 本体", ACCENT_GREEN)
-            } else {
-                ("SD カード", ACCENT_CYAN)
-            };
-            c.round_rect(MAIN_X + 16, ry + 12, 96, 24, 5, badge_col);
-            c.text_centered(MAIN_X + 16, ry + 12, 96, 24, badge_txt, BG_MAIN, FontSize::Small);
-
-            // Title & Description
-            let main_title = if is_nand {
-                "Nintendo Switch 本体のセーブデータ (直接マウント編集)"
-            } else {
-                path.as_str()
-            };
-            let sub_desc = if is_nand {
-                "保存時に自動で /switch/XXSE/backups/ にバックアップを作成します"
-            } else {
-                "SDカード内のセーブデータファイル（保存時に .bak を作成します）"
-            };
-            c.text_clipped(
-                MAIN_X + 124,
-                ry + 10,
-                list_w - 260,
-                main_title,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            c.text_clipped(
-                MAIN_X + 124,
-                ry + 38,
-                list_w - 260,
-                sub_desc,
-                TEXT_SECONDARY,
+        if total > 0 {
+            let pos_txt = format!("{} / {}", cur_pos + 1, total);
+            c.text_right(
+                MAIN_X + V1_LIST_W - 4,
+                CONTENT_Y + 3,
+                &pos_txt,
+                t.text_secondary,
                 FontSize::Small,
             );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            // Open button
-            let bx = MAIN_X + list_w - 118;
-            let by = ry + 16;
-            c.round_rect(bx, by, 104, 36, 6, if selected { BG_BTN_PRIMARY } else { BG_BTN });
-            c.round_rect_border(bx, by, 104, 36, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, by, 104, 36, "[A] 開く", TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, by, 104, 36, UiAction::Key(Key::A));
-            } else {
-                self.add_hit(bx, by, 104, 36, UiAction::SelectRow(idx));
-            }
         }
 
-        self.draw_scrollbar(c, ed.cursor, total, visible);
-    }
+        let body_y = CONTENT_Y + 30; // 132
+        let body_h = FOOTER_Y - body_y - 10; // 526
 
-    // --- Screen: Slots (3 Hunter Profile Cards + Official DLC Bar) ---------
-    fn draw_slots(&mut self, c: &mut Canvas, ed: &Editor) {
-        let Some(save) = &ed.save else {
-            c.text_sized(
-                MAIN_X + 20,
-                CONTENT_Y + 20,
-                "セーブデータが開かれていません",
-                TEXT_SECONDARY,
+        if total == 0 {
+            c.round_rect(MAIN_X, body_y, MAIN_W, 120, t.corner_r, t.bg_panel);
+            c.round_rect_border(MAIN_X, body_y, MAIN_W, 120, t.corner_r, 1, t.border_subtle);
+            c.text_centered(
+                MAIN_X,
+                body_y,
+                MAIN_W,
+                120,
+                "データがありません",
+                t.text_secondary,
                 FontSize::Medium,
             );
             return;
-        };
+        }
 
-        let card_h = 152;
-        for i in 0..3 {
-            let cy = CONTENT_Y + (i as i32) * (card_h + 10);
-            let selected = ed.slot == i;
-            let used = save.slot_used(i);
-            let ch = save.read_character(i);
+        // Left List Panel (x = 20, y = 132, w = 796, h = 526)
+        c.round_rect(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, 1, t.border_subtle);
 
-            let bg = if selected { BG_SELECTED } else { BG_CARD };
-            let border = if selected { ACCENT_CYAN } else { BORDER_CARD };
-            c.round_rect(MAIN_X, cy, MAIN_W, card_h, 10, bg);
-            c.round_rect_border(MAIN_X, cy, MAIN_W, card_h, 10, if selected { 2 } else { 1 }, border);
-            if selected {
-                c.round_rect(MAIN_X + 4, cy + 8, 6, card_h - 16, 3, ACCENT_CYAN);
+        let vis = 9usize;
+        let start = window_start(cur_pos, total, vis);
+        let row_h = 56i32;
+
+        for i in 0..vis {
+            let Some((r_idx, title, _meta, val, badge)) = rows.get(start + i) else {
+                break;
+            };
+            let row_idx = *r_idx;
+            let ry = body_y + 10 + (i as i32) * row_h;
+            let is_sel = row_idx == active_row_idx;
+
+            if is_sel {
+                c.round_rect(MAIN_X + 8, ry + 2, V1_LIST_W - 16, row_h - 4, 6, t.bg_selected);
+                c.rect(MAIN_X + 8, ry + 8, 4, row_h - 16, t.accent_primary);
+            } else if i + 1 < vis && start + i + 1 < total {
+                c.hline(MAIN_X + 16, ry + row_h - 1, V1_LIST_W - 32, t.border_subtle);
             }
 
-            // Slot number badge
-            c.round_rect(
-                MAIN_X + 20,
-                cy + 14,
-                110,
-                30,
-                6,
-                if selected { ACCENT_CYAN } else { BG_BTN },
+            self.add_row_hit(MAIN_X + 8, ry + 2, V1_LIST_W - 16, row_h - 4, row_idx);
+
+            // 1. Left Badge
+            let mut tx = MAIN_X + 20;
+            if !badge.is_empty() {
+                let bw = (c.text_width_sized(badge, FontSize::Small) + 16).clamp(44, 88);
+                let bbg = if is_sel { t.accent_primary } else { t.bg_val_box };
+                let bfg = if is_sel {
+                    white_or_dark(t.accent_primary)
+                } else {
+                    t.text_secondary
+                };
+                c.round_rect(tx, ry + 15, bw, 24, 4, bbg);
+                btn_text(c, tx, ry + 15, bw, 24, badge, bfg, FontSize::Small);
+                tx += bw + 14;
+            }
+
+            // 2. Right Value (clipped to max 230px so it never crowds the left title)
+            let right_edge = MAIN_X + V1_LIST_W - 22;
+            let val_w = if val.is_empty() {
+                0
+            } else {
+                let raw_vw = c.text_width_sized(val, FontSize::Medium);
+                let max_vw = 230;
+                let actual_vw = raw_vw.min(max_vw);
+                let val_col = if is_sel { t.accent_primary } else { t.text_primary };
+                if raw_vw <= max_vw {
+                    c.text_right(right_edge, ry + 16, val, val_col, FontSize::Medium);
+                } else {
+                    c.text_clipped(
+                        right_edge - max_vw,
+                        ry + 16,
+                        max_vw,
+                        val,
+                        val_col,
+                        FontSize::Medium,
+                    );
+                }
+                actual_vw + 20
+            };
+
+            // 3. Left Title (strictly clipped to the space before `val`)
+            let max_title_w = (right_edge - val_w - tx).max(60);
+            c.text_clipped(
+                tx,
+                ry + 16,
+                max_title_w,
+                title,
+                if is_sel { t.text_primary } else { t.text_secondary },
+                FontSize::Medium,
             );
-            c.text_centered(
-                MAIN_X + 20,
-                cy + 14,
-                110,
-                30,
-                &format!("SLOT {}", i + 1),
-                if selected { BG_MAIN } else { TEXT_PRIMARY },
+        }
+
+        // Right Inspector Panel (x = 832, y = 132, w = 428, h = 526)
+        if let Some(sel_row) = rows.get(cur_pos) {
+            self.draw_studio_inspector(
+                c,
+                ed,
+                body_y,
+                body_h,
+                sel_row,
+                cur_pos,
+                total,
+                has_stepper,
+                primary_a_label,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_studio_inspector(
+        &mut self,
+        c: &mut Canvas,
+        ed: &Editor,
+        iy: i32,
+        ih: i32,
+        row: &(usize, String, String, String, String),
+        cur_pos: usize,
+        total: usize,
+        has_stepper: bool,
+        primary_a_label: &str,
+    ) {
+        let t = theme();
+        let ix = V1_INSP_X; // 832
+        let iw = V1_INSP_W; // 428
+        let (row_idx, ref title, ref meta, ref val, ref badge) = *row;
+
+        c.round_rect(ix, iy, iw, ih, t.corner_r, t.bg_panel);
+        c.round_rect_border(ix, iy, iw, ih, t.corner_r, 1, t.border_subtle);
+
+        // Slot 1 (iy + 14): Badge on left, "#pos / total" on right
+        let top_tag = if badge.is_empty() { "選択項目" } else { badge.as_str() };
+        c.text_clipped(ix + 20, iy + 14, 240, top_tag, t.accent_primary, FontSize::Small);
+        c.text_right(
+            ix + iw - 20,
+            iy + 14,
+            &format!("#{} / {}", cur_pos + 1, total),
+            t.text_muted,
+            FontSize::Small,
+        );
+
+        if ed.screen == Screen::Gmd {
+            let role_label = if meta.is_empty() { "クエスト文章" } else { meta.as_str() };
+            c.text_clipped(ix + 20, iy + 40, iw - 40, role_label, t.text_primary, FontSize::Medium);
+
+            let raw_str = ed
+                .gmd
+                .as_ref()
+                .and_then(|g| g.strings.get(row_idx))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let key_str = ed
+                .gmd
+                .as_ref()
+                .map(|g| g.key.as_str())
+                .unwrap_or("GMD");
+            let line_cnt = raw_str.lines().count().max(1);
+            c.text_clipped(
+                ix + 20,
+                iy + 70,
+                iw - 40,
+                &format!("{}  ({} B / {} 行)", key_str, raw_str.len(), line_cnt),
+                t.text_secondary,
+                FontSize::Small,
+            );
+            c.hline(ix + 16, iy + 98, iw - 32, t.border_subtle);
+
+            // Multi-line preview box (iy + 108, h = 196)
+            let box_y = iy + 108;
+            let box_h = 196;
+            c.round_rect(ix + 20, box_y, iw - 40, box_h, 6, t.bg_val_box);
+            c.round_rect_border(ix + 20, box_y, iw - 40, box_h, 6, 1, t.border_subtle);
+            if raw_str.is_empty() {
+                c.text_centered(
+                    ix + 20,
+                    box_y,
+                    iw - 40,
+                    box_h,
+                    "(空のテキスト)",
+                    t.text_muted,
+                    FontSize::Small,
+                );
+            } else {
+                for (li, line) in raw_str.split('\n').take(6).enumerate() {
+                    let clean_line = line.trim_end_matches('\r');
+                    c.text_clipped(
+                        ix + 32,
+                        box_y + 12 + (li as i32) * 28,
+                        iw - 64,
+                        clean_line,
+                        t.text_primary,
+                        FontSize::Small,
+                    );
+                }
+            }
+
+            let btn_y = box_y + box_h + 14;
+            c.round_rect(ix + 20, btn_y, iw - 40, 44, 6, t.accent_primary);
+            btn_text(
+                c,
+                ix + 20,
+                btn_y,
+                iw - 40,
+                44,
+                "[A] テキスト編集",
+                white_or_dark(t.accent_primary),
+                FontSize::Medium,
+            );
+            self.add_hit(ix + 20, btn_y, iw - 40, 44, UiAction::ActivateRow(row_idx));
+
+            let save_y = btn_y + 56;
+            self.draw_tool_button(
+                c,
+                ix + 20,
+                save_y,
+                iw - 40,
+                40,
+                "[X] 変更を保存",
+                UiAction::QuickSave,
+            );
+            return;
+        }
+
+        // Slot 2 (iy + 40): Selected Item Title
+        c.text_clipped(ix + 20, iy + 40, iw - 40, title, t.text_primary, FontSize::Medium);
+
+        // Slot 3 (iy + 70): Concise Meta Info (if non-empty)
+        if !meta.is_empty() {
+            c.text_clipped(ix + 20, iy + 70, iw - 40, meta, t.text_secondary, FontSize::Small);
+        }
+
+        c.hline(ix + 16, iy + 98, iw - 32, t.border_subtle);
+
+        // Slot 4 (iy + 110, h = 48): Current Value Box
+        let disp_val = if val.is_empty() { title.as_str() } else { val.as_str() };
+        c.round_rect(ix + 20, iy + 110, iw - 40, 48, 6, t.bg_val_box);
+        c.round_rect_border(ix + 20, iy + 110, iw - 40, 48, 6, 1, t.border_subtle);
+        btn_text(
+            c,
+            ix + 20,
+            iy + 110,
+            iw - 40,
+            48,
+            disp_val,
+            t.accent_primary,
+            FontSize::Large,
+        );
+
+        // Slot 5 (iy + 168, h = 42): Primary [A] Button
+        let btn_y = iy + 168;
+        let a_txt = format!("[A] {}", primary_a_label);
+        c.round_rect(ix + 20, btn_y, iw - 40, 42, 6, t.accent_primary);
+        btn_text(
+            c,
+            ix + 20,
+            btn_y,
+            iw - 40,
+            42,
+            &a_txt,
+            white_or_dark(t.accent_primary),
+            FontSize::Medium,
+        );
+        self.add_hit(ix + 20, btn_y, iw - 40, 42, UiAction::ActivateRow(row_idx));
+
+        let mut cur_y = btn_y + 52; // iy + 220
+
+        // Slot 6: Numeric Stepper & Step Size Selector
+        if has_stepper {
+            let bw = (iw - 56) / 3; // 124px each
+            // [◀ -]
+            c.round_rect(ix + 20, cur_y, bw, 38, 5, t.bg_btn);
+            c.round_rect_border(ix + 20, cur_y, bw, 38, 5, 1, t.border_subtle);
+            btn_text(c, ix + 20, cur_y, bw, 38, "◀ -", t.text_primary, FontSize::Small);
+            self.add_hit(ix + 20, cur_y, bw, 38, UiAction::AdjustRow(row_idx, Key::Left));
+
+            // [+ ▶]
+            let bx2 = ix + 20 + bw + 8;
+            c.round_rect(bx2, cur_y, bw, 38, 5, t.bg_btn);
+            c.round_rect_border(bx2, cur_y, bw, 38, 5, 1, t.border_subtle);
+            btn_text(c, bx2, cur_y, bw, 38, "+ ▶", t.text_primary, FontSize::Small);
+            self.add_hit(bx2, cur_y, bw, 38, UiAction::AdjustRow(row_idx, Key::Right));
+
+            // [MAX]
+            let bx3 = bx2 + bw + 8;
+            let max_lbl = if ed.screen == Screen::EntryView
+                && ed
+                    .arc
+                    .as_ref()
+                    .and_then(|a| a.entries.get(ed.entry))
+                    .and_then(|e| extension_for(e.type_hash))
+                    == Some("sem")
+            {
+                "0リセット"
+            } else {
+                "MAX"
+            };
+            c.round_rect(bx3, cur_y, bw, 38, 5, t.bg_btn_primary);
+            c.round_rect_border(bx3, cur_y, bw, 38, 5, 1, t.accent_primary);
+            btn_text(c, bx3, cur_y, bw, 38, max_lbl, t.text_primary, FontSize::Small);
+            self.add_hit(bx3, cur_y, bw, 38, UiAction::SetRowMax(row_idx));
+
+            cur_y += 46; // iy + 266
+
+            // Step size selector pills [Y]
+            c.text_sized(ix + 20, cur_y + 6, "刻み [Y]", t.text_secondary, FontSize::Small);
+            let mut sx = ix + 104;
+            let sw = 72i32;
+            for (s_idx, &step_val) in STEPS.iter().enumerate() {
+                let is_s = ed.step == s_idx;
+                let sbg = if is_s { t.bg_selected } else { t.bg_btn };
+                let sbd = if is_s { t.accent_primary } else { t.border_subtle };
+                let sfg = if is_s { t.accent_primary } else { t.text_secondary };
+                c.round_rect(sx, cur_y, sw, 30, 4, sbg);
+                c.round_rect_border(sx, cur_y, sw, 30, 4, 1, sbd);
+                let slbl = format!("±{}", step_val);
+                btn_text(c, sx, cur_y, sw, 30, &slbl, sfg, FontSize::Small);
+                self.add_hit(sx, cur_y, sw, 30, UiAction::SetStep(s_idx));
+                sx += sw + 6;
+            }
+            cur_y += 40; // iy + 306
+        }
+
+        // Slot 7: Clean Tool Actions (No `★`, concise labels)
+        c.hline(ix + 16, cur_y, iw - 32, t.border_subtle);
+        cur_y += 8;
+
+        let full_w = iw - 40;
+        let half_w = (iw - 48) / 2;
+
+        match ed.screen {
+            Screen::Char | Screen::Slots => {
+                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "所持金・HR・全P 一括MAX",
+                    UiAction::CharMaxAll,
+                );
+                cur_y += 44;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "対象スロット切替 (Slot 1〜3)",
+                    UiAction::SelectSlot((ed.slot + 1) % 3),
+                );
+            }
+            Screen::Items => {
+                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "所持アイテム 全枠×99",
+                    UiAction::ItemsMaxAll,
+                );
+            }
+            Screen::Charms | Screen::CharmEdit => {
+                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    36,
+                    "合法最大値 + スロ3をセット",
+                    UiAction::CharmLegalMax,
+                );
+                cur_y += 42;
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, "痛撃6 達人10 S3", UiAction::CharmPreset(0));
+                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, "斬れ味6 達人10 S3", UiAction::CharmPreset(1));
+                cur_y += 42;
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, "溜め6 達人10 S3", UiAction::CharmPreset(2));
+                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, "通常6 達人10 S3", UiAction::CharmPreset(3));
+            }
+            Screen::Roster => {
+                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "全オトモ Lv99・なつき100・EXP最大",
+                    UiAction::RosterMaxAll,
+                );
+            }
+            Screen::Palico => {
+                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "配信オトモ 全28匹を一括導入",
+                    UiAction::InstallAllPalicoes,
+                );
+            }
+            Screen::SaveQuests | Screen::ArcList => {
+                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "公式イベント189件 一括導入",
+                    UiAction::InstallOfficialDlc,
+                );
+                cur_y += 44;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "内蔵クエストをSDへ展開",
+                    UiAction::ExtractOfficialArcs,
+                );
+            }
+            Screen::Mib => {
+                let is_mob = questfields::MIB_FIELDS
+                    .get(row_idx)
+                    .map(|f| f.key.starts_with("mob_slot["))
+                    .unwrap_or(false);
+                if is_mob {
+                    c.text_sized(
+                        ix + 20,
+                        cur_y,
+                        "モンスター個別パラメータ ([-] またはタッチで選択)",
+                        t.text_muted,
+                        FontSize::Small,
+                    );
+                    cur_y += 22;
+                    let mib = ed.mib_bytes();
+                    let off = questfields::MIB_FIELDS
+                        .get(row_idx)
+                        .map(|f| f.offset)
+                        .unwrap_or(0);
+                    let pw = (iw - 58) / 4; // 92px
+                    let ph = 32;
+                    for s_i in 0..8usize {
+                        let col = (s_i % 4) as i32;
+                        let r = (s_i / 4) as i32;
+                        let px = ix + 20 + col * (pw + 6);
+                        let py = cur_y + r * (ph + 6);
+                        let active = self.mib_mob_sub == s_i;
+                        let bg = if active { t.bg_selected } else { t.bg_btn };
+                        let bd = if active { t.accent_primary } else { t.border_subtle };
+                        let fg = if active { t.accent_primary } else { t.text_secondary };
+                        let v_str = if off + 13 <= mib.len() {
+                            match s_i {
+                                0 => format!("HP:{}", mib[off + 5]),
+                                1 => format!("攻:{}", mib[off + 6]),
+                                2 => format!("防:{}", mib[off + 7]),
+                                3 => {
+                                    let sz = u16::from_le_bytes([mib[off + 9], mib[off + 10]]);
+                                    format!("{}%", sz)
+                                }
+                                4 => format!("数:{}", mib[off + 4]),
+                                5 => format!("疲:{}", mib[off + 8]),
+                                6 => format!("変:{}", mib[off + 11]),
+                                _ => format!("特:{}", mib[off + 3]),
+                            }
+                        } else {
+                            MIB_MOB_SUB_LABELS[s_i].to_string()
+                        };
+                        c.round_rect(px, py, pw, ph, 4, bg);
+                        c.round_rect_border(px, py, pw, ph, 4, 1, bd);
+                        btn_text(c, px, py, pw, ph, &v_str, fg, FontSize::Small);
+                        self.add_hit(px, py, pw, ph, UiAction::SelectSubField(row_idx, s_i));
+                    }
+                    cur_y += 78;
+                } else {
+                    c.text_sized(ix + 20, cur_y, "一括操作・初期配置", t.text_muted, FontSize::Small);
+                    cur_y += 24;
+                }
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 34, "大型体力=1", UiAction::MibPreset(0));
+                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 34, "最大金冠 200%", UiAction::MibPreset(1));
+                cur_y += 38;
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 34, "最小金冠 50%", UiAction::MibPreset(2));
+                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 34, "初期配置(.sem)", UiAction::SelectSubTab(1));
+            }
+            Screen::EntryView => {
+                c.text_sized(ix + 20, cur_y, "初期配置・エントリ操作", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                let ext = ed
+                    .arc
+                    .as_ref()
+                    .and_then(|a| a.entries.get(ed.entry))
+                    .and_then(|e| extension_for(e.type_hash));
+                if ext == Some("sem") {
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        36,
+                        "配置1のエリア・座標を他モンスターへコピー",
+                        UiAction::SemPreset(0),
+                    );
+                    cur_y += 42;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        36,
+                        "選択中の座標を 0.0 にリセット",
+                        UiAction::SemPreset(1),
+                    );
+                } else {
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[X] 変更を保存",
+                        UiAction::QuickSave,
+                    );
+                }
+            }
+            _ => {
+                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[X] 変更を保存",
+                    UiAction::QuickSave,
+                );
+            }
+        }
+    }
+
+    fn draw_tool_button(
+        &mut self,
+        c: &mut Canvas,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        label: &str,
+        action: UiAction,
+    ) {
+        let t = theme();
+        c.round_rect(x, y, w, h, 5, t.bg_btn);
+        c.round_rect_border(x, y, w, h, 5, 1, t.border_subtle);
+        btn_text(c, x, y, w, h, label, t.text_primary, FontSize::Small);
+        self.add_hit(x, y, w, h, action);
+    }
+
+    // -----------------------------------------------------------------------
+    // Screen Implementations (Concise, Non-Redundant Strings)
+    // -----------------------------------------------------------------------
+
+    fn draw_save_list(&mut self, c: &mut Canvas, ed: &Editor) {
+        let mut rows = Vec::with_capacity(ed.save_files.len());
+        for (i, path) in ed.save_files.iter().enumerate() {
+            let is_console = path == CONSOLE_SAVE;
+            let badge = if is_console {
+                String::from("本体")
+            } else {
+                format!("#{:02}", i + 1)
+            };
+            let title = if is_console {
+                String::from("Switch 本体セーブデータ")
+            } else {
+                path.rsplit('/').next().unwrap_or(path.as_str()).to_string()
+            };
+            rows.push((i, title, path.clone(), String::new(), badge));
+        }
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "セーブデータ一覧",
+            "",
+            &rows,
+            ed.cursor,
+            false,
+            "開く",
+        );
+    }
+
+    fn draw_slots(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        c.text_sized(MAIN_X + 4, CONTENT_Y, "スロット選択", t.text_primary, FontSize::Medium);
+
+        let card_w = 396i32;
+        let card_h = 460i32;
+        let gap = 26i32;
+        let y = CONTENT_Y + 36;
+
+        for s in 0..3usize {
+            let x = MAIN_X + (s as i32) * (card_w + gap);
+            let is_sel = ed.slot == s;
+            let bg = if is_sel { t.bg_selected } else { t.bg_panel };
+            let bd = if is_sel { t.border_focus } else { t.border_subtle };
+
+            c.round_rect(x, y, card_w, card_h, t.corner_r, bg);
+            c.round_rect_border(x, y, card_w, card_h, t.corner_r, if is_sel { 2 } else { 1 }, bd);
+
+            let badge = format!("SLOT {}", s + 1);
+            c.round_rect(
+                x + 20,
+                y + 20,
+                92,
+                28,
+                5,
+                if is_sel { t.accent_primary } else { t.bg_val_box },
+            );
+            btn_text(
+                c,
+                x + 20,
+                y + 20,
+                92,
+                28,
+                &badge,
+                if is_sel {
+                    white_or_dark(t.accent_primary)
+                } else {
+                    t.accent_primary
+                },
                 FontSize::Small,
             );
 
-            if let Some(ch) = ch {
-                let name_str = if ch.name.is_empty() {
-                    "(名前なし)"
+            let (summary, zenny_v, hr_v, hrp_v, wyc_v, play_v) = if let Some(save) = &ed.save {
+                if let Some(ch) = save.read_character(s) {
+                    (
+                        if ch.name.is_empty() {
+                            String::from("(未使用)")
+                        } else {
+                            ch.name
+                        },
+                        ch.funds,
+                        ch.hunter_rank,
+                        ch.hr_points,
+                        ch.academy_points,
+                        ch.play_time,
+                    )
                 } else {
-                    ch.name.as_str()
-                };
-                c.text_sized(MAIN_X + 144, cy + 12, name_str, TEXT_PRIMARY, FontSize::Large);
+                    (String::from("(空き)"), 0, 0, 0, 0, 0)
+                }
+            } else {
+                (String::from("(未読込)"), 0, 0, 0, 0, 0)
+            };
+            c.text_clipped(x + 20, y + 66, card_w - 40, &summary, t.text_primary, FontSize::Large);
+            c.hline(x + 20, y + 110, card_w - 40, t.border_subtle);
 
-                let status_badge = if used { "使用中" } else { "未使用枠" };
-                c.text_sized(
-                    MAIN_X + 420,
-                    cy + 18,
-                    status_badge,
-                    if used { ACCENT_GREEN } else { TEXT_MUTED },
-                    FontSize::Small,
-                );
+            if ed.save.is_some() {
+                let zenny = format!("所持金: {} z", zenny_v);
+                let hr = format!("HR: {}  (HRP: {})", hr_v, hrp_v);
+                let wyc = format!("龍歴院P: {} pts", wyc_v);
+                let play = format!("プレイ時間: {}h {:02}m", play_v / 3600, (play_v % 3600) / 60);
+                c.text_clipped(x + 24, y + 132, card_w - 48, &zenny, t.accent_secondary, FontSize::Medium);
+                c.text_clipped(x + 24, y + 170, card_w - 48, &hr, t.text_primary, FontSize::Medium);
+                c.text_clipped(x + 24, y + 208, card_w - 48, &wyc, t.text_secondary, FontSize::Medium);
+                c.text_clipped(x + 24, y + 246, card_w - 48, &play, t.text_secondary, FontSize::Small);
+            }
 
-                // Stats row
-                let hours = ch.play_time / 3600;
-                let mins = (ch.play_time % 3600) / 60;
-                let gender_str = if ch.gender == 0 { "男性" } else { "女性" };
-                let stats_text = format!(
-                    "HR: {}    所持金: {} z    プレイ時間: {}時間{:02}分    性別: {}    龍歴院P: {} pts",
-                    ch.hunter_rank, ch.funds, hours, mins, gender_str, ch.academy_points
-                );
+            let btn_y = y + card_h - 62;
+            let btn_bg = if is_sel { t.accent_primary } else { t.bg_btn };
+            let btn_fg = if is_sel {
+                white_or_dark(t.accent_primary)
+            } else {
+                t.text_secondary
+            };
+            c.round_rect(x + 20, btn_y, card_w - 40, 42, 6, btn_bg);
+            btn_text(c, x + 20, btn_y, card_w - 40, 42, "[A] 選択", btn_fg, FontSize::Medium);
+
+            self.add_hit(x, y, card_w, card_h, UiAction::SelectSlot(s));
+        }
+    }
+
+    fn draw_convert(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        let by = CONTENT_Y + 16;
+        c.round_rect(MAIN_X, by, MAIN_W, 300, t.corner_r, t.bg_panel);
+        c.round_rect_border(MAIN_X, by, MAIN_W, 300, t.corner_r, 1, t.border_subtle);
+
+        c.text_sized(
+            MAIN_X + 28,
+            by + 22,
+            "3DS / Switch 形式変換",
+            t.accent_primary,
+            FontSize::Large,
+        );
+
+        match (&ed.save, &ed.save_path) {
+            (None, _) => {
                 c.text_sized(
-                    MAIN_X + 22,
-                    cy + 56,
-                    &stats_text,
-                    TEXT_GOLD,
+                    MAIN_X + 28,
+                    by + 80,
+                    "セーブデータを開いてください",
+                    t.text_secondary,
                     FontSize::Medium,
                 );
             }
+            (Some(s), p) => {
+                let src_kind = match s.kind() {
+                    SaveKind::ThreeDs => "3DS (ヘッダなし)",
+                    SaveKind::Switch => "Switch MHXX (36Bヘッダ)",
+                    SaveKind::Mhgu => "Switch MHGU",
+                };
+                let dst_kind = if s.kind() == SaveKind::ThreeDs {
+                    "Switch MHXX"
+                } else {
+                    "3DS MHXX"
+                };
+                let stem = if ed.convert_name.trim().is_empty() {
+                    "system"
+                } else {
+                    ed.convert_name.trim()
+                };
+                let ext = if s.kind() == SaveKind::ThreeDs { "switch" } else { "3ds" };
 
-            self.add_row_hit(MAIN_X, cy, MAIN_W, card_h, i);
-
-            // Quick Action Buttons inside each Slot card
-            let quick_btns: &[(&str, Screen)] = &[
-                ("[A] ステータス", Screen::Char),
-                ("[X] アイテムBOX", Screen::Items),
-                ("装備BOX", Screen::Equip),
-                ("お守り", Screen::Charms),
-                ("オトモ", Screen::Roster),
-                ("[Y] クエスト", Screen::SaveQuests),
-            ];
-            let mut bx = MAIN_X + 20;
-            let by = cy + 98;
-            for &(b_label, target_scr) in quick_btns {
-                let bw = 154;
-                let bh = 38;
-                c.round_rect(
-                    bx,
-                    by,
-                    bw,
-                    bh,
-                    6,
-                    if selected { BG_BTN_PRIMARY } else { BG_BTN },
-                );
-                c.round_rect_border(bx, by, bw, bh, 6, 1, if selected { ACCENT_CYAN } else { BORDER_BTN });
-                c.text_centered(bx, by, bw, bh, b_label, TEXT_PRIMARY, FontSize::Small);
-                self.add_hit(bx, by, bw, bh, UiAction::SelectSlot(i));
-                self.add_hit(bx, by, bw, bh, UiAction::GotoScreen(target_scr));
-                bx += bw + 8;
-            }
-        }
-    }
-
-    // --- Screen: Char (Character Status & Appearance) ----------------------
-    fn draw_char(&mut self, c: &mut Canvas, ed: &Editor) {
-        let total = CHAR_FIELDS.len();
-        let visible = 10;
-        let start = window_start(ed.field, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(&(key, ja)) = CHAR_FIELDS.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.field;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            // Category tag
-            let (cat_txt, cat_col) = if idx == 0 {
-                ("名前", ACCENT_CYAN)
-            } else if idx <= 4 {
-                ("基本", ACCENT_GOLD)
-            } else if idx <= 9 {
-                ("ポイント", ACCENT_GREEN)
-            } else {
-                ("外見", ACCENT_PURPLE)
-            };
-            c.round_rect(MAIN_X + 14, ry + 9, 68, 28, 5, BG_VAL_BOX);
-            c.round_rect_border(MAIN_X + 14, ry + 9, 68, 28, 5, 1, cat_col);
-            c.text_centered(MAIN_X + 14, ry + 9, 68, 28, cat_txt, cat_col, FontSize::Small);
-
-            // Label
-            // Labels are the secondary text now: the value next to them is
-            // the primary one, and two things cannot both be primary.
-            c.text_sized(MAIN_X + 94, ry + 11, ja, TEXT_SECONDARY, FontSize::Medium);
-            c.text_sized(MAIN_X + 290, ry + 14, key, TEXT_MUTED, FontSize::Small);
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            if idx == 0 {
-                // Character Name row
-                let name_val = ed.character().map(|ch| ch.name).unwrap_or_default();
-                let val_x = MAIN_X + list_w - 430;
-                c.round_rect(val_x, ry + 6, 260, 34, 6, BG_VAL_BOX);
-                c.round_rect_border(val_x, ry + 6, 260, 34, 6, 1, ACCENT_CYAN);
-                c.text_centered(val_x, ry + 6, 260, 34, &name_val, TEXT_GOLD, FontSize::Medium);
-                self.add_hit(val_x, ry + 6, 260, 34, UiAction::AdjustRow(idx, Key::Right));
-
-                let btn_x = val_x + 270;
-                c.round_rect(btn_x, ry + 6, 146, 34, 6, BG_BTN_PRIMARY);
-                c.round_rect_border(btn_x, ry + 6, 146, 34, 6, 1, ACCENT_CYAN);
-                c.text_centered(
-                    btn_x,
-                    ry + 6,
-                    146,
-                    34,
-                    "名前変更 [A / </>]",
-                    TEXT_PRIMARY,
+                c.text_sized(MAIN_X + 28, by + 76, &format!("変換元 : {}", src_kind), t.text_primary, FontSize::Medium);
+                c.text_sized(MAIN_X + 28, by + 114, &format!("変換先 : {}", dst_kind), t.accent_secondary, FontSize::Medium);
+                c.text_clipped(
+                    MAIN_X + 28,
+                    by + 152,
+                    MAIN_W - 56,
+                    &format!("出力名 : {}.{}  ({})", stem, ext, p.as_deref().unwrap_or("-")),
+                    t.text_secondary,
                     FontSize::Small,
                 );
-                self.add_hit(btn_x, ry + 6, 146, 34, UiAction::AdjustRow(idx, Key::Right));
-            } else {
-                // Numeric field row with [-] [ value ] [+] [MAX]
-                let raw_v = ed.char_value(idx);
-                let disp_v = match idx {
-                    1 => format!("{} z", raw_v),
-                    2 => format!(
-                        "{}時間{:02}分 ({}秒)",
-                        raw_v / 3600,
-                        (raw_v % 3600) / 60,
-                        raw_v
-                    ),
-                    3 => format!("HR {}", raw_v),
-                    13 => format!(
-                        "{} ({})",
-                        if raw_v == 0 { "男性" } else { "女性" },
-                        raw_v
-                    ),
-                    _ => format!("{}", raw_v),
-                };
 
-                let has_max = matches!(idx, 1 | 3 | 4 | 5..=9);
-                self.draw_value_stepper(
+                let btn_y = by + 216;
+                c.round_rect(MAIN_X + 28, btn_y, 200, 44, 6, t.bg_btn);
+                c.round_rect_border(MAIN_X + 28, btn_y, 200, 44, 6, 1, t.border_subtle);
+                btn_text(c, MAIN_X + 28, btn_y, 200, 44, "[Y] 出力名変更", t.text_primary, FontSize::Small);
+                self.add_hit(MAIN_X + 28, btn_y, 200, 44, UiAction::Key(Key::Y));
+
+                c.round_rect(MAIN_X + 244, btn_y, 220, 44, 6, t.accent_primary);
+                btn_text(
                     c,
-                    MAIN_X + list_w - 430,
-                    ry + 6,
-                    idx,
-                    &disp_v,
-                    selected,
-                    has_max,
+                    MAIN_X + 244,
+                    btn_y,
+                    220,
+                    44,
+                    "[A] 変換出力",
+                    white_or_dark(t.accent_primary),
+                    FontSize::Medium,
                 );
+                self.add_hit(MAIN_X + 244, btn_y, 220, 44, UiAction::Key(Key::A));
             }
         }
-
-        self.draw_scrollbar(c, ed.field, total, visible);
     }
 
-    // --- Screen: Items (Item Box with Japanese Item Names & Steppers) ------
-    fn draw_items(&mut self, c: &mut Canvas, ed: &Editor) {
-        let vis = ed.visible_items();
-        let total = vis.len();
-        let visible = 10;
-        let start = window_start(ed.cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
+    fn draw_options(&mut self, c: &mut Canvas, ed: &Editor) {
+        let o = ed
+            .save
+            .as_ref()
+            .map(|s| s.options())
+            .unwrap_or_else(Options::default);
+        let rows = alloc::vec![
+            (
+                0,
+                String::from("画面の明るさ"),
+                String::from("Brightness"),
+                format!("{}", o.brightness),
+                String::from("#01"),
+            ),
+            (
+                1,
+                String::from("振動設定"),
+                String::from("Rumble"),
+                String::from(if o.rumble != 0 { "ON" } else { "OFF" }),
+                String::from("#02"),
+            ),
+            (
+                2,
+                String::from("3D表示無効"),
+                String::from("3DS Flag"),
+                String::from(if o.disable_3d != 0 { "YES" } else { "NO" }),
+                String::from("#03"),
+            ),
+            (
+                3,
+                String::from("拡張スライドパッド"),
+                String::from("3DS Flag"),
+                String::from(if o.circle_pad_pro != 0 { "ON" } else { "OFF" }),
+                String::from("#04"),
+            ),
+        ];
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "環境設定",
+            "",
+            &rows,
+            ed.option_cursor.min(3),
+            true,
+            "切替",
+        );
+    }
 
-        let Some(items) = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot)) else {
-            return;
+    fn draw_char(&mut self, c: &mut Canvas, ed: &Editor) {
+        let is_appearance = ed.field >= 10;
+        let range = if is_appearance {
+            10..CHAR_FIELDS.len()
+        } else {
+            0..10.min(CHAR_FIELDS.len())
         };
 
-        for row in 0..visible {
-            let v_idx = start + row;
-            let Some(&box_idx) = vis.get(v_idx) else {
-                break;
-            };
-            let slot = items[box_idx];
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = v_idx == ed.cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
+        let mut rows = Vec::new();
+        for f in range {
+            let label = CHAR_FIELDS[f].1.to_string();
+            let val = if f == 0 {
+                ed.save
+                    .as_ref()
+                    .and_then(|s| s.read_character(ed.slot))
+                    .map(|ch| ch.name)
+                    .unwrap_or_else(|| String::from("-"))
             } else {
-                BG_CARD_ALT
+                let raw_v = ed.char_value(f);
+                match f {
+                    1 => format!("{} z", raw_v),
+                    2 => format!("{}h {:02}m", raw_v / 3600, (raw_v % 3600) / 60),
+                    5..=9 => format!("{} pts", raw_v),
+                    13 => String::from(if raw_v == 0 { "男性 (0)" } else { "女性 (1)" }),
+                    _ => format!("{}", raw_v),
+                }
             };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            // Box Page & Slot # badge
-            let page = box_idx / 100 + 1;
-            c.round_rect(MAIN_X + 14, ry + 8, 108, 30, 5, BG_VAL_BOX);
-            c.text_centered(
-                MAIN_X + 14,
-                ry + 8,
-                108,
-                30,
-                &format!("P{:02} #{}", page, box_idx + 1),
-                TEXT_SECONDARY,
-                FontSize::Small,
-            );
-
-            // Item ID & Japanese Item Name!
-            let item_name = if slot.id == 0 {
-                String::from("(空きスロット)")
-            } else {
-                item_name_of(slot.id)
+            let meta = match f {
+                0 => "最大 12 Byte",
+                1 => "上限 9,999,999",
+                2 => "秒単位",
+                3 => "上限 999",
+                4 => "上限 99,999,999",
+                5..=9 => "上限 9,999,999",
+                13 => "0: 男性 / 1: 女性",
+                _ => "外見パラメータ",
             };
-            let id_str = format!("ID:{:04}", slot.id);
-            c.text_sized(MAIN_X + 132, ry + 14, &id_str, TEXT_MUTED, FontSize::Small);
-            c.text_clipped(
-                MAIN_X + 206,
-                ry + 11,
-                290,
-                &item_name,
-                if slot.id == 0 {
-                    TEXT_MUTED
-                } else {
-                    TEXT_PRIMARY
-                },
-                FontSize::Medium,
-            );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, v_idx);
-
-            // Change item type button [R 変更]
-            let pick_x = MAIN_X + list_w - 498;
-            c.round_rect(pick_x, ry + 6, 84, 34, 6, BG_BTN);
-            c.round_rect_border(pick_x, ry + 6, 84, 34, 6, 1, BORDER_BTN);
-            c.text_centered(pick_x, ry + 6, 84, 34, "[R] 変更", TEXT_CYAN, FontSize::Small);
-            self.add_hit(pick_x, ry + 6, 84, 34, UiAction::OpenItemPicker(v_idx));
-
-            // Count Stepper: [-] [ x99 ] [+] [99]
-            let cnt_str = format!("x {}", slot.count);
-            self.draw_value_stepper(
-                c,
-                MAIN_X + list_w - 406,
-                ry + 6,
-                v_idx,
-                &cnt_str,
-                selected,
-                true,
-            );
+            let badge = format!("#{:02}", f + 1);
+            rows.push((f, label, meta.to_string(), val, badge));
         }
 
-        self.draw_scrollbar(c, ed.cursor, total, visible);
+        let (hdr, a_lbl) = if is_appearance {
+            (
+                "外見・性別・ボイス",
+                if ed.field == 13 { "性別切替" } else { "変更" },
+            )
+        } else {
+            (
+                "基本ステータス・所持金・ポイント",
+                if ed.field == 0 { "名前変更" } else { "最大値" },
+            )
+        };
+
+        self.draw_adaptive_rows(c, ed, hdr, "", &rows, ed.field, true, a_lbl);
     }
 
-    // --- Screen: ItemPick & SkillPick --------------------------------------
-    fn draw_item_pick(&mut self, c: &mut Canvas, ed: &Editor) {
-        let matches = ed.item_pick_matches();
-        let total = matches.len();
-        let visible = 10;
-        let start = window_start(ed.item_pick_cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
+    fn draw_items(&mut self, c: &mut Canvas, ed: &Editor) {
+        let vis = ed.visible_items();
+        let all_slots = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot));
+        let mut rows = Vec::with_capacity(vis.len());
 
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(&id) = matches.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.item_pick_cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
+        for (list_idx, &box_slot) in vis.iter().enumerate() {
+            let (id, cnt) = all_slots
+                .as_ref()
+                .and_then(|b| b.get(box_slot))
+                .map(|it| (it.id, it.count))
+                .unwrap_or((0, 0));
+            let name = if id == 0 {
+                String::from("(空き)")
             } else {
-                BG_CARD_ALT
+                item_name_of(id)
             };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            c.round_rect(MAIN_X + 14, ry + 8, 86, 30, 5, BG_VAL_BOX);
-            c.text_centered(
-                MAIN_X + 14,
-                ry + 8,
-                86,
-                30,
-                &format!("ID {:04}", id),
-                TEXT_CYAN,
-                FontSize::Small,
-            );
-
-            let name = item_name_of(id);
-            c.text_clipped(
-                MAIN_X + 114,
-                ry + 11,
-                list_w - 250,
-                &name,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            let bx = MAIN_X + list_w - 116;
-            c.round_rect(bx, ry + 6, 102, 34, 6, if selected { BG_BTN_PRIMARY } else { BG_BTN });
-            c.round_rect_border(bx, ry + 6, 102, 34, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, ry + 6, 102, 34, "[A] 決定", TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, ry + 6, 102, 34, UiAction::Key(Key::A));
+            let page = box_slot / 100 + 1;
+            let pos = box_slot % 100 + 1;
+            let val = if id == 0 {
+                String::from("-")
             } else {
-                self.add_hit(bx, ry + 6, 102, 34, UiAction::SelectRow(idx));
-            }
+                format!("×{}", cnt)
+            };
+            rows.push((
+                list_idx,
+                name,
+                format!("BOX P{:02}-{:03} / ID:{:04}", page, pos, id),
+                val,
+                format!("#{:04}", box_slot + 1),
+            ));
         }
 
-        self.draw_scrollbar(c, ed.item_pick_cursor, total, visible);
+        let hdr = if ed.show_empty {
+            "アイテムBOX (全枠)"
+        } else {
+            "アイテムBOX (所持品)"
+        };
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            hdr,
+            "",
+            &rows,
+            ed.cursor.min(rows.len().saturating_sub(1)),
+            true,
+            "アイテム変更",
+        );
+    }
+
+    fn draw_item_pick(&mut self, c: &mut Canvas, ed: &Editor) {
+        let matches = ed.item_pick_matches();
+        let mut rows = Vec::with_capacity(matches.len());
+        for (i, &id) in matches.iter().enumerate() {
+            rows.push((
+                i,
+                item_name_of(id),
+                format!("Item ID: {}", id),
+                String::new(),
+                format!("{:04}", id),
+            ));
+        }
+        let hdr = if ed.item_pick_filter.is_empty() {
+            String::from("アイテム選択")
+        } else {
+            format!("アイテム選択 (検索: {})", ed.item_pick_filter)
+        };
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            &hdr,
+            "",
+            &rows,
+            ed.item_pick_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "決定",
+        );
     }
 
     fn draw_skill_pick(&mut self, c: &mut Canvas, ed: &Editor) {
         let matches = ed.skill_pick_matches();
-        let total = matches.len();
-        let visible = 10;
-        let start = window_start(ed.skill_pick_cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(&id) = matches.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.skill_pick_cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            c.round_rect(MAIN_X + 14, ry + 8, 86, 30, 5, BG_VAL_BOX);
-            c.text_centered(
-                MAIN_X + 14,
-                ry + 8,
-                86,
-                30,
-                &format!("ID {:03}", id),
-                ACCENT_PURPLE,
-                FontSize::Small,
-            );
-
-            let name = mhnx_core::skills::skill_name(id).unwrap_or("?");
-            c.text_clipped(
-                MAIN_X + 114,
-                ry + 11,
-                list_w - 250,
+        let mut rows = Vec::with_capacity(matches.len());
+        for (i, &id) in matches.iter().enumerate() {
+            let name = mhnx_core::skills::skill_name(id).unwrap_or("?").to_string();
+            rows.push((
+                i,
                 name,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            let bx = MAIN_X + list_w - 116;
-            c.round_rect(bx, ry + 6, 102, 34, 6, if selected { BG_BTN_PRIMARY } else { BG_BTN });
-            c.round_rect_border(bx, ry + 6, 102, 34, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, ry + 6, 102, 34, "[A] 決定", TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, ry + 6, 102, 34, UiAction::Key(Key::A));
-            } else {
-                self.add_hit(bx, ry + 6, 102, 34, UiAction::SelectRow(idx));
-            }
+                format!("Skill ID: {}", id),
+                String::new(),
+                format!("{:03}", id),
+            ));
         }
-
-        self.draw_scrollbar(c, ed.skill_pick_cursor, total, visible);
+        let hdr = if ed.skill_pick_filter.is_empty() {
+            String::from("スキル選択")
+        } else {
+            format!("スキル選択 (検索: {})", ed.skill_pick_filter)
+        };
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            &hdr,
+            "",
+            &rows,
+            ed.skill_pick_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "決定",
+        );
     }
 
-    // --- Screen: Charms & CharmEdit ----------------------------------------
     fn draw_charms(&mut self, c: &mut Canvas, ed: &Editor) {
         let list = ed.charms();
-        let total = list.len();
-        if total == 0 {
-            c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, 120, 10, BG_CARD);
-            c.text_centered(
-                MAIN_X,
-                CONTENT_Y,
-                MAIN_W,
-                120,
-                "お守りがありません。上部の「[L] 新規お守り作成」ボタンを押して作成できます。",
-                TEXT_SECONDARY,
-                FontSize::Medium,
-            );
-            return;
+        let mut rows = Vec::with_capacity(list.len());
+        for (i, chm) in list.iter().enumerate() {
+            let s1 = mhnx_core::skills::skill_name(chm.skill1).unwrap_or("なし");
+            let s2 = mhnx_core::skills::skill_name(chm.skill2).unwrap_or("なし");
+            let summary = if chm.skill2 != 0 {
+                format!("{} {:+} / {} {:+}", s1, chm.points1, s2, chm.points2)
+            } else {
+                format!("{} {:+}", s1, chm.points1)
+            };
+            let slots_str = format!("S{}", chm.slots);
+            rows.push((
+                i,
+                summary,
+                format!("装備BOX枠 #{:04}", chm.index),
+                slots_str,
+                format!("#{:02}", i + 1),
+            ));
         }
-        let visible = 10;
-        let start = window_start(ed.cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(chm) = list.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            // Box index
-            c.round_rect(MAIN_X + 14, ry + 8, 92, 30, 5, BG_VAL_BOX);
-            c.text_centered(
-                MAIN_X + 14,
-                ry + 8,
-                92,
-                30,
-                &format!("枠 #{:04}", chm.index),
-                ACCENT_PURPLE,
-                FontSize::Small,
-            );
-
-            // Skill 1 & Skill 2
-            let s1_name = mhnx_core::skills::skill_name(chm.skill1).unwrap_or("なし");
-            let s2_name = mhnx_core::skills::skill_name(chm.skill2).unwrap_or("なし");
-            let s1_txt = format!("第1: {} {:+}", s1_name, chm.points1);
-            let s2_txt = if chm.skill2 == 0 {
-                String::from("第2: (なし)")
-            } else {
-                format!("第2: {} {:+}", s2_name, chm.points2)
-            };
-            c.text_clipped(MAIN_X + 120, ry + 11, 240, &s1_txt, TEXT_PRIMARY, FontSize::Medium);
-            c.text_clipped(MAIN_X + 370, ry + 11, 240, &s2_txt, TEXT_GOLD, FontSize::Medium);
-
-            // Slots indicator
-            let slots_str = match chm.slots {
-                0 => "スロ: ーーー (0)",
-                1 => "スロ: ◯ーー (1)",
-                2 => "スロ: ◯◯ー (2)",
-                _ => "スロ: ◯◯◯ (3)",
-            };
-            c.text_sized(MAIN_X + 620, ry + 13, slots_str, TEXT_CYAN, FontSize::Small);
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            let bx = MAIN_X + list_w - 116;
-            c.round_rect(bx, ry + 6, 102, 34, 6, if selected { BG_BTN_PRIMARY } else { BG_BTN });
-            c.round_rect_border(bx, ry + 6, 102, 34, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, ry + 6, 102, 34, "[Y] 編集", TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, ry + 6, 102, 34, UiAction::Key(Key::Y));
-            } else {
-                self.add_hit(bx, ry + 6, 102, 34, UiAction::SelectRow(idx));
-            }
-        }
-
-        self.draw_scrollbar(c, ed.cursor, total, visible);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "護石一覧",
+            "",
+            &rows,
+            ed.cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "編集",
+        );
     }
 
     fn draw_charm_edit(&mut self, c: &mut Canvas, ed: &Editor) {
-        let ce = ed.charm_edit.unwrap_or_default();
-        let s1_name = mhnx_core::skills::skill_name(ce.skill1).unwrap_or("なし");
-        let s2_name = mhnx_core::skills::skill_name(ce.skill2).unwrap_or("なし");
-        let slots_disp = match ce.slots {
-            0 => "ーーー (0スロ)",
-            1 => "◯ーー (1スロ)",
-            2 => "◯◯ー (2スロ)",
-            _ => "◯◯◯ (3スロ)",
+        let Some(ce) = ed.charm_edit else {
+            return;
         };
-
-        let rows: [(&str, String, bool); 6] = [
-            ("装備BOX枠番号", format!("枠 #{}", ce.index), false),
-            ("スロット数", String::from(slots_disp), false),
-            ("第1スキル種類", format!("{} (ID: {})", s1_name, ce.skill1), true),
-            ("第1スキルポイント", format!("{:+}", ce.points1), false),
-            ("第2スキル種類", format!("{} (ID: {})", s2_name, ce.skill2), true),
-            ("第2スキルポイント", format!("{:+}", ce.points2), false),
+        let s1 = mhnx_core::skills::skill_name(ce.skill1).unwrap_or("なし");
+        let s2 = mhnx_core::skills::skill_name(ce.skill2).unwrap_or("なし");
+        let rows = alloc::vec![
+            (
+                0,
+                String::from("装備BOX枠"),
+                String::from("対象スロット"),
+                format!("#{:04}", ce.index),
+                String::from("#01"),
+            ),
+            (
+                1,
+                String::from("スロット数"),
+                String::from("0 〜 3"),
+                format!("S{} ({})", ce.slots, "◯".repeat(ce.slots.min(3) as usize)),
+                String::from("#02"),
+            ),
+            (
+                2,
+                String::from("第1スキル"),
+                format!("Skill ID: {}", ce.skill1),
+                s1.to_string(),
+                String::from("#03"),
+            ),
+            (
+                3,
+                String::from("第1スキル値"),
+                String::from("-10 〜 +14"),
+                format!("{:+}", ce.points1),
+                String::from("#04"),
+            ),
+            (
+                4,
+                String::from("第2スキル"),
+                format!("Skill ID: {}", ce.skill2),
+                s2.to_string(),
+                String::from("#05"),
+            ),
+            (
+                5,
+                String::from("第2スキル値"),
+                String::from("-10 〜 +14"),
+                format!("{:+}", ce.points2),
+                String::from("#06"),
+            ),
         ];
 
-        let row_h = 52;
-        for (i, (label, val, is_skill_id)) in rows.iter().enumerate() {
-            let ry = CONTENT_Y + (i as i32) * (row_h + 6);
-            let selected = ce.field == i;
+        let a_lbl = if ce.field == 2 || ce.field == 4 {
+            "スキル選択"
+        } else if ce.field == 1 {
+            "スロ数変更"
+        } else {
+            "BOXへ反映"
+        };
 
-            c.round_rect(
-                MAIN_X,
-                ry,
-                MAIN_W,
-                row_h,
-                8,
-                if selected { BG_SELECTED } else { BG_CARD },
-            );
-            c.round_rect_border(
-                MAIN_X,
-                ry,
-                MAIN_W,
-                row_h,
-                8,
-                if selected { 2 } else { 1 },
-                if selected { ACCENT_CYAN } else { BORDER_CARD },
-            );
-            if selected {
-                c.round_rect(MAIN_X + 3, ry + 6, 5, row_h - 12, 2, ACCENT_CYAN);
-            }
-
-            c.text_sized(MAIN_X + 20, ry + 14, label, TEXT_PRIMARY, FontSize::Medium);
-            self.add_row_hit(MAIN_X, ry, MAIN_W, row_h, i);
-
-            if *is_skill_id {
-                let pick_x = MAIN_X + MAIN_W - 510;
-                c.round_rect(pick_x, ry + 9, 150, 34, 6, BG_BTN_PRIMARY);
-                c.round_rect_border(pick_x, ry + 9, 150, 34, 6, 1, ACCENT_CYAN);
-                c.text_centered(
-                    pick_x,
-                    ry + 9,
-                    150,
-                    34,
-                    "[Y] 名前から選択",
-                    TEXT_PRIMARY,
-                    FontSize::Small,
-                );
-                self.add_hit(pick_x, ry + 9, 150, 34, UiAction::OpenCharmSkill(i));
-            }
-
-            self.draw_value_stepper(
-                c,
-                MAIN_X + MAIN_W - 350,
-                ry + 9,
-                i,
-                val,
-                selected,
-                false,
-            );
-        }
-
-        // Legality / Allowed Skill Points Inspector Panel at bottom of CharmEdit
-        let panel_y = CONTENT_Y + 6 * (row_h + 6) + 8;
-        let panel_h = CONTENT_Y + CONTENT_H - panel_y;
-        if panel_h >= 60 {
-            c.round_rect(MAIN_X, panel_y, MAIN_W, panel_h, 8, rgb(30, 30, 34));
-            c.round_rect_border(MAIN_X, panel_y, MAIN_W, panel_h, 8, 1, BORDER_CARD);
-
-            let ty = ed
-                .save
-                .as_ref()
-                .and_then(|s| s.equipment_box(ed.slot))
-                .and_then(|b| b.get(ce.index * charm::CHARM_RECORD + 2).copied())
-                .unwrap_or(0);
-            let rarity_str = charm::rarity_of(ty)
-                .map(|r| format!("護石種別: 0x{:02X} (レア度 {})", ty, r))
-                .unwrap_or_else(|| format!("護石種別: 0x{:02X}", ty));
-            c.text_sized(
-                MAIN_X + 18,
-                panel_y + 10,
-                &format!("適正範囲チェック — {}", rarity_str),
-                TEXT_CYAN,
-                FontSize::Small,
-            );
-
-            let mut py = panel_y + 36;
-            for (tag, sid, pts, second) in [
-                ("第1スキル", ce.skill1, ce.points1, false),
-                ("第2スキル", ce.skill2, ce.points2, true),
-            ] {
-                if sid == 0 {
-                    c.text_sized(
-                        MAIN_X + 24,
-                        py,
-                        &format!("{}: 未設定 (問題なし)", tag),
-                        TEXT_SECONDARY,
-                        FontSize::Small,
-                    );
-                } else if let Some(r) = charm::allowed_points(ty, sid, second) {
-                    let sname = mhnx_core::skills::skill_name(sid).unwrap_or("?");
-                    if r.min == 0 && r.max == 0 {
-                        c.text_sized(
-                            MAIN_X + 24,
-                            py,
-                            &format!(
-                                "⚠ {}: 「{}」はこの護石種別には付与できません（ゲーム内で消去されます）",
-                                tag, sname
-                            ),
-                            ACCENT_RED,
-                            FontSize::Small,
-                        );
-                    } else if pts < r.min || pts > r.max {
-                        c.text_sized(
-                            MAIN_X + 24,
-                            py,
-                            &format!(
-                                "⚠ {}: 「{} {:+}」は範囲外です（許容範囲: {:+} 〜 {:+}）",
-                                tag, sname, pts, r.min, r.max
-                            ),
-                            ACCENT_ORANGE,
-                            FontSize::Small,
-                        );
-                    } else {
-                        c.text_sized(
-                            MAIN_X + 24,
-                            py,
-                            &format!(
-                                "✓ {}: 「{} {:+}」は正常範囲内です（許容範囲: {:+} 〜 {:+}）",
-                                tag, sname, pts, r.min, r.max
-                            ),
-                            ACCENT_GREEN,
-                            FontSize::Small,
-                        );
-                    }
-                }
-                py += 26;
-            }
-
-            // Apply button inside panel
-            let apply_x = MAIN_X + MAIN_W - 190;
-            let apply_y = panel_y + panel_h - 46;
-            c.round_rect(apply_x, apply_y, 174, 36, 7, BG_BTN_PRIMARY);
-            c.round_rect_border(apply_x, apply_y, 174, 36, 7, 2, ACCENT_CYAN);
-            c.text_centered(
-                apply_x,
-                apply_y,
-                174,
-                36,
-                "[A] お守りを反映",
-                TEXT_PRIMARY,
-                FontSize::Small,
-            );
-            self.add_hit(apply_x, apply_y, 174, 36, UiAction::Key(Key::A));
-        }
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "護石編集",
+            "",
+            &rows,
+            ce.field.min(5),
+            true,
+            a_lbl,
+        );
     }
 
-    // --- Screen: Equip -----------------------------------------------------
     fn draw_equip(&mut self, c: &mut Canvas, ed: &Editor) {
         let all = ed.equipment();
-        let total = all.len();
-        let visible = 10;
-        let start = window_start(ed.equip_cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(eq) = all.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.equip_cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            c.round_rect(MAIN_X + 14, ry + 8, 92, 30, 5, BG_VAL_BOX);
-            c.text_centered(
-                MAIN_X + 14,
-                ry + 8,
-                92,
-                30,
-                &format!("枠 #{:04}", eq.index),
-                TEXT_SECONDARY,
-                FontSize::Small,
-            );
-
+        let mut rows = Vec::with_capacity(all.len());
+        for (i, eq) in all.iter().enumerate() {
             let tname = mhnx_core::equip::type_name(eq.kind);
-            c.round_rect(MAIN_X + 114, ry + 8, 120, 30, 5, rgb(44, 44, 50));
-            c.text_centered(MAIN_X + 114, ry + 8, 120, 30, tname, TEXT_CYAN, FontSize::Small);
-
-            c.text_sized(
-                MAIN_X + 248,
-                ry + 13,
-                &format!("Lv {}", eq.level),
-                TEXT_GOLD,
-                FontSize::Small,
-            );
-
-            let ename = mhnx_core::equip::name(eq);
-            c.text_clipped(
-                MAIN_X + 320,
-                ry + 11,
-                list_w - 340,
-                &ename,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
+            let ename = mhnx_core::equip::name(eq).to_string();
+            rows.push((
+                i,
+                ename,
+                format!("枠 #{:04} / {}", eq.index, tname),
+                format!("Lv{}", eq.level),
+                tname.to_string(),
+            ));
         }
-
-        self.draw_scrollbar(c, ed.equip_cursor, total, visible);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "装備BOX",
+            "",
+            &rows,
+            ed.equip_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "選択",
+        );
     }
 
-    // --- Screen: Hunts (Monster Hunt / Capture / Crown Sizes) --------------
+    fn draw_sets(&mut self, c: &mut Canvas, ed: &Editor) {
+        let Some(save) = &ed.save else {
+            return;
+        };
+        let mut rows = Vec::new();
+        if self.sets_tab == 0 {
+            for (i, s) in mhnx_core::myset::item_sets(save, ed.slot).into_iter().enumerate() {
+                if !s.is_empty() {
+                    let n = s.used_items().len();
+                    let idx = rows.len();
+                    rows.push((
+                        idx,
+                        s.name,
+                        format!("アイテムセット #{}", i + 1),
+                        format!("{}枠", n),
+                        format!("#{:02}", i + 1),
+                    ));
+                }
+            }
+        } else {
+            for (i, s) in mhnx_core::myset::equip_sets(save, ed.slot).into_iter().enumerate() {
+                if !s.is_empty() {
+                    let n = s.parts.iter().filter(|&&p| p != 0).count();
+                    let idx = rows.len();
+                    rows.push((
+                        idx,
+                        s.name,
+                        format!("装備セット #{}", i + 1),
+                        format!("{}部位", n),
+                        format!("#{:02}", i + 1),
+                    ));
+                }
+            }
+        }
+        let hdr = if self.sets_tab == 0 {
+            "マイセット (アイテム)"
+        } else {
+            "マイセット (装備)"
+        };
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            hdr,
+            "",
+            &rows,
+            self.sets_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "切替",
+        );
+    }
+
+    fn draw_roster(&mut self, c: &mut Canvas, ed: &Editor) {
+        let list = ed.palicos();
+        let target_col = match ed.roster_field {
+            0 => "Lv",
+            1 => "なつき度",
+            _ => "EXP",
+        };
+        let mut rows = Vec::with_capacity(list.len());
+        for (i, p) in list.iter().enumerate() {
+            let val = match ed.roster_field {
+                0 => format!("Lv {}", p.level),
+                1 => format!("なつき {}", p.enthusiasm),
+                _ => format!("EXP {}", p.exp),
+            };
+            rows.push((
+                i,
+                p.name.clone(),
+                format!("Lv:{} / なつき:{} / EXP:{}", p.level, p.enthusiasm, p.exp),
+                val,
+                format!("#{:02}", p.index + 1),
+            ));
+        }
+        let hdr = format!("所持オトモ (編集列: {})", target_col);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            &hdr,
+            "",
+            &rows,
+            ed.roster_cursor.min(rows.len().saturating_sub(1)),
+            true,
+            "名前変更",
+        );
+    }
+
+    fn draw_palico(&mut self, c: &mut Canvas, ed: &Editor) {
+        let ids = dlcats::all_ids();
+        let lang = if ed.palico_lang == 0 { Lang::Jp } else { Lang::En };
+        let installed_ids: Vec<u8> = ed
+            .save
+            .as_ref()
+            .map(|s| s.dlc_palicoes().iter().map(|cat| cat.id).collect())
+            .unwrap_or_default();
+        let mut rows = Vec::with_capacity(ids.len());
+        for (i, &id) in ids.iter().enumerate() {
+            let name = dlcats::record(lang, id)
+                .map(dlcats::record_name)
+                .unwrap_or_else(|| format!("DLC #{}", id));
+            let installed = installed_ids.contains(&id);
+            let status = if installed { "導入済" } else { "未導入" };
+            rows.push((
+                i,
+                name,
+                format!("DLC ID: {}", id),
+                status.to_string(),
+                format!("#{:02}", i + 1),
+            ));
+        }
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "配信オトモ (全28匹)",
+            "",
+            &rows,
+            ed.palico_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "導入/解除",
+        );
+    }
+
     fn draw_hunts(&mut self, c: &mut Canvas, ed: &Editor) {
-        let rows = ed.hunt_rows();
-        let total = rows.len();
-        let visible = 9;
-        let start = window_start(ed.hunt_cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        // Column header bar
-        c.round_rect(MAIN_X, CONTENT_Y, list_w, 32, 6, rgb(32, 32, 36));
-        c.text_sized(MAIN_X + 16, CONTENT_Y + 6, "モンスター名", TEXT_SECONDARY, FontSize::Small);
-        let col_labels = ["討伐数", "捕獲数", "最小サイズ", "最大サイズ"];
-        for (f, col_name) in col_labels.iter().enumerate() {
-            let cx = MAIN_X + 330 + (f as i32) * 108;
-            let active_f = ed.hunt_field == f;
-            c.text_centered(
-                cx,
-                CONTENT_Y + 4,
-                100,
-                24,
-                col_name,
-                if active_f { TEXT_GOLD } else { TEXT_SECONDARY },
-                FontSize::Small,
-            );
-            self.add_hit(
-                cx,
-                CONTENT_Y,
-                100,
-                32,
-                UiAction::SelectSubField(ed.hunt_cursor, f),
-            );
-        }
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(&(id, slay, cap, lo, hi)) = rows.get(idx) else {
-                break;
+        let hunt_list = ed.hunt_rows();
+        let col_name = match ed.hunt_field {
+            0 => "討伐数",
+            1 => "捕獲数",
+            2 => "最小サイズ",
+            _ => "最大サイズ",
+        };
+        let mut rows = Vec::with_capacity(hunt_list.len());
+        for (i, &(id, slay, cap, lo, hi)) in hunt_list.iter().enumerate() {
+            let mname = monster_name(id);
+            let val = match ed.hunt_field {
+                0 => format!("討伐 {}", slay),
+                1 => format!("捕獲 {}", cap),
+                2 => format!("最小 {}%", lo),
+                _ => format!("最大 {}%", hi),
             };
-            let ry = CONTENT_Y + 38 + (row as i32) * (row_h + 4);
-            let selected = idx == ed.hunt_cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            c.text_clipped(
-                MAIN_X + 16,
-                ry + 11,
-                304,
-                &format!("#{:03}  {}", id, monster_name(id)),
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            self.add_row_hit(MAIN_X, ry, 320, row_h, idx);
-
-            let vals = [slay, cap, lo, hi];
-            for (f, &v) in vals.iter().enumerate() {
-                let cx = MAIN_X + 330 + (f as i32) * 108;
-                let is_active_cell = selected && ed.hunt_field == f;
-                c.round_rect(
-                    cx,
-                    ry + 6,
-                    100,
-                    34,
-                    6,
-                    if is_active_cell {
-                        BG_VAL_ACTIVE
-                    } else {
-                        BG_VAL_BOX
-                    },
-                );
-                c.round_rect_border(
-                    cx,
-                    ry + 6,
-                    100,
-                    34,
-                    6,
-                    if is_active_cell { 2 } else { 1 },
-                    if is_active_cell {
-                        ACCENT_GOLD
-                    } else {
-                        BORDER_SUBTLE
-                    },
-                );
-                c.text_centered(
-                    cx,
-                    ry + 6,
-                    100,
-                    34,
-                    &format!("{}", v),
-                    if is_active_cell {
-                        TEXT_GOLD
-                    } else {
-                        TEXT_PRIMARY
-                    },
-                    FontSize::Small,
-                );
-                self.add_hit(cx, ry + 6, 100, 34, UiAction::SelectSubField(idx, f));
-            }
-
-            // [-] [+] buttons on the right of each monster row
-            let bx = MAIN_X + list_w - 172;
-            self.draw_mini_pm_buttons(c, bx, ry + 6, idx, selected);
+            rows.push((
+                i,
+                mname.to_string(),
+                format!("討伐:{} / 捕獲:{} / 最小:{}% / 最大:{}%", slay, cap, lo, hi),
+                val,
+                format!("#{:03}", id + 1),
+            ));
         }
-
-        self.draw_scrollbar(c, ed.hunt_cursor, total, visible);
+        let hdr = format!("狩猟記録 (編集列: {})", col_name);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            &hdr,
+            "",
+            &rows,
+            ed.hunt_cursor.min(rows.len().saturating_sub(1)),
+            true,
+            "刻み切替",
+        );
     }
 
-    // --- Screen: Guild (Guild Card & Arena Records) ------------------------
     fn draw_guild(&mut self, c: &mut Canvas, ed: &Editor) {
         let Some(save) = &ed.save else {
             return;
@@ -2962,2125 +4001,808 @@ impl GuiState {
         let hr = mhnx_core::guildcard::hunter_rank(save, ed.slot).unwrap_or(0);
         let time = mhnx_core::guildcard::play_time(save, ed.slot).unwrap_or(0);
         let comment = mhnx_core::guildcard::comment(save, ed.slot).unwrap_or_default();
-
-        let fields: [(&str, String); 3] = [
-            ("ギルドカード HR", format!("HR {}", hr)),
+        let rows = alloc::vec![
             (
-                "ギルドカード プレイ時間",
-                format!("{}時間{:02}分{:02}秒", time / 3600, (time % 3600) / 60, time % 60),
-            ),
-            ("ギルドカード コメント [A]", comment),
-        ];
-
-        for (i, (label, val)) in fields.iter().enumerate() {
-            let ry = CONTENT_Y + (i as i32) * 56;
-            let selected = ed.guild_field == i;
-            c.round_rect(
-                MAIN_X,
-                ry,
-                MAIN_W,
-                50,
-                8,
-                if selected { BG_SELECTED } else { BG_CARD },
-            );
-            c.round_rect_border(
-                MAIN_X,
-                ry,
-                MAIN_W,
-                50,
-                8,
-                if selected { 2 } else { 1 },
-                if selected { ACCENT_CYAN } else { BORDER_CARD },
-            );
-            c.text_sized(MAIN_X + 20, ry + 13, label, TEXT_PRIMARY, FontSize::Medium);
-            self.add_hit(MAIN_X, ry, MAIN_W, 50, UiAction::SelectSubField(i, i));
-
-            if i < 2 {
-                self.draw_value_stepper(
-                    c,
-                    MAIN_X + MAIN_W - 350,
-                    ry + 8,
-                    i,
-                    val,
-                    selected,
-                    false,
-                );
-            } else {
-                let vx = MAIN_X + 320;
-                let vw = MAIN_W - 340;
-                c.round_rect(vx, ry + 8, vw, 34, 6, BG_VAL_BOX);
-                c.round_rect_border(vx, ry + 8, vw, 34, 6, 1, ACCENT_CYAN);
-                c.text_clipped(vx + 12, ry + 12, vw - 24, val, TEXT_GOLD, FontSize::Small);
-                self.add_hit(vx, ry + 8, vw, 34, UiAction::SelectSubField(2, 2));
-            }
-        }
-
-        // Arena records table below
-        let ay = CONTENT_Y + 180;
-        let ah = CONTENT_Y + CONTENT_H - ay;
-        c.round_rect(MAIN_X, ay, MAIN_W, ah, 8, BG_CARD);
-        c.round_rect_border(MAIN_X, ay, MAIN_W, ah, 8, 1, BORDER_CARD);
-        c.text_sized(MAIN_X + 18, ay + 12, "闘技大会 記録一覧", TEXT_CYAN, FontSize::Medium);
-
-        let log = mhnx_core::guildcard::arena(save, ed.slot);
-        let mut ry = ay + 46;
-        for a in 0..mhnx_core::guildcard::ARENA_COUNT {
-            if ry + 26 > ay + ah {
-                break;
-            }
-            let times: Vec<String> = log
-                .iter()
-                .filter(|e| e.arena == a && !e.is_empty())
-                .map(|e| {
-                    let (m, s, cs) = e.as_clock();
-                    format!("{}:{:02}.{:02}", m, s, cs)
-                })
-                .collect();
-            if times.is_empty() {
-                continue;
-            }
-            c.text_clipped(
-                MAIN_X + 24,
-                ry,
-                MAIN_W - 48,
-                &format!("闘技 #{:02} :   {}", a, times.join("    ")),
-                TEXT_SECONDARY,
-                FontSize::Small,
-            );
-            ry += 26;
-        }
-    }
-
-    // --- Screen: Roster (Owned Palicoes) -----------------------------------
-    fn draw_roster(&mut self, c: &mut Canvas, ed: &Editor) {
-        let list = ed.palicos();
-        let total = list.len();
-        let visible = 9;
-        let start = window_start(ed.roster_cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        c.round_rect(MAIN_X, CONTENT_Y, list_w, 32, 6, rgb(32, 32, 36));
-        c.text_sized(
-            MAIN_X + 16,
-            CONTENT_Y + 6,
-            "オトモ名 (タップ/Aで名前変更)",
-            TEXT_SECONDARY,
-            FontSize::Small,
-        );
-        let cols = ["レベル (Lv)", "なつき度", "経験値 (EXP)"];
-        for (f, col_name) in cols.iter().enumerate() {
-            let cx = MAIN_X + 330 + (f as i32) * 140;
-            let active_f = ed.roster_field == f;
-            c.text_centered(
-                cx,
-                CONTENT_Y + 4,
-                130,
-                24,
-                col_name,
-                if active_f { TEXT_GOLD } else { TEXT_SECONDARY },
-                FontSize::Small,
-            );
-            self.add_hit(
-                cx,
-                CONTENT_Y,
-                130,
-                32,
-                UiAction::SelectSubField(ed.roster_cursor, f),
-            );
-        }
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(p) = list.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + 38 + (row as i32) * (row_h + 4);
-            let selected = idx == ed.roster_cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            c.text_clipped(
-                MAIN_X + 16,
-                ry + 11,
-                300,
-                &format!("#{:02}  {}", p.index, p.name),
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            self.add_row_hit(MAIN_X, ry, 320, row_h, idx);
-
-            let vals = [
-                format!("Lv {}", p.level),
-                format!("{}", p.enthusiasm),
-                format!("{}", p.exp),
-            ];
-            for (f, v_str) in vals.iter().enumerate() {
-                let cx = MAIN_X + 330 + (f as i32) * 140;
-                let is_active = selected && ed.roster_field == f;
-                c.round_rect(
-                    cx,
-                    ry + 6,
-                    130,
-                    34,
-                    6,
-                    if is_active { BG_VAL_ACTIVE } else { BG_VAL_BOX },
-                );
-                c.round_rect_border(
-                    cx,
-                    ry + 6,
-                    130,
-                    34,
-                    6,
-                    if is_active { 2 } else { 1 },
-                    if is_active { ACCENT_GOLD } else { BORDER_SUBTLE },
-                );
-                c.text_centered(
-                    cx,
-                    ry + 6,
-                    130,
-                    34,
-                    v_str,
-                    if is_active { TEXT_GOLD } else { TEXT_PRIMARY },
-                    FontSize::Small,
-                );
-                self.add_hit(cx, ry + 6, 130, 34, UiAction::SelectSubField(idx, f));
-            }
-
-            let bx = MAIN_X + list_w - 172;
-            self.draw_mini_pm_buttons(c, bx, ry + 6, idx, selected);
-        }
-
-        self.draw_scrollbar(c, ed.roster_cursor, total, visible);
-    }
-
-    // --- Screen: Sets (Item Sets & Equipment Sets) -------------------------
-    fn draw_sets(&mut self, c: &mut Canvas, ed: &Editor) {
-        let Some(save) = &ed.save else {
-            return;
-        };
-        let col_w = (MAIN_W - 16) / 2;
-
-        // Left Card: Item Sets
-        c.round_rect(MAIN_X, CONTENT_Y, col_w, CONTENT_H, 8, BG_CARD);
-        c.round_rect_border(MAIN_X, CONTENT_Y, col_w, CONTENT_H, 8, 1, BORDER_CARD);
-        c.text_sized(
-            MAIN_X + 18,
-            CONTENT_Y + 12,
-            "アイテムマイセット",
-            ACCENT_GREEN,
-            FontSize::Medium,
-        );
-        let mut iy = CONTENT_Y + 48;
-        for set in mhnx_core::myset::item_sets(save, ed.slot) {
-            if set.is_empty() || iy + 28 > CONTENT_Y + CONTENT_H {
-                continue;
-            }
-            let n = set.used_items().len();
-            c.text_clipped(
-                MAIN_X + 20,
-                iy,
-                col_w - 40,
-                &format!("[{:02}]  {}  ({}枠)", set.index, set.name, n),
-                TEXT_PRIMARY,
-                FontSize::Small,
-            );
-            iy += 28;
-        }
-
-        // Right Card: Equipment Sets
-        let rx = MAIN_X + col_w + 16;
-        c.round_rect(rx, CONTENT_Y, col_w, CONTENT_H, 8, BG_CARD);
-        c.round_rect_border(rx, CONTENT_Y, col_w, CONTENT_H, 8, 1, BORDER_CARD);
-        c.text_sized(
-            rx + 18,
-            CONTENT_Y + 12,
-            "装備マイセット",
-            ACCENT_GOLD,
-            FontSize::Medium,
-        );
-        let mut ey = CONTENT_Y + 48;
-        for set in mhnx_core::myset::equip_sets(save, ed.slot) {
-            if set.is_empty() || ey + 28 > CONTENT_Y + CONTENT_H {
-                continue;
-            }
-            c.text_clipped(
-                rx + 20,
-                ey,
-                col_w - 40,
-                &format!("[{:02}]  {}", set.index, set.name),
-                TEXT_PRIMARY,
-                FontSize::Small,
-            );
-            ey += 28;
-        }
-    }
-
-    // --- Screen: Palico (Download Palico Catalogue) ------------------------
-    fn draw_palico(&mut self, c: &mut Canvas, ed: &Editor) {
-        let lang = if ed.palico_lang == 0 {
-            Lang::Jp
-        } else {
-            Lang::En
-        };
-        let installed: Vec<u8> = ed
-            .save
-            .as_ref()
-            .map(|s| s.dlc_palicoes().iter().map(|cat| cat.id).collect())
-            .unwrap_or_default();
-        let ids = dlcats::all_ids();
-        let total = ids.len();
-        let visible = 10;
-        let start = window_start(ed.palico_cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(&id) = ids.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.palico_cursor;
-            let has_it = installed.contains(&id);
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            // Installed badge
-            let (b_txt, b_col) = if has_it {
-                ("導入済", ACCENT_GREEN)
-            } else {
-                ("未導入", BORDER_BTN)
-            };
-            c.round_rect(MAIN_X + 14, ry + 8, 84, 30, 5, b_col);
-            c.text_centered(
-                MAIN_X + 14,
-                ry + 8,
-                84,
-                30,
-                b_txt,
-                if has_it { BG_MAIN } else { TEXT_PRIMARY },
-                FontSize::Small,
-            );
-
-            c.text_sized(
-                MAIN_X + 112,
-                ry + 13,
-                &format!("ID 0x{:02X}", id),
-                TEXT_MUTED,
-                FontSize::Small,
-            );
-
-            let name = dlcats::record(lang, id)
-                .map(dlcats::record_name)
-                .unwrap_or_default();
-            c.text_clipped(
-                MAIN_X + 206,
-                ry + 11,
-                list_w - 360,
-                &name,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            let bx = MAIN_X + list_w - 134;
-            let btn_lbl = if has_it { "[A] 解除する" } else { "[A] 導入する" };
-            c.round_rect(bx, ry + 6, 120, 34, 6, if has_it { BG_BTN } else { BG_BTN_PRIMARY });
-            c.round_rect_border(bx, ry + 6, 120, 34, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, ry + 6, 120, 34, btn_lbl, TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, ry + 6, 120, 34, UiAction::Key(Key::A));
-            } else {
-                self.add_hit(bx, ry + 6, 120, 34, UiAction::SelectRow(idx));
-            }
-        }
-
-        self.draw_scrollbar(c, ed.palico_cursor, total, visible);
-    }
-
-    // --- Screen: Options & Convert -----------------------------------------
-    fn draw_options(&mut self, c: &mut Canvas, ed: &Editor) {
-        let o = ed
-            .save
-            .as_ref()
-            .map(|s| s.options())
-            .unwrap_or_else(Options::default);
-        let rows: [(&str, String); 4] = [
-            ("画面の明るさ (Brightness)", format!("{}", o.brightness)),
-            (
-                "コントローラー振動 (Rumble)",
-                String::from(if o.rumble != 0 { "ON (有効)" } else { "OFF (無効)" }),
+                0,
+                String::from("ギルドカード HR"),
+                String::from("Hunter Rank"),
+                format!("HR {}", hr),
+                String::from("#01"),
             ),
             (
-                "3D表示の無効化 (3DSフラグ)",
-                String::from(if o.disable_3d != 0 { "YES" } else { "NO" }),
+                1,
+                String::from("プレイ時間"),
+                String::from("Play Time"),
+                format!("{}h {:02}m", time / 3600, (time % 3600) / 60),
+                String::from("#02"),
             ),
             (
-                "拡張スライドパッド (3DSフラグ)",
-                String::from(if o.circle_pad_pro != 0 { "ON" } else { "OFF" }),
+                2,
+                String::from("コメント"),
+                String::from("Greeting"),
+                comment,
+                String::from("#03"),
             ),
         ];
-
-        for (i, (label, val)) in rows.iter().enumerate() {
-            let ry = CONTENT_Y + (i as i32) * 64;
-            let selected = ed.option_cursor == i;
-            c.round_rect(
-                MAIN_X,
-                ry,
-                MAIN_W,
-                56,
-                8,
-                if selected { BG_SELECTED } else { BG_CARD },
-            );
-            c.round_rect_border(
-                MAIN_X,
-                ry,
-                MAIN_W,
-                56,
-                8,
-                if selected { 2 } else { 1 },
-                if selected { ACCENT_CYAN } else { BORDER_CARD },
-            );
-            c.text_sized(MAIN_X + 22, ry + 15, label, TEXT_PRIMARY, FontSize::Medium);
-            self.add_row_hit(MAIN_X, ry, MAIN_W, 56, i);
-            self.draw_value_stepper(
-                c,
-                MAIN_X + MAIN_W - 350,
-                ry + 11,
-                i,
-                val,
-                selected,
-                false,
-            );
-        }
-
-        // Link card to Convert screen
-        let cy = CONTENT_Y + 4 * 64 + 16;
-        c.round_rect(MAIN_X, cy, MAIN_W, 74, 8, BG_CARD);
-        c.round_rect_border(MAIN_X, cy, MAIN_W, 74, 8, 1, ACCENT_GOLD);
-        c.text_sized(
-            MAIN_X + 22,
-            cy + 14,
-            "3DS ⇔ Switch セーブデータコンテナ変換",
-            TEXT_GOLD,
-            FontSize::Medium,
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "ギルドカード",
+            "",
+            &rows,
+            ed.guild_field.min(2),
+            true,
+            "編集",
         );
-        c.text_sized(
-            MAIN_X + 22,
-            cy + 44,
-            "3DS版MHXXとSwitch版MHXXの間でセーブデータのヘッダ変換を行います",
-            TEXT_SECONDARY,
-            FontSize::Small,
-        );
-        let bx = MAIN_X + MAIN_W - 190;
-        c.round_rect(bx, cy + 18, 170, 38, 6, BG_BTN_PRIMARY);
-        c.round_rect_border(bx, cy + 18, 170, 38, 6, 1, ACCENT_CYAN);
-        c.text_centered(
-            bx,
-            cy + 18,
-            170,
-            38,
-            "変換画面を開く",
-            TEXT_PRIMARY,
-            FontSize::Small,
-        );
-        self.add_hit(bx, cy + 18, 170, 38, UiAction::GotoScreen(Screen::Convert));
     }
 
-    fn draw_convert(&mut self, c: &mut Canvas, ed: &Editor) {
-        c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, 290, 10, BG_CARD);
-        c.round_rect_border(MAIN_X, CONTENT_Y, MAIN_W, 290, 10, 1, BORDER_CARD);
-
-        c.text_sized(
-            MAIN_X + 24,
-            CONTENT_Y + 18,
-            "3DS ⇔ Nintendo Switch セーブフォーマット変換",
-            TEXT_CYAN,
-            FontSize::Large,
-        );
-
-        match (&ed.save, &ed.save_path) {
-            (None, _) => {
-                c.text_sized(
-                    MAIN_X + 24,
-                    CONTENT_Y + 70,
-                    "先に「セーブデータ選択」から変換元のセーブを開いてください。",
-                    TEXT_SECONDARY,
-                    FontSize::Medium,
-                );
-            }
-            (Some(s), p) => {
-                let src_kind = match s.kind() {
-                    SaveKind::ThreeDs => "3DS版 MHXX (ヘッダなし)",
-                    SaveKind::Switch => "Switch版 MHXX (36バイトヘッダ付き)",
-                    SaveKind::Mhgu => "Switch版 MHGU",
-                };
-                let dst_kind = if s.kind() == SaveKind::ThreeDs {
-                    "Switch版 MHXX (36バイトヘッダを付与)"
-                } else {
-                    "3DS版 MHXX (ヘッダを除去)"
-                };
-                let stem = if ed.convert_name.trim().is_empty() {
-                    "system"
-                } else {
-                    ed.convert_name.trim()
-                };
-                let ext = if s.kind() == SaveKind::ThreeDs {
-                    "switch"
-                } else {
-                    "3ds"
-                };
-
-                c.text_sized(
-                    MAIN_X + 28,
-                    CONTENT_Y + 68,
-                    &format!("変換元フォーマット :   {}", src_kind),
-                    TEXT_PRIMARY,
-                    FontSize::Medium,
-                );
-                c.text_sized(
-                    MAIN_X + 28,
-                    CONTENT_Y + 106,
-                    &format!("変換先フォーマット :   {}", dst_kind),
-                    TEXT_GOLD,
-                    FontSize::Medium,
-                );
-                c.text_sized(
-                    MAIN_X + 28,
-                    CONTENT_Y + 144,
-                    &format!(
-                        "出力ファイル名     :   {}.{}   (元パス: {})",
-                        stem,
-                        ext,
-                        p.as_deref().unwrap_or("-")
-                    ),
-                    TEXT_SECONDARY,
-                    FontSize::Small,
-                );
-
-                // Buttons
-                let by = CONTENT_Y + 206;
-                c.round_rect(MAIN_X + 28, by, 220, 46, 8, BG_BTN);
-                c.round_rect_border(MAIN_X + 28, by, 220, 46, 8, 1, BORDER_BTN);
-                c.text_centered(
-                    MAIN_X + 28,
-                    by,
-                    220,
-                    46,
-                    "[Y] 出力ファイル名変更",
-                    TEXT_PRIMARY,
-                    FontSize::Small,
-                );
-                self.add_hit(MAIN_X + 28, by, 220, 46, UiAction::Key(Key::Y));
-
-                c.round_rect(MAIN_X + 268, by, 240, 46, 8, BG_BTN_PRIMARY);
-                c.round_rect_border(MAIN_X + 268, by, 240, 46, 8, 2, ACCENT_CYAN);
-                c.text_centered(
-                    MAIN_X + 268,
-                    by,
-                    240,
-                    46,
-                    "[A] 変換して書き出す",
-                    TEXT_PRIMARY,
-                    FontSize::Medium,
-                );
-                self.add_hit(MAIN_X + 268, by, 240, 46, UiAction::Key(Key::A));
-            }
-        }
-    }
-
-    // --- Screen: SaveQuests & QuestEquip -----------------------------------
     fn draw_save_quests(&mut self, c: &mut Canvas, ed: &Editor) {
-        let save_list = ed.filtered_quests();
-        let all_in_save = ed.save_quests();
-        let list_w = MAIN_W - 44;
-
-        // Top 3-Tab Category Bar ([L ◀] セーブ内 / 公式イベント (189件) / 没データ (34件) [▶ R])
-        let tab_labels: [String; 3] = [
-            format!("セーブ内 ({}/205枠)", all_in_save.len()),
-            String::from("公式イベント (189件)"),
-            String::from("没データ・予備 (34件)"),
-        ];
-        let tab_cols: [Color; 3] = [ACCENT_CYAN, ACCENT_GREEN, ACCENT_ORANGE];
-        let tab_w = (list_w - 12) / 3;
-        let tab_h = 36;
-        for t in 0..3 {
-            let tx = MAIN_X + (t as i32) * (tab_w + 6);
-            let active = self.quest_tab == t;
-            c.round_rect(
-                tx,
-                CONTENT_Y,
-                tab_w,
-                tab_h,
-                7,
-                if active { BG_SELECTED } else { BG_CARD },
-            );
-            c.round_rect_border(
-                tx,
-                CONTENT_Y,
-                tab_w,
-                tab_h,
-                7,
-                if active { 2 } else { 1 },
-                if active { tab_cols[t] } else { BORDER_BTN },
-            );
-            c.text_centered(
-                tx,
-                CONTENT_Y,
-                tab_w,
-                tab_h,
-                &tab_labels[t],
-                if active { tab_cols[t] } else { TEXT_SECONDARY },
-                FontSize::Small,
-            );
-            self.add_hit(tx, CONTENT_Y, tab_w, tab_h, UiAction::SetQuestTab(t));
-        }
-
-        let body_y = CONTENT_Y + tab_h + 8;
-        let visible = 9;
-        let row_h = 46;
-
         if self.quest_tab == 0 {
-            let total = save_list.len();
-            if total == 0 {
-                c.round_rect(MAIN_X, body_y, MAIN_W, 220, 10, BG_CARD);
-                c.round_rect_border(MAIN_X, body_y, MAIN_W, 220, 10, 2, ACCENT_PURPLE);
-                let is_filtered = !ed.quest_filter.is_empty();
-                let title_msg = if is_filtered {
-                    "一致するクエストがありません"
-                } else {
-                    "セーブ内にイベントクエストがありません"
-                };
-                let sub_msg = if is_filtered {
-                    "[X] キーで検索を解除できます。"
-                } else {
-                    "[◀/▶] で「公式イベント(189件)」「没データ(34件)」タブに切り替えるか、下のボタンで一括追加できます。"
-                };
-                c.text_sized(
-                    MAIN_X + 24,
-                    body_y + 24,
-                    title_msg,
-                    TEXT_PRIMARY,
-                    FontSize::Large,
-                );
-                c.text_sized(
-                    MAIN_X + 24,
-                    body_y + 70,
-                    sub_msg,
-                    TEXT_SECONDARY,
-                    FontSize::Small,
-                );
-
-                let by = body_y + 124;
-                c.round_rect(MAIN_X + 24, by, 360, 52, 8, BG_BTN_PRIMARY);
-                c.round_rect_border(MAIN_X + 24, by, 360, 52, 8, 2, ACCENT_CYAN);
-                c.text_centered(
-                    MAIN_X + 24,
-                    by,
-                    360,
-                    52,
-                    "[A / X] 公式イベント189件を一括追加",
-                    TEXT_PRIMARY,
-                    FontSize::Medium,
-                );
-                self.add_hit(MAIN_X + 24, by, 360, 52, UiAction::InstallDlcCategory(0));
-
-                c.round_rect(MAIN_X + 400, by, 280, 52, 8, BG_BTN);
-                c.round_rect_border(MAIN_X + 400, by, 280, 52, 8, 1, ACCENT_ORANGE);
-                c.text_centered(
-                    MAIN_X + 400,
-                    by,
-                    280,
-                    52,
-                    "没データ一覧を開く (34件)",
-                    TEXT_GOLD,
-                    FontSize::Medium,
-                );
-                self.add_hit(MAIN_X + 400, by, 280, 52, UiAction::SetQuestTab(2));
-                return;
-            }
-
-            let start = window_start(ed.save_quest_cursor, total, visible);
-            for row in 0..visible {
-                let idx = start + row;
-                let Some(q) = save_list.get(idx) else {
-                    break;
-                };
-                let ry = body_y + (row as i32) * (row_h + 4);
-                let selected = idx == ed.save_quest_cursor;
-
-                let bg = if selected {
-                    BG_SELECTED
-                } else if row % 2 == 0 {
-                    BG_CARD
-                } else {
-                    BG_CARD_ALT
-                };
-                c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-                if selected {
-                    c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                    c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-                }
-
-                c.round_rect(MAIN_X + 12, ry + 8, 76, 30, 5, BG_VAL_BOX);
-                c.text_centered(
-                    MAIN_X + 12,
-                    ry + 8,
-                    76,
-                    30,
-                    &format!("枠 {:03}", q.slot),
-                    ACCENT_PURPLE,
-                    FontSize::Small,
-                );
-
-                // Category badge
-                let cat_opt = mhnx_core::dlc_bundle::find_official_quest(q.quest_id)
-                    .map(|m| m.category);
-                let (cat_str, cat_col) = match cat_opt {
-                    Some(mhnx_core::dlc_bundle::DlcQuestCategory::Official) => ("公式", ACCENT_GREEN),
-                    Some(mhnx_core::dlc_bundle::DlcQuestCategory::Dead) => ("没", ACCENT_ORANGE),
-                    None => ("改造", ACCENT_CYAN),
-                };
-                c.round_rect(MAIN_X + 94, ry + 8, 56, 30, 5, BG_VAL_BOX);
-                c.round_rect_border(MAIN_X + 94, ry + 8, 56, 30, 5, 1, cat_col);
-                c.text_centered(MAIN_X + 94, ry + 8, 56, 30, cat_str, cat_col, FontSize::Small);
-
-                c.text_sized(
-                    MAIN_X + 158,
-                    ry + 13,
-                    &format!("ID {}", q.quest_id),
-                    TEXT_CYAN,
-                    FontSize::Small,
-                );
-
+            let list = ed.filtered_quests();
+            let mut rows = Vec::with_capacity(list.len());
+            for (i, q) in list.iter().enumerate() {
                 let title = ed.quest_title(q.quest_id);
-                let disp_title = if title.is_empty() {
-                    "(タイトルなし)"
-                } else {
-                    title
-                };
-                c.text_clipped(
-                    MAIN_X + 262,
-                    ry + 11,
-                    list_w - 536,
-                    disp_title,
-                    TEXT_PRIMARY,
-                    FontSize::Medium,
-                );
-
-                self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-                // [A 編集], [- 抽出], [削除]
-                let bx1 = MAIN_X + list_w - 266;
-                c.round_rect(bx1, ry + 6, 88, 34, 6, if selected { BG_BTN_PRIMARY } else { BG_BTN });
-                c.round_rect_border(bx1, ry + 6, 88, 34, 6, 1, ACCENT_CYAN);
-                c.text_centered(bx1, ry + 6, 88, 34, "[A] 編集", TEXT_PRIMARY, FontSize::Small);
-                if selected {
-                    self.add_hit(bx1, ry + 6, 88, 34, UiAction::Key(Key::A));
-                } else {
-                    self.add_hit(bx1, ry + 6, 88, 34, UiAction::SelectRow(idx));
-                }
-
-                let bx2 = MAIN_X + list_w - 172;
-                c.round_rect(bx2, ry + 6, 84, 34, 6, BG_BTN);
-                c.round_rect_border(bx2, ry + 6, 84, 34, 6, 1, BORDER_BTN);
-                c.text_centered(bx2, ry + 6, 84, 34, "[-] 抽出", TEXT_SECONDARY, FontSize::Small);
-                if selected {
-                    self.add_hit(bx2, ry + 6, 84, 34, UiAction::Key(Key::Minus));
-                } else {
-                    self.add_hit(bx2, ry + 6, 84, 34, UiAction::SelectRow(idx));
-                }
-
-                let bx3 = MAIN_X + list_w - 82;
-                let armed = self.pending_delete == Some(q.quest_id);
-                c.round_rect(
-                    bx3,
-                    ry + 6,
-                    72,
-                    34,
-                    6,
-                    if armed { BG_DANGER } else { BG_BTN },
-                );
-                c.round_rect_border(
-                    bx3,
-                    ry + 6,
-                    72,
-                    34,
-                    6,
-                    if armed { 2 } else { 1 },
-                    ACCENT_RED,
-                );
-                c.text_centered(
-                    bx3,
-                    ry + 6,
-                    72,
-                    34,
-                    if armed { "本当に?" } else { "削除" },
-                    if armed { TEXT_PRIMARY } else { ACCENT_RED },
-                    FontSize::Small,
-                );
-                self.add_hit(bx3, ry + 6, 72, 34, UiAction::RemoveSaveQuest(q.quest_id));
+                rows.push((
+                    i,
+                    if title.is_empty() {
+                        format!("Quest {}", q.quest_id)
+                    } else {
+                        title.to_string()
+                    },
+                    format!("Quest ID: {}", q.quest_id),
+                    format!("ID {}", q.quest_id),
+                    format!("#{:03}", q.slot + 1),
+                ));
             }
-
-            self.draw_scrollbar(c, ed.save_quest_cursor, total, visible);
+            self.draw_adaptive_rows(
+                c,
+                ed,
+                "セーブ内クエスト",
+                "",
+                &rows,
+                ed.save_quest_cursor.min(rows.len().saturating_sub(1)),
+                false,
+                "編集",
+            );
         } else {
-            // Bundled Catalogue Tabs (1 = Official 189, 2 = Dead 34)
-            let cat_list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
-            let total = cat_list.len();
-            let cur_idx = self.quest_cat_cursor[self.quest_tab].min(total.saturating_sub(1));
-            self.quest_cat_cursor[self.quest_tab] = cur_idx;
-            let start = window_start(cur_idx, total, visible);
-
-            for row in 0..visible {
-                let idx = start + row;
-                let Some(&q) = cat_list.get(idx) else {
-                    break;
-                };
-                let ry = body_y + (row as i32) * (row_h + 4);
-                let selected = idx == cur_idx;
-                let slot_opt = all_in_save
-                    .iter()
-                    .find(|sq| sq.quest_id == q.quest_id)
-                    .map(|sq| sq.slot);
-                let is_installed = slot_opt.is_some();
-
-                let bg = if selected {
-                    BG_SELECTED
-                } else if row % 2 == 0 {
-                    BG_CARD
-                } else {
-                    BG_CARD_ALT
-                };
-                c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-                if selected {
-                    c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                    c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-                }
-
-                // Installed status badge
-                let (st_txt, st_col) = match slot_opt {
-                    Some(sl) => (format!("済(枠{:03})", sl), ACCENT_GREEN),
-                    None => (String::from("未導入"), BORDER_BTN),
-                };
-                c.round_rect(MAIN_X + 12, ry + 8, 96, 30, 5, st_col);
-                c.text_centered(
-                    MAIN_X + 12,
-                    ry + 8,
-                    96,
-                    30,
-                    &st_txt,
-                    if is_installed { BG_MAIN } else { TEXT_PRIMARY },
-                    FontSize::Small,
-                );
-
-                // Category badge
-                let (cat_txt, cat_col) = match q.category {
-                    mhnx_core::dlc_bundle::DlcQuestCategory::Official => ("公式", ACCENT_GREEN),
-                    mhnx_core::dlc_bundle::DlcQuestCategory::Dead => ("没", ACCENT_ORANGE),
-                };
-                c.round_rect(MAIN_X + 114, ry + 8, 56, 30, 5, BG_VAL_BOX);
-                c.round_rect_border(MAIN_X + 114, ry + 8, 56, 30, 5, 1, cat_col);
-                c.text_centered(MAIN_X + 114, ry + 8, 56, 30, cat_txt, cat_col, FontSize::Small);
-
-                c.text_sized(
-                    MAIN_X + 178,
-                    ry + 13,
-                    &format!("ID {}", q.quest_id),
-                    TEXT_CYAN,
-                    FontSize::Small,
-                );
-
-                c.text_clipped(
-                    MAIN_X + 282,
-                    ry + 11,
-                    list_w - 500,
-                    q.title,
-                    TEXT_PRIMARY,
-                    FontSize::Medium,
-                );
-
-                self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-                // [A 導入/解除] and [編集]
-                let bx1 = MAIN_X + list_w - 206;
-                let toggle_lbl = if is_installed { "[A] 解除" } else { "[A] 導入" };
-                c.round_rect(
-                    bx1,
-                    ry + 6,
-                    102,
-                    34,
-                    6,
-                    if is_installed { BG_BTN } else { BG_BTN_PRIMARY },
-                );
-                c.round_rect_border(bx1, ry + 6, 102, 34, 6, 1, ACCENT_CYAN);
-                c.text_centered(bx1, ry + 6, 102, 34, toggle_lbl, TEXT_PRIMARY, FontSize::Small);
-                self.add_hit(bx1, ry + 6, 102, 34, UiAction::ToggleBundledQuest(q.quest_id));
-
-                let bx2 = MAIN_X + list_w - 96;
-                c.round_rect(bx2, ry + 6, 86, 34, 6, BG_BTN);
-                c.round_rect_border(bx2, ry + 6, 86, 34, 6, 1, ACCENT_GOLD);
-                c.text_centered(bx2, ry + 6, 86, 34, "編集", TEXT_GOLD, FontSize::Small);
-                self.add_hit(bx2, ry + 6, 86, 34, UiAction::OpenBundledQuest(q.quest_id));
+            let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
+            let in_save = ed.save_quests();
+            let mut rows = Vec::with_capacity(list.len());
+            for (i, q) in list.iter().enumerate() {
+                let installed = in_save.iter().any(|sq| sq.quest_id == q.quest_id);
+                let val = if installed { "導入済" } else { "未導入" };
+                rows.push((
+                    i,
+                    q.title.to_string(),
+                    format!("Quest ID: {}", q.quest_id),
+                    val.to_string(),
+                    format!("#{:03}", i + 1),
+                ));
             }
-
-            self.draw_scrollbar(c, cur_idx, total, visible);
+            let hdr = if self.quest_tab == 1 {
+                "公式イベントクエスト (189)"
+            } else {
+                "没クエスト (34)"
+            };
+            let cur = self.quest_cat_cursor[self.quest_tab].min(rows.len().saturating_sub(1));
+            self.draw_adaptive_rows(
+                c,
+                ed,
+                hdr,
+                "",
+                &rows,
+                cur,
+                false,
+                "導入/解除",
+            );
         }
     }
 
     fn draw_quest_equip(&mut self, c: &mut Canvas, ed: &Editor) {
-        let visible = 10;
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
         if ed.qe_open {
             let items = ed.quest_equip_items();
-            let total = items.len();
-            let start = window_start(ed.qe_item_cursor, total, visible);
-            for row in 0..visible {
-                let idx = start + row;
-                let Some(it) = items.get(idx) else {
-                    break;
-                };
-                let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-                let selected = idx == ed.qe_item_cursor;
-
-                c.round_rect(
-                    MAIN_X,
-                    ry,
-                    list_w,
-                    row_h,
-                    7,
-                    if selected { BG_SELECTED } else { BG_CARD },
-                );
-                if selected {
-                    c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                }
-
+            let mut rows = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
                 let kind_str = match it.list {
-                    mhnx_core::dlc::QuestEquipList::Supply => "支給品",
-                    mhnx_core::dlc::QuestEquipList::Ammo => "弾ポーチ",
+                    mhnx_core::dlc::QuestEquipList::Supply => "支給",
+                    mhnx_core::dlc::QuestEquipList::Ammo => "弾",
                 };
-                c.round_rect(MAIN_X + 14, ry + 8, 120, 30, 5, BG_VAL_BOX);
-                c.text_centered(
-                    MAIN_X + 14,
-                    ry + 8,
-                    120,
-                    30,
-                    &format!("rec{} {}[{}]", it.record, kind_str, it.index),
-                    TEXT_CYAN,
-                    FontSize::Small,
-                );
-
                 let iname = if it.item == 0 {
-                    String::from("(なし)")
+                    String::from("(空き)")
                 } else {
                     item_name_of(it.item)
                 };
-                c.text_clipped(
-                    MAIN_X + 148,
-                    ry + 11,
-                    300,
-                    &format!("{}  (ID:{})", iname, it.item),
-                    TEXT_PRIMARY,
-                    FontSize::Medium,
-                );
-                self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-                // The count was printed as text and nothing could change it,
-                // which is what a user hit first when editing a supply box.
-                let cnt_str = format!("x {}", it.count);
-                // 374 wide including MAX; the [A] button starts at -134, so
-                // the stepper starts far enough left not to sit under it.
-                self.draw_value_stepper(
-                    c,
-                    MAIN_X + list_w - 514,
-                    ry + 6,
-                    idx,
-                    &cnt_str,
-                    selected,
-                    true,
-                );
-
-                let bx = MAIN_X + list_w - 134;
-                c.round_rect(bx, ry + 6, 120, 34, 6, BG_BTN_PRIMARY);
-                c.text_centered(bx, ry + 6, 120, 34, "[A] 変更", TEXT_PRIMARY, FontSize::Small);
-                self.add_hit(bx, ry + 6, 120, 34, UiAction::KeyOnRow(idx, Key::A));
+                rows.push((
+                    i,
+                    iname,
+                    format!("Rec {} / {}[{}] / ID:{}", it.record, kind_str, it.index, it.item),
+                    format!("×{}", it.count),
+                    format!("{}{:02}", kind_str, it.index + 1),
+                ));
             }
-            self.draw_scrollbar(c, ed.qe_item_cursor, total, visible);
+            self.draw_adaptive_rows(
+                c,
+                ed,
+                "固定装備・支給品アイテム",
+                "",
+                &rows,
+                ed.qe_item_cursor.min(rows.len().saturating_sub(1)),
+                true,
+                "変更",
+            );
         } else {
             let list = ed.quest_equipment();
-            let total = list.len();
-            let start = window_start(ed.cursor, total, visible);
-            for row in 0..visible {
-                let idx = start + row;
-                let Some(e) = list.get(idx) else {
-                    break;
-                };
-                let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-                let selected = idx == ed.cursor;
-                c.round_rect(
-                    MAIN_X,
-                    ry,
-                    list_w,
-                    row_h,
-                    7,
-                    if selected { BG_SELECTED } else { BG_CARD },
-                );
-                if selected {
-                    c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                }
-                let q_str = if e.occupied {
-                    format!("クエストID: {}  ({})", e.quest_id, ed.quest_title(e.quest_id))
+            let mut rows = Vec::with_capacity(list.len());
+            for (i, e) in list.iter().enumerate() {
+                let title = if e.occupied {
+                    format!("{} (ID:{})", ed.quest_title(e.quest_id), e.quest_id)
                 } else {
-                    String::from("(未使用スロット)")
+                    String::from("(未使用)")
                 };
-                c.text_sized(
-                    MAIN_X + 20,
-                    ry + 11,
-                    &format!("クエスト装備枠 #{:02}    {}", e.index, q_str),
-                    if e.occupied { TEXT_PRIMARY } else { TEXT_MUTED },
-                    FontSize::Medium,
-                );
-                self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
+                rows.push((
+                    i,
+                    title,
+                    format!("固定装備枠 #{:02}", e.index),
+                    String::from(if e.occupied { "使用中" } else { "-" }),
+                    format!("#{:02}", e.index),
+                ));
             }
-            self.draw_scrollbar(c, ed.cursor, total, visible);
+            self.draw_adaptive_rows(
+                c,
+                ed,
+                "固定装備枠一覧",
+                "",
+                &rows,
+                ed.cursor.min(rows.len().saturating_sub(1)),
+                false,
+                "開く",
+            );
         }
     }
 
-    // --- Screen: ArcList & ArcEntries --------------------------------------
     fn draw_arc_list(&mut self, c: &mut Canvas, ed: &Editor) {
-        let total = ed.arc_files.len();
-        if total == 0 {
-            c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, 220, 10, BG_CARD);
-            c.round_rect_border(MAIN_X, CONTENT_Y, MAIN_W, 220, 10, 2, ACCENT_PURPLE);
-            c.text_sized(
-                MAIN_X + 24,
-                CONTENT_Y + 26,
-                "SDカード内に .arc ファイルがありません",
-                TEXT_PRIMARY,
-                FontSize::Large,
-            );
-            c.text_sized(
-                MAIN_X + 24,
-                CONTENT_Y + 72,
-                "内蔵のクエストデータ（公式189件＋没34件）をSDカードへ展開するか、セーブへ直接追加できます。",
-                TEXT_SECONDARY,
-                FontSize::Small,
-            );
-
-            let by = CONTENT_Y + 128;
-            c.round_rect(MAIN_X + 24, by, 340, 52, 8, BG_BTN_PRIMARY);
-            c.round_rect_border(MAIN_X + 24, by, 340, 52, 8, 2, ACCENT_CYAN);
-            c.text_centered(
-                MAIN_X + 24,
-                by,
-                340,
-                52,
-                "[R] 内蔵クエストをSDへ展開",
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            self.add_hit(MAIN_X + 24, by, 340, 52, UiAction::ExtractOfficialArcs);
-
-            if ed.save.is_some() {
-                c.round_rect(MAIN_X + 380, by, 340, 52, 8, BG_BTN);
-                c.round_rect_border(MAIN_X + 380, by, 340, 52, 8, 2, ACCENT_GOLD);
-                c.text_centered(
-                    MAIN_X + 380,
-                    by,
-                    340,
-                    52,
-                    "セーブへ公式189件を追加",
-                    TEXT_GOLD,
-                    FontSize::Medium,
-                );
-                self.add_hit(MAIN_X + 380, by, 340, 52, UiAction::InstallOfficialDlc);
-            }
-            return;
-        }
-        let visible = 10;
-        let start = window_start(ed.cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(path) = ed.arc_files.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            let base_name = path.rsplit('/').next().unwrap_or(path.as_str());
-            c.round_rect(MAIN_X + 14, ry + 8, 120, 30, 5, BG_VAL_BOX);
-            c.text_centered(MAIN_X + 14, ry + 8, 120, 30, base_name, ACCENT_PURPLE, FontSize::Small);
-
-            // Show official quest title if filename matches qXXXXXXX.arc
-            let qid_opt = base_name
+        let mut rows = Vec::with_capacity(ed.arc_files.len());
+        for (i, path) in ed.arc_files.iter().enumerate() {
+            let base = path.rsplit('/').next().unwrap_or(path.as_str());
+            let qid_opt = base
                 .strip_prefix('q')
                 .and_then(|s| s.strip_suffix(".arc"))
                 .and_then(|s| s.parse::<i32>().ok());
-            let disp_str = match qid_opt.and_then(mhnx_core::dlc_bundle::official_quest_title) {
-                Some(t) if !t.is_empty() => format!("{}   ({})", t, path),
-                _ => path.clone(),
+            let title = match qid_opt.and_then(mhnx_core::dlc_bundle::official_quest_title) {
+                Some(t) if !t.is_empty() => t.to_string(),
+                _ => base.to_string(),
             };
-
-            c.text_clipped(
-                MAIN_X + 148,
-                ry + 11,
-                list_w - 410,
-                &disp_str,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            let bx_add = MAIN_X + list_w - 246;
-            c.round_rect(bx_add, ry + 6, 124, 34, 6, BG_BTN);
-            c.round_rect_border(bx_add, ry + 6, 124, 34, 6, 1, ACCENT_GOLD);
-            c.text_centered(bx_add, ry + 6, 124, 34, "[L] セーブ追加", TEXT_GOLD, FontSize::Small);
-            self.add_hit(bx_add, ry + 6, 124, 34, UiAction::InstallArcRow(idx));
-
-            let bx = MAIN_X + list_w - 114;
-            c.round_rect(bx, ry + 6, 100, 34, 6, if selected { BG_BTN_PRIMARY } else { BG_BTN });
-            c.round_rect_border(bx, ry + 6, 100, 34, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, ry + 6, 100, 34, "[A] 編集", TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, ry + 6, 100, 34, UiAction::Key(Key::A));
-            } else {
-                self.add_hit(bx, ry + 6, 100, 34, UiAction::SelectRow(idx));
-            }
+            rows.push((
+                i,
+                title,
+                path.clone(),
+                base.to_string(),
+                format!("#{:03}", i + 1),
+            ));
         }
-
-        self.draw_scrollbar(c, ed.cursor, total, visible);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "SDカード .arc 一覧",
+            "",
+            &rows,
+            ed.cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "開く",
+        );
     }
 
     fn draw_arc_entries(&mut self, c: &mut Canvas, ed: &Editor) {
         let Some(arc) = &ed.arc else {
             return;
         };
-        let total = arc.entries.len();
-        let visible = 10;
-        let start = window_start(ed.cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(e) = arc.entries.get(idx) else {
-                break;
+        let mut rows = Vec::with_capacity(arc.entries.len());
+        for (i, e) in arc.entries.iter().enumerate() {
+            let ext = extension_for(e.type_hash).unwrap_or("bin");
+            let (desc, val_txt) = match ext {
+                "mib" => (String::from("クエスト条件 (.mib)"), format!("{} B", e.data.len())),
+                "gmd" => (String::from("テキスト (.gmd)"), format!("{} B", e.data.len())),
+                "rem" => (String::from("報酬テーブル (.rem)"), format!("{} B", e.data.len())),
+                "sup" => (String::from("支給品テーブル (.sup)"), format!("{} B", e.data.len())),
+                "sem" => {
+                    if e.data.len() >= 0x20 {
+                        let area = u32::from_le_bytes([e.data[0x0C], e.data[0x0D], e.data[0x0E], e.data[0x0F]]);
+                        let x = f32::from_le_bytes([e.data[0x10], e.data[0x11], e.data[0x12], e.data[0x13]]);
+                        let y = f32::from_le_bytes([e.data[0x14], e.data[0x15], e.data[0x16], e.data[0x17]]);
+                        let z = f32::from_le_bytes([e.data[0x18], e.data[0x19], e.data[0x1A], e.data[0x1B]]);
+                        (
+                            format!("大型初期配置 (.sem) — ({:.0}, {:.0}, {:.0})", x, y, z),
+                            if area == 0 {
+                                String::from("未使用(0)")
+                            } else {
+                                format!("エリア {}", area)
+                            },
+                        )
+                    } else {
+                        (String::from("大型初期配置 (.sem)"), format!("{} B", e.data.len()))
+                    }
+                }
+                "esl" => (String::from("小型配置 (.esl)"), format!("{} B", e.data.len())),
+                _ => (String::from("データ"), format!("{} B", e.data.len())),
             };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.cursor;
-            let ext = extension_for(e.type_hash).unwrap_or("?");
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
-
-            let (type_label, badge_col) = match ext {
-                "mib" => ("MIB クエスト条件", ACCENT_GOLD),
-                "gmd" => ("GMD テキスト", ACCENT_CYAN),
-                "rem" => ("REM 報酬テーブル", ACCENT_GREEN),
-                "sup" => ("SUP 支給品", ACCENT_GREEN),
-                "sem" => ("SEM 大型配置", ACCENT_ORANGE),
-                "esl" => ("ESL 小型配置", ACCENT_PURPLE),
-                _ => (ext, TEXT_SECONDARY),
-            };
-            c.round_rect(MAIN_X + 14, ry + 8, 148, 30, 5, BG_VAL_BOX);
-            c.round_rect_border(MAIN_X + 14, ry + 8, 148, 30, 5, 1, badge_col);
-            c.text_centered(MAIN_X + 14, ry + 8, 148, 30, type_label, badge_col, FontSize::Small);
-
-            c.text_clipped(
-                MAIN_X + 174,
-                ry + 11,
-                list_w - 400,
-                &e.file_name(),
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            c.text_right(
-                MAIN_X + list_w - 196,
-                ry + 14,
-                &format!("{} B", e.data.len()),
-                TEXT_MUTED,
-                FontSize::Small,
-            );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            let is_direct_edit = matches!(ext, "mib" | "gmd");
-            let bx = MAIN_X + list_w - 180;
-            let (btn_txt, key_act) = if is_direct_edit {
-                ("[A] 条件/文を編集", Key::A)
-            } else {
-                ("[Y] 中身を開く", Key::Y)
-            };
-            c.round_rect(bx, ry + 6, 166, 34, 6, if selected { BG_BTN_PRIMARY } else { BG_BTN });
-            c.round_rect_border(bx, ry + 6, 166, 34, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, ry + 6, 166, 34, btn_txt, TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, ry + 6, 166, 34, UiAction::Key(key_act));
-            } else {
-                self.add_hit(bx, ry + 6, 166, 34, UiAction::SelectRow(idx));
-            }
+            rows.push((
+                i,
+                format!("{}.{}", e.name, ext),
+                desc,
+                val_txt,
+                ext.to_uppercase(),
+            ));
         }
-
-        self.draw_scrollbar(c, ed.cursor, total, visible);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "ARC内ファイル構成",
+            "",
+            &rows,
+            ed.cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "開く",
+        );
     }
 
-    // --- Screen: Mib (Quest Parameters with Japanese Labels & Notes!) ------
     fn draw_mib(&mut self, c: &mut Canvas, ed: &Editor) {
-        let fields = questfields::MIB_FIELDS;
-        let total = fields.len();
-        let visible = 8;
-        let start = window_start(ed.mib_cursor, total, visible);
-        let row_h = 46;
-        let list_w = MAIN_W - 44;
         let mib = ed.mib_bytes();
+        let total = questfields::MIB_FIELDS.len();
+        let mut rows = Vec::with_capacity(total);
 
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(f) = fields.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.mib_cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
+        for (i, f) in questfields::MIB_FIELDS.iter().enumerate() {
+            let raw_val = if f.key.starts_with("mob_slot[") {
+                if f.offset + 2 <= mib.len() {
+                    u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]) as u32
+                } else {
+                    0
+                }
             } else {
-                BG_CARD_ALT
+                questfields::read_u32(mib, f.offset, f.kind).unwrap_or(0)
             };
-            c.round_rect(MAIN_X, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                c.round_rect(MAIN_X + 3, ry + 5, 5, row_h - 10, 2, ACCENT_CYAN);
-            }
 
-            // Offset badge
-            c.round_rect(MAIN_X + 12, ry + 9, 64, 28, 5, BG_VAL_BOX);
-            c.text_centered(
-                MAIN_X + 12,
-                ry + 9,
-                64,
-                28,
-                &format!("+0x{:02X}", f.offset),
-                TEXT_CYAN,
-                FontSize::Small,
-            );
-
-            // Japanese field name (`f.ja`) + English key (`f.key`)
-            c.text_clipped(
-                MAIN_X + 86,
-                ry + 11,
-                220,
-                f.ja,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            c.text_clipped(
-                MAIN_X + 312,
-                ry + 14,
-                140,
-                f.key,
-                TEXT_MUTED,
-                FontSize::Small,
-            );
-
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            if f.kind == FieldKind::Bytes {
-                if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
-                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
-                    let mname = monster_name_for_mint(mid as u32);
+            let (meta, val_str) = if f.key.starts_with("mob_slot[") {
+                if f.offset + 13 <= mib.len() {
+                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]) as u32;
+                    let tbl = mib[f.offset + 3];
                     let cnt = mib[f.offset + 4];
                     let hp = mib[f.offset + 5];
                     let atk = mib[f.offset + 6];
+                    let def = mib[f.offset + 7];
+                    let sta = mib[f.offset + 8];
                     let sz = u16::from_le_bytes([mib[f.offset + 9], mib[f.offset + 10]]);
-                    let disp = if mid == 0 {
-                        String::from("なし (ID: 0)")
-                    } else {
-                        format!("{} (ID:{}) [{}頭/HP{}/攻{}/{}%]", mname, mid, cnt, hp, atk, sz)
+                    let var = mib[f.offset + 11];
+                    let sub_stat = match self.mib_mob_sub {
+                        0 => format!("HP:{}", hp),
+                        1 => format!("攻:{}", atk),
+                        2 => format!("防:{}", def),
+                        3 => format!("{}%", sz),
+                        4 => format!("数:{}", cnt),
+                        5 => format!("疲:{}", sta),
+                        6 => format!("変:{}", var),
+                        _ => format!("特:{}", tbl),
                     };
-                    let pick_x = MAIN_X + list_w - 518;
-                    c.round_rect(pick_x, ry + 6, 104, 34, 6, BG_BTN_PRIMARY);
-                    c.round_rect_border(pick_x, ry + 6, 104, 34, 6, 1, ACCENT_CYAN);
-                    c.text_centered(
-                        pick_x,
-                        ry + 6,
-                        104,
-                        34,
-                        "[Y] 選択",
-                        TEXT_PRIMARY,
-                        FontSize::Small,
+                    let m_meta = format!(
+                        "HP:{} 攻:{} 防:{} 寸:{}% 数:{} 疲:{} 変:{} 特:{}",
+                        hp, atk, def, sz, cnt, sta, var, tbl
                     );
-                    self.add_hit(pick_x, ry + 6, 104, 34, UiAction::OpenMibPicker(idx));
-
-                    self.draw_value_stepper(
-                        c,
-                        MAIN_X + list_w - 406,
-                        ry + 6,
-                        idx,
-                        &disp,
-                        selected,
-                        false,
-                    );
+                    let m_val = if mid == 0 {
+                        format!("なし [{}]", sub_stat)
+                    } else {
+                        format!("{} [{}]", monster_name_for_mint(mid), sub_stat)
+                    };
+                    (m_meta, m_val)
                 } else {
-                    let a = f.offset.min(mib.len());
-                    let b = (f.offset + f.size).min(mib.len());
-                    let hex: String = mib[a..b]
-                        .iter()
-                        .take(10)
-                        .map(|x| format!("{:02X} ", x))
-                        .collect();
-                    c.text_right(
-                        MAIN_X + list_w - 18,
-                        ry + 14,
-                        &hex,
-                        TEXT_MUTED,
-                        FontSize::Small,
-                    );
+                    (
+                        format!("offset +0x{:03X} ({}B)", f.offset, f.size),
+                        format!("{}", raw_val),
+                    )
                 }
+            } else if let Some(ename) = f.enum_name {
+                let label = questfields::enum_table(ename)
+                    .and_then(|t| t.get(raw_val as usize).copied())
+                    .unwrap_or("?");
+                (
+                    format!("offset +0x{:03X} ({}B)", f.offset, f.size),
+                    format!("{} ({})", label, raw_val),
+                )
             } else {
-                let v = questfields::read_u32(mib, f.offset, f.kind).unwrap_or(0);
-                let disp = match f.enum_name.and_then(questfields::enum_table) {
-                    Some(t) => format!("{} ({})", t.get(v as usize).copied().unwrap_or("?"), v),
-                    None => mib_extra_value_label(f.key, v),
-                };
-                if mib_has_picker(f) {
-                    let pick_x = MAIN_X + list_w - 518;
-                    c.round_rect(pick_x, ry + 6, 104, 34, 6, BG_BTN_PRIMARY);
-                    c.round_rect_border(pick_x, ry + 6, 104, 34, 6, 1, ACCENT_CYAN);
-                    c.text_centered(
-                        pick_x,
-                        ry + 6,
-                        104,
-                        34,
-                        "[Y] 選択",
-                        TEXT_PRIMARY,
-                        FontSize::Small,
-                    );
-                    self.add_hit(pick_x, ry + 6, 104, 34, UiAction::OpenMibPicker(idx));
-                }
-                self.draw_value_stepper(
-                    c,
-                    MAIN_X + list_w - 406,
-                    ry + 6,
-                    idx,
-                    &disp,
-                    selected,
-                    false,
-                );
-            }
+                (
+                    format!("offset +0x{:03X} ({}B)", f.offset, f.size),
+                    mib_extra_value_label(f.key, raw_val),
+                )
+            };
+
+            rows.push((i, f.ja.to_string(), meta, val_str, format!("#{:02}", i + 1)));
         }
 
-        // Field Note / Help Inspector Card at bottom of MIB screen!
-        let info_y = CONTENT_Y + visible as i32 * (row_h + 4) + 6;
-        let info_h = CONTENT_Y + CONTENT_H - info_y;
-        if info_h >= 48 {
-            c.round_rect(MAIN_X, info_y, list_w, info_h, 8, rgb(30, 30, 34));
-            c.round_rect_border(MAIN_X, info_y, list_w, info_h, 8, 1, ACCENT_GOLD);
-            if let Some(cur_f) = fields.get(ed.mib_cursor) {
-                c.text_clipped(
-                    MAIN_X + 16,
-                    info_y + 8,
-                    list_w - 32,
-                    &format!("項目解説 [{} / {}]:", cur_f.ja, cur_f.key),
-                    TEXT_GOLD,
-                    FontSize::Small,
-                );
-                let note = if cur_f.note.is_empty() {
-                    "左右キーまたは [-] [+] ボタンで値を変更できます。[A] で保存します。"
-                } else {
-                    cur_f.note
-                };
-                c.text_clipped(
-                    MAIN_X + 16,
-                    info_y + 32,
-                    list_w - 32,
-                    note,
-                    TEXT_SECONDARY,
-                    FontSize::Small,
-                );
-            }
-        }
+        let cur = ed.mib_cursor.min(total.saturating_sub(1));
+        let a_lbl = if questfields::MIB_FIELDS
+            .get(cur)
+            .map(|f| mib_has_picker(f))
+            .unwrap_or(false)
+        {
+            "一覧選択"
+        } else {
+            "変更"
+        };
 
-        self.draw_scrollbar(c, ed.mib_cursor, total, visible);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "クエスト条件 (.mib)",
+            "",
+            &rows,
+            cur,
+            true,
+            a_lbl,
+        );
     }
 
-    // --- Screen: Gmd (Quest Text Editor) -----------------------------------
     fn draw_gmd(&mut self, c: &mut Canvas, ed: &Editor) {
-        let Some(g) = &ed.gmd else {
+        let Some(gmd) = &ed.gmd else {
             return;
         };
-        let total = g.strings.len();
-        let visible = 8;
-        let start = window_start(ed.gmd_cursor, total, visible);
-        let row_h = 56;
-        let list_w = MAIN_W - 44;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some(s) = g.strings.get(idx) else {
-                break;
-            };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 6);
-            let selected = idx == ed.gmd_cursor;
-            let label = Gmd::LABELS.get(idx).copied().unwrap_or("その他");
-
-            c.round_rect(
-                MAIN_X,
-                ry,
-                list_w,
-                row_h,
-                8,
-                if selected { BG_SELECTED } else { BG_CARD },
-            );
-            c.round_rect_border(
-                MAIN_X,
-                ry,
-                list_w,
-                row_h,
-                8,
-                if selected { 2 } else { 1 },
-                if selected { ACCENT_CYAN } else { BORDER_CARD },
-            );
-
-            c.round_rect(MAIN_X + 14, ry + 13, 120, 30, 5, BG_VAL_BOX);
-            c.text_centered(MAIN_X + 14, ry + 13, 120, 30, label, TEXT_CYAN, FontSize::Small);
-
-            let one_line = s.replace('\n', " / ").replace('\r', "");
-            c.text_clipped(
-                MAIN_X + 148,
-                ry + 15,
-                list_w - 290,
-                &one_line,
-                TEXT_PRIMARY,
-                FontSize::Medium,
-            );
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            let bx = MAIN_X + list_w - 130;
-            c.round_rect(bx, ry + 11, 116, 34, 6, BG_BTN_PRIMARY);
-            c.text_centered(bx, ry + 11, 116, 34, "[A] 文字編集", TEXT_PRIMARY, FontSize::Small);
-            if selected {
-                self.add_hit(bx, ry + 11, 116, 34, UiAction::Key(Key::A));
+        let mut rows = Vec::with_capacity(gmd.strings.len());
+        for (i, s) in gmd.strings.iter().enumerate() {
+            let role = mhnx_core::quest::Gmd::LABELS
+                .get(i)
+                .copied()
+                .unwrap_or("テキスト");
+            let clean = s.replace("\r\n", "\n");
+            let one_line = if clean.trim().is_empty() {
+                String::from("(空)")
             } else {
-                self.add_hit(bx, ry + 11, 116, 34, UiAction::SelectRow(idx));
-            }
+                clean.replace('\n', " / ")
+            };
+            rows.push((
+                i,
+                format!("[{}]  {}", role, one_line),
+                role.to_string(),
+                String::new(),
+                format!("#{:02}", i + 1),
+            ));
         }
-
-        self.draw_scrollbar(c, ed.gmd_cursor, total, visible);
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "クエスト文章 (.gmd)",
+            "",
+            &rows,
+            ed.gmd_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "テキスト編集",
+        );
     }
 
-    // --- Screen: EntryView (.rem / .sup / .sem / .esl / .qdp / .qdl) -------
     fn draw_entry_view(&mut self, c: &mut Canvas, ed: &Editor) {
         let Some(entry) = ed.arc.as_ref().and_then(|a| a.entries.get(ed.entry)) else {
             return;
         };
-        let ext = extension_for(entry.type_hash).unwrap_or("?");
-        let list_w = MAIN_W - 44;
+        let ext = extension_for(entry.type_hash).unwrap_or("bin");
+        let mut rows = Vec::new();
 
         match ext {
             "rem" | "sup" => {
-                if let Ok(t) = ItemTable::parse(&entry.data) {
-                    let total = t.records.len();
-                    let visible = 10;
-                    let start = window_start(ed.entry_row_cursor, total, visible);
-                    let row_h = 46;
-                    for row in 0..visible {
-                        let idx = start + row;
-                        let Some(r) = t.records.get(idx) else {
-                            break;
-                        };
-                        let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-                        let selected = idx == ed.entry_row_cursor;
-
-                        c.round_rect(
-                            MAIN_X,
-                            ry,
-                            list_w,
-                            row_h,
-                            7,
-                            if selected { BG_SELECTED } else { BG_CARD },
-                        );
-                        if selected {
-                            c.round_rect_border(MAIN_X, ry, list_w, row_h, 7, 2, ACCENT_CYAN);
-                        }
-
-                        c.round_rect(MAIN_X + 14, ry + 8, 92, 30, 5, BG_VAL_BOX);
-                        c.text_centered(
-                            MAIN_X + 14,
-                            ry + 8,
-                            92,
-                            30,
-                            &format!("#{:02} 枠{}", idx, r.slot),
-                            ACCENT_GREEN,
-                            FontSize::Small,
-                        );
-
-                        c.text_clipped(
-                            MAIN_X + 120,
-                            ry + 11,
-                            330,
-                            &format!("{}  (ID: {})", item_name_of(r.item), r.item),
-                            TEXT_PRIMARY,
-                            FontSize::Medium,
-                        );
-                        self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-                        // The count was printed and fixed. Left and right on
-                        // the editor change it now, so the row shows a stepper
-                        // like every other editable number.
-                        let cnt_str = format!("x {}", r.count);
-                        // 342 wide without a MAX button; [A] starts at -134.
-                        self.draw_value_stepper(
-                            c,
-                            MAIN_X + list_w - 482,
-                            ry + 6,
-                            idx,
-                            &cnt_str,
-                            selected,
-                            false,
-                        );
-
-                        let bx = MAIN_X + list_w - 134;
-                        c.round_rect(bx, ry + 6, 120, 34, 6, BG_BTN_PRIMARY);
-                        c.text_centered(
-                            bx,
-                            ry + 6,
-                            120,
-                            34,
-                            "[A] アイテム変更",
-                            TEXT_PRIMARY,
-                            FontSize::Small,
-                        );
-                        if selected {
-                            self.add_hit(bx, ry + 6, 120, 34, UiAction::Key(Key::A));
+                if let Ok(tbl) = ItemTable::parse(&entry.data) {
+                    for (i, rec) in tbl.records.iter().enumerate() {
+                        let iname = if rec.item == 0 {
+                            String::from("(なし)")
                         } else {
-                            self.add_hit(bx, ry + 6, 120, 34, UiAction::SelectRow(idx));
-                        }
+                            item_name_of(rec.item)
+                        };
+                        let sub = if ext == "rem" {
+                            format!("確率/重み: {}% / ID:{}", rec.slot, rec.item)
+                        } else {
+                            format!("Slot: {} / ID:{}", rec.slot, rec.item)
+                        };
+                        rows.push((
+                            i,
+                            iname,
+                            sub,
+                            format!("×{}", rec.count),
+                            format!("#{:03}", i + 1),
+                        ));
                     }
-                    self.draw_scrollbar(c, ed.entry_row_cursor, total, visible);
                 }
             }
             "sem" => {
-                c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, CONTENT_H, 8, BG_CARD);
-                c.text_sized(
-                    MAIN_X + 20,
-                    CONTENT_Y + 14,
-                    "大型モンスター初期配置 (.sem)",
-                    ACCENT_ORANGE,
-                    FontSize::Medium,
-                );
-                let mut ry = CONTENT_Y + 54;
-                for (i, ch) in entry.data.chunks_exact(32).take(12).enumerate() {
-                    let s = SemEntry { raw: ch.to_vec() };
-                    let (x, y, z, _) = s.position();
-                    c.text_sized(
-                        MAIN_X + 24,
-                        ry,
-                        &format!(
-                            "#{:02}   X: {:>8.1}   Y: {:>8.1}   Z: {:>8.1}   ({})",
-                            i,
-                            x,
-                            y,
-                            z,
-                            if s.is_dummy() { "ダミー" } else { "実体" }
-                        ),
-                        TEXT_PRIMARY,
-                        FontSize::Small,
-                    );
-                    ry += 32;
-                }
-            }
-            "esl" => {
-                c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, 120, 8, BG_CARD);
-                if let Ok(l) = Esl::parse(&entry.data) {
-                    c.text_sized(
-                        MAIN_X + 24,
-                        CONTENT_Y + 24,
-                        &format!("小型モンスター配置パック (.esl) — ウェーブ数: {}", l.waves),
-                        TEXT_PRIMARY,
-                        FontSize::Medium,
-                    );
-                }
-            }
-            "qdp" => {
-                c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, 120, 8, BG_CARD);
-                if let Ok(q) = Qdp::parse(&entry.data) {
-                    let hex: String = q.flags().iter().map(|b| format!("{:02X} ", b)).collect();
-                    c.text_sized(
-                        MAIN_X + 24,
-                        CONTENT_Y + 24,
-                        &format!("クエストフラグ (.qdp): {}", hex),
-                        TEXT_PRIMARY,
-                        FontSize::Medium,
-                    );
-                }
-            }
-            "qdl" => {
-                c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, CONTENT_H, 8, BG_CARD);
-                if let Ok(q) = QuestLink::parse(&entry.data) {
-                    let mut ry = CONTENT_Y + 20;
-                    for r in q.refs.iter().take(15) {
-                        c.text_sized(
-                            MAIN_X + 24,
-                            ry,
-                            &format!(
-                                "[{}]   {}",
-                                extension_for(r.type_hash).unwrap_or("?"),
-                                r.name
-                            ),
-                            TEXT_PRIMARY,
-                            FontSize::Small,
-                        );
-                        ry += 30;
+                let sems = sem_entry_indices(ed);
+                if let Some(arc) = &ed.arc {
+                    for (k, &e_idx) in sems.iter().enumerate() {
+                        let Some(se) = arc.entries.get(e_idx) else {
+                            continue;
+                        };
+                        if se.data.len() < 0x20 {
+                            continue;
+                        }
+                        let wave = u32::from_le_bytes([se.data[0x08], se.data[0x09], se.data[0x0A], se.data[0x0B]]);
+                        let area = u32::from_le_bytes([se.data[0x0C], se.data[0x0D], se.data[0x0E], se.data[0x0F]]);
+                        let x = f32::from_le_bytes([se.data[0x10], se.data[0x11], se.data[0x12], se.data[0x13]]);
+                        let y = f32::from_le_bytes([se.data[0x14], se.data[0x15], se.data[0x16], se.data[0x17]]);
+                        let z = f32::from_le_bytes([se.data[0x18], se.data[0x19], se.data[0x1A], se.data[0x1B]]);
+                        let w = f32::from_le_bytes([se.data[0x1C], se.data[0x1D], se.data[0x1E], se.data[0x1F]]);
+
+                        let base_row = k * 6;
+                        let tag = format!("S{}", k + 1);
+                        let meta_str = format!("{}.sem  (エリア:{} / X:{:.0} Y:{:.0} Z:{:.0})", se.name, area, x, y, z);
+                        let area_val = if area == 0 {
+                            String::from("0 (未使用)")
+                        } else {
+                            format!("エリア {}", area)
+                        };
+
+                        rows.push((
+                            base_row,
+                            format!("配置{} ({}) — 初期エリア番号", k + 1, se.name),
+                            meta_str.clone(),
+                            area_val,
+                            tag.clone(),
+                        ));
+                        rows.push((
+                            base_row + 1,
+                            format!("配置{} ({}) — 初期配置 X座標", k + 1, se.name),
+                            meta_str.clone(),
+                            format!("{:.1}", x),
+                            tag.clone(),
+                        ));
+                        rows.push((
+                            base_row + 2,
+                            format!("配置{} ({}) — 初期配置 Y座標(高さ)", k + 1, se.name),
+                            meta_str.clone(),
+                            format!("{:.1}", y),
+                            tag.clone(),
+                        ));
+                        rows.push((
+                            base_row + 3,
+                            format!("配置{} ({}) — 初期配置 Z座標", k + 1, se.name),
+                            meta_str.clone(),
+                            format!("{:.1}", z),
+                            tag.clone(),
+                        ));
+                        rows.push((
+                            base_row + 4,
+                            format!("配置{} ({}) — 向き角度(W)", k + 1, se.name),
+                            meta_str.clone(),
+                            format!("{:.1}°", w),
+                            tag.clone(),
+                        ));
+                        rows.push((
+                            base_row + 5,
+                            format!("配置{} ({}) — 出現ウェーブ/条件", k + 1, se.name),
+                            meta_str,
+                            format!("Wave {}", wave),
+                            tag,
+                        ));
                     }
                 }
             }
-            _ => {
-                c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, 100, 8, BG_CARD);
-                c.text_sized(
-                    MAIN_X + 24,
-                    CONTENT_Y + 34,
-                    "このエントリは前の画面に戻り [A] キーで編集できます。",
-                    TEXT_SECONDARY,
-                    FontSize::Medium,
-                );
+            "esl" => {
+                if let Ok(esl) = Esl::parse(&entry.data) {
+                    rows.push((
+                        0,
+                        String::from("小型Wave数"),
+                        format!("{} bytes", esl.raw.len()),
+                        format!("{} Waves", esl.waves),
+                        String::from("ESL"),
+                    ));
+                }
             }
+            "qdp" => {
+                if let Ok(qdp) = Qdp::parse(&entry.data) {
+                    for (i, &b) in qdp.flags().iter().enumerate() {
+                        rows.push((
+                            i,
+                            format!("Flag +0x{:02X}", i + 8),
+                            String::from("QDP"),
+                            format!("0x{:02X}", b),
+                            format!("F{:02}", i),
+                        ));
+                    }
+                }
+            }
+            "qdl" | "qlv" => {
+                if let Ok(q) = QuestLink::parse(&entry.data) {
+                    for (i, r) in q.refs.iter().enumerate() {
+                        rows.push((
+                            i,
+                            r.name.clone(),
+                            format!("0x{:08X}", r.type_hash),
+                            String::from("LINK"),
+                            format!("L{:02}", i + 1),
+                        ));
+                    }
+                }
+            }
+            _ => {}
         }
+
+        let hdr = match ext {
+            "rem" => "報酬テーブル (.rem)",
+            "sup" => "支給品テーブル (.sup)",
+            "sem" => "大型初期配置座標・エリア (.sem)",
+            "esl" => "小型配置 (.esl)",
+            _ => "エントリ詳細",
+        };
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            hdr,
+            "",
+            &rows,
+            ed.entry_row_cursor.min(rows.len().saturating_sub(1)),
+            matches!(ext, "rem" | "sup" | "sem" | "esl" | "qdp"),
+            "変更",
+        );
     }
 
-    // --- Screen: Check (Quest Integrity Checker) ---------------------------
     fn draw_check(&mut self, c: &mut Canvas, ed: &Editor) {
-        let total = ed.findings.len();
-        if total == 0 {
-            c.round_rect(MAIN_X, CONTENT_Y, MAIN_W, 120, 10, BG_CARD);
-            c.text_centered(
-                MAIN_X,
-                CONTENT_Y,
-                MAIN_W,
-                120,
-                "✓ 問題は検出されませんでした（クエストデータは正常です）",
-                ACCENT_GREEN,
-                FontSize::Medium,
-            );
-            return;
+        let mut rows = Vec::with_capacity(ed.findings.len());
+        for (i, f) in ed.findings.iter().enumerate() {
+            let sev = match f.severity {
+                Severity::Error => "ERR",
+                Severity::Warn => "WARN",
+                Severity::Info => "OK",
+            };
+            let act = if f.fixable { "修正可" } else { "-" };
+            rows.push((
+                i,
+                f.message.clone(),
+                String::from("整合性検査"),
+                act.to_string(),
+                sev.to_string(),
+            ));
         }
-        let visible = 8;
-        let start = window_start(ed.check_cursor, total, visible);
-        // 8 rows at 58 + 6 reached 642, ten pixels under the footer.
-        let row_h = 56;
-        let list_w = MAIN_W - 44;
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            "クエスト整合性検査",
+            "",
+            &rows,
+            ed.check_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "自動修正",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Modal Overlays: MIB Picker & Built-in OSK
+    // -----------------------------------------------------------------------
+    fn draw_mib_picker(&mut self, c: &mut Canvas) {
+        let Some(picker) = self.mib_picker.clone() else {
+            return;
+        };
+        let t = theme();
+        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 165));
+
+        let mx = 160;
+        let my = 48;
+        let mw = 960;
+        let mh = 624;
+        c.round_rect(mx, my, mw, mh, 12, t.bg_panel);
+        c.round_rect_border(mx, my, mw, mh, 12, 2, t.border_focus);
+
+        c.text_clipped(mx + 24, my + 16, mw - 380, &picker.title, t.text_primary, FontSize::Medium);
+        c.text_right(
+            mx + mw - 24,
+            my + 20,
+            "[▲/▼] 選択  [L/R] ±10  [A] 決定  [B] 閉じる",
+            t.text_secondary,
+            FontSize::Small,
+        );
+        c.hline(mx + 16, my + 52, mw - 32, t.border_subtle);
+
+        let total = picker.items.len();
+        let visible = 10;
+        let start = window_start(picker.cursor, total, visible);
+        let row_h = 46;
+        let list_x = mx + 24;
+        let list_w = mw - 48;
+        let list_y0 = my + 64;
 
         for row in 0..visible {
             let idx = start + row;
-            let Some(f) = ed.findings.get(idx) else {
+            let Some((_, label)) = picker.items.get(idx) else {
                 break;
             };
-            let ry = CONTENT_Y + (row as i32) * (row_h + 4);
-            let selected = idx == ed.check_cursor;
+            let ry = list_y0 + (row as i32) * (row_h + 4);
+            let selected = idx == picker.cursor;
 
-            c.round_rect(
-                MAIN_X,
-                ry,
-                list_w,
-                row_h,
-                8,
-                if selected { BG_SELECTED } else { BG_CARD },
-            );
+            let bg = if selected {
+                t.bg_selected
+            } else if row % 2 == 0 {
+                t.bg_row_even
+            } else {
+                t.bg_row_odd
+            };
+            c.round_rect(list_x, ry, list_w, row_h, 6, bg);
             if selected {
-                c.round_rect_border(MAIN_X, ry, list_w, row_h, 8, 2, ACCENT_CYAN);
+                c.round_rect_border(list_x, ry, list_w, row_h, 6, 2, t.border_focus);
+                c.round_rect(list_x + 3, ry + 5, 4, row_h - 10, 2, t.accent_primary);
             }
 
-            let (tag, col) = match f.severity {
-                Severity::Error => ("ERROR", ACCENT_RED),
-                Severity::Warn => ("WARN", ACCENT_ORANGE),
-                Severity::Info => ("INFO", ACCENT_CYAN),
-            };
-            c.round_rect(MAIN_X + 14, ry + 14, 76, 30, 5, col);
-            c.text_centered(MAIN_X + 14, ry + 14, 76, 30, tag, BG_MAIN, FontSize::Small);
-
             c.text_clipped(
-                MAIN_X + 104,
-                ry + 8,
-                list_w - 250,
-                &f.message,
-                TEXT_PRIMARY,
+                list_x + 18,
+                ry + 11,
+                list_w - 140,
+                label,
+                if selected { t.accent_primary } else { t.text_primary },
                 FontSize::Medium,
             );
-            c.text_clipped(
-                MAIN_X + 104,
-                ry + 34,
-                list_w - 250,
-                f.code,
-                TEXT_MUTED,
-                FontSize::Small,
-            );
 
-            self.add_row_hit(MAIN_X, ry, list_w, row_h, idx);
-
-            if f.fixable {
-                let bx = MAIN_X + list_w - 134;
-                c.round_rect(bx, ry + 12, 120, 34, 6, BG_BTN_PRIMARY);
-                c.text_centered(
+            if selected {
+                let bx = list_x + list_w - 108;
+                c.round_rect(bx, ry + 6, 94, 34, 5, t.accent_primary);
+                btn_text(
+                    c,
                     bx,
-                    ry + 12,
-                    120,
+                    ry + 6,
+                    94,
                     34,
-                    "[A] 自動修正",
-                    TEXT_PRIMARY,
+                    "[A] 決定",
+                    white_or_dark(t.accent_primary),
                     FontSize::Small,
                 );
-                self.add_hit(bx, ry + 12, 120, 34, UiAction::Key(Key::A));
             }
+            self.add_hit(list_x, ry, list_w, row_h, UiAction::MibPickerSelect(idx));
         }
 
-        self.draw_scrollbar(c, ed.check_cursor, total, visible);
-    }
-
-    // -----------------------------------------------------------------------
-    // Shared Widgets: Value Stepper, Mini PM, Scrollbar, Footer
-    // -----------------------------------------------------------------------
-
-    fn draw_value_stepper(
-        &mut self,
-        c: &mut Canvas,
-        x: i32,
-        y: i32,
-        row_idx: usize,
-        val_text: &str,
-        selected: bool,
-        show_max: bool,
-    ) {
-        let btn_w = 42;
-        let h = 34;
-        let val_w = if show_max { 220 } else { 250 };
-
-        // [-] button
-        c.round_rect(x, y, btn_w, h, 6, BG_BTN);
-        c.round_rect_border(x, y, btn_w, h, 6, 1, BORDER_BTN);
-        c.text_centered(x, y, btn_w, h, "◀ -", TEXT_CYAN, FontSize::Small);
-        self.add_hit(x, y, btn_w, h, UiAction::AdjustRow(row_idx, Key::Left));
-
-        // Value box
-        let vx = x + btn_w + 4;
-        c.round_rect(
-            vx,
-            y,
-            val_w,
-            h,
-            6,
-            if selected { BG_VAL_ACTIVE } else { BG_VAL_BOX },
+        let foot_y = my + mh - 50;
+        c.text_sized(
+            mx + 24,
+            foot_y + 10,
+            &format!("{} / {}", picker.cursor + 1, total),
+            t.text_secondary,
+            FontSize::Small,
         );
-        c.round_rect_border(
-            vx,
-            y,
-            val_w,
-            h,
-            6,
-            if selected { 2 } else { 1 },
-            if selected { ACCENT_GOLD } else { BORDER_SUBTLE },
-        );
-        // The number being edited used to be the smallest text on the row
-        // while its label was the largest: the thing you came to change read
-        // as the least important. Values are Medium now.
-        let fg = if selected { TEXT_GOLD } else { TEXT_PRIMARY };
-        if c.text_width_sized(val_text, FontSize::Medium) > val_w - 14 {
-            c.text_clipped(vx + 8, y + 4, val_w - 16, val_text, fg, FontSize::Medium);
-        } else {
-            c.text_centered(vx, y, val_w, h, val_text, fg, FontSize::Medium);
-        }
-
-        // [+] button
-        let px = vx + val_w + 4;
-        c.round_rect(px, y, btn_w, h, 6, BG_BTN);
-        c.round_rect_border(px, y, btn_w, h, 6, 1, BORDER_BTN);
-        c.text_centered(px, y, btn_w, h, "+ ▶", TEXT_CYAN, FontSize::Small);
-        self.add_hit(px, y, btn_w, h, UiAction::AdjustRow(row_idx, Key::Right));
-
-        // Optional [MAX] button
-        if show_max {
-            let mx = px + btn_w + 6;
-            c.round_rect(mx, y, 56, h, 6, rgb(52, 46, 34));
-            c.round_rect_border(mx, y, 56, h, 6, 1, ACCENT_GOLD);
-            c.text_centered(mx, y, 56, h, "MAX", TEXT_GOLD, FontSize::Small);
-            self.add_hit(mx, y, 56, h, UiAction::SetRowMax(row_idx));
-        }
+        let close_x = mx + mw - 180;
+        c.round_rect(close_x, foot_y, 156, 38, 6, t.bg_btn);
+        c.round_rect_border(close_x, foot_y, 156, 38, 6, 1, t.border_subtle);
+        btn_text(c, close_x, foot_y, 156, 38, "[B] 閉じる", t.text_primary, FontSize::Small);
+        self.add_hit(close_x, foot_y, 156, 38, UiAction::MibPickerClose);
     }
 
-    fn draw_mini_pm_buttons(
-        &mut self,
-        c: &mut Canvas,
-        x: i32,
-        y: i32,
-        row_idx: usize,
-        selected: bool,
-    ) {
-        let bw = 76;
-        let h = 34;
-        let bg = if selected { BG_BTN_PRIMARY } else { BG_BTN };
-        c.round_rect(x, y, bw, h, 6, bg);
-        c.round_rect_border(x, y, bw, h, 6, 1, BORDER_BTN);
-        c.text_centered(x, y, bw, h, "◀ 減", TEXT_PRIMARY, FontSize::Small);
-        self.add_hit(x, y, bw, h, UiAction::AdjustRow(row_idx, Key::Left));
+    fn draw_osk(&mut self, c: &mut Canvas) {
+        let Some(osk) = self.osk.clone() else { return };
+        let t = theme();
 
-        c.round_rect(x + bw + 6, y, bw, h, 6, bg);
-        c.round_rect_border(x + bw + 6, y, bw, h, 6, 1, BORDER_BTN);
-        c.text_centered(x + bw + 6, y, bw, h, "増 ▶", TEXT_PRIMARY, FontSize::Small);
-        self.add_hit(x + bw + 6, y, bw, h, UiAction::AdjustRow(row_idx, Key::Right));
-    }
+        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 165));
+        let mx = 100;
+        let my = 44;
+        let mw = 1080;
+        let mh = 632;
+        c.round_rect(mx, my, mw, mh, 12, t.bg_panel);
+        c.round_rect_border(mx, my, mw, mh, 12, 2, t.border_focus);
 
-    fn draw_scrollbar(&mut self, c: &mut Canvas, cursor: usize, total: usize, visible: usize) {
-        let sx = MAIN_X + MAIN_W - 34;
-        let sy = CONTENT_Y;
-        let sh = CONTENT_H;
-
-        // Page Up button [▲]
-        c.round_rect(sx, sy, 34, 40, 6, BG_BTN);
-        c.round_rect_border(sx, sy, 34, 40, 6, 1, BORDER_BTN);
-        c.text_centered(sx, sy, 34, 40, "▲", TEXT_CYAN, FontSize::Small);
-        self.add_hit(sx, sy, 34, 40, UiAction::PageScroll(-(visible as i32)));
-
-        // Page Down button [▼]
-        let by = sy + sh - 40;
-        c.round_rect(sx, by, 34, 40, 6, BG_BTN);
-        c.round_rect_border(sx, by, 34, 40, 6, 1, BORDER_BTN);
-        c.text_centered(sx, by, 34, 40, "▼", TEXT_CYAN, FontSize::Small);
-        self.add_hit(sx, by, 34, 40, UiAction::PageScroll(visible as i32));
-
-        // Track & Thumb
-        let track_y = sy + 46;
-        let track_h = (sh - 92).max(20);
-        c.round_rect(sx + 11, track_y, 12, track_h, 6, BG_VAL_BOX);
-
-        if total > 0 {
-            let thumb_h = ((visible as i32 * track_h) / (total.max(visible) as i32)).clamp(24, track_h);
-            let max_off = track_h - thumb_h;
-            let thumb_y = if total <= 1 {
-                track_y
-            } else {
-                track_y + ((cursor.min(total - 1) as i32) * max_off) / ((total - 1) as i32)
-            };
-            c.round_rect(sx + 11, thumb_y, 12, thumb_h, 6, ACCENT_CYAN);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // 5. Bottom Status & Interactive Action Bar
-    // -----------------------------------------------------------------------
-    fn draw_footer(&mut self, c: &mut Canvas, ed: &Editor) {
-        let w = c.width();
-        c.rect(0, FOOTER_Y, w, FOOTER_H, BG_FOOTER);
-        c.hline(0, FOOTER_Y, w, BORDER_CARD);
-
-        // Status message line
-        c.circle(20, FOOTER_Y + 16, 4, ACCENT_GOLD);
         c.text_clipped(
-            32,
-            FOOTER_Y + 6,
-            w - 48,
-            &ed.message,
-            TEXT_GOLD,
+            mx + 24,
+            my + 16,
+            500,
+            &format!("文字入力: {}", osk.header),
+            t.text_primary,
+            FontSize::Medium,
+        );
+        c.text_right(
+            mx + mw - 24,
+            my + 20,
+            "[A] 入力  [B] 削除  [L/R] 文字種  [+] 確定",
+            t.text_secondary,
             FontSize::Small,
         );
 
-        // Interactive Button Chips tailored to the Switch GUI
-        let mut x = 14;
-        let cy = FOOTER_Y + 34;
-        let ch = 34;
+        let ib_x = mx + 24;
+        let ib_y = my + 56;
+        let ib_w = mw - 48;
+        let ib_h = 50;
+        c.round_rect(ib_x, ib_y, ib_w, ib_h, 6, t.bg_val_box);
+        c.round_rect_border(ib_x, ib_y, ib_w, ib_h, 6, 1, t.border_focus);
+        let disp_text = format!("{}|", osk.buffer);
+        c.text_clipped(ib_x + 16, ib_y + 11, ib_w - 160, &disp_text, t.accent_primary, FontSize::Large);
 
-        for (k_str, label, act) in ui_footer_chips(ed) {
-            let badge_col = match k_str {
-                "A" => ACCENT_GREEN,
-                "B" => ACCENT_RED,
-                "X" => rgb(143, 182, 196),
-                "Y" => ACCENT_ORANGE,
-                "ZL/ZR" => ACCENT_PURPLE,
-                _ => rgb(120, 120, 130),
-            };
-            let key_w = (k_str.chars().count() as i32) * 10 + 18;
-            let lbl_w = c.text_width_sized(label, FontSize::Small);
-            let chip_w = key_w + lbl_w + 22;
+        let cnt_str = format!("{} / {} B", osk.buffer.len(), osk.max_bytes);
+        c.text_right(ib_x + ib_w - 16, ib_y + 16, &cnt_str, t.text_secondary, FontSize::Small);
 
-            c.round_rect(x, cy, chip_w, ch, 8, BG_BTN);
-            c.round_rect_border(x, cy, chip_w, ch, 8, 1, BORDER_BTN);
-
-            // Key pill inside chip
-            c.round_rect(x + 4, cy + 4, key_w, ch - 8, 6, badge_col);
-            c.text_centered(
-                x + 4,
-                cy + 4,
-                key_w,
-                ch - 8,
-                k_str,
-                white_or_dark(badge_col),
+        // Keyboard Mode Tabs (L / R or Touch)
+        let tab_y = my + 118;
+        let tab_w = 246;
+        let tab_h = 38;
+        for (ti, &tname) in OSK_TAB_NAMES.iter().enumerate() {
+            let tx = ib_x + (ti as i32) * (tab_w + 16);
+            let active = osk.tab == ti;
+            c.round_rect(tx, tab_y, tab_w, tab_h, 6, if active { t.bg_selected } else { t.bg_row_even });
+            c.round_rect_border(
+                tx,
+                tab_y,
+                tab_w,
+                tab_h,
+                6,
+                if active { 2 } else { 1 },
+                if active { t.border_focus } else { t.border_subtle },
+            );
+            btn_text(
+                c,
+                tx,
+                tab_y,
+                tab_w,
+                tab_h,
+                tname,
+                if active { t.accent_primary } else { t.text_secondary },
                 FontSize::Small,
             );
+            self.add_hit(tx, tab_y, tab_w, tab_h, UiAction::OskTab(ti));
+        }
 
-            // Label
-            c.text_sized(
-                x + key_w + 10,
-                cy + 7,
-                label,
-                TEXT_PRIMARY,
-                FontSize::Small,
-            );
+        // Character Grid (10 columns x 5 rows)
+        let grid = osk_grid_for(osk.tab);
+        let gx0 = ib_x;
+        let gy0 = my + 170;
+        let cell_w = 96;
+        let cell_h = 68;
+        let gap_x = 8;
+        let gap_y = 8;
 
-            self.add_hit(x, cy, chip_w, ch, act);
-
-            x += chip_w + 8;
-            if x > w - 80 {
-                break;
+        for r in 0..5 {
+            for col in 0..10 {
+                let cx = gx0 + (col as i32) * (cell_w + gap_x);
+                let cy = gy0 + (r as i32) * (cell_h + gap_y);
+                let sel = osk.row == r && osk.col == col;
+                let label = grid[r][col];
+                let is_mod = matches!(label, "゛濁" | "゜半" | "小ぁ" | "小ァ" | "a↔A");
+                let bg = if sel {
+                    t.bg_selected
+                } else if is_mod {
+                    t.bg_btn_primary
+                } else {
+                    t.bg_row_even
+                };
+                let border = if sel {
+                    t.border_focus
+                } else if is_mod {
+                    t.accent_primary
+                } else {
+                    t.border_subtle
+                };
+                c.round_rect(cx, cy, cell_w, cell_h, 6, bg);
+                c.round_rect_border(cx, cy, cell_w, cell_h, 6, if sel { 2 } else { 1 }, border);
+                btn_text(
+                    c,
+                    cx,
+                    cy,
+                    cell_w,
+                    cell_h,
+                    label,
+                    if sel { t.accent_primary } else { t.text_primary },
+                    if osk.tab == 3 { FontSize::Small } else { FontSize::Medium },
+                );
+                self.add_hit(cx, cy, cell_w, cell_h, UiAction::OskCell(r, col));
             }
         }
-    }
-}
 
-/// Text that stays readable on top of `c`.
-///
-/// This used to ignore its argument and return white, so the key caps drew
-/// white on bright green and orange: 2.1 to 3.2 to 1, under every threshold.
-/// Rec. 601 luma is enough to pick the side, and integer maths keeps it const.
-#[inline]
-const fn white_or_dark(c: Color) -> Color {
-    let r = (c & 0xFF) as u32;
-    let g = ((c >> 8) & 0xFF) as u32;
-    let b = ((c >> 16) & 0xFF) as u32;
-    let luma = (r * 299 + g * 587 + b * 114) / 1000;
-    // 120, not the midpoint: the red used for destructive buttons sits at 129
-    // and reads far better with dark text (5.4 to 1) than white (3.5 to 1).
-    if luma >= 120 {
-        rgb(14, 17, 24)
-    } else {
-        rgb(255, 255, 255)
-    }
-}
-
-/// Accurate controller hint chips for the Switch GUI footer.
-fn ui_footer_chips(ed: &Editor) -> Vec<(&'static str, &'static str, UiAction)> {
-    use Screen::*;
-    let prev_slot = (ed.slot + 2) % 3;
-    let next_slot = (ed.slot + 1) % 3;
-    let _ = prev_slot;
-    match ed.screen {
-        SaveList => alloc::vec![
-            ("A", "セーブを開く", UiAction::Key(Key::A)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("L", "3DS変換", UiAction::Key(Key::L)),
-            ("X", "環境設定", UiAction::Key(Key::X)),
-            ("-", "再読込", UiAction::Rescan),
-            ("+", "終了", UiAction::Key(Key::Plus)),
-        ],
-        Slots => alloc::vec![
-            ("A", "ステータス", UiAction::Key(Key::A)),
-            ("L/R", "枠切替", UiAction::SelectSlot(next_slot)),
-            ("X", "アイテム", UiAction::Key(Key::X)),
-            ("Y", "クエスト", UiAction::GotoScreen(Screen::SaveQuests)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Char => {
-            let a_chip = if ed.field == 0 {
-                ("A", "名前変更", UiAction::AdjustRow(0, Key::Right))
-            } else {
-                ("A", "セーブ保存", UiAction::Key(Key::A))
-            };
-            alloc::vec![
-                a_chip,
-                ("</>", "値を変更", UiAction::Key(Key::Right)),
-                ("X", "刻み幅切替", UiAction::Key(Key::X)),
-                ("L/R", "キャラ枠切替", UiAction::SelectSlot(next_slot)),
-                ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-                ("B", "戻る", UiAction::Key(Key::B)),
-            ]
+        // Bottom Action Buttons Row
+        let by = my + 560;
+        let bh = 48;
+        let actions: &[(&str, i32, Color, Color, UiAction)] = &[
+            ("[B] 1字削除", 160, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
+            ("[X] クリア", 140, t.bg_danger, t.accent_danger, UiAction::OskClear),
+            ("[Y] 濁点/小字", 176, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
+            ("空白", 110, t.bg_btn, t.border_subtle, UiAction::OskSpace),
+            ("[-] 取消", 160, t.bg_btn, t.border_subtle, UiAction::OskCancel),
+            ("[+] 確定", 220, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
+        ];
+        let mut bx = ib_x;
+        for &(label, bw, bg, border, act) in actions {
+            c.round_rect(bx, by, bw, bh, 6, bg);
+            c.round_rect_border(bx, by, bw, bh, 6, 1, border);
+            btn_text(c, bx, by, bw, bh, label, white_or_dark(bg), FontSize::Small);
+            self.add_hit(bx, by, bw, bh, act);
+            bx += bw + 12;
         }
-        Items => alloc::vec![
-            ("</>", "個数変更", UiAction::Key(Key::Right)),
-            ("R", "アイテム変更", UiAction::Key(Key::R)),
-            ("X", "刻み幅", UiAction::Key(Key::X)),
-            ("Y", "空き枠表示", UiAction::Key(Key::Y)),
-            ("L", "元に戻す", UiAction::Key(Key::L)),
-            ("A", "セーブ保存", UiAction::Key(Key::A)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        ItemPick | SkillPick => alloc::vec![
-            ("A", "決定", UiAction::Key(Key::A)),
-            ("L/R", "ページ送り", UiAction::PageScroll(10)),
-            ("Y", "名前で検索", UiAction::Key(Key::Y)),
-            ("X", "検索クリア", UiAction::Key(Key::X)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Charms => alloc::vec![
-            ("Y", "お守り編集", UiAction::Key(Key::Y)),
-            ("L", "新規作成", UiAction::Key(Key::L)),
-            ("A", "選択枠削除", UiAction::Key(Key::A)),
-            ("X", "セーブ保存", UiAction::Key(Key::X)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        CharmEdit => alloc::vec![
-            ("</>", "値変更", UiAction::Key(Key::Right)),
-            ("Y", "スキル名選択", UiAction::Key(Key::Y)),
-            ("X", "刻み幅", UiAction::Key(Key::X)),
-            ("A", "お守り反映", UiAction::Key(Key::A)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Equip => alloc::vec![
-            ("L/R", "ページ送り", UiAction::PageScroll(10)),
-            ("Y", "名前で検索", UiAction::Key(Key::Y)),
-            ("X", "検索クリア", UiAction::Key(Key::X)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Hunts => alloc::vec![
-            ("L/R", "対象列切替", UiAction::Key(Key::X)),
-            ("</>", "値を増減", UiAction::Key(Key::Right)),
-            ("Y", "刻み幅切替", UiAction::Key(Key::Y)),
-            ("A", "セーブ保存", UiAction::QuickSave),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Guild => alloc::vec![
-            ("▲/▼", "項目選択", UiAction::Key(Key::Down)),
-            ("</>", "値を増減", UiAction::Key(Key::Right)),
-            ("A", "コメント編集", UiAction::Key(Key::A)),
-            ("L/R", "キャラ枠切替", UiAction::SelectSlot(next_slot)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Roster => alloc::vec![
-            ("L/R", "対象列(Lv/なつき/EXP)", UiAction::Key(Key::X)),
-            ("</>", "値を増減", UiAction::Key(Key::Right)),
-            ("A", "オトモ名変更", UiAction::Key(Key::A)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Palico => alloc::vec![
-            ("A", "導入 / 解除", UiAction::Key(Key::A)),
-            ("Y", "全28匹一括導入", UiAction::InstallAllPalicoes),
-            ("L/R", "日/英切替", UiAction::Key(Key::L)),
-            ("X", "セーブ保存", UiAction::Key(Key::X)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        // L and R used to be swallowed here to switch catalogue tab, which is
-        // why the quest-equipment screen and the extract-all request could not
-        // be reached from a controller at all. The chips said so; they say
-        // what the keys do now.
-        SaveQuests => alloc::vec![
-            ("L", "クエスト装備", UiAction::Key(Key::L)),
-            ("R", "全件SD抽出", UiAction::Key(Key::R)),
-            ("◀/▶", "タブ切替(公式/没)", UiAction::SetQuestTab(1)),
-            ("A", "編集 / 導入", UiAction::Key(Key::A)),
-            ("X", "一括追加", UiAction::InstallOfficialDlc),
-            ("Y", "検索", UiAction::Key(Key::Y)),
-            ("-", "1件抽出", UiAction::Key(Key::Minus)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        QuestEquip => alloc::vec![
-            ("A", "開く/変更", UiAction::Key(Key::A)),
-            ("L/R", "ページ送り", UiAction::PageScroll(10)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        ArcList => alloc::vec![
-            ("A", "開く", UiAction::Key(Key::A)),
-            ("L", "セーブ追加", UiAction::InstallArcRow(ed.cursor)),
-            ("R", "SD展開", UiAction::ExtractOfficialArcs),
-            ("X", "セーブ内一覧", UiAction::Key(Key::X)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::GotoScreen(if ed.save.is_some() { Screen::SaveQuests } else { Screen::SaveList })),
-        ],
-        ArcEntries => alloc::vec![
-            ("A", "編集", UiAction::Key(Key::A)),
-            ("Y", "表示", UiAction::Key(Key::Y)),
-            ("X", "セーブ書込", UiAction::Key(Key::X)),
-            ("L", "検査", UiAction::Key(Key::L)),
-            ("-", "抽出", UiAction::Key(Key::Minus)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Mib => alloc::vec![
-            ("Y", "リスト選択", UiAction::OpenMibPicker(ed.mib_cursor)),
-            ("</>", "値変更", UiAction::Key(Key::Right)),
-            ("L/R", "ページ送り", UiAction::PageScroll(10)),
-            ("X", "刻み幅", UiAction::Key(Key::X)),
-            ("A", ".arc保存", UiAction::Key(Key::A)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Gmd | EntryView | Check => alloc::vec![
-            ("A", "編集/修正", UiAction::Key(Key::A)),
-            ("L/R", "ページ送り", UiAction::PageScroll(10)),
-            ("X", ".arc保存", UiAction::Key(Key::X)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Sets => alloc::vec![
-            ("L/R", "キャラ枠切替", UiAction::SelectSlot(next_slot)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Options => alloc::vec![
-            ("</>", "設定変更", UiAction::Key(Key::Right)),
-            ("A", "セーブ保存", UiAction::Key(Key::A)),
-            ("ZL/ZR", "タブ移動", UiAction::CycleTab(true)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
-        Convert => alloc::vec![
-            ("A", "変換して保存", UiAction::Key(Key::A)),
-            ("Y", "出力名変更", UiAction::Key(Key::Y)),
-            ("B", "戻る", UiAction::Key(Key::B)),
-        ],
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pure Helper Functions (Pagination, MIB Choices, OSK Character Tables)
+// ---------------------------------------------------------------------------
 
 fn window_start(cursor: usize, total: usize, visible: usize) -> usize {
     if total <= visible {
@@ -5094,7 +4816,6 @@ fn window_start(cursor: usize, total: usize, visible: usize) -> usize {
     start
 }
 
-/// Bundled quests matching `quest_tab` (`1` = Official 189, `2` = Dead 34) and `filter`.
 fn bundled_quests_for_tab(
     tab: usize,
     filter: &str,
@@ -5117,7 +4838,6 @@ fn bundled_quests_for_tab(
         .collect()
 }
 
-/// Resolve a monster ID in `ENUM_MINT_` space (`0`, `1`, `80`, `1025`, `1303`, etc.) to its Japanese name in `ENUM_MONS_`.
 fn monster_name_for_mint(v: u32) -> &'static str {
     let mint = questfields::ENUM_MINT_;
     let mons = questfields::ENUM_MONS_;
@@ -5129,7 +4849,6 @@ fn monster_name_for_mint(v: u32) -> &'static str {
     "?"
 }
 
-/// Does this `.mib` field have a list picker modal?
 fn mib_has_picker(f: &questfields::FieldDef) -> bool {
     if f.enum_name.is_some() {
         return true;
@@ -5162,7 +4881,6 @@ fn mib_has_picker(f: &questfields::FieldDef) -> bool {
     )
 }
 
-/// Build the list of `(raw_value, display_label)` choices and current raw value for `.mib` field `field_idx`.
 fn mib_field_choices(mib: &[u8], field_idx: usize) -> Option<(String, Vec<(u32, String)>, u32)> {
     let f = questfields::MIB_FIELDS.get(field_idx)?;
     if f.key.starts_with("mob_slot[") {
@@ -5181,10 +4899,10 @@ fn mib_field_choices(mib: &[u8], field_idx: usize) -> Option<(String, Vec<(u32, 
                 continue;
             }
             if let Ok(raw_id) = id_str.parse::<u32>() {
-                items.push((raw_id, format!("ID {:04}:  {}", raw_id, mname)));
+                items.push((raw_id, format!("ID {:04}: {}", raw_id, mname)));
             }
         }
-        return Some((format!("{} — モンスター選択 (130種)", f.ja), items, cur));
+        return Some((format!("{} (モンスター選択)", f.ja), items, cur));
     }
 
     let cur = questfields::read_u32(mib, f.offset, f.kind).unwrap_or(0);
@@ -5204,55 +4922,54 @@ fn mib_field_choices(mib: &[u8], field_idx: usize) -> Option<(String, Vec<(u32, 
                     if f.size == 1 && raw_id > 255 {
                         continue;
                     }
-                    items.push((raw_id, format!("ID {:04}:  {}", raw_id, mname)));
+                    items.push((raw_id, format!("ID {:04}: {}", raw_id, mname)));
                 }
             }
-            Some((format!("{} — モンスター選択", f.ja), items, cur))
+            Some((format!("{} (モンスター選択)", f.ja), items, cur))
         }
         "map_id" => {
             let mut items = Vec::with_capacity(questfields::ENUM_MAP_.len());
             for (i, &name) in questfields::ENUM_MAP_.iter().enumerate() {
                 let raw = if i < 28 { i as u32 } else { (i + 73) as u32 };
-                items.push((raw, format!("{:03}:  {}", raw, name)));
+                items.push((raw, format!("{:03}: {}", raw, name)));
             }
-            Some((String::from("目的地(マップ)を選択"), items, cur))
+            Some((String::from("マップ選択"), items, cur))
         }
         "quest_level" => {
             let mut items = Vec::with_capacity(questfields::ENUM_LEVEL_.len());
             for (i, &name) in questfields::ENUM_LEVEL_.iter().enumerate() {
                 let raw = if i < 16 { i as u32 } else { (i + 85) as u32 };
-                items.push((raw, format!("{:03}:  {}", raw, name)));
+                items.push((raw, format!("{:03}: {}", raw, name)));
             }
-            Some((String::from("クエストLvを選択"), items, cur))
+            Some((String::from("クエストLv選択"), items, cur))
         }
         "icn1" | "icn2" | "icn3" | "icn4" | "icn5" => {
             let mut items = Vec::with_capacity(questfields::ENUM_ICN_.len());
             for (i, &name) in questfields::ENUM_ICN_.iter().enumerate() {
-                items.push((i as u32, format!("Icon {:03}:  {}", i, name)));
+                items.push((i as u32, format!("{:03}: {}", i, name)));
             }
-            Some((format!("{} — アイコン選択 (188種)", f.ja), items, cur))
+            Some((format!("{} (アイコン選択)", f.ja), items, cur))
         }
         "ran2" | "ran3" | "ran4" => {
             let table = f.enum_name.and_then(questfields::enum_table)?;
             let mut items = Vec::with_capacity(table.len());
             for (i, &name) in table.iter().enumerate() {
                 let raw = (i + 1) as u32;
-                items.push((raw, format!("{}:  {}", raw, name)));
+                items.push((raw, format!("{}: {}", raw, name)));
             }
-            Some((format!("{} を選択", f.ja), items, cur))
+            Some((format!("{}", f.ja), items, cur))
         }
         _ => {
             let table = f.enum_name.and_then(questfields::enum_table)?;
             let mut items = Vec::with_capacity(table.len());
             for (i, &name) in table.iter().enumerate() {
-                items.push((i as u32, format!("{:02}:  {}", i, name)));
+                items.push((i as u32, format!("{:02}: {}", i, name)));
             }
-            Some((format!("{} を選択", f.ja), items, cur))
+            Some((format!("{}", f.ja), items, cur))
         }
     }
 }
 
-/// Write a chosen `raw_val` from `MibPickerState` into `ed.mib_bytes`.
 fn apply_mib_choice(ed: &mut Editor, field_idx: usize, raw_val: u32, label: &str) {
     let Some(f) = questfields::MIB_FIELDS.get(field_idx) else {
         return;
@@ -5272,47 +4989,38 @@ fn apply_mib_choice(ed: &mut Editor, field_idx: usize, raw_val: u32, label: &str
                 ed.mib_bytes[f.offset..f.offset + 13].fill(0);
             }
             ed.dirty = true;
-            ed.message = format!("{} を「{}」に変更しました", f.ja, label);
+            ed.message = format!("{}: {}", f.ja, label);
         }
         return;
     }
     if questfields::write_u32(&mut ed.mib_bytes, f.offset, f.kind, raw_val) {
         ed.dirty = true;
-        ed.message = format!("{} を「{}」に変更しました", f.ja, label);
+        ed.message = format!("{}: {}", f.ja, label);
     }
 }
 
-/// Provide human-readable monster / map / level / icon / item names for MIB fields.
 fn mib_extra_value_label(key: &str, v: u32) -> String {
     match key {
         "com0" | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
         | "ko1" | "ko2" | "ko3" => {
             if v == 0 {
-                String::from("なし (0)")
+                String::from("なし")
             } else {
                 let mname = monster_name_for_mint(v);
                 if mname != "?" {
-                    format!("{} (ID: {})", mname, v)
+                    format!("{} ({})", mname, v)
                 } else {
-                    format!("{} (アイテムID: {})", item_name_of(v as u16), v)
+                    format!("{} ({})", item_name_of(v as u16), v)
                 }
             }
         }
         "map_id" => {
-            let idx = if v > 100 {
-                (v - 73) as usize
-            } else {
-                v as usize
-            };
+            let idx = if v > 100 { (v - 73) as usize } else { v as usize };
             let mname = questfields::ENUM_MAP_.get(idx).copied().unwrap_or("?");
             format!("{} ({})", mname, v)
         }
         "quest_level" => {
-            let idx = if v > 100 {
-                (v - 85) as usize
-            } else {
-                v as usize
-            };
+            let idx = if v > 100 { (v - 85) as usize } else { v as usize };
             let lname = questfields::ENUM_LEVEL_.get(idx).copied().unwrap_or("?");
             format!("{} ({})", lname, v)
         }
@@ -5326,16 +5034,7 @@ fn mib_extra_value_label(key: &str, v: u32) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Built-in On-Screen Keyboard (OSK) for Applet Mode
-// ---------------------------------------------------------------------------
-
-const OSK_TAB_NAMES: [&str; 4] = [
-    "ひらがな",
-    "カタカナ",
-    "英数字・記号",
-    "よく使う漢字・検索語",
-];
+const OSK_TAB_NAMES: [&str; 4] = ["ひらがな", "カタカナ", "英数字", "単語・漢字"];
 
 const OSK_GRID_HIRA: [[&str; 10]; 5] = [
     ["あ", "い", "う", "え", "お", "か", "き", "く", "け", "こ"],
@@ -5474,325 +5173,5 @@ fn osk_cycle_last_char(buf: &mut String) {
         }
         c if c.is_ascii_alphabetic() => osk_apply_small_or_case(buf),
         _ => osk_apply_dakuten(buf),
-    }
-}
-
-impl GuiState {
-    fn draw_osk(&mut self, c: &mut Canvas) {
-        let Some(osk) = self.osk.clone() else { return };
-
-        // Full-screen darkened backdrop. Without it the panel sat on the
-        // background at 1.02:1 and only its 2px border said where it started.
-        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 150));
-        let mx = 100;
-        let my = 44;
-        let mw = 1080;
-        let mh = 632;
-        c.round_rect(mx, my, mw, mh, 14, rgb(28, 28, 32));
-        c.round_rect_border(mx, my, mw, mh, 14, 2, ACCENT_CYAN);
-
-        // Title & Applet Mode Note
-        c.text_sized(
-            mx + 24,
-            my + 16,
-            &format!("文字入力: {}", osk.header),
-            TEXT_PRIMARY,
-            FontSize::Large,
-        );
-        c.text_sized(
-            mx + 560,
-            my + 22,
-            "※タッチ または 十字キー+A で文字を入力し [+] で決定",
-            TEXT_CYAN,
-            FontSize::Small,
-        );
-
-        // Text Input Box
-        let ib_x = mx + 24;
-        let ib_y = my + 58;
-        let ib_w = mw - 48;
-        let ib_h = 52;
-        c.round_rect(ib_x, ib_y, ib_w, ib_h, 8, BG_VAL_BOX);
-        c.round_rect_border(ib_x, ib_y, ib_w, ib_h, 8, 2, ACCENT_GOLD);
-        let disp_text = format!("{}|", osk.buffer);
-        c.text_clipped(ib_x + 16, ib_y + 12, ib_w - 170, &disp_text, TEXT_GOLD, FontSize::Large);
-
-        // Byte counter badge inside input box
-        let cur_b = osk.buffer.len();
-        let max_b = osk.max_bytes;
-        let cnt_str = format!("{} / {} B", cur_b, max_b);
-        let cnt_col = if cur_b >= max_b {
-            ACCENT_ORANGE
-        } else {
-            TEXT_SECONDARY
-        };
-        c.text_right(ib_x + ib_w - 16, ib_y + 16, &cnt_str, cnt_col, FontSize::Small);
-
-        // Keyboard Mode Tabs (L / R or Touch)
-        let tab_y = my + 122;
-        let tab_w = 240;
-        let tab_h = 40;
-        for (ti, &tname) in OSK_TAB_NAMES.iter().enumerate() {
-            let tx = ib_x + (ti as i32) * (tab_w + 12);
-            let active = osk.tab == ti;
-            c.round_rect(
-                tx,
-                tab_y,
-                tab_w,
-                tab_h,
-                7,
-                if active { BG_SELECTED } else { BG_CARD },
-            );
-            c.round_rect_border(
-                tx,
-                tab_y,
-                tab_w,
-                tab_h,
-                7,
-                if active { 2 } else { 1 },
-                if active { ACCENT_CYAN } else { BORDER_BTN },
-            );
-            c.text_centered(
-                tx,
-                tab_y,
-                tab_w,
-                tab_h,
-                tname,
-                if active { TEXT_CYAN } else { TEXT_SECONDARY },
-                FontSize::Medium,
-            );
-            self.add_hit(tx, tab_y, tab_w, tab_h, UiAction::OskTab(ti));
-        }
-
-        // Character Grid (10 columns x 5 rows)
-        let grid = osk_grid_for(osk.tab);
-        let gx0 = ib_x;
-        let gy0 = my + 174;
-        let cell_w = 96;
-        let cell_h = 68;
-        let gap_x = 8;
-        let gap_y = 8;
-
-        for r in 0..5 {
-            for col in 0..10 {
-                let cx = gx0 + (col as i32) * (cell_w + gap_x);
-                let cy = gy0 + (r as i32) * (cell_h + gap_y);
-                let sel = osk.row == r && osk.col == col;
-                let label = grid[r][col];
-                let is_mod = matches!(label, "゛濁" | "゜半" | "小ぁ" | "小ァ" | "a↔A");
-                let bg = if sel {
-                    BG_SELECTED
-                } else if is_mod {
-                    BG_BTN_PRIMARY
-                } else {
-                    BG_CARD
-                };
-                let border = if sel {
-                    ACCENT_GOLD
-                } else if is_mod {
-                    ACCENT_CYAN
-                } else {
-                    BORDER_CARD
-                };
-                c.round_rect(cx, cy, cell_w, cell_h, 8, bg);
-                c.round_rect_border(cx, cy, cell_w, cell_h, 8, if sel { 2 } else { 1 }, border);
-                c.text_centered(
-                    cx,
-                    cy,
-                    cell_w,
-                    cell_h,
-                    label,
-                    if sel {
-                        TEXT_GOLD
-                    } else if is_mod {
-                        TEXT_CYAN
-                    } else {
-                        TEXT_PRIMARY
-                    },
-                    if osk.tab == 3 {
-                        FontSize::Medium
-                    } else {
-                        FontSize::Large
-                    },
-                );
-                self.add_hit(cx, cy, cell_w, cell_h, UiAction::OskCell(r, col));
-            }
-        }
-
-        // Bottom Action Buttons Row
-        let by = my + 560;
-        let bh = 52;
-        let actions: &[(&str, i32, Color, Color, UiAction)] = &[
-            ("[B] 1文字消す", 160, BG_BTN, BORDER_BTN, UiAction::OskBackspace),
-            ("[X] 全消去", 140, BG_BTN_WARN, ACCENT_RED, UiAction::OskClear),
-            (
-                "[Y] 濁点/小文字",
-                176,
-                BG_BTN_PRIMARY,
-                ACCENT_CYAN,
-                UiAction::OskModify,
-            ),
-            ("[空白]", 110, BG_BTN, BORDER_BTN, UiAction::OskSpace),
-            (
-                "[-] キャンセル",
-                170,
-                BG_BTN,
-                BORDER_BTN,
-                UiAction::OskCancel,
-            ),
-            (
-                "[+] 決定 (OK)",
-                216,
-                rgb(22, 92, 64),
-                ACCENT_GREEN,
-                UiAction::OskConfirm,
-            ),
-        ];
-        let mut bx = ib_x;
-        for &(label, bw, bg, border, act) in actions {
-            c.round_rect(bx, by, bw, bh, 8, bg);
-            c.round_rect_border(bx, by, bw, bh, 8, 2, border);
-            c.text_centered(bx, by, bw, bh, label, TEXT_PRIMARY, FontSize::Medium);
-            self.add_hit(bx, by, bw, bh, act);
-            bx += bw + 12;
-        }
-    }
-
-    /// Modal list picker for `.mib` quest fields (Monsters, Maps, Quest Levels, Icons, Conditions).
-    fn draw_mib_picker(&mut self, c: &mut Canvas) {
-        let Some(picker) = self.mib_picker.clone() else {
-            return;
-        };
-
-        // Same reason as the keyboard: the panel needs to sit above the page.
-        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 150));
-        let mx = 160;
-        let my = 48;
-        let mw = 960;
-        let mh = 624;
-        c.round_rect(mx, my, mw, mh, 14, rgb(28, 28, 32));
-        c.round_rect_border(mx, my, mw, mh, 14, 2, ACCENT_CYAN);
-
-        c.text_clipped(
-            mx + 24,
-            my + 16,
-            mw - 380,
-            &picker.title,
-            TEXT_PRIMARY,
-            FontSize::Large,
-        );
-        c.text_right(
-            mx + mw - 24,
-            my + 22,
-            "[▲/▼] 選択   [L/R・◀/▶] 10行移動   [A] 決定   [B] キャンセル",
-            TEXT_CYAN,
-            FontSize::Small,
-        );
-        c.hline(mx + 16, my + 54, mw - 32, BORDER_CARD);
-
-        let total = picker.items.len();
-        let visible = 10;
-        let start = window_start(picker.cursor, total, visible);
-        let row_h = 46;
-        let list_x = mx + 24;
-        let list_w = mw - 92;
-        let list_y0 = my + 66;
-
-        for row in 0..visible {
-            let idx = start + row;
-            let Some((_, label)) = picker.items.get(idx) else {
-                break;
-            };
-            let ry = list_y0 + (row as i32) * (row_h + 4);
-            let selected = idx == picker.cursor;
-
-            let bg = if selected {
-                BG_SELECTED
-            } else if row % 2 == 0 {
-                BG_CARD
-            } else {
-                BG_CARD_ALT
-            };
-            c.round_rect(list_x, ry, list_w, row_h, 7, bg);
-            if selected {
-                c.round_rect_border(list_x, ry, list_w, row_h, 7, 2, ACCENT_GOLD);
-                c.round_rect(list_x + 3, ry + 5, 5, row_h - 10, 2, ACCENT_GOLD);
-            }
-
-            c.text_clipped(
-                list_x + 18,
-                ry + 11,
-                list_w - 140,
-                label,
-                if selected { TEXT_GOLD } else { TEXT_PRIMARY },
-                FontSize::Medium,
-            );
-
-            let bx = list_x + list_w - 116;
-            c.round_rect(
-                bx,
-                ry + 6,
-                102,
-                34,
-                6,
-                if selected { BG_BTN_PRIMARY } else { BG_BTN },
-            );
-            c.round_rect_border(bx, ry + 6, 102, 34, 6, 1, ACCENT_CYAN);
-            c.text_centered(bx, ry + 6, 102, 34, "[A] 決定", TEXT_PRIMARY, FontSize::Small);
-            self.add_hit(list_x, ry, list_w, row_h, UiAction::MibPickerSelect(idx));
-        }
-
-        // Scrollbar inside modal
-        let sx = mx + mw - 54;
-        let sy = list_y0;
-        let sh = visible as i32 * (row_h + 4) - 4;
-        c.round_rect(sx, sy, 34, 40, 6, BG_BTN);
-        c.round_rect_border(sx, sy, 34, 40, 6, 1, BORDER_BTN);
-        c.text_centered(sx, sy, 34, 40, "▲", TEXT_CYAN, FontSize::Small);
-        self.add_hit(sx, sy, 34, 40, UiAction::MibPickerScroll(-10));
-
-        let by_dn = sy + sh - 40;
-        c.round_rect(sx, by_dn, 34, 40, 6, BG_BTN);
-        c.round_rect_border(sx, by_dn, 34, 40, 6, 1, BORDER_BTN);
-        c.text_centered(sx, by_dn, 34, 40, "▼", TEXT_CYAN, FontSize::Small);
-        self.add_hit(sx, by_dn, 34, 40, UiAction::MibPickerScroll(10));
-
-        let track_y = sy + 46;
-        let track_h = (sh - 92).max(20);
-        c.round_rect(sx + 11, track_y, 12, track_h, 6, BG_VAL_BOX);
-        if total > 0 {
-            let thumb_h =
-                ((visible as i32 * track_h) / (total.max(visible) as i32)).clamp(24, track_h);
-            let max_off = track_h - thumb_h;
-            let thumb_y = if total <= 1 {
-                track_y
-            } else {
-                track_y + ((picker.cursor.min(total - 1) as i32) * max_off) / ((total - 1) as i32)
-            };
-            c.round_rect(sx + 11, thumb_y, 12, thumb_h, 6, ACCENT_CYAN);
-        }
-
-        // Bottom modal bar
-        let foot_y = my + mh - 52;
-        c.text_sized(
-            mx + 24,
-            foot_y + 10,
-            &format!("{} / {} 件", picker.cursor + 1, total),
-            TEXT_SECONDARY,
-            FontSize::Medium,
-        );
-        let close_x = mx + mw - 200;
-        c.round_rect(close_x, foot_y, 176, 40, 8, BG_BTN);
-        c.round_rect_border(close_x, foot_y, 176, 40, 8, 1, ACCENT_RED);
-        c.text_centered(
-            close_x,
-            foot_y,
-            176,
-            40,
-            "[B] キャンセル",
-            TEXT_PRIMARY,
-            FontSize::Medium,
-        );
-        self.add_hit(close_x, foot_y, 176, 40, UiAction::MibPickerClose);
     }
 }

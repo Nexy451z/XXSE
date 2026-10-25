@@ -4,8 +4,8 @@
 
   Layout, the same shape other Switch homebrew uses:
 
-    XXSE-Alpha-v0.1.0.zip
-      XXSE-Alpha-v0.1.0/
+    XXSE-Alpha-v0.2.5.zip
+      XXSE-Alpha-v0.2.5/
         switch/XXSE/XXSE.nro     <- extract to the SD card root
         XXSE.exe                 <- PC build
         README.txt
@@ -14,7 +14,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = 'Alpha v0.1.0',
+    [string]$Version = 'Alpha v0.2.5',
     [string]$Root = (Split-Path $PSScriptRoot -Parent)
 )
 
@@ -58,7 +58,7 @@ if (Test-Path $sdcard) {
 
 $readme = @'
 XXSE - Monster Hunter XX (NX) Save Editor
-Alpha v0.1.0
+Alpha v0.2.5
 
 Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
@@ -74,7 +74,9 @@ Monster Hunter XX (3DS / Switch) のセーブエディタです。
     SD カードのルート/
     └─ switch/
        └─ XXSE/
-          └─ XXSE.nro
+          ├─ XXSE.nro
+          ├─ backups/          書き込み前の控え
+          └─ mhxx/quest/arc/   クエストの書き出し先
 
   hbmenu から起動します。PC 版は XXSE.exe をそのまま実行してください。
 
@@ -89,7 +91,7 @@ Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
 注意
 ----
-  書き込み前に /switch/mhnxeditor/backups/ へ控えを作ります。
+  書き込み前に /switch/XXSE/backups/ へ控えを作ります。
   セーブは必ずバックアップを取ってから使ってください。
 
 ライセンス: MIT

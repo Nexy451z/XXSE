@@ -857,7 +857,11 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
         {
             ("オトモの名前 (最大20B / 全角6文字)", 20)
         } else {
-            ("クエストテキスト", 180)
+            let label = mhnx_core::quest::Gmd::LABELS
+                .get(idx)
+                .copied()
+                .unwrap_or("クエスト文章");
+            (label, 512)
         };
         if !crate::swkbd::is_available() {
             // In Applet mode (launched from Album), Horizon OS forbids launching
