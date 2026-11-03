@@ -23,6 +23,7 @@ use alloc::vec::Vec;
 use crate::arc::{extension_for, Arc};
 use crate::awards;
 use crate::check::{self, Finding, Severity};
+use crate::diffvalues::{diff_values, ValueChange};
 use crate::charm::{self, Charm, CHARM_COUNT};
 use crate::dlc;
 use crate::dlcats::{self, Lang};
@@ -1372,6 +1373,12 @@ pub struct SaveDiff {
     pub changed: usize,
     /// Feature level lines, e.g. "スロット1: 名前、装備ボックス 1 枠".
     pub summary: Vec<String>,
+    /// Value level lines, e.g. "装備ボックス #12 レベル: 1 → 3".
+    ///
+    /// One entry per field, read through an existing getter by
+    /// [crate::diffvalues]. Readable values only: a byte nobody can decode
+    /// stays in `ranges`.
+    pub values: Vec<ValueChange>,
     /// The stretches themselves, in file order.
     pub ranges: Vec<DiffRange>,
 }
@@ -1385,8 +1392,10 @@ impl SaveDiff {
         self.changed == 0
     }
 
-    /// The review body: what changes, then where. shown caps the ranges so a
-    /// difference in hundreds of places cannot push the buttons off screen.
+    /// The review body: what changes, then what values, then where. shown caps
+    /// the ranges and [crate::diffvalues::VALUE_SHOWN] the values, so a
+    /// difference in hundreds of places cannot push the buttons off screen;
+    /// what is left over is counted rather than dropped silently.
     pub fn lines(&self, shown: usize) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         out.push(String::from("■ 変更される内容"));
@@ -1395,6 +1404,20 @@ impl SaveDiff {
         }
         for line in &self.summary {
             out.push(format!("・{}", line));
+        }
+        if !self.values.is_empty() {
+            out.push(String::new());
+            out.push(String::from("■ 変更される値（旧 → 新）"));
+            for value in self.values.iter().take(crate::diffvalues::VALUE_SHOWN) {
+                out.push(format!("・{}", value.line()));
+            }
+            if self.values.len() > crate::diffvalues::VALUE_SHOWN {
+                out.push(format!(
+                    "・ほか {} 件（値は先頭 {} 件まで。残りは下の範囲に残ります）",
+                    self.values.len() - crate::diffvalues::VALUE_SHOWN,
+                    crate::diffvalues::VALUE_SHOWN
+                ));
+            }
         }
         out.push(String::new());
         out.push(String::from("■ 変更される範囲"));
@@ -1744,14 +1767,20 @@ pub fn diff_save(old: &[u8], new: &[u8]) -> SaveDiff {
         0
     };
     let (changed, ranges) = diff_ranges(old, new, header_len, &new_save);
-    let summary = if changed > 0 {
-        diff_summary(&ranges, &old_save, &new_save)
+    let (summary, values) = if changed > 0 {
+        (
+            diff_summary(&ranges, &old_save, &new_save),
+            // Parsed once here, so the value walk costs the reads of the parts
+            // the ranges named and no second copy of the save.
+            diff_values(&ranges, &old_save, &new_save, None),
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     SaveDiff {
         changed,
         summary,
+        values,
         ranges,
     }
 }
@@ -1766,6 +1795,11 @@ pub struct SaveReview {
     pub lines: Vec<String>,
     /// The feature level lines, for tests and the size note.
     pub summary: Vec<String>,
+    /// The value level lines, e.g. "スロット1 名前: ナナ → 差分テスト".
+    ///
+    /// The \`lines\` field already carries them as the "■ 変更される値" section;
+    /// this is what the screen and the tests read them from.
+    pub values: Vec<ValueChange>,
     /// The named stretches.
     pub ranges: Vec<DiffRange>,
     /// How many bytes differ from the file on disk.
@@ -3416,6 +3450,7 @@ impl Editor {
         self.review = Some(SaveReview {
             lines,
             summary: diff.summary,
+            values: diff.values,
             ranges: diff.ranges,
             changed: diff.changed,
             old_len: old.len(),
@@ -11049,5 +11084,48 @@ mod tests {
         assert!(ed.message.contains("中止"), "{}", ed.message);
         // Nothing was written: the save in memory is still the file on disk.
         assert_eq!(ed.save.as_ref().expect("save").to_bytes(), old);
+    }
+
+    #[test]
+    fn the_console_review_carries_the_values_before_the_ranges() {
+        let (mut ed, gear) = editor_with_palico_gear(&["テスト"]);
+        let old = ed.save.as_ref().expect("save").to_bytes();
+        // Put the weapon record on the first palico: the worn list is what
+        // moves, so the review has to name the part and the box index.
+        assert!(ed.palico_equip_assign(0, 0, gear[0] as u16), "{}", ed.message);
+        let new = ed.save.as_ref().expect("save").to_bytes();
+        assert_ne!(old, new);
+
+        assert!(ed.stage_save_review("nand:/system", &old, &new));
+        let review = ed.review.as_ref().expect("a review");
+        let values = review
+            .values
+            .iter()
+            .map(|value| value.line())
+            .collect::<Vec<String>>()
+            .join("\n");
+        assert!(
+            values.contains("スロット1 オトモ #1 武器: なし → 枠 0 / オトモ武器 ID 431"),
+            "{}",
+            values
+        );
+        // The body the console draws has the section, above the ranges.
+        let lines = review.lines.join("\n");
+        assert!(lines.contains("■ 変更される値（旧 → 新）"), "{}", lines);
+        assert!(lines.contains("オトモ #1 武器"), "{}", lines);
+        let at = |needle: &str| {
+            review
+                .lines
+                .iter()
+                .position(|l| l == needle)
+                .unwrap_or_else(|| panic!("no {:?} in\n{}", needle, lines))
+        };
+        assert!(at("■ 変更される値（旧 → 新）") < at("■ 変更される範囲"));
+
+        // The second press still writes exactly the reviewed bytes.
+        match ed.confirm_save_review().expect("the second press writes") {
+            Write::File { bytes, .. } => assert_eq!(bytes, new),
+        }
+        assert!(!ed.review_open());
     }
 }

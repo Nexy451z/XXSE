@@ -3328,10 +3328,34 @@ impl GuiState {
         );
         c.hline(mx + 20, my + 52, mw - 40, t.border_subtle);
 
-        let mut y = my + 64;
-        for line in review.lines.iter().take(17) {
+        // The body is now summary + values + ranges, and the values alone can be
+        // thirty lines (hbedit::SaveReview, 上限は diffvalues::VALUE_SHOWN).
+        // The panel holds a fixed number of rows, so the walk stops on the
+        // footer's rule and says how many rows it folded away: a fixed take(17)
+        // would have cut the "ほか N 件" line off and hidden the ranges with no
+        // word. Geometry, not a guess: a glyph is 17px tall and a row is 23px
+        // (an empty spacer row is 10px), the body starts at my + 64 and the
+        // footer rule sits at foot_y - 12, so the last row drawn here ends at
+        // most 7px above the rule and the two can never overlap.
+        const ROW: i32 = 23;
+        const SPACER: i32 = 10;
+        const GLYPH: i32 = 17;
+        let foot_y = my + mh - 56;
+        let body_top = my + 64;
+        let body_bottom = foot_y - 20;
+        let total = review.lines.len();
+        let mut y = body_top;
+        let mut drawn = 0usize;
+        for (i, line) in review.lines.iter().enumerate() {
+            // Keep one row free for the count while lines remain after this
+            // one, so the count is never the line that falls off.
+            let reserve = if i + 1 < total { ROW } else { 0 };
+            if y + GLYPH + reserve > body_bottom {
+                break;
+            }
             if line.is_empty() {
-                y += 10;
+                y += SPACER;
+                drawn += 1;
                 continue;
             }
             let color = if line.starts_with('■') {
@@ -3340,10 +3364,20 @@ impl GuiState {
                 t.text_primary
             };
             c.text_clipped(mx + 30, y, mw - 60, line, color, FontSize::Small);
-            y += 23;
+            y += ROW;
+            drawn += 1;
+        }
+        if drawn < total && y + GLYPH <= body_bottom {
+            c.text_clipped(
+                mx + 30,
+                y,
+                mw - 60,
+                &format!("・ほか {} 行（この画面に収まりません）", total - drawn),
+                t.text_secondary,
+                FontSize::Small,
+            );
         }
 
-        let foot_y = my + mh - 56;
         c.hline(mx + 20, foot_y - 12, mw - 40, t.border_subtle);
         c.text_sized(
             mx + 30,
