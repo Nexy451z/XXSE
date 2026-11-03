@@ -27,9 +27,10 @@ use mhnx_core::check::Severity;
 use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
-    decoration_name_of, item_name_of, monster_name, Editor, Key, Screen, CHAR_FIELDS,
-    CONSOLE_SAVE, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO,
-    ITEM_OPS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
+    decoration_name_of, item_name_of, monster_name, palico_part_name, Editor, Key,
+    PalicoEquipRow, Screen, CHAR_FIELDS, CONSOLE_SAVE, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT,
+    ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, SET_EDIT_ROWS,
+    SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -509,10 +510,21 @@ impl GuiState {
         }
     }
 
+    /// Put the palico equipment panel away when a jump leaves its screens.
+    ///
+    /// The key path closes it through B, but a touch or a ZL / ZR jump changes
+    /// `ed.screen` without going through the state machine, and a panel left
+    /// open on a screen that no longer draws it is a trap. Silent on purpose:
+    /// the jump already sets a message of its own.
+    fn close_palico_panel(&mut self, ed: &mut Editor) {
+        ed.palico_equip = None;
+    }
+
     fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
         self.pending_delete = None;
         self.pending_delete_charm = None;
         self.close_set_form(ed);
+        self.close_palico_panel(ed);
         if sec != MainSection::File && sec != MainSection::Quest && ed.save.is_none() {
             ed.message = String::from("先にセーブデータを開いてください");
             return;
@@ -705,6 +717,8 @@ impl GuiState {
         // The マイセット tab means the list, so a tab press also closes the
         // set editor; leaving the screen any other way does too.
         self.close_set_form(ed);
+        // Same rule for the palico equipment panel.
+        self.close_palico_panel(ed);
 
         if is_quest_inner(ed.screen) {
             safe_flush_quest_entry(ed);
@@ -1008,6 +1022,12 @@ impl GuiState {
             if ed.screen == Screen::Sets && ed.set_edit.is_some() {
                 return;
             }
+            // Same rule for the palico equipment panel: cycling the sub-tab
+            // under it would leave the panel open on a screen that no longer
+            // shows it, and L / R would take the pad's only way to page it.
+            if ed.palico_equip_open() {
+                return;
+            }
             // The second stage of the bulk add is one number: L/R step it
             // instead of paging the list underneath.
             if ed.screen == Screen::ItemPick
@@ -1164,6 +1184,10 @@ impl GuiState {
                 }
                 other => ed.input(other),
             },
+            // The palico equipment panel is a mode of these two screens: while
+            // it is open every key belongs to it, the same shape the item menu
+            // has on the item box.
+            Screen::Roster | Screen::Palico if ed.palico_equip_open() => ed.input(key),
             Screen::Roster => match key {
                 Key::Y => {
                     ed.roster_field = (ed.roster_field + 1) % 3;
@@ -2118,7 +2142,11 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::JewelPick => ed.jewel_pick_cursor,
         Screen::Hunts => ed.hunt_cursor,
         Screen::Guild => ed.guild_field,
-        Screen::Roster => ed.roster_cursor,
+        // The panel's row while it is open, the list's row otherwise.
+        Screen::Roster => match ed.palico_equip {
+            Some(state) => state.field,
+            None => ed.roster_cursor,
+        },
         // The list's row while the list is showing, and the form's row while
         // the set editor is open: the editor is a mode of this screen.
         Screen::Sets => match ed.set_edit {
@@ -2143,7 +2171,10 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Gmd => ed.gmd_cursor,
         Screen::Check => ed.check_cursor,
         Screen::EntryView => ed.entry_row_cursor,
-        Screen::Palico => ed.palico_cursor,
+        Screen::Palico => match ed.palico_equip {
+            Some(state) => state.field,
+            None => ed.palico_cursor,
+        },
         Screen::Options => ed.option_cursor,
         _ => ed.cursor,
     }
@@ -2173,7 +2204,10 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::JewelPick => ed.jewel_pick_matches().len(),
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => 3,
-        Screen::Roster => ed.palicos().len(),
+        Screen::Roster => match ed.palico_equip {
+            Some(_) => PALICO_EQUIP_ROWS,
+            None => ed.palicos().len(),
+        },
         Screen::Sets => {
             if ed.set_edit.is_some() {
                 SET_EDIT_ROWS
@@ -2218,7 +2252,10 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Mib => questfields::MIB_FIELDS.len(),
         Screen::Gmd => ed.gmd.as_ref().map(|g| g.strings.len()).unwrap_or(0),
         Screen::Check => ed.findings.len(),
-        Screen::Palico => dlcats::all_ids().len(),
+        Screen::Palico => match ed.palico_equip {
+            Some(_) => PALICO_EQUIP_ROWS,
+            None => dlcats::all_ids().len(),
+        },
         Screen::Options => 4,
         Screen::Convert => 0,
     }
@@ -2295,7 +2332,17 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         Screen::JewelPick => ed.jewel_pick_cursor = clamped,
         Screen::Hunts => ed.hunt_cursor = clamped,
         Screen::Guild => ed.guild_field = clamped,
-        Screen::Roster => ed.roster_cursor = clamped,
+        Screen::Roster => {
+            if let Some(mut state) = ed.palico_equip {
+                // A tap on another row is a cursor move, so the pending release
+                // (which belongs to the row it was armed on) is dropped.
+                state.field = clamped;
+                state.clear_armed = None;
+                ed.palico_equip = Some(state);
+            } else {
+                ed.roster_cursor = clamped;
+            }
+        }
         Screen::SaveQuests => {
             ed.save_quest_cursor = clamped;
             ed.cursor = clamped;
@@ -2321,8 +2368,14 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         }
         Screen::EntryView => ed.entry_row_cursor = clamped,
         Screen::Palico => {
-            ed.palico_cursor = clamped;
-            ed.cursor = clamped;
+            if let Some(mut state) = ed.palico_equip {
+                state.field = clamped;
+                state.clear_armed = None;
+                ed.palico_equip = Some(state);
+            } else {
+                ed.palico_cursor = clamped;
+                ed.cursor = clamped;
+            }
         }
         Screen::Options => ed.option_cursor = clamped,
         _ => ed.cursor = clamped,
@@ -2567,7 +2620,9 @@ fn trigger_quick_save(ed: &mut Editor) {
             }
         }
         Screen::Char | Screen::Items | Screen::Options => ed.input(Key::A),
-        Screen::Charms | Screen::Palico => ed.input(Key::X),
+        // X on the roster is the save it advertises, on both states of the
+        // screen - the list and the equipment panel above it.
+        Screen::Charms | Screen::Palico | Screen::Roster => ed.input(Key::X),
         _ => {
             if ed.save.is_some() {
                 let prev_screen = ed.screen;
@@ -2891,13 +2946,36 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, &preset_lbl, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::CharmPreset(0));
             }
+            // The equipment panel is a mode of both palico screens, so its two
+            // keys are the only chips while it is open.
+            Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[-] 解除×2", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "[A] 装着", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
+            }
             Screen::Roster => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[-] 装備", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
+
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
                 btn_text(c, 1108, sy, 158, sh, "全オトモ Lv99", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::RosterMaxAll);
             }
             Screen::Palico => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[-] 装備", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
+
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
                 btn_text(c, 1108, sy, 158, sh, "全28匹 一括導入", t.text_primary, FontSize::Small);
@@ -2968,8 +3046,13 @@ impl GuiState {
             }
             Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
             Screen::Options => "[◀/▶] 値変更  [Y] 直近スナップショットへ戻す  [X] 保存  [B] 戻る",
-            Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [L/R] サブタブ  [X] 保存",
-            Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [L/R] サブタブ  [X] 保存",
+            // The equipment panel is a mode of both palico screens: its chips
+            // replace theirs while it is open.
+            Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
+                "[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-×2] 解除  [B] 一覧  [X] 保存"
+            }
+            Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [L/R] サブタブ  [X] 保存",
+            Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
             Screen::Hunts => "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [L/R] サブタブ  [X] 保存",
             Screen::SaveQuests => "[A] 編集/導入  [Y] 検索  [L/R] サブタブ  [X] 保存",
             Screen::ArcEntries => "[A] 開く  [Y] 検査  [L/R] サブタブ  [X] 保存  [B] 戻る",
@@ -3011,6 +3094,11 @@ impl GuiState {
             Screen::EquipEdit => self.draw_equip_edit(c, ed),
             Screen::JewelPick => self.draw_jewel_pick(c, ed),
             Screen::Sets => self.draw_sets(c, ed),
+            // The palico equipment panel is a mode of the two palico screens,
+            // so it is dispatched before the screens themselves.
+            Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
+                self.draw_palico_equip(c, ed)
+            }
             Screen::Roster => self.draw_roster(c, ed),
             Screen::Palico => self.draw_palico(c, ed),
             Screen::Hunts => self.draw_hunts(c, ed),
@@ -3412,6 +3500,59 @@ impl GuiState {
         self.add_hit(ix + 20, btn_y, iw - 40, 42, UiAction::ActivateRow(row_idx));
 
         let mut cur_y = btn_y + 52; // iy + 220
+
+        // The palico equipment panel is a mode of the two palico screens and
+        // has the two tools those screens do not: the candidate stepper and the
+        // two-press release. The value box and the [A] button above already say
+        // what the row holds and what [A] would write, so nothing is repeated.
+        if ed.palico_equip_open() {
+            let part = row_idx;
+            c.hline(ix + 16, cur_y, iw - 32, t.border_subtle);
+            cur_y += 8;
+            let full_w = iw - 40;
+            let half_w = (iw - 48) / 2;
+            c.text_sized(ix + 20, cur_y, "候補をめくる・外す", t.text_muted, FontSize::Small);
+            cur_y += 24;
+            self.draw_tool_button(
+                c,
+                ix + 20,
+                cur_y,
+                half_w,
+                38,
+                "◀ 前の候補",
+                UiAction::AdjustRow(part, Key::Left),
+            );
+            self.draw_tool_button(
+                c,
+                ix + 28 + half_w,
+                cur_y,
+                half_w,
+                38,
+                "▶ 次の候補",
+                UiAction::AdjustRow(part, Key::Right),
+            );
+            cur_y += 44;
+            // A touch press goes through the same key path the pad uses, so a
+            // tap can never release a part the pad would ask twice about.
+            let armed = ed.palico_equip.and_then(|s| s.clear_armed) == Some(part);
+            let clear_lbl = if armed {
+                "もう一度タップで解除"
+            } else {
+                "[-] 解除（2回）"
+            };
+            self.draw_tool_button(c, ix + 20, cur_y, full_w, 38, clear_lbl, UiAction::Key(Key::Minus));
+            cur_y += 44;
+            self.draw_tool_button(
+                c,
+                ix + 20,
+                cur_y,
+                full_w,
+                38,
+                "[B] 一覧に戻る",
+                UiAction::Key(Key::B),
+            );
+            return;
+        }
 
         // Slot 6: Numeric Stepper & Step Size Selector
         if has_stepper {
@@ -4882,6 +5023,49 @@ impl GuiState {
             } else {
                 "決定"
             },
+            &notice,
+        );
+    }
+
+    /// The palico equipment panel: weapon, head and body, one row each.
+    ///
+    /// A mode of the roster and download-palico screens, so this draws the
+    /// three rows and the note in the same list/inspector layout those screens
+    /// use - the row's value is the candidate [A] would write and the meta line
+    /// is what the palico wears now.
+    fn draw_palico_equip(&mut self, c: &mut Canvas, ed: &Editor) {
+        let panel: Vec<PalicoEquipRow> = ed.palico_equip_rows();
+        let field = ed.palico_equip.map(|s| s.field).unwrap_or(0);
+        let (who, roster_no) = match ed.palico_equip_target() {
+            Some(p) => (p.name, p.index + 1),
+            None => (
+                String::from("?"),
+                ed.palico_equip.map(|s| s.palico + 1).unwrap_or(0),
+            ),
+        };
+        let mut rows = Vec::with_capacity(panel.len());
+        for row in panel.iter() {
+            rows.push((
+                row.part,
+                String::from(palico_part_name(row.part)),
+                format!("現在: {}", row.worn_text()),
+                row.pick_text(),
+                format!("#{:02}", row.part + 1),
+            ));
+        }
+        let hdr = format!("オトモ装備 — {}（ロスター #{}）", who, roster_no);
+        // The names are not in the catalogue, so the one line that says so is
+        // pinned under the list, where `draw_adaptive_rows_warn` reserves room
+        // for it instead of letting it draw over the last row.
+        let notice = alloc::vec![String::from(PALICO_EQUIP_NAME_NOTE)];
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            &hdr,
+            &rows,
+            field.min(PALICO_EQUIP_ROWS.saturating_sub(1)),
+            false,
+            "装着",
             &notice,
         );
     }

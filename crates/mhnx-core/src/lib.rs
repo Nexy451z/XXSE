@@ -42,6 +42,7 @@ pub mod arc;
 pub mod charm;
 pub mod check;
 pub mod crc;
+pub mod csvout;
 pub mod dlc;
 // The bundle holds quest data taken from the game, so the repository ships an
 // empty stub and build.rs compiles the generated module when one exists.

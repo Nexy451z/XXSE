@@ -214,6 +214,17 @@ pub struct MhnxEditor {
     /// Search text of the seven equipment pickers in the set editor, one per
     /// part: each picker narrows the box on its own.
     pub set_part_search: [String; mhnx_core::myset::EQUIP_SET_PARTS],
+    /// Roster index of the otomo whose three gear slots the panel is editing.
+    pub palico_selected: Option<usize>,
+    /// Box index of the otomo gear record the editor on the right is showing.
+    pub palico_gear_selected: Option<usize>,
+    /// Search text of the otomo gear list.
+    pub palico_gear_filter: String,
+    /// Show the blank records of the otomo gear box too. Off by default: the
+    /// box holds a thousand records and the sample character uses 72.
+    pub palico_gear_show_empty: bool,
+    /// Search text of the three otomo decoration pickers, one per socket.
+    pub palico_deco_search: [String; 3],
     /// Search text of the three decoration pickers, one per socket.
     pub equip_deco_search: [String; 3],
     /// Type, id and level the "空き枠に作成" row is set to.
@@ -318,6 +329,11 @@ impl Default for MhnxEditor {
                 String::new(),
             ],
             equip_deco_search: [String::new(), String::new(), String::new()],
+            palico_selected: None,
+            palico_gear_selected: None,
+            palico_gear_filter: String::new(),
+            palico_gear_show_empty: false,
+            palico_deco_search: [String::new(), String::new(), String::new()],
             equip_new_kind: 7,
             equip_new_id: 1,
             equip_new_level: 1,
@@ -398,6 +414,10 @@ impl MhnxEditor {
         for s in self.set_part_search.iter_mut() {
             s.clear();
         }
+        // The otomo panel names a roster record and a row of this slot's own
+        // gear box, so neither number means anything in another slot.
+        self.palico_selected = None;
+        self.palico_gear_selected = None;
         let Some(s) = &self.save else { return };
         if let Some(c) = s.read_character(self.slot) {
             self.edit = c;
@@ -4036,21 +4056,52 @@ impl MhnxEditor {
     }
 
     fn tab_palico_detail(&mut self, ui: &mut egui::Ui) {
-        ui.heading("オトモ")
-            ;
+        ui.heading("オトモ");
         let Some(save) = &self.save else {
             ui.label("セーブを開くと、オトモの一覧を表示します");
             return;
         };
-        let list = mhnx_core::palico::used(save, self.slot);
-        ui.label(format!("{} 匹", list.len()));
+        // Copied out of the save once per frame, the way the equipment tab does
+        // it: the two lists and the editor all read these bytes, and holding
+        // &self.save across them would lock the fields the writes touch.
+        let slot = self.slot;
+        let list = mhnx_core::palico::used(save, slot);
+        let gear = mhnx_core::palicogear::decode(save, slot);
+        let gear_bytes = mhnx_core::palicogear::box_bytes(save, slot)
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "{} 匹 / オトモ装備 {} 件（{} 枠中）",
+                list.len(),
+                gear.len(),
+                mhnx_core::palicogear::PALICO_EQUIP_COUNT
+            ));
+            // The name tables for this box have never been mapped, so every
+            // row names its record by id. Saying so once beats a "-" column.
+            ui.label(
+                egui::RichText::new("オトモ装備の名前は未対応です。装備は ID で表示します。")
+                    .weak()
+                    .small(),
+            );
+        });
         if list.is_empty() {
             ui.label("このスロットにはオトモがいません");
             return;
         }
+        // Land on the first palico the first time the tab is opened: an empty
+        // gear panel below the list looks like the tab has no editor at all.
+        if !list.iter().any(|p| Some(p.index) == self.palico_selected) {
+            self.palico_selected = Some(list[0].index);
+        }
         let mut changed = false;
+        // Bounded so the two panels below stay on screen. A share of what is
+        // left rather than a fixed number: the window can be as short as 600
+        // points, and a fixed 172 would push the gear editor off the bottom.
+        let roster_h = (ui.available_height() * 0.34).clamp(120.0, 180.0);
         egui::ScrollArea::vertical()
             .id_salt("palicolist")
+            .max_height(roster_h)
             .show(ui, |ui| {
                 // Six headers and six cells per row: the grid used to declare
                 // four columns, which squeezed every column and left the tail
@@ -4065,7 +4116,17 @@ impl MhnxEditor {
                         }
                         ui.end_row();
                         for p in &list {
-                            ui.label(format!("{}", p.index));
+                            // The frame number is the selector: the gear panel
+                            // below edits whichever palico is picked here.
+                            if ui
+                                .selectable_label(
+                                    self.palico_selected == Some(p.index),
+                                    format!("{}", p.index),
+                                )
+                                .clicked()
+                            {
+                                self.palico_selected = Some(p.index);
+                            }
                             let mut name = p.name.clone();
                             if ui
                                 .add(
@@ -4127,7 +4188,485 @@ impl MhnxEditor {
             self.dirty = true;
             self.message = "オトモを更新しました（まだファイルには書いていません）".to_owned();
         }
+        ui.separator();
+        let palico = self.palico_selected.unwrap_or(list[0].index);
+        // Gear assignment on the left, the box it points into on the right.
+        // The box list takes the rest of the height.
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_width(470.0);
+                self.palico_equip_panel(ui, palico, &gear, &gear_bytes);
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                self.palico_gear_panel(ui, &gear, &gear_bytes);
+            });
+        });
     }
+
+    /// Name of one of the three slots a palico wears things in.
+    fn palico_part_name(part: usize) -> &'static str {
+        match part {
+            0 => "武器",
+            1 => "頭",
+            2 => "胴",
+            _ => "?",
+        }
+    }
+
+    /// "枠 4 / ID 431" for a worn box index, "なし" for the empty value.
+    fn palico_gear_label(index: u16, gear: &[mhnx_core::equip::Equipment]) -> String {
+        if index == u16::MAX {
+            return String::from("なし");
+        }
+        match gear.iter().find(|e| e.index == index as usize) {
+            Some(e) => format!("枠 {} / ID {}", e.index, e.id),
+            // The roster can name a record the box no longer holds. Showing
+            // the number beats pretending nothing is worn.
+            None => format!("枠 {} / 不明", index),
+        }
+    }
+
+    /// The three gear slots of one palico.
+    ///
+    /// Picking a row writes its box index into the roster record at +0x100;
+    /// 解除 writes 0xFFFF. The box record itself is never touched: the roster
+    /// names a row, and the game lets two palicos name the same one.
+    fn palico_equip_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        palico: usize,
+        gear: &[mhnx_core::equip::Equipment],
+        gear_bytes: &[u8],
+    ) {
+        let worn = self.palico_equip_of(palico).unwrap_or([u16::MAX; 3]);
+        ui.label(egui::RichText::new(format!("枠 {} の装備の割当", palico)).strong());
+        let mut assign: Option<(usize, u16)> = None;
+        let mut release: Option<usize> = None;
+        for part in 0..mhnx_core::palico::EQUIP_SLOTS {
+            let want = mhnx_core::palicogear::KINDS[part];
+            let current = worn[part];
+            ui.horizontal_wrapped(|ui| {
+                ui.label(Self::palico_part_name(part));
+                let shown = Self::palico_gear_label(current, gear);
+                egui::ComboBox::from_id_salt(("palicopart", palico, part))
+                    .selected_text(shown)
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_label(current == u16::MAX, "なし（外す）")
+                            .clicked()
+                            && current != u16::MAX
+                        {
+                            release = Some(part);
+                        }
+                        // Only the records of the kind this part takes: the
+                        // real save has all 21 worn indices landing on the
+                        // kind their position implies, and a file that says
+                        // otherwise is not something to write back.
+                        for e in gear.iter().filter(|e| e.kind == want) {
+                            let label = format!("枠 {} / ID {}", e.index, e.id);
+                            if ui
+                                .selectable_label(current == e.index as u16, label)
+                                .clicked()
+                            {
+                                assign = Some((part, e.index as u16));
+                            }
+                        }
+                    });
+                if current != u16::MAX && ui.small_button("解除").clicked() {
+                    release = Some(part);
+                }
+            });
+        }
+        if let Some((part, index)) = assign {
+            self.palico_equip_assign(palico, part, index);
+        } else if let Some(part) = release {
+            self.palico_equip_release(palico, part);
+        }
+        ui.label(
+            egui::RichText::new(
+                "書き換えるのはオトモの記録（+0x100 の 3×u16）だけで、オトモ装備ボックスのレコードはそのままです。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(4.0);
+        ui.separator();
+        self.palico_gear_editor(ui, gear, gear_bytes);
+    }
+
+    /// Level and decoration editor for the selected otomo gear record.
+    fn palico_gear_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        gear: &[mhnx_core::equip::Equipment],
+        gear_bytes: &[u8],
+    ) {
+        // Land on the first record so the panel is useful without a click.
+        if self
+            .palico_gear_selected
+            .map_or(true, |i| !gear.iter().any(|e| e.index == i))
+        {
+            self.palico_gear_selected = gear.first().map(|e| e.index);
+        }
+        let Some(eq) = self
+            .palico_gear_selected
+            .and_then(|i| gear.iter().find(|e| e.index == i).copied())
+        else {
+            ui.label(egui::RichText::new("編集できるオトモ装備がありません").weak());
+            return;
+        };
+        ui.label(egui::RichText::new(format!("装備 {} の編集", eq.index)).strong());
+        ui.label(format!(
+            "{} / ID {}（名前は未対応）",
+            mhnx_core::equip::type_name(eq.kind),
+            eq.id
+        ));
+        let mut level = eq.level;
+        ui.horizontal(|ui| {
+            ui.label("レベル");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut level)
+                        .range(1..=mhnx_core::palicogear::MAX_LEVEL),
+                )
+                .changed()
+            {
+                self.palico_gear_level(eq.index, level);
+            }
+            ui.label(egui::RichText::new("1〜32").weak().small());
+        });
+        let at = eq.index * mhnx_core::palicogear::RECORD;
+        let decos = gear_bytes
+            .get(at..at + mhnx_core::palicogear::RECORD)
+            .map(|rec| mhnx_core::equip::Equipment::decorations(eq.index, rec))
+            .unwrap_or([0; 3]);
+        let mut deco_action: Option<(usize, u16)> = None;
+        for socket in 0..3 {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}枠目", socket + 1));
+                if let Some(id) = Self::deco_combo(
+                    ui,
+                    "palico",
+                    socket,
+                    decos[socket],
+                    &mut self.palico_deco_search[socket],
+                ) {
+                    deco_action = Some((socket, id));
+                }
+            });
+        }
+        if let Some((socket, id)) = deco_action {
+            self.palico_gear_decoration(eq.index, socket, id);
+        }
+        ui.label(
+            egui::RichText::new(
+                "先頭 12 バイト（Lv・装飾品）だけを書き換え、+0x0C 以降は保持します。",
+            )
+            .weak()
+            .small(),
+        );
+    }
+
+    /// The used otomo gear records, and the row the editor is showing.
+    fn palico_gear_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        gear: &[mhnx_core::equip::Equipment],
+        gear_bytes: &[u8],
+    ) {
+        // Pinned before anything is drawn. set_height() unions the min_rect
+        // with the cursor, so calling it after the filter row would pull the
+        // cursor back to the top of the column and the table would paint over
+        // the row above it.
+        ui.set_height(ui.available_height());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("オトモ装備ボックス").strong());
+            ui.add(
+                egui::TextEdit::singleline(&mut self.palico_gear_filter)
+                    .hint_text("種類・ID・枠番号")
+                    .desired_width(140.0),
+            );
+            if ui.small_button("クリア").clicked() {
+                self.palico_gear_filter.clear();
+            }
+            ui.checkbox(&mut self.palico_gear_show_empty, "空き枠を表示");
+        });
+        let needle = self.palico_gear_filter.trim().to_lowercase();
+        let show_empty = self.palico_gear_show_empty;
+        let mut rows: Vec<mhnx_core::equip::Equipment> = if show_empty {
+            let Some(save) = &self.save else {
+                return;
+            };
+            (0..mhnx_core::palicogear::PALICO_EQUIP_COUNT)
+                .map(|i| {
+                    mhnx_core::palicogear::decode_one(save, self.slot, i).unwrap_or(
+                        mhnx_core::equip::Equipment {
+                            index: i,
+                            kind: 0,
+                            level: 1,
+                            transmog_level: 1,
+                            id: 0,
+                            transmog: 0,
+                        },
+                    )
+                })
+                .collect()
+        } else {
+            gear.to_vec()
+        };
+        rows.retain(|e| {
+            needle.is_empty()
+                || mhnx_core::equip::type_name(e.kind)
+                    .to_lowercase()
+                    .contains(&needle)
+                || format!("{}", e.id).contains(&needle)
+                || format!("{}", e.index).contains(&needle)
+        });
+        if self
+            .palico_gear_selected
+            .map_or(true, |i| !rows.iter().any(|e| e.index == i))
+        {
+            self.palico_gear_selected = rows.iter().find(|e| e.kind != 0).map(|e| e.index);
+        }
+        ui.label(
+            egui::RichText::new(format!("{} 件を表示", rows.len()))
+                .weak()
+                .small(),
+        );
+        let selected = self.palico_gear_selected;
+        let mut pick: Option<usize> = None;
+        TableBuilder::new(ui)
+            .id_salt("palicogearlist")
+            .striped(true)
+            .sense(egui::Sense::click())
+            .column(Column::exact(46.0))
+            .column(Column::exact(96.0))
+            .column(Column::exact(70.0))
+            .column(Column::exact(40.0))
+            .column(Column::remainder())
+            .header(22.0, |mut h| {
+                for t in ["枠", "種類", "ID", "Lv", "装飾品"] {
+                    h.col(|ui| {
+                        ui.strong(t);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(20.0, rows.len(), |mut row| {
+                    let e = rows[row.index()];
+                    row.set_selected(selected == Some(e.index));
+                    row.col(|ui| {
+                        ui.label(format!("{}", e.index));
+                    });
+                    row.col(|ui| {
+                        ui.label(mhnx_core::equip::type_name(e.kind));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{}", e.id));
+                    });
+                    row.col(|ui| {
+                        ui.label(format!("{}", e.level));
+                    });
+                    row.col(|ui| {
+                        let at = e.index * mhnx_core::palicogear::RECORD;
+                        let d = gear_bytes
+                            .get(at..at + mhnx_core::palicogear::RECORD)
+                            .map(|rec| {
+                                mhnx_core::equip::Equipment::decorations(e.index, rec)
+                            })
+                            .unwrap_or([0; 3]);
+                        let text = format!(
+                            "{}・{}・{}",
+                            deco_label(d[0]),
+                            deco_label(d[1]),
+                            deco_label(d[2])
+                        );
+                        ui.label(text.clone()).on_hover_text(text);
+                    });
+                    if row.response().clicked() {
+                        pick = Some(e.index);
+                    }
+                });
+            });
+        if let Some(p) = pick {
+            self.palico_gear_selected = Some(p);
+        }
+    }
+
+    /// The three box indices one palico wears, weapon / head / body.
+    pub fn palico_equip_of(&self, palico: usize) -> Option<[u16; 3]> {
+        let save = self.save.as_ref()?;
+        mhnx_core::palico::roster(save, self.slot)
+            .get(palico)
+            .map(|p| p.equip)
+    }
+
+    /// Point one of a palico's three equipment slots at a record in its box.
+    ///
+    /// The record has to be in use and has to carry the kind that part takes:
+    /// the sample save has every worn index landing on the right kind, and a
+    /// value that breaks that is not something this editor should create. The
+    /// record itself is read but never written - the roster names it by index.
+    pub fn palico_equip_assign(&mut self, palico: usize, part: usize, box_index: u16) -> bool {
+        let slot = self.slot;
+        let part_name = Self::palico_part_name(part);
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if part >= mhnx_core::palico::EQUIP_SLOTS {
+            self.message = format!("{} はオトモの装備部位ではありません", part);
+            return false;
+        }
+        // An empty roster record is not a palico: writing gear into it would
+        // leave an index the game reads for a slot it never shows.
+        let exists = mhnx_core::palico::roster(save, slot)
+            .get(palico)
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        if !exists {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        }
+        let Some(eq) = mhnx_core::palicogear::decode_one(save, slot, box_index as usize) else {
+            self.message = format!(
+                "装備ボックスの枠 {} は空きなので、{}にできません",
+                box_index, part_name
+            );
+            return false;
+        };
+        let want = mhnx_core::palicogear::KINDS[part];
+        if eq.kind != want {
+            self.message = format!(
+                "枠 {} は{}なので、{}にはできません",
+                box_index,
+                mhnx_core::equip::type_name(eq.kind),
+                part_name
+            );
+            return false;
+        }
+        if !Self::write_palico_equip(save, slot, palico, part, box_index) {
+            self.message = format!("枠 {} の{}を書き換えられませんでした", palico, part_name);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "枠 {} の{}をオトモ装備の枠 {} にしました（ボックスのレコードはそのままです）",
+            palico, part_name, box_index
+        );
+        true
+    }
+
+    /// Take one piece off a palico by writing 0xFFFF into its roster slot.
+    pub fn palico_equip_release(&mut self, palico: usize, part: usize) -> bool {
+        let slot = self.slot;
+        let part_name = Self::palico_part_name(part);
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if part >= mhnx_core::palico::EQUIP_SLOTS {
+            self.message = format!("{} はオトモの装備部位ではありません", part);
+            return false;
+        }
+        let current = mhnx_core::palico::roster(save, slot)
+            .get(palico)
+            .map(|p| p.equip[part]);
+        let Some(current) = current else {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        };
+        if current == u16::MAX {
+            self.message = format!("枠 {} の{}はすでに外れています", palico, part_name);
+            return false;
+        }
+        if !Self::write_palico_equip(save, slot, palico, part, u16::MAX) {
+            self.message = format!("枠 {} の{}を外せませんでした", palico, part_name);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!("枠 {} の{}を外しました（0xFFFF）", palico, part_name);
+        true
+    }
+
+    /// Write one box index into the roster record at +0x100.
+    ///
+    /// Only the two bytes of the one part move. The offset is assembled from
+    /// the constants in palico, which is where the roster layout is stated.
+    fn write_palico_equip(
+        save: &mut Save,
+        slot: usize,
+        palico: usize,
+        part: usize,
+        index: u16,
+    ) -> bool {
+        if palico >= mhnx_core::palico::SLOTS || part >= mhnx_core::palico::EQUIP_SLOTS {
+            return false;
+        }
+        let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+            return false;
+        };
+        let at = base
+            + mhnx_core::palico::OFF_ROSTER
+            + palico * mhnx_core::palico::RECORD
+            + mhnx_core::palico::EQUIP
+            + part * 2;
+        let Some(dst) = save.body_mut().get_mut(at..at + 2) else {
+            return false;
+        };
+        dst.copy_from_slice(&index.to_le_bytes());
+        true
+    }
+
+    /// Rewrite the level of one otomo gear record.
+    pub fn palico_gear_level(&mut self, index: usize, level: u16) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if mhnx_core::palicogear::set_level(save, slot, index, level) {
+            self.dirty = true;
+            self.message = format!("オトモ装備の枠 {} をレベル {} にしました", index, level);
+            true
+        } else {
+            self.message = format!(
+                "枠 {} のレベルを {} にできませんでした（1〜32、空き枠は不可）",
+                index,
+                level
+            );
+            false
+        }
+    }
+
+    /// Rewrite one decoration socket of an otomo gear record.
+    pub fn palico_gear_decoration(&mut self, index: usize, socket: usize, id: u16) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if mhnx_core::palicogear::set_decoration(save, slot, index, socket, id) {
+            self.dirty = true;
+            self.message = format!(
+                "オトモ装備の枠 {} の {} 枠目を {} にしました",
+                index,
+                socket + 1,
+                deco_label(id)
+            );
+            true
+        } else {
+            self.message = format!(
+                "枠 {} の {} 枠目の装飾品を書き換えられませんでした",
+                index,
+                socket + 1
+            );
+            false
+        }
+    }
+
     fn tab_hunts(&mut self, ui: &mut egui::Ui) {
         ui.heading("狩猟記録");
         if self.save.is_none() {
@@ -4630,6 +5169,7 @@ impl MhnxEditor {
                 ui.label(format!("{}枠目", socket + 1));
                 if let Some(id) = Self::deco_combo(
                     ui,
+                    "equip",
                     socket,
                     decos[socket],
                     &mut self.equip_deco_search[socket],
@@ -4834,6 +5374,7 @@ impl MhnxEditor {
     #[cfg(feature = "gamedata")]
     fn deco_combo(
         ui: &mut egui::Ui,
+        salt: &'static str,
         socket: usize,
         current: u16,
         search: &mut String,
@@ -4844,7 +5385,7 @@ impl MhnxEditor {
         } else {
             format!("{} ({})", deco_name(current), current)
         };
-        egui::ComboBox::from_id_salt(("deco", socket))
+        egui::ComboBox::from_id_salt((salt, socket))
             .selected_text(shown)
             .width(230.0)
             .show_ui(ui, |ui| {
@@ -4861,7 +5402,7 @@ impl MhnxEditor {
                 }
                 let needle = search.trim().to_lowercase();
                 egui::ScrollArea::vertical()
-                    .id_salt(("deco", socket))
+                    .id_salt((salt, socket))
                     .max_height(240.0)
                     .show(ui, |ui| {
                         for (i, name) in mhnx_core::gamedata::JWL_NAMES.iter().enumerate() {
@@ -4895,6 +5436,7 @@ impl MhnxEditor {
     #[cfg(not(feature = "gamedata"))]
     fn deco_combo(
         ui: &mut egui::Ui,
+        _salt: &'static str,
         socket: usize,
         current: u16,
         _search: &mut String,
@@ -6890,7 +7432,255 @@ mod tests {
         assert_eq!(app.set_selected, None);
         assert!(app.set_part_search.iter().all(|s| s.is_empty()));
     }
+
+    /// The fixture writes zeros into the roster, but the game writes 0xFFFF
+    /// for "nothing worn": with zeros there, every unnamed record would claim
+    /// to wear box row 0. Put the real empty value in all three slots.
+    fn clear_worn(app: &mut MhnxEditor) {
+        let slot = app.slot;
+        let Some(save) = app.save.as_mut() else {
+            return;
+        };
+        let base = save.slot_base(slot).expect("slot base") as usize;
+        for palico in 0..mhnx_core::palico::SLOTS {
+            for part in 0..mhnx_core::palico::EQUIP_SLOTS {
+                let at = base
+                    + mhnx_core::palico::OFF_ROSTER
+                    + palico * mhnx_core::palico::RECORD
+                    + mhnx_core::palico::EQUIP
+                    + part * 2;
+                save.body_mut()[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            }
+        }
+    }
+
+    /// A palico names the box row it wears in its own record at +0x100: the
+    /// two bytes of one part move, and the record they name does not.
+    #[test]
+    fn assigning_palico_gear_writes_only_the_roster_slot() {
+        let dir = Scratch::new("palicogear");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        clear_worn(&mut app);
+
+        // One named palico and two pieces of gear of different kinds.
+        let (weapon, head) = {
+            let save = app.save.as_mut().expect("save");
+            assert!(mhnx_core::palico::set_name(save, 0, 0, "テスト"));
+            let w = mhnx_core::palicogear::create(save, 0, mhnx_core::palicogear::WEAPON, 431, 1)
+                .expect("a blank weapon record");
+            let h = mhnx_core::palicogear::create(save, 0, mhnx_core::palicogear::HEAD, 464, 1)
+                .expect("a blank head record");
+            (w, h)
+        };
+        let base = app
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        let box_before = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::palicogear::record(s, 0, weapon))
+            .expect("the weapon record")
+            .to_vec();
+        let body_before = app.save.as_ref().expect("save").body().to_vec();
+        app.dirty = false;
+
+        assert!(app.palico_equip_assign(0, 0, weapon as u16), "{}", app.message);
+        assert!(app.dirty, "an assignment has to mark the save dirty");
+        assert_eq!(
+            app.palico_equip_of(0).expect("a palico"),
+            [weapon as u16, u16::MAX, u16::MAX]
+        );
+
+        // The record the palico names is untouched...
+        assert_eq!(
+            app.save
+                .as_ref()
+                .and_then(|s| mhnx_core::palicogear::record(s, 0, weapon))
+                .expect("the weapon record"),
+            &box_before[..]
+        );
+        // ...and exactly the two bytes of part 0 in the roster moved.
+        let at = base + mhnx_core::palico::OFF_ROSTER + mhnx_core::palico::EQUIP;
+        let body_after = app.save.as_ref().expect("save").body().to_vec();
+        for (off, (a, b)) in body_before.iter().zip(body_after.iter()).enumerate() {
+            if a != b {
+                assert!(
+                    off >= at && off < at + 2,
+                    "byte 0x{:X} changed, outside the worn index",
+                    off
+                );
+            }
+        }
+
+        // A record of another kind, a blank box row and a roster record with
+        // no name are all refused, and a refusal writes nothing.
+        app.dirty = false;
+        assert!(!app.palico_equip_assign(0, 1, weapon as u16));
+        assert!(app.message.contains("なので"), "{}", app.message);
+        assert!(!app.dirty, "a refused assignment must not dirty the save");
+        assert_eq!(app.palico_equip_of(0).expect("a palico")[1], u16::MAX);
+        assert!(!app.palico_equip_assign(0, 2, 999));
+        assert!(!app.palico_equip_assign(1, 0, weapon as u16));
+        assert!(!app.palico_equip_assign(0, 3, weapon as u16));
+
+        // 解除 writes 0xFFFF, and a second press has nothing to do.
+        assert!(app.palico_equip_assign(0, 1, head as u16), "{}", app.message);
+        assert_eq!(
+            app.palico_equip_of(0).expect("a palico"),
+            [weapon as u16, head as u16, u16::MAX]
+        );
+        assert!(app.palico_equip_release(0, 0), "{}", app.message);
+        assert_eq!(
+            app.palico_equip_of(0).expect("a palico"),
+            [u16::MAX, head as u16, u16::MAX]
+        );
+        app.dirty = false;
+        assert!(!app.palico_equip_release(0, 0));
+        assert!(!app.dirty);
+    }
+
+    /// The box's own level and decoration writers are reached through the
+    /// panel, and a value the fields cannot hold is refused without writing.
+    #[test]
+    fn palico_gear_level_and_decoration_are_edited_in_place() {
+        let dir = Scratch::new("palicogearlevel");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        let index = {
+            let save = app.save.as_mut().expect("save");
+            assert!(mhnx_core::palico::set_name(save, 0, 0, "テスト"));
+            mhnx_core::palicogear::create(save, 0, mhnx_core::palicogear::HEAD, 464, 1)
+                .expect("a blank head record")
+        };
+        assert!(app.palico_equip_assign(0, 1, index as u16), "{}", app.message);
+        let before = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::palicogear::record(s, 0, index))
+            .expect("the record")
+            .to_vec();
+        app.dirty = false;
+
+        assert!(app.palico_gear_level(index, 7), "{}", app.message);
+        assert!(app.dirty, "a level edit has to mark the save dirty");
+        let eq = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::palicogear::decode_one(s, 0, index))
+            .expect("still decodes");
+        assert_eq!(
+            (eq.kind, eq.id, eq.level),
+            (mhnx_core::palicogear::HEAD, 464, 7)
+        );
+        let after = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::palicogear::record(s, 0, index))
+            .expect("the record")
+            .to_vec();
+        assert_eq!(
+            &after[mhnx_core::palicogear::WRITABLE..],
+            &before[mhnx_core::palicogear::WRITABLE..],
+            "the tail is type owned"
+        );
+
+        // A level the five bit field cannot show is refused, not clamped.
+        app.dirty = false;
+        assert!(!app.palico_gear_level(index, 0));
+        assert!(!app.palico_gear_level(index, 33));
+        assert!(!app.dirty, "a refused level must not dirty the save");
+
+        // One decoration socket moves; the other two and the tail do not.
+        assert!(app.palico_gear_decoration(index, 1, 2639), "{}", app.message);
+        let after_deco = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::palicogear::record(s, 0, index))
+            .expect("the record")
+            .to_vec();
+        assert_eq!(
+            mhnx_core::equip::Equipment::decorations(0, &after_deco),
+            [0, 2639, 0]
+        );
+        assert_eq!(&after_deco[..0x08], &after[..0x08]);
+        assert_eq!(&after_deco[0x0A..], &after[0x0A..]);
+
+        // A fourth socket and a blank record have nothing to write.
+        app.dirty = false;
+        assert!(!app.palico_gear_decoration(index, 3, 1));
+        assert!(!app.palico_gear_decoration(999, 0, 1));
+        assert!(!app.dirty);
+
+        // Nothing open: both writers refuse rather than panic.
+        let mut fresh = MhnxEditor::default();
+        assert!(!fresh.palico_gear_level(0, 2));
+        assert!(!fresh.palico_gear_decoration(0, 0, 1));
+    }
+
+    /// Two palicos can name the same box row, because the roster stores an
+    /// index and the box record is never copied or rewritten.
+    #[test]
+    fn two_palicos_can_wear_the_same_gear_row() {
+        let dir = Scratch::new("palicoshare");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        clear_worn(&mut app);
+
+        let weapon = {
+            let save = app.save.as_mut().expect("save");
+            assert!(mhnx_core::palico::set_name(save, 0, 0, "テスト"));
+            assert!(mhnx_core::palico::set_name(save, 0, 1, "テスト2"));
+            mhnx_core::palicogear::create(save, 0, mhnx_core::palicogear::WEAPON, 431, 2)
+                .expect("a blank weapon record")
+        };
+        let record_before = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::palicogear::record(s, 0, weapon))
+            .expect("the weapon record")
+            .to_vec();
+
+        assert!(app.palico_equip_assign(0, 0, weapon as u16), "{}", app.message);
+        assert!(app.palico_equip_assign(1, 0, weapon as u16), "{}", app.message);
+        assert_eq!(
+            app.palico_equip_of(1).expect("a palico")[0],
+            weapon as u16
+        );
+        let worn = {
+            let save = app.save.as_ref().expect("save");
+            mhnx_core::palicogear::worn_by_all(save, 0, weapon)
+        };
+        assert_eq!(worn, vec![0, 1], "both palicos name the one row");
+        assert_eq!(
+            app.save
+                .as_ref()
+                .and_then(|s| mhnx_core::palicogear::record(s, 0, weapon))
+                .expect("the weapon record"),
+            &record_before[..],
+            "the shared record is not rewritten"
+        );
+
+        // Past the end of the box there is no record to point at.
+        app.dirty = false;
+        assert!(!app.palico_equip_assign(
+            0,
+            0,
+            mhnx_core::palicogear::PALICO_EQUIP_COUNT as u16
+        ));
+        assert!(!app.dirty);
+    }
 }
+
 
 /// Name shown for a decoration socket: a dash when it is empty.
 fn deco_label(id: u16) -> String {

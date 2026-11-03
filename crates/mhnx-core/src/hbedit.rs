@@ -261,6 +261,120 @@ impl EquipEdit {
     }
 }
 
+/// Rows of the palico equipment panel: the weapon, the head and the body.
+///
+/// The order is the worn list's own (`palico::EQUIP` holds weapon, head, body),
+/// which is also `palicogear::KINDS`, so row `n` edits part `n` of both.
+pub const PALICO_EQUIP_ROWS: usize = crate::palico::EQUIP_SLOTS;
+
+/// Names of the three parts, in worn-list order.
+pub const PALICO_PART_NAMES: [&str; PALICO_EQUIP_ROWS] = ["武器", "頭", "胴"];
+
+/// What a worn-list slot holds when the palico wears nothing there.
+///
+/// `palico::Palico::equip` documents 0xFFFF as the empty value and the game
+/// writes it, so [-] clears a part back to the value the save itself uses
+/// rather than to one made up here.
+pub const PALICO_EQUIP_NONE: u16 = 0xFFFF;
+
+/// Shown under the palico equipment rows.
+///
+/// `equip::name` answers "-" for the three palico kinds on purpose: the name
+/// tables exist but their id mapping is not established, so the panel prints
+/// the box index and the equip id instead of a name that could be wrong.
+pub const PALICO_EQUIP_NAME_NOTE: &str = "オトモ装備の名前は未対応（装備IDと枠番号で表示します）";
+
+/// The palico equipment panel, open as a mode of one of two screens.
+///
+/// This is a **mode**, not a variant of `Screen`: the roster screen and the
+/// download-palico screen both keep their own list and cursor underneath, and
+/// the panel is the same state whichever one opened it. `pick` is what [A]
+/// would write and is kept apart from the roster on purpose - walking the rows
+/// must not write anything, only [A] and the second [-] do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PalicoEquip {
+    /// Roster record index (0..palico::SLOTS) being equipped.
+    pub palico: usize,
+    /// Row under the cursor: 0 weapon, 1 head, 2 body.
+    pub field: usize,
+    /// Box index [A] would write, per part.
+    ///
+    /// `PALICO_EQUIP_NONE` means the box holds no record of that kind, which is
+    /// the only value that cannot be written.
+    pub pick: [u16; PALICO_EQUIP_ROWS],
+    /// Part whose [-] release is waiting for its second press.
+    ///
+    /// A release is never one press: the first only names what would go and
+    /// any other key drops it, the rule the equipment list and the set editor
+    /// already use.
+    pub clear_armed: Option<usize>,
+}
+
+/// One decoded row of the palico equipment panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PalicoEquipRow {
+    /// 0 weapon, 1 head, 2 body.
+    pub part: usize,
+    /// Box index the palico wears now, `PALICO_EQUIP_NONE` when nothing.
+    pub worn: u16,
+    /// Equip id of the worn record, 0 when nothing is worn.
+    pub worn_id: u16,
+    /// Box index [A] would write, `PALICO_EQUIP_NONE` when nothing is picked.
+    pub pick: u16,
+    /// Equip id of the picked record, 0 when nothing is picked.
+    pub pick_id: u16,
+}
+
+impl PalicoEquipRow {
+    /// "枠 7 / ID 431" for the record the palico wears now, "なし" for nothing.
+    pub fn worn_text(&self) -> String {
+        if self.worn == PALICO_EQUIP_NONE {
+            String::from("なし")
+        } else {
+            format!("枠 {} / ID {}", self.worn, self.worn_id)
+        }
+    }
+
+    /// The same shape for the record [A] would write.
+    pub fn pick_text(&self) -> String {
+        if self.pick == PALICO_EQUIP_NONE {
+            String::from("候補なし")
+        } else {
+            format!("枠 {} / ID {}", self.pick, self.pick_id)
+        }
+    }
+}
+
+/// Name of one of the three slots a palico wears things in.
+pub fn palico_part_name(part: usize) -> &'static str {
+    PALICO_PART_NAMES.get(part).copied().unwrap_or("?")
+}
+
+/// Write one worn-list index into one roster record.
+///
+/// `palico::EQUIP` is the documented offset (+0x100) of the three u16 worn
+/// list and `part` picks which of them, so only the two bytes of that part
+/// move. The target range is bounded by the body's own length, so a bad slot
+/// or a short body writes nothing instead of panicking.
+fn write_palico_equip(save: &mut Save, slot: usize, palico: usize, part: usize, index: u16) -> bool {
+    if palico >= crate::palico::SLOTS || part >= crate::palico::EQUIP_SLOTS {
+        return false;
+    }
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return false;
+    };
+    let at = base
+        + crate::palico::OFF_ROSTER
+        + palico * crate::palico::RECORD
+        + crate::palico::EQUIP
+        + part * 2;
+    let Some(dst) = save.body_mut().get_mut(at..at + 2) else {
+        return false;
+    };
+    dst.copy_from_slice(&index.to_le_bytes());
+    true
+}
+
 /// Rows on the equipment set editor: 0 is the name, 1..=7 the seven parts.
 pub const SET_EDIT_ROWS: usize = 1 + crate::myset::EQUIP_SET_PARTS;
 
@@ -756,6 +870,11 @@ pub struct Editor {
     pub palico_cursor: usize,
     /// 0 = Japanese, 1 = English.
     pub palico_lang: u8,
+    /// The palico equipment panel, when it is open.
+    ///
+    /// A mode of the roster / download-palico screen, the same shape `set_edit`
+    /// has on the my-sets screen: `None` means the screen shows its own list.
+    pub palico_equip: Option<PalicoEquip>,
     /// Cursor inside the options list.
     pub option_cursor: usize,
     /// Save files offered by the I/O layer.
@@ -854,6 +973,7 @@ impl Editor {
             save_quest_cursor: 0,
             palico_cursor: 0,
             palico_lang: 0,
+            palico_equip: None,
             option_cursor: 0,
             save_files: Vec::new(),
             arc_files: Vec::new(),
@@ -957,6 +1077,9 @@ impl Editor {
             // The set editor uses Minus for the two-press part clear. On the
             // list above it Minus still means "rescan".
             Screen::Sets => self.set_edit.is_some(),
+            // On the two palico screens Minus opens the equipment panel, so it
+            // cannot also rescan there: one press would do both at once.
+            Screen::Roster | Screen::Palico => true,
             _ => false,
         }
     }
@@ -1424,6 +1547,11 @@ impl Editor {
     }
 
     fn input_palico(&mut self, key: Key) {
+        // Same rule as the roster: the panel owns every key while it is open.
+        if self.palico_equip.is_some() {
+            self.input_palico_equip(key);
+            return;
+        }
         let ids = dlcats::all_ids();
         let n = ids.len();
         match key {
@@ -1473,6 +1601,15 @@ impl Editor {
                             Err(e) => self.message = format!("{}", e),
                         }
                     }
+                }
+            }
+            // Minus opens the equipment panel for the palico the highlighted
+            // download entry became in the roster. Y already means "install
+            // all", L / R mean "language", A installs or removes and X saves,
+            // so Minus is the one key this screen had left.
+            Key::Minus => {
+                if let Some(&id) = ids.get(self.palico_cursor) {
+                    self.open_palico_equip_for_dlc(id);
                 }
             }
             Key::X => self.request_write_save(),
@@ -2509,6 +2646,12 @@ impl Editor {
     }
 
     fn input_roster(&mut self, key: Key) {
+        // The equipment panel is a mode of this screen: while it is open every
+        // key belongs to it and the list underneath cannot move.
+        if self.palico_equip.is_some() {
+            self.input_palico_equip(key);
+            return;
+        }
         let list = self.palicos();
         let n = list.len();
         match key {
@@ -2518,8 +2661,12 @@ impl Editor {
                     self.roster_cursor = (self.roster_cursor + 1).min(n - 1);
                 }
             }
-            // X walks the editable fields of the highlighted palico.
-            Key::X | Key::R => self.roster_field = (self.roster_field + 1) % 3,
+            // R walks the editable fields of the highlighted palico. X used to
+            // do the same, but on the pad X is the save key and never reached
+            // this screen; keeping it as a second field key meant the chips had
+            // to advertise X as something it did not do.
+            Key::R => self.roster_field = (self.roster_field + 1) % 3,
+            Key::X => self.request_write_save(),
             Key::L => self.roster_field = (self.roster_field + 2) % 3,
             Key::Left | Key::Right => {
                 let Some(p) = list.get(self.roster_cursor).cloned() else {
@@ -2565,6 +2712,15 @@ impl Editor {
                 };
                 self.pending_text = Some((TEXT_PALICO_NAME + p.index, p.name.clone()));
             }
+            // Minus opens the equipment panel for the highlighted palico. The
+            // Switch layer therefore stops rescanning on this screen; one
+            // press cannot do both (see `uses_minus`).
+            Key::Minus => {
+                if let Some(p) = list.get(self.roster_cursor) {
+                    let index = p.index;
+                    self.open_palico_equip(index);
+                }
+            }
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
@@ -2579,6 +2735,380 @@ impl Editor {
         match &self.save {
             Some(s) => crate::palico::used(s, self.slot),
             None => Vec::new(),
+        }
+    }
+
+    /// Is the palico equipment panel open?
+    pub fn palico_equip_open(&self) -> bool {
+        self.palico_equip.is_some()
+    }
+
+    /// The roster record the panel edits, as the save holds it now.
+    pub fn palico_equip_target(&self) -> Option<crate::palico::Palico> {
+        let state = self.palico_equip?;
+        self.palicos().into_iter().find(|p| p.index == state.palico)
+    }
+
+    /// The three panel rows: what is worn now and what [A] would write.
+    ///
+    /// A worn index the box no longer holds keeps its number and reports ID 0
+    /// rather than pretending nothing is worn: the roster names a record by
+    /// index and showing the number is what lets the user go and look.
+    pub fn palico_equip_rows(&self) -> Vec<PalicoEquipRow> {
+        let mut out = Vec::with_capacity(PALICO_EQUIP_ROWS);
+        let Some(state) = self.palico_equip else {
+            return out;
+        };
+        let target = self.palico_equip_target();
+        let save = self.save.as_ref();
+        let id_of = |index: u16| -> u16 {
+            match save {
+                Some(save) if index != PALICO_EQUIP_NONE => {
+                    crate::palicogear::decode_one(save, self.slot, index as usize)
+                        .map(|e| e.id)
+                        .unwrap_or(0)
+                }
+                _ => 0,
+            }
+        };
+        for part in 0..PALICO_EQUIP_ROWS {
+            let worn = target
+                .as_ref()
+                .map(|p| p.equip[part])
+                .unwrap_or(PALICO_EQUIP_NONE);
+            let pick = state.pick[part];
+            out.push(PalicoEquipRow {
+                part,
+                worn,
+                worn_id: id_of(worn),
+                pick,
+                pick_id: id_of(pick),
+            });
+        }
+        out
+    }
+
+    /// The box records one part can pick from, in box order.
+    ///
+    /// Only records whose type is the one that part takes are offered: the box
+    /// is a flat array and the sample save interleaves the three kinds, so the
+    /// type decides membership, not a range of indices.
+    pub fn palico_equip_candidates(&self, part: usize) -> Vec<u16> {
+        let Some(kind) = crate::palicogear::KINDS.get(part).copied() else {
+            return Vec::new();
+        };
+        let Some(save) = self.save.as_ref() else {
+            return Vec::new();
+        };
+        crate::palicogear::decode(save, self.slot)
+            .into_iter()
+            .filter(|e| e.kind == kind)
+            .map(|e| e.index as u16)
+            .collect()
+    }
+
+    /// Open the equipment panel for one roster record.
+    pub fn open_palico_equip(&mut self, palico: usize) -> bool {
+        if palico >= crate::palico::SLOTS {
+            return false;
+        }
+        let Some(record) = self.palicos().into_iter().find(|p| p.index == palico) else {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        };
+        let mut pick = [PALICO_EQUIP_NONE; PALICO_EQUIP_ROWS];
+        for part in 0..PALICO_EQUIP_ROWS {
+            // Start on what the palico wears, so [A] on an untouched row writes
+            // the same index back; a part with nothing worn starts on the
+            // first record of its kind, so the panel is usable without moving.
+            if record.equip[part] != PALICO_EQUIP_NONE {
+                pick[part] = record.equip[part];
+            } else if let Some(first) = self.palico_equip_candidates(part).first().copied() {
+                pick[part] = first;
+            }
+        }
+        self.palico_equip = Some(PalicoEquip {
+            palico,
+            field: 0,
+            pick,
+            clear_armed: None,
+        });
+        self.message = format!(
+            "{} の装備を割り当てます（[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-]×2 解除）",
+            record.name
+        );
+        true
+    }
+
+    /// Open the panel for the download palico the list row names.
+    ///
+    /// A download record is the game's template for the roster entry it
+    /// installs, and the roster copy carries the same name. That name field is
+    /// the one link both documented layouts share, so a missing or ambiguous
+    /// name is refused instead of writing an index into the wrong palico.
+    pub fn open_palico_equip_for_dlc(&mut self, id: u8) -> bool {
+        let Some(record) = self
+            .save
+            .as_ref()
+            .and_then(|s| s.dlc_palicoes().into_iter().find(|c| c.id == id))
+        else {
+            self.message = format!("DLC ID {} はまだ導入されていません（[A] で導入）", id);
+            return false;
+        };
+        let name = record.name;
+        let matches: Vec<usize> = self
+            .palicos()
+            .into_iter()
+            .filter(|p| p.name == name)
+            .map(|p| p.index)
+            .collect();
+        match matches.len() {
+            0 => {
+                self.message = format!(
+                    "「{}」はロスターに居ません（ゲーム内で受け取ると並びます）",
+                    name
+                );
+                false
+            }
+            1 => self.open_palico_equip(matches[0]),
+            _ => {
+                self.message = format!(
+                    "「{}」と同じ名前のオトモが {} 居るので、どれか決められません",
+                    name,
+                    matches.len()
+                );
+                false
+            }
+        }
+    }
+
+    /// Put the panel away. The screen keeps its list and its cursor.
+    pub fn close_palico_equip(&mut self) {
+        if self.palico_equip.take().is_some() {
+            self.message = String::from("装備の割当を閉じました");
+        }
+    }
+
+    /// Point one of a palico's three equipment slots at a record in its box.
+    ///
+    /// The record has to be in use and has to carry the kind that part takes:
+    /// the sample save has every worn index landing on the right kind, and a
+    /// value that breaks that is not something this editor should create. The
+    /// record itself is read but never written - the roster names it by index.
+    pub fn palico_equip_assign(&mut self, palico: usize, part: usize, index: u16) -> bool {
+        let slot = self.slot;
+        let part_name = palico_part_name(part);
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if part >= PALICO_EQUIP_ROWS {
+            self.message = format!("{} はオトモの装備部位ではありません", part);
+            return false;
+        }
+        // An empty roster record is not a palico: writing gear into it would
+        // leave an index the game reads for a slot it never shows.
+        let exists = crate::palico::roster(save, slot)
+            .get(palico)
+            .map(|p| !p.is_empty())
+            .unwrap_or(false);
+        if !exists {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        }
+        let Some(eq) = crate::palicogear::decode_one(save, slot, index as usize) else {
+            self.message = format!(
+                "装備ボックスの枠 {} は空きなので、{}にできません",
+                index, part_name
+            );
+            return false;
+        };
+        if eq.kind != crate::palicogear::KINDS[part] {
+            self.message = format!(
+                "枠 {} は{}なので、{}にはできません",
+                index,
+                crate::equip::type_name(eq.kind),
+                part_name
+            );
+            return false;
+        }
+        if !write_palico_equip(save, slot, palico, part, index) {
+            self.message = format!("枠 {} の{}を書き換えられませんでした", palico, part_name);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "枠 {} の{}をオトモ装備の枠 {} にしました（ボックスのレコードはそのままです）",
+            palico, part_name, index
+        );
+        true
+    }
+
+    /// Take one piece off a palico by writing 0xFFFF into its roster slot.
+    pub fn palico_equip_release(&mut self, palico: usize, part: usize) -> bool {
+        let slot = self.slot;
+        let part_name = palico_part_name(part);
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if part >= PALICO_EQUIP_ROWS {
+            self.message = format!("{} はオトモの装備部位ではありません", part);
+            return false;
+        }
+        let current = crate::palico::roster(save, slot)
+            .get(palico)
+            .map(|p| p.equip[part]);
+        let Some(current) = current else {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        };
+        if current == PALICO_EQUIP_NONE {
+            self.message = format!("枠 {} の{}はすでに外れています", palico, part_name);
+            return false;
+        }
+        if !write_palico_equip(save, slot, palico, part, PALICO_EQUIP_NONE) {
+            self.message = format!("枠 {} の{}を外せませんでした", palico, part_name);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!("枠 {} の{}を外しました（0xFFFF）", palico, part_name);
+        true
+    }
+
+    /// Keys of the palico equipment panel.
+    ///
+    /// [A] is the only key that writes a worn index and [-] is the only one
+    /// that empties a part, twice. Every other key is a cursor move and drops a
+    /// pending release first, so a press can never land on a part the user has
+    /// stopped looking at.
+    fn input_palico_equip(&mut self, key: Key) {
+        let Some(mut state) = self.palico_equip else {
+            return;
+        };
+        if key != Key::Minus {
+            state.clear_armed = None;
+        }
+        let field = state.field.min(PALICO_EQUIP_ROWS - 1);
+        match key {
+            Key::Up => {
+                state.field = (field + PALICO_EQUIP_ROWS - 1) % PALICO_EQUIP_ROWS;
+                self.palico_equip = Some(state);
+            }
+            Key::Down => {
+                state.field = (field + 1) % PALICO_EQUIP_ROWS;
+                self.palico_equip = Some(state);
+            }
+            Key::Left | Key::Right => {
+                self.palico_equip = Some(state);
+                self.cycle_palico_pick(if key == Key::Right { 1 } else { -1 });
+            }
+            Key::A => {
+                let pick = state.pick[field];
+                let palico = state.palico;
+                self.palico_equip = Some(state);
+                if pick == PALICO_EQUIP_NONE {
+                    self.message = format!(
+                        "{}の候補がありません（装備BOXで作成してください）",
+                        palico_part_name(field)
+                    );
+                } else {
+                    self.palico_equip_assign(palico, field, pick);
+                }
+            }
+            Key::Minus => {
+                let palico = state.palico;
+                self.palico_equip = Some(state);
+                self.release_palico_part(palico, field);
+            }
+            Key::B => self.close_palico_equip(),
+            Key::X => self.request_write_save(),
+            // Y has no tool of its own here; it repeats the one line the panel
+            // cannot say on a row (the names are not in the catalogue).
+            Key::Y => {
+                self.palico_equip = Some(state);
+                self.message = String::from(PALICO_EQUIP_NAME_NOTE);
+            }
+            Key::Plus => self.quit = true,
+            // L / R would jump to another sub-tab and Z is ZR on the pad; both
+            // are swallowed while the panel owns the screen.
+            Key::L | Key::R | Key::Z => {
+                self.palico_equip = Some(state);
+            }
+        }
+    }
+
+    /// Move the row's candidate through the records of that part's kind.
+    fn cycle_palico_pick(&mut self, delta: i64) {
+        let Some(mut state) = self.palico_equip else {
+            return;
+        };
+        let part = state.field.min(PALICO_EQUIP_ROWS - 1);
+        let list = self.palico_equip_candidates(part);
+        if list.is_empty() {
+            self.message = format!(
+                "{}の装備がBOXにありません（装備BOXで作成してください）",
+                palico_part_name(part)
+            );
+            return;
+        }
+        let n = list.len() as i64;
+        let next = match list.iter().position(|v| *v == state.pick[part]) {
+            Some(pos) => (pos as i64 + delta).rem_euclid(n) as usize,
+            // Nothing chosen yet: step in from the end the key points at.
+            None => {
+                if delta >= 0 {
+                    0
+                } else {
+                    list.len() - 1
+                }
+            }
+        };
+        state.pick[part] = list[next];
+        state.clear_armed = None;
+        self.palico_equip = Some(state);
+        self.message = format!("{}の候補: 枠 {} / ID {}", palico_part_name(part), list[next], self.palico_gear_id(list[next]));
+    }
+
+    /// First half of the two-press release: report, do not touch the record.
+    fn release_palico_part(&mut self, palico: usize, part: usize) {
+        let Some(mut state) = self.palico_equip else {
+            return;
+        };
+        let worn = self
+            .palico_equip_target()
+            .map(|p| p.equip[part])
+            .unwrap_or(PALICO_EQUIP_NONE);
+        if worn == PALICO_EQUIP_NONE {
+            state.clear_armed = None;
+            self.palico_equip = Some(state);
+            self.message = format!("{}はすでに外れています", palico_part_name(part));
+            return;
+        }
+        if state.clear_armed != Some(part) {
+            state.clear_armed = Some(part);
+            self.palico_equip = Some(state);
+            self.message = format!(
+                "{}を外しますか？ もう一度 [-] で解除（枠 {} / オトモ枠 {}）",
+                palico_part_name(part),
+                worn,
+                palico
+            );
+            return;
+        }
+        self.palico_equip = Some(state);
+        self.palico_equip_release(palico, part);
+    }
+
+    /// Equip id of one palico box record, 0 when the index holds nothing.
+    fn palico_gear_id(&self, index: u16) -> u16 {
+        match self.save.as_ref() {
+            Some(save) if index != PALICO_EQUIP_NONE => {
+                crate::palicogear::decode_one(save, self.slot, index as usize)
+                    .map(|e| e.id)
+                    .unwrap_or(0)
+            }
+            _ => 0,
         }
     }
     fn input_quest_equip(&mut self, key: Key) {
@@ -4523,6 +5053,48 @@ impl Editor {
             });
         };
 
+        // The palico equipment panel is a mode of two screens, so it is drawn
+        // before the screen match: while it is open it owns the output and the
+        // list underneath keeps its own lines to itself.
+        if let Some(state) = self.palico_equip {
+            let (who, roster_no) = match self.palico_equip_target() {
+                Some(p) => (p.name, p.index + 1),
+                None => (String::from("?"), state.palico + 1),
+            };
+            push(
+                &mut out,
+                format!("オトモ装備 — {}（ロスター #{}）", who, roster_no),
+                false,
+                false,
+            );
+            for row in self.palico_equip_rows() {
+                push(
+                    &mut out,
+                    format!(
+                        "  {}  現在: {}  → {}",
+                        palico_part_name(row.part),
+                        row.worn_text(),
+                        row.pick_text()
+                    ),
+                    true,
+                    row.part == state.field,
+                );
+            }
+            push(
+                &mut out,
+                format!("  {}", PALICO_EQUIP_NAME_NOTE),
+                false,
+                false,
+            );
+            push(
+                &mut out,
+                String::from("  Up/Down 部位  Left/Right 候補  A 装着  - x2 解除  X save  B back"),
+                false,
+                false,
+            );
+            return out;
+        }
+
         match self.screen {
             Screen::SaveList => {
                 push(&mut out, format!("SAVE FILES  ({} found)", self.save_files.len()), false, false);
@@ -5438,6 +6010,12 @@ impl Editor {
                     false,
                     false,
                 );
+                push(
+                    &mut out,
+                    String::from("  Y 項目切替   - 装備/解除(2回)   X save   B back"),
+                    false,
+                    false,
+                );
             }            Screen::QuestEquip => {
                 let list = self.quest_equipment();
                 let used = list.iter().filter(|e| e.occupied).count();
@@ -5945,7 +6523,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A add/remove   L R language   X write save   B back"),
+                    String::from("  A add/remove   - 装備/解除(2回)   L R language   X write save   B back"),
                     false,
                     false,
                 );
@@ -5989,5 +6567,266 @@ impl Editor {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::palico;
+    use crate::palicogear;
+
+    /// A blank Switch save with the given roster names, one record of each
+    /// palico gear kind, and an editor that has it open.
+    ///
+    /// Nothing here comes from a real save: the box, the roster and the worn
+    /// list are all written through the documented writers, so the test runs on
+    /// any machine and still exercises the same bytes.
+    fn editor_with_palico_gear(names: &[&str]) -> (Editor, [usize; 3]) {
+        let mut save = crate::save::empty_switch_save();
+        for (i, name) in names.iter().enumerate() {
+            assert!(palico::set_name(&mut save, 0, i, name));
+        }
+        let weapon = palicogear::create(&mut save, 0, palicogear::WEAPON, 431, 1)
+            .expect("a blank weapon record");
+        let head =
+            palicogear::create(&mut save, 0, palicogear::HEAD, 464, 1).expect("a blank head record");
+        let body =
+            palicogear::create(&mut save, 0, palicogear::BODY, 465, 1).expect("a blank body record");
+        // A blank save holds zeros in the worn list, but the game writes
+        // 0xFFFF for "nothing worn": with zeros there every palico would claim
+        // to wear box record 0. Put the real empty value in all three slots.
+        let base = save.slot_base(0).expect("slot base") as usize;
+        for palico in 0..palico::SLOTS {
+            for part in 0..palico::EQUIP_SLOTS {
+                let at =
+                    base + palico::OFF_ROSTER + palico * palico::RECORD + palico::EQUIP + part * 2;
+                save.body_mut()[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+            }
+        }
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        assert!(ed.save.is_some(), "{}", ed.message);
+        (ed, [weapon, head, body])
+    }
+
+    #[test]
+    fn the_roster_panel_shows_three_rows_and_offers_only_their_kind() {
+        let (mut ed, gear) = editor_with_palico_gear(&["テスト"]);
+        ed.screen = Screen::Roster;
+        ed.roster_cursor = 0;
+        ed.input(Key::Minus);
+        assert!(ed.palico_equip_open(), "{}", ed.message);
+        // A mode, not a screen: the list underneath is still the roster.
+        assert_eq!(ed.screen, Screen::Roster);
+        assert_eq!(ed.palico_equip.map(|s| s.palico), Some(0));
+
+        let rows = ed.palico_equip_rows();
+        assert_eq!(rows.len(), PALICO_EQUIP_ROWS);
+        assert_eq!(PALICO_EQUIP_ROWS, palico::EQUIP_SLOTS);
+        for (part, row) in rows.iter().enumerate() {
+            assert_eq!(row.part, part);
+            // Nothing is worn yet, and a part with nothing worn starts on the
+            // first record of its kind so [A] is usable without moving.
+            assert_eq!(row.worn, PALICO_EQUIP_NONE);
+            assert_eq!(row.worn_text(), "なし");
+            assert_eq!(row.pick as usize, gear[part]);
+            assert_eq!(row.pick_id, [431u16, 464, 465][part]);
+
+            // Only records of that kind are offered, and the box holds one.
+            let candidates = ed.palico_equip_candidates(part);
+            assert_eq!(candidates, alloc::vec![gear[part] as u16]);
+            let save = ed.save.as_ref().expect("save");
+            let eq = palicogear::decode_one(save, 0, gear[part]).expect("decodes");
+            assert_eq!(eq.kind, palicogear::KINDS[part]);
+        }
+
+        // Walking the rows is not a write.
+        assert!(!ed.dirty);
+        ed.input(Key::Down);
+        ed.input(Key::Down);
+        ed.input(Key::Up);
+        assert!(!ed.dirty);
+        assert_eq!(ed.palico_equip.map(|s| s.field), Some(1));
+    }
+
+    #[test]
+    fn assigning_a_row_writes_only_the_roster_slot() {
+        let (mut ed, gear) = editor_with_palico_gear(&["テスト"]);
+        ed.screen = Screen::Roster;
+        ed.roster_cursor = 0;
+        ed.input(Key::Minus);
+        assert!(ed.palico_equip_open(), "{}", ed.message);
+        let base = ed
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        let before = ed.save.as_ref().expect("save").body().to_vec();
+        ed.dirty = false;
+
+        // Row 0 is the weapon and already starts on the only weapon record.
+        ed.input(Key::A);
+        assert!(ed.dirty, "an assignment has to mark the save dirty");
+        let roster = palico::roster(ed.save.as_ref().expect("save"), 0);
+        assert_eq!(roster[0].equip[0], gear[0] as u16);
+        assert_eq!(roster[0].equip[1], PALICO_EQUIP_NONE);
+        assert_eq!(roster[0].equip[2], PALICO_EQUIP_NONE);
+
+        // Exactly the two bytes of part 0 moved, and no box record was rewritten.
+        let after = ed.save.as_ref().expect("save").body().to_vec();
+        let at = base + palico::OFF_ROSTER + palico::EQUIP;
+        let mut moved = 0usize;
+        for (off, (a, b)) in before.iter().zip(after.iter()).enumerate() {
+            if a != b {
+                assert!(
+                    off >= at && off < at + 2,
+                    "byte 0x{:X} changed, outside the worn index",
+                    off
+                );
+                moved += 1;
+            }
+        }
+        assert_eq!(moved, 2);
+        let eq = palicogear::decode_one(ed.save.as_ref().expect("save"), 0, gear[0])
+            .expect("still there");
+        assert_eq!((eq.kind, eq.id), (palicogear::WEAPON, 431));
+
+        // A record of another kind is refused, and a refusal writes nothing.
+        ed.dirty = false;
+        assert!(!ed.palico_equip_assign(0, 0, gear[1] as u16), "{}", ed.message);
+        assert!(ed.message.contains("なので"), "{}", ed.message);
+        assert!(!ed.dirty);
+        assert_eq!(
+            palico::roster(ed.save.as_ref().expect("save"), 0)[0].equip[0],
+            gear[0] as u16
+        );
+
+        // Past the end of the box, past the last part and past the last record
+        // there is nothing to write.
+        assert!(!ed.palico_equip_assign(0, 0, palicogear::PALICO_EQUIP_COUNT as u16));
+        assert!(!ed.palico_equip_assign(0, PALICO_EQUIP_ROWS, gear[0] as u16));
+        assert!(!ed.palico_equip_assign(palico::SLOTS, 0, gear[0] as u16));
+        assert!(!ed.dirty);
+    }
+
+    #[test]
+    fn releasing_a_part_takes_two_presses() {
+        let (mut ed, gear) = editor_with_palico_gear(&["テスト"]);
+        ed.screen = Screen::Roster;
+        ed.roster_cursor = 0;
+        ed.input(Key::Minus);
+        assert!(ed.palico_equip_open(), "{}", ed.message);
+        ed.input(Key::A);
+        let weapon = gear[0] as u16;
+        assert_eq!(
+            palico::roster(ed.save.as_ref().expect("save"), 0)[0].equip[0],
+            weapon
+        );
+        ed.dirty = false;
+
+        // The first press only names what would go.
+        ed.input(Key::Minus);
+        assert!(!ed.dirty, "one press must not write");
+        assert_eq!(ed.palico_equip.and_then(|s| s.clear_armed), Some(0));
+        assert!(ed.message.contains("もう一度"), "{}", ed.message);
+        assert_eq!(
+            palico::roster(ed.save.as_ref().expect("save"), 0)[0].equip[0],
+            weapon
+        );
+
+        // Any other key drops the pending release.
+        ed.input(Key::Down);
+        assert_eq!(ed.palico_equip.and_then(|s| s.clear_armed), None);
+        assert!(!ed.dirty);
+
+        // Two presses in a row clear the part to 0xFFFF.
+        ed.input(Key::Up);
+        ed.input(Key::Minus);
+        ed.input(Key::Minus);
+        assert!(ed.dirty, "{}", ed.message);
+        assert_eq!(
+            palico::roster(ed.save.as_ref().expect("save"), 0)[0].equip[0],
+            PALICO_EQUIP_NONE
+        );
+
+        // A part that is already empty says so and writes nothing.
+        ed.dirty = false;
+        ed.input(Key::Down);
+        ed.input(Key::Down);
+        ed.input(Key::Minus);
+        assert!(!ed.dirty);
+        assert!(ed.message.contains("すでに外れています"), "{}", ed.message);
+    }
+
+    #[test]
+    fn the_download_list_opens_the_roster_twin() {
+        let mut save = crate::save::empty_switch_save();
+        let ids = dlcats::all_ids();
+        let id = *ids.first().expect("the catalogue has entries");
+        assert!(
+            save.install_dlc_palico(dlcats::Lang::Jp, id).is_ok(),
+            "the blank save has a free download slot"
+        );
+        // The game copies the download record into the roster, so the name is
+        // the one thing the two layouts share. Write that name into a roster
+        // record and the panel must find it.
+        let name = save
+            .dlc_palicoes()
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| c.name)
+            .expect("the record just installed");
+        assert!(palico::set_name(&mut save, 0, 5, &name));
+
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        ed.screen = Screen::Palico;
+        ed.palico_cursor = ids.iter().position(|v| *v == id).expect("in the list");
+        ed.input(Key::Minus);
+        assert!(ed.palico_equip_open(), "{}", ed.message);
+        assert_eq!(ed.palico_equip_target().map(|p| p.index), Some(5));
+
+        // An entry that was never installed has no roster twin to write to.
+        ed.close_palico_equip();
+        let other = ids.iter().copied().find(|v| *v != id).expect("a second id");
+        ed.palico_cursor = ids.iter().position(|v| *v == other).expect("pos");
+        ed.input(Key::Minus);
+        assert!(!ed.palico_equip_open());
+        assert!(ed.message.contains("導入"), "{}", ed.message);
+    }
+
+    #[test]
+    fn the_panel_names_the_record_and_says_the_names_are_missing() {
+        let (mut ed, _gear) = editor_with_palico_gear(&["テスト"]);
+        ed.screen = Screen::Roster;
+        ed.roster_cursor = 0;
+        ed.input(Key::Minus);
+        assert!(ed.palico_equip_open(), "{}", ed.message);
+        let rows = ed.palico_equip_rows();
+        assert_eq!(rows[0].pick_text(), format!("枠 {} / ID 431", rows[0].pick));
+        assert_eq!(rows[0].worn_text(), "なし");
+        assert_eq!(palico_part_name(0), "武器");
+        assert_eq!(palico_part_name(1), "頭");
+        assert_eq!(palico_part_name(2), "胴");
+        assert_eq!(palico_part_name(3), "?");
+
+        // The console output carries the three rows, the note about the
+        // missing names, and nothing else selectable.
+        ed.screen = Screen::Roster;
+        let lines = ed.lines();
+        assert!(
+            lines.iter().any(|l| l.text.contains(PALICO_EQUIP_NAME_NOTE)),
+            "the note line is missing"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.selectable).count(),
+            PALICO_EQUIP_ROWS
+        );
+        assert_eq!(lines.iter().filter(|l| l.cursor).count(), 1);
+
+        // The panel's row count is the worn list's own number, not a new one.
+        assert_eq!(PALICO_PART_NAMES.len(), palico::EQUIP_SLOTS);
+        assert_eq!(palicogear::KINDS.len(), PALICO_EQUIP_ROWS);
     }
 }

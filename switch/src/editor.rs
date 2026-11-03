@@ -899,7 +899,16 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Check => &[("A", "修正"), ("X", ".arc 保存"), ("B", "戻る")],
         Hunts => &[("</>", "値"), ("X", "項目"), ("A", "反映"), ("B", "戻る")],
         Guild => &[("</>", "値"), ("X", "項目"), ("A", "コメント"), ("B", "戻る")],
-        Roster => &[("</>", "値"), ("X", "項目"), ("A", "名前"), ("B", "戻る")],
+        // Minus opens the palico equipment panel on both palico screens, and
+        // inside it Minus is the two-press release, so the chip says both.
+        Roster => &[
+            ("</>", "値"),
+            ("Y", "項目切替"),
+            ("A", "名前"),
+            ("-", "装備/解除(2回)"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
         // Two modes on one screen: the list, and the set editor that [A] opens.
         // The chips name both, because this table is per screen and Y means
         // different things in the two (tab switch on the list, warnings in the
@@ -912,7 +921,15 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("X", "保存"),
             ("B", "戻る"),
         ],
-        Palico => &[("A", "追加/削除"), ("L", "言語"), ("R", "言語"), ("X", "保存"), ("B", "戻る")],
+        Palico => &[
+            ("A", "追加/削除"),
+            ("Y", "全導入"),
+            ("L", "言語"),
+            ("R", "言語"),
+            ("-", "装備/解除(2回)"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
         Options => &[
             ("</>", "値変更"),
             ("A", "保存"),

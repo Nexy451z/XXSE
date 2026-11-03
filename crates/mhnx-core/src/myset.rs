@@ -26,6 +26,11 @@
 //!
 //! An unused record has the name '－－－', seven NONE parts and the tail
 //! pattern in `EMPTY_TAIL`.
+//!
+//! The item sets end at slot + 0x27BF, where the pouch begins: thirty-two more
+//! (id, count) pairs, packed nineteen bits each into 76 bytes. A set is a
+//! snapshot of the pouch, so the two are read and written with the same pair
+//! type and the same codec as the item box. See `OFF_POUCH` for the evidence.
 
 use alloc::format;
 use alloc::string::String;
@@ -335,6 +340,380 @@ pub fn set_item_set_entry(
     dst[0..2].copy_from_slice(&id.to_le_bytes());
     dst[2..4].copy_from_slice(&count.to_le_bytes());
     true
+}
+
+// ---------------------------------------------------------------------------
+// Item set operations
+//
+// An item set is a snapshot of the pouch: the same thirty-two (id, count)
+// pairs a character carries into a quest. The two arrays sit next to each
+// other in the slot, sets first and the pouch second, so the pouch offset is
+// fixed by arithmetic on constants that were already here rather than by a
+// number taken from another editor. See [`OFF_POUCH`].
+// ---------------------------------------------------------------------------
+
+/// Offset of the pouch, relative to the slot base.
+///
+/// Three measurements in the sample save close on this byte:
+///
+/// * the item set array ends here: `0x17CF + 24 * 170 == 0x27BF`;
+/// * the field is thirty-two nineteen bit records, 608 bits, 76 whole bytes;
+/// * the next field this library knows, [`crate::save::OFF_HR_POINTS`], starts
+///   at `0x280B`, the byte after `0x27BF + 76`.
+///
+/// Decoding those 76 bytes with the same nineteen bit codec the item box uses
+/// yields a believable pouch: 23 used pairs, every id inside the item table and
+/// every count at or below 99, and 22 of them identical, count included, to the
+/// entries of one of the two item sets the save holds. A set is registered from
+/// the pouch, so that agreement is the evidence for the offset.
+pub const OFF_POUCH: usize = 0x27BF;
+/// Slots in the pouch; the same number an item set holds.
+pub const POUCH_SLOTS: usize = ITEM_SET_ITEMS;
+/// Bytes the pouch takes: `32 * 19` bits, which is exactly 76 bytes.
+pub const POUCH_SIZE: usize = POUCH_SLOTS * ITEM_BITS / 8;
+
+/// Bits one pouch record takes.
+const ITEM_BITS: usize = 19;
+/// Bits of the id inside a pouch record; the count takes the rest.
+const ITEM_ID_BITS: usize = 12;
+
+/// Does a pair describe something the game could have written?
+///
+/// The id runs 0..=[`crate::gamedata::LAST_ITEM_ID`], the count stops at
+/// [`crate::itembox::MAX_COUNT`], and an empty record (id 0) carries no count:
+/// the count of an unused record is not read, so a set written here never
+/// leaves a stray one behind.
+fn pair_is_sane(id: u16, count: u16) -> bool {
+    if count > crate::itembox::MAX_COUNT {
+        return false;
+    }
+    if id as usize > crate::gamedata::LAST_ITEM_ID {
+        return false;
+    }
+    id != 0 || count == 0
+}
+
+fn item_set_field(save: &Save, slot: usize, set: usize) -> Option<core::ops::Range<usize>> {
+    if set >= ITEM_SETS {
+        return None;
+    }
+    let base = save.slot_base(slot)? as usize;
+    let at = base
+        .checked_add(OFF_ITEM_SETS)?
+        .checked_add(set.checked_mul(ITEM_SET_SIZE)?)?;
+    if at.checked_add(ITEM_SET_SIZE)? > save.body().len() {
+        return None;
+    }
+    Some(at..at + ITEM_SET_SIZE)
+}
+
+fn item_set_bytes(save: &Save, slot: usize, set: usize) -> Option<&[u8]> {
+    save.body().get(item_set_field(save, slot, set)?)
+}
+
+fn item_set_bytes_mut<'a>(
+    save: &'a mut Save,
+    slot: usize,
+    set: usize,
+) -> Option<&'a mut [u8]> {
+    let r = item_set_field(save, slot, set)?;
+    save.body_mut().get_mut(r)
+}
+
+/// One entry of an item set record.
+fn read_set_item(rec: &[u8], index: usize) -> SetItem {
+    let o = ITEM_SET_BODY + index * 4;
+    SetItem {
+        id: u16_at(rec, o),
+        count: u16_at(rec, o + 2),
+    }
+}
+
+fn write_set_item(rec: &mut [u8], index: usize, item: SetItem) {
+    let o = ITEM_SET_BODY + index * 4;
+    rec[o..o + 2].copy_from_slice(&item.id.to_le_bytes());
+    rec[o + 2..o + 4].copy_from_slice(&item.count.to_le_bytes());
+}
+
+/// Write one entry of an item set.
+///
+/// `index` runs 0..[`ITEM_SET_ITEMS`]. The write is refused, and nothing at all
+/// is changed, when the set index, the entry index, the id or the count is out
+/// of range; the count may not exceed [`crate::itembox::MAX_COUNT`] and an empty
+/// entry (id 0) may not carry a count. Writing id 0 with count 0 clears the
+/// entry, which is what [`clear_item`] does.
+///
+/// Only the four bytes of that one entry move; the name, the other entries and
+/// the neighbouring records keep what they had.
+pub fn set_item(
+    save: &mut Save,
+    slot: usize,
+    set: usize,
+    index: usize,
+    id: u16,
+    count: u16,
+) -> bool {
+    if index >= ITEM_SET_ITEMS || !pair_is_sane(id, count) {
+        return false;
+    }
+    let Some(rec) = item_set_bytes_mut(save, slot, set) else {
+        return false;
+    };
+    write_set_item(rec, index, SetItem { id, count });
+    true
+}
+
+/// Empty one entry of an item set: the id and the count both become zero.
+///
+/// The rest of the record keeps what it had. An entry that was already empty
+/// is left byte for byte as it was.
+pub fn clear_item(save: &mut Save, slot: usize, set: usize, index: usize) -> bool {
+    if index >= ITEM_SET_ITEMS {
+        return false;
+    }
+    let Some(rec) = item_set_bytes_mut(save, slot, set) else {
+        return false;
+    };
+    write_set_item(rec, index, SetItem { id: 0, count: 0 });
+    true
+}
+
+fn pouch_field(save: &Save, slot: usize) -> Option<core::ops::Range<usize>> {
+    let base = save.slot_base(slot)? as usize;
+    let at = base.checked_add(OFF_POUCH)?;
+    if at.checked_add(POUCH_SIZE)? > save.body().len() {
+        return None;
+    }
+    Some(at..at + POUCH_SIZE)
+}
+
+fn pouch_bytes(save: &Save, slot: usize) -> Option<&[u8]> {
+    save.body().get(pouch_field(save, slot)?)
+}
+
+fn pouch_bytes_mut<'a>(save: &'a mut Save, slot: usize) -> Option<&'a mut [u8]> {
+    let r = pouch_field(save, slot)?;
+    save.body_mut().get_mut(r)
+}
+
+/// One entry of the pouch field.
+///
+/// The bit address is `slot * 19` inside the 76 byte block, read low bit
+/// first: the twelve id bits come first, then the seven count bits. This is the
+/// same codec the item box uses; decoding the box with it reproduces
+/// [`crate::itembox::decode`] byte for byte on the sample save, which is one of
+/// the reasons the pouch is read this way.
+fn read_pouch_item(raw: &[u8], index: usize) -> SetItem {
+    let bit = index * ITEM_BITS;
+    let mut id = 0u16;
+    for k in 0..ITEM_ID_BITS {
+        let b = bit + k;
+        if (raw[b / 8] >> (b % 8)) & 1 == 1 {
+            id |= 1u16 << k;
+        }
+    }
+    let mut count = 0u16;
+    for k in ITEM_ID_BITS..ITEM_BITS {
+        let b = bit + k;
+        if (raw[b / 8] >> (b % 8)) & 1 == 1 {
+            count |= 1u16 << (k - ITEM_ID_BITS);
+        }
+    }
+    SetItem { id, count }
+}
+
+fn write_pouch_item(raw: &mut [u8], index: usize, item: SetItem) {
+    let bit = index * ITEM_BITS;
+    let value = (item.id as u32) | ((item.count as u32) << ITEM_ID_BITS);
+    for k in 0..ITEM_BITS {
+        let b = bit + k;
+        let mask = 1u8 << (b % 8);
+        if (value >> k) & 1 == 1 {
+            raw[b / 8] |= mask;
+        } else {
+            raw[b / 8] &= !mask;
+        }
+    }
+}
+
+/// What the pouch holds, in slot order.
+///
+/// The result is empty when the slot has no base or the field does not fit the
+/// save body; otherwise it always has [`POUCH_SLOTS`] entries, with id 0 for an
+/// empty one.
+///
+/// Decoding this field is a read of the save, not of an item set: what a set
+/// holds is a snapshot taken when it was registered, and the character may have
+/// changed the pouch since.
+pub fn pouch(save: &Save, slot: usize) -> Vec<SetItem> {
+    let mut out = Vec::with_capacity(POUCH_SLOTS);
+    let Some(raw) = pouch_bytes(save, slot) else {
+        return out;
+    };
+    for index in 0..POUCH_SLOTS {
+        out.push(read_pouch_item(raw, index));
+    }
+    out
+}
+
+/// Write one pouch entry.
+///
+/// The same range checks as [`set_item`] apply. Only the bits of that one
+/// nineteen bit record move; the rest of the 76 bytes, and the hunter rank
+/// points that follow them, keep what they had.
+pub fn set_pouch_item(
+    save: &mut Save,
+    slot: usize,
+    index: usize,
+    id: u16,
+    count: u16,
+) -> bool {
+    if index >= POUCH_SLOTS || !pair_is_sane(id, count) {
+        return false;
+    }
+    let Some(raw) = pouch_bytes_mut(save, slot) else {
+        return false;
+    };
+    write_pouch_item(raw, index, SetItem { id, count });
+    true
+}
+
+/// Copy the pouch into an item set, returning how many entries hold something.
+///
+/// All thirty-two entries are written, including the empty ones, so the set is
+/// an exact snapshot of what the character carries. The set's name is not
+/// touched. An out of range set index, or a slot whose pouch cannot be read,
+/// returns 0 and writes nothing.
+///
+/// **An existing set is overwritten** and nothing here asks first: the caller
+/// owns the confirmation.
+pub fn copy_from_pouch(save: &mut Save, slot: usize, set: usize) -> usize {
+    let items = pouch(save, slot);
+    if items.len() != POUCH_SLOTS {
+        return 0;
+    }
+    let Some(rec) = item_set_bytes_mut(save, slot, set) else {
+        return 0;
+    };
+    let mut used = 0;
+    for (index, item) in items.iter().enumerate() {
+        write_set_item(rec, index, *item);
+        if item.id != 0 {
+            used += 1;
+        }
+    }
+    used
+}
+
+/// Copy an item set into the pouch, returning how many entries hold something.
+///
+/// **The pouch is replaced**, and the caller owns the confirmation. Nothing
+/// else in the slot moves: the set keeps what it had.
+///
+/// A record the game itself left unused - its name is [`EMPTY_NAME`] and every
+/// entry is empty - is refused and the pouch keeps what it had, because loading
+/// it would quietly empty what the character carries. A record that holds items
+/// is applied even if it was never named: [`copy_from_pouch`] fills entries and
+/// leaves the name as it found it, and the caller may apply that snapshot
+/// before naming it.
+pub fn apply_to_pouch(save: &mut Save, slot: usize, set: usize) -> usize {
+    let items = {
+        let Some(rec) = item_set_bytes(save, slot, set) else {
+            return 0;
+        };
+        let mut items = [SetItem { id: 0, count: 0 }; POUCH_SLOTS];
+        for (index, item) in items.iter_mut().enumerate() {
+            *item = read_set_item(rec, index);
+        }
+        let unused = read_name(rec) == EMPTY_NAME
+            && items.iter().all(|item| item.id == 0 && item.count == 0);
+        if unused {
+            return 0;
+        }
+        items
+    };
+    let used = items.iter().filter(|item| item.id != 0).count();
+    let Some(raw) = pouch_bytes_mut(save, slot) else {
+        return 0;
+    };
+    for (index, item) in items.iter().enumerate() {
+        write_pouch_item(raw, index, *item);
+    }
+    used
+}
+
+/// Everything about an item set that looks wrong, as text for the user.
+///
+/// Only reports; none of this is repaired, because a save that came from the
+/// game (or from a hand edit) can hold each of them:
+///
+/// * an empty entry (id 0) that still carries a count - the count of an unused
+///   entry is not read, so only a broken write leaves one;
+/// * the same item id in more than one entry;
+/// * a count above [`crate::itembox::MAX_COUNT`];
+/// * an id above the item table;
+/// * a used entry whose count is zero;
+/// * a record still named '－－－' that holds items.
+///
+/// A record the game left unused produces no warnings, and an out of range set
+/// index produces none either.
+pub fn item_set_warnings(save: &Save, slot: usize, set: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(rec) = item_set_bytes(save, slot, set) else {
+        return out;
+    };
+    let mut items = [SetItem { id: 0, count: 0 }; POUCH_SLOTS];
+    for (index, item) in items.iter_mut().enumerate() {
+        *item = read_set_item(rec, index);
+    }
+
+    // The record the game never used, in the state the game leaves it.
+    let untouched = items.iter().all(|item| item.id == 0 && item.count == 0);
+    if read_name(rec) == EMPTY_NAME && untouched {
+        return out;
+    }
+    if read_name(rec) == EMPTY_NAME {
+        out.push(String::from("名前が '－－－' のまま中身が入っています"));
+    }
+
+    let mut seen: Vec<u16> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        if item.id == 0 {
+            if item.count != 0 {
+                out.push(format!(
+                    "{}: 空きなのに個数だけ入っています（{}）",
+                    index, item.count
+                ));
+            }
+            continue;
+        }
+        if item.count == 0 {
+            out.push(format!("{}: アイテムはあるのに個数が 0 です", index));
+        }
+        if item.count > crate::itembox::MAX_COUNT {
+            out.push(format!(
+                "{}: 個数が上限 {} を超えています（{}）",
+                index,
+                crate::itembox::MAX_COUNT,
+                item.count
+            ));
+        }
+        if item.id as usize > crate::gamedata::LAST_ITEM_ID {
+            out.push(format!(
+                "{}: アイテムIDが範囲外です（{}）",
+                index, item.id
+            ));
+        }
+        if seen.contains(&item.id) {
+            out.push(format!(
+                "{}: 同じアイテムが重複しています（ID {}）",
+                index, item.id
+            ));
+        } else {
+            seen.push(item.id);
+        }
+    }
+    out
 }
 
 /// Rename an equipment set.
