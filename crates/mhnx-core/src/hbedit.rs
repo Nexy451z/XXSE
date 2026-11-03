@@ -25,6 +25,8 @@ use crate::check::{self, Finding, Severity};
 use crate::charm::{self, Charm, CHARM_COUNT};
 use crate::dlc;
 use crate::dlcats::{self, Lang};
+use crate::equipops::{self, EquipError};
+use crate::equiprefs;
 use crate::save::Options;
 use crate::itembox::ItemSlot;
 use crate::quest::{Gmd, Mib};
@@ -180,8 +182,19 @@ pub struct CharmEdit {
     pub field: usize,
 }
 
-/// Rows on the equipment form.
-pub const EQUIP_EDIT_ROWS: usize = 7;
+/// Rows on the equipment form when an existing record is edited.
+///
+/// The first seven are the rows the form has always had; 種別 and ID were
+/// added at the end rather than at the top so the seven existing rows keep
+/// their numbers (the on-screen highlight, the decoration range and the
+/// console audit all step by row number).
+pub const EQUIP_EDIT_ROWS: usize = 9;
+
+/// Rows on the equipment form when a record is being created.
+///
+/// A new record has no level word, layer or sockets to preserve yet, so the
+/// form asks for the three things `equipops::create` writes: type, id, level.
+pub const EQUIP_NEW_ROWS: usize = 3;
 
 /// The equipment record currently being edited on the EquipEdit screen.
 ///
@@ -191,10 +204,19 @@ pub const EQUIP_EDIT_ROWS: usize = 7;
 /// the kinsect, the charge blade phials) is copied through untouched, because
 /// this save holds weapon records that carry talisman-shaped data there and
 /// are in use.
+///
+/// Changing the type or the id is not a plain field edit: it goes through
+/// `equipops::replace`, which empties the three sockets because they belonged
+/// to the item that was there. A record being created goes through
+/// `equipops::create`, which writes the first blank row of the box.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EquipEdit {
-    /// Box slot index (0..1999).
+    /// Box slot index (0..1999). Unused while `new` is set.
     pub index: usize,
+    /// Equipment type, 1..=21 (see `equip::type_name`).
+    pub kind: u8,
+    /// Weapon, armour or talisman id at +0x02.
+    pub id: u16,
     /// Level, 1..=32 (stored minus one in five bits).
     pub level: u16,
     /// Layered (transmog) id at +0x04.
@@ -205,8 +227,38 @@ pub struct EquipEdit {
     pub decorations: [u16; 3],
     /// Which row the cursor is on.
     ///
-    /// 0 枠 / 1 レベル / 2 着せ替えID / 3 着せ替え元Lv / 4..6 装飾品1..3.
+    /// Editing: 0 枠 / 1 レベル / 2 着せ替えID / 3 着せ替え元Lv /
+    /// 4..6 装飾品1..3 / 7 種別 / 8 ID.
+    /// Creating: 0 種別 / 1 ID / 2 レベル.
     pub field: usize,
+    /// Is the form making a new record rather than editing one?
+    pub new: bool,
+}
+
+impl EquipEdit {
+    /// How many rows the form shows in its current mode.
+    pub fn rows(&self) -> usize {
+        if self.new {
+            EQUIP_NEW_ROWS
+        } else {
+            EQUIP_EDIT_ROWS
+        }
+    }
+
+    /// Which decoration socket a row writes, if any.
+    ///
+    /// Only the editing form has sockets; a record that does not exist yet
+    /// cannot carry a decoration id.
+    pub fn decoration_socket(&self, field: usize) -> Option<usize> {
+        if self.new {
+            return None;
+        }
+        if (4..=6).contains(&field) {
+            Some(field - 4)
+        } else {
+            None
+        }
+    }
 }
 
 /// A text edit request (software keyboard).
@@ -312,6 +364,22 @@ pub const TEXT_JEWEL_FILTER: usize = usize::MAX - 6;
 fn clamp_u16(value: u16, step: i64) -> u16 {
     let v = value as i64 + step;
     v.clamp(0, u16::MAX as i64) as u16
+}
+
+/// Step the equipment type through 1..=21, the range a record can hold.
+///
+/// 12 is deliberately unused by the game (see `equip::type_name`), and it is
+/// still one of the reachable values: the field is five bits wide and an
+/// editor that silently skipped a number would be lying about the field.
+fn cycle_equip_kind(kind: u8, d: i64) -> u8 {
+    let cur = if (1..=21).contains(&kind) { kind as i64 } else { 1 };
+    ((cur - 1 + d).rem_euclid(21) + 1) as u8
+}
+
+/// Step a five bit level field, which is stored minus one: 1..=32 wraps.
+fn cycle_equip_level(level: u16, d: i64) -> u16 {
+    let cur = level.clamp(1, 32) as i64;
+    ((cur - 1 + d).rem_euclid(32) + 1) as u16
 }
 
 /// Label for the monster under the hunt cursor, for the status line.
@@ -432,6 +500,13 @@ pub struct Editor {
     pub equip_cursor: usize,
     /// The equipment record being edited, if the form is open.
     pub equip_edit: Option<EquipEdit>,
+    /// Box index of a record whose delete is waiting for its second press.
+    ///
+    /// A delete is never one press: the first press only says what would go
+    /// and which worn slots / saved sets still point at it, and the second one
+    /// performs it. Any cursor move drops the pending index so a press can
+    /// never land on a record the user has stopped looking at.
+    pub equip_delete_armed: Option<usize>,
     /// Decoration name filter used by the jewel picker.
     pub jewel_pick_filter: String,
     /// Cursor inside the filtered decoration list.
@@ -528,6 +603,7 @@ impl Editor {
             equip_filter: String::new(),
             equip_cursor: 0,
             equip_edit: None,
+            equip_delete_armed: None,
             jewel_pick_filter: String::new(),
             jewel_pick_cursor: 0,
             item_pick_mode: 0,
@@ -635,9 +711,14 @@ impl Editor {
 
     /// Does the current screen consume the Minus button itself?
     ///
-    /// The Switch layer uses Minus to rescan folders everywhere else.
+    /// The Switch layer uses Minus to rescan folders everywhere else. The
+    /// equipment list uses it for the two-press delete, so the rescan must not
+    /// fire there.
     pub fn uses_minus(&self) -> bool {
-        matches!(self.screen, Screen::ArcEntries | Screen::SaveQuests)
+        matches!(
+            self.screen,
+            Screen::ArcEntries | Screen::SaveQuests | Screen::Equip
+        )
     }
 
     /// The I/O layer answers an ExtractQuests request with this.
@@ -1480,7 +1561,10 @@ impl Editor {
                     };
                     if let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) {
                         let c = items[idx].count as i64 + step;
-                        items[idx].count = c.clamp(0, 127) as u8;
+                        // 99 is the ceiling the game itself uses (and the PC
+                        // build has always clamped at); 127 could be stored
+                        // but no item in this game is handed out above 99.
+                        items[idx].count = c.clamp(0, 99) as u8;
                         if let Some(s) = &mut self.save {
                             let _ = s.write_item_box(self.slot, &items);
                             self.dirty = true;
@@ -2101,6 +2185,12 @@ impl Editor {
 
     fn input_equip(&mut self, key: Key) {
         let n = self.equipment().len();
+        // Anything other than the confirmation itself means the user is no
+        // longer looking at the record that was armed, so the pending delete
+        // is dropped before the key does its own work.
+        if key != Key::Minus {
+            self.equip_delete_armed = None;
+        }
         match key {
             Key::Up => self.equip_cursor = self.equip_cursor.saturating_sub(1),
             Key::Down => {
@@ -2111,13 +2201,21 @@ impl Editor {
             Key::Y => {
                 self.pending_text = Some((TEXT_EQUIP_FILTER, self.equip_filter.clone()));
             }
-            // A opens the form for the highlighted record. Nothing is created,
-            // removed or swapped here: the box is edited in place.
+            // A opens the form for the highlighted record.
             Key::A => self.open_equip_editor(),
             Key::X => {
                 self.equip_filter.clear();
                 self.equip_cursor = 0;
             }
+            // Two presses: the first only names what would go, the second one
+            // clears the record. The reference check is the same one
+            // equipops::clear runs, asked first so the first press cannot
+            // delete anything by surprise.
+            Key::Minus => self.delete_equip_under_cursor(),
+            // The new-record form. Plus is the one key this screen can take
+            // from the global "quit" shortcut (the console layer routes it
+            // here only on this screen).
+            Key::Plus => self.open_equip_creator(),
             Key::L => {
                 self.screen = Screen::Guild;
             }
@@ -2129,17 +2227,124 @@ impl Editor {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
             }
-            Key::Plus => self.quit = true,
             _ => {}
         }
     }
 
+    /// First half of the two-press delete: report, do not touch the record.
+    ///
+    /// The second half is the same key again with `equip_delete_armed` set to
+    /// the record under the cursor.
+    fn delete_equip_under_cursor(&mut self) {
+        let list = self.equipment();
+        let Some(eq) = list.get(self.equip_cursor).copied() else {
+            self.equip_delete_armed = None;
+            self.message = String::from("削除する装備がありません");
+            return;
+        };
+        let index = eq.index;
+        let slot = self.slot;
+        let second_press = self.equip_delete_armed == Some(index);
+
+        if !second_press {
+            let Some(save) = &self.save else {
+                self.message = String::from("先にセーブを開いてください");
+                return;
+            };
+            // The same question equipops::clear asks, asked before anything is
+            // written. Calling clear(false) here would already have cleared an
+            // unreferenced record, and a delete must never happen on the first
+            // press.
+            let refs = equiprefs::references(save, slot, index);
+            let count = refs.len();
+            self.equip_delete_armed = Some(index);
+            self.message = if refs.is_empty() {
+                format!("枠 #{} を削除しますか？ もう一度 [-] で削除確定", index)
+            } else {
+                format!(
+                    "{}。もう一度 [-] で強制削除します（参照 {} 件）",
+                    EquipError::Referenced(refs).text(),
+                    count
+                )
+            };
+            return;
+        }
+
+        // Second press: go ahead. `force` is what the armed state earned.
+        let Some(save) = &mut self.save else {
+            self.equip_delete_armed = None;
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        };
+        match equipops::clear(save, slot, index, true) {
+            Ok(()) => {
+                self.dirty = true;
+                self.equip_delete_armed = None;
+                let list = self.equipment();
+                let pos = list.iter().position(|q| q.index == index);
+                self.equip_cursor =
+                    pos.unwrap_or_else(|| self.equip_cursor.min(list.len().saturating_sub(1)));
+                self.message = format!(
+                    "枠 #{} を削除しました（{}）",
+                    index,
+                    crate::equip::type_name(eq.kind)
+                );
+            }
+            Err(err) => {
+                self.equip_delete_armed = None;
+                self.message = err.text();
+            }
+        }
+    }
+
+    /// What the next [-] would do, for the screens and the tests.
+    ///
+    /// `None` when no delete is armed. Otherwise the box index, how many worn
+    /// slots and saved sets still point at it, and the line naming them.
+    pub fn equip_delete_pending(&self) -> Option<(usize, usize, alloc::string::String)> {
+        let index = self.equip_delete_armed?;
+        let save = self.save.as_ref()?;
+        let refs = equiprefs::references(save, self.slot, index);
+        let count = refs.len();
+        let text = if refs.is_empty() {
+            format!("枠 #{} を削除しますか？ もう一度 [-] で削除確定", index)
+        } else {
+            format!(
+                "{}。もう一度 [-] で強制削除します（参照 {} 件）",
+                EquipError::Referenced(refs).text(),
+                count
+            )
+        };
+        Some((index, count, text))
+    }
+
+    /// Open the form in its create mode (type, id, level; no record behind it
+    /// yet, so no layer or sockets to show).
+    fn open_equip_creator(&mut self) {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        }
+        self.equip_delete_armed = None;
+        self.equip_edit = Some(EquipEdit {
+            index: 0,
+            kind: 1,
+            id: 1,
+            level: 1,
+            transmog_id: 0,
+            transmog_level: 1,
+            decorations: [0; 3],
+            field: 0,
+            new: true,
+        });
+        self.screen = Screen::EquipEdit;
+        self.message = String::from("新規装備: 種別・ID・レベルを決めて [A] で作成");
+    }
+
     /// Box indices that already hold a record, in box order.
     ///
-    /// The form only ever moves between these. Creating a record, deleting one
-    /// or swapping one out is deliberately not part of this screen: it edits
-    /// what is already in the box, and nothing here can leave a worn slot or a
-    /// saved set pointing at a record that moved.
+    /// The row that walks the box only ever moves between these: a blank
+    /// record has nothing to edit, and `equipops::create` is what fills one.
     fn equip_record_indices(&self) -> Vec<usize> {
         let Some(save) = &self.save else {
             return Vec::new();
@@ -2178,14 +2383,23 @@ impl Editor {
         let Some(eq) = crate::equip::decode_record(index, rec) else {
             return false;
         };
-        let field = self.equip_edit.map(|e| e.field).unwrap_or(1);
+        // Moving off the armed record is a cursor move like any other.
+        self.equip_delete_armed = None;
+        let field = self
+            .equip_edit
+            .map(|e| e.field)
+            .unwrap_or(1)
+            .min(EQUIP_EDIT_ROWS - 1);
         self.equip_edit = Some(EquipEdit {
             index,
+            kind: eq.kind,
+            id: eq.id,
             level: eq.level,
             transmog_id: eq.transmog,
             transmog_level: eq.transmog_level,
             decorations: crate::equip::Equipment::decorations(index, rec),
             field,
+            new: false,
         });
         true
     }
@@ -2213,103 +2427,84 @@ impl Editor {
             self.screen = Screen::Equip;
             return;
         };
+        let rows = e.rows();
         match key {
-            Key::Up => e.field = (e.field + EQUIP_EDIT_ROWS - 1) % EQUIP_EDIT_ROWS,
-            Key::Down => e.field = (e.field + 1) % EQUIP_EDIT_ROWS,
+            Key::Up => e.field = (e.field + rows - 1) % rows,
+            Key::Down => e.field = (e.field + 1) % rows,
             Key::Left | Key::Right => {
                 let d: i64 = if key == Key::Right { 1 } else { -1 } * STEPS[self.step].min(10).max(1);
-                match e.field {
-                    // The slot row walks the records that already hold
-                    // something; the form never points at an empty slot.
-                    0 => {
-                        let ids = self.equip_record_indices();
-                        let n = ids.len();
-                        if n > 0 {
-                            let pos = ids.iter().position(|i| *i == e.index).unwrap_or(0);
-                            let next = if d > 0 { (pos + 1) % n } else { (pos + n - 1) % n };
-                            if self.load_equip_form(ids[next]) {
-                                if let Some(reloaded) = self.equip_edit {
-                                    e = reloaded;
+                if e.new {
+                    // 種別 / ID / レベル: the three values create() writes.
+                    match e.field {
+                        0 => e.kind = cycle_equip_kind(e.kind, d),
+                        1 => e.id = clamp_u16(e.id, d),
+                        _ => e.level = cycle_equip_level(e.level, d),
+                    }
+                } else {
+                    match e.field {
+                        // The slot row walks the records that already hold
+                        // something; the form never points at an empty slot.
+                        0 => {
+                            let ids = self.equip_record_indices();
+                            let n = ids.len();
+                            if n > 0 {
+                                let pos = ids.iter().position(|i| *i == e.index).unwrap_or(0);
+                                let next = if d > 0 { (pos + 1) % n } else { (pos + n - 1) % n };
+                                if self.load_equip_form(ids[next]) {
+                                    if let Some(reloaded) = self.equip_edit {
+                                        e = reloaded;
+                                    }
+                                    e.field = 0;
+                                    self.message = alloc::format!("枠 #{} を編集中", e.index);
                                 }
-                                e.field = 0;
-                                self.message = alloc::format!("枠 #{} を編集中", e.index);
                             }
                         }
-                    }
-                    // Level and layer level are five bit fields stored minus
-                    // one, so 1..=32 wraps rather than clamping at either end.
-                    1 => e.level = ((e.level as i64 - 1 + d).rem_euclid(32) + 1) as u16,
-                    2 => e.transmog_id = clamp_u16(e.transmog_id, d),
-                    3 => {
-                        e.transmog_level =
-                            ((e.transmog_level as i64 - 1 + d).rem_euclid(32) + 1) as u16
-                    }
-                    // The decorations step through the ids the name table
-                    // knows, so a socket never takes an id the game has no
-                    // decoration for.
-                    _ => {
-                        let ids = decoration_ids();
-                        let s = e.field - 4;
-                        if s < 3 && !ids.is_empty() {
-                            let pos = ids.iter().position(|i| *i == e.decorations[s]).unwrap_or(0);
-                            let n = ids.len() as i64;
-                            let next = ((pos as i64 + d).rem_euclid(n)) as usize;
-                            e.decorations[s] = ids[next];
+                        // Level and layer level are five bit fields stored
+                        // minus one, so 1..=32 wraps rather than clamping.
+                        1 => e.level = cycle_equip_level(e.level, d),
+                        2 => e.transmog_id = clamp_u16(e.transmog_id, d),
+                        3 => e.transmog_level = cycle_equip_level(e.transmog_level, d),
+                        // The decorations step through the ids the name table
+                        // knows, so a socket never takes an id the game has no
+                        // decoration for.
+                        4..=6 => {
+                            let ids = decoration_ids();
+                            let s = e.field - 4;
+                            if !ids.is_empty() {
+                                let pos = ids.iter().position(|i| *i == e.decorations[s]).unwrap_or(0);
+                                let n = ids.len() as i64;
+                                let next = ((pos as i64 + d).rem_euclid(n)) as usize;
+                                e.decorations[s] = ids[next];
+                            }
                         }
+                        // 種別 / ID. Changing either is what makes A replace
+                        // the record instead of patching its fields.
+                        7 => e.kind = cycle_equip_kind(e.kind, d),
+                        _ => e.id = clamp_u16(e.id, d),
                     }
                 }
             }
             Key::Y => {
-                if (4..EQUIP_EDIT_ROWS).contains(&e.field) {
+                if e.decoration_socket(e.field).is_some() {
                     self.equip_edit = Some(e);
                     self.jewel_pick_filter.clear();
                     self.jewel_pick_cursor = 0;
                     self.screen = Screen::JewelPick;
                     self.message = String::from("装飾品を名前から選んでください");
+                } else if e.new {
+                    self.message =
+                        String::from("装飾品は作成後に選べます（[A] で作成してから編集）");
                 } else {
                     self.message = String::from("先に装飾品の行へ移動してください");
                 }
             }
             Key::X => self.step = (self.step + 1) % STEPS.len(),
             Key::A => {
-                let idx = e.index;
-                let slot = self.slot;
-                let mut written = false;
-                let mut kind = 0u8;
-                if let Some(save) = &mut self.save {
-                    if let Some(rec) = save.equipment_record_mut(slot, idx) {
-                        if !crate::equip::record_is_blank(rec) {
-                            if let Some(decoded) = crate::equip::decode_record(idx, rec) {
-                                kind = decoded.kind;
-                            }
-                            // +0x00..+0x0C only. The rest of the record - the
-                            // talisman's skills above all - is left as it was,
-                            // because those bytes are in use on this save.
-                            let mut ok = crate::equip::set_level(rec, e.level);
-                            ok &= crate::equip::set_transmog(rec, e.transmog_id, e.transmog_level);
-                            for s in 0..3 {
-                                ok &= crate::equip::set_decoration(rec, s, e.decorations[s]);
-                            }
-                            written = ok;
-                        }
-                    }
-                }
-                if written {
-                    self.dirty = true;
-                    let pos = self.equipment().iter().position(|q| q.index == idx).unwrap_or(0);
-                    self.equip_cursor = pos;
-                    self.message = alloc::format!(
-                        "{} 枠 #{} を書き込みました（Lv{}）",
-                        crate::equip::type_name(kind),
-                        idx,
-                        e.level
-                    );
+                if e.new {
+                    self.write_new_equip(&e);
                 } else {
-                    self.message =
-                        String::from("書き込めませんでした（空き枠は編集できません）");
+                    self.write_equip_edit(&e);
                 }
-                self.equip_edit = None;
-                self.screen = Screen::Equip;
                 return;
             }
             Key::B => {
@@ -2322,6 +2517,119 @@ impl Editor {
             _ => {}
         }
         self.equip_edit = Some(e);
+    }
+
+    /// Write the form's values for an existing record, replacing it when its
+    /// type or id changed.
+    fn write_equip_edit(&mut self, e: &EquipEdit) {
+        let idx = e.index;
+        let slot = self.slot;
+        let current = match self.save.as_ref().and_then(|s| s.equipment_at(slot, idx)) {
+            Some(q) => q,
+            None => {
+                self.message = String::from("この枠は空なので編集できません");
+                return;
+            }
+        };
+        let identity_changed = current.kind != e.kind || current.id != e.id;
+
+        if identity_changed {
+            // equipops::replace is the only writer that may move the type and
+            // the id: it also empties the three sockets, because they belonged
+            // to the item that was there. Writing them back afterwards from
+            // the form would put old decorations on the new item.
+            let Some(save) = &mut self.save else { return };
+            let replaced = match equipops::replace(save, slot, idx, e.kind, e.id, e.level) {
+                Ok(()) => true,
+                Err(err) => {
+                    self.message = err.text();
+                    false
+                }
+            };
+            if !replaced {
+                return;
+            }
+            // The layer id at +0x04 is not part of replace's contract: it is a
+            // field edit like the level, and the form still shows it.
+            if let Some(rec) = save.equipment_record_mut(slot, idx) {
+                crate::equip::set_transmog(rec, e.transmog_id, e.transmog_level);
+            }
+            self.dirty = true;
+            let pos = self.equipment().iter().position(|q| q.index == idx).unwrap_or(0);
+            self.equip_cursor = pos;
+            self.message = alloc::format!(
+                "枠 #{} を {} ID {} に差し替えました（装飾品は外れました / Lv{}）",
+                idx,
+                crate::equip::type_name(e.kind),
+                e.id,
+                e.level
+            );
+            self.equip_edit = None;
+            self.screen = Screen::Equip;
+            return;
+        }
+
+        let mut written = false;
+        if let Some(save) = &mut self.save {
+            if let Some(rec) = save.equipment_record_mut(slot, idx) {
+                if !crate::equip::record_is_blank(rec) {
+                    // +0x00..+0x0C only. The rest of the record - the
+                    // talisman's skills above all - is left as it was,
+                    // because those bytes are in use on this save.
+                    let mut ok = crate::equip::set_level(rec, e.level);
+                    ok &= crate::equip::set_transmog(rec, e.transmog_id, e.transmog_level);
+                    for s in 0..3 {
+                        ok &= crate::equip::set_decoration(rec, s, e.decorations[s]);
+                    }
+                    written = ok;
+                }
+            }
+        }
+        if written {
+            self.dirty = true;
+            let pos = self.equipment().iter().position(|q| q.index == idx).unwrap_or(0);
+            self.equip_cursor = pos;
+            self.message = alloc::format!(
+                "{} 枠 #{} を書き込みました（Lv{}）",
+                crate::equip::type_name(e.kind),
+                idx,
+                e.level
+            );
+        } else {
+            self.message = String::from("書き込めませんでした（空き枠は編集できません）");
+        }
+        self.equip_edit = None;
+        self.screen = Screen::Equip;
+    }
+
+    /// Create the form's values in the first blank record of the box.
+    fn write_new_equip(&mut self, e: &EquipEdit) {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        };
+        match equipops::create(save, slot, e.kind, e.id, e.level) {
+            Ok(index) => {
+                self.dirty = true;
+                self.equip_edit = None;
+                self.equip_delete_armed = None;
+                self.screen = Screen::Equip;
+                // Select the row that was just written, so the list shows what
+                // create() produced instead of leaving the cursor behind.
+                let list = self.equipment();
+                let pos = list.iter().position(|q| q.index == index);
+                self.equip_cursor = pos.unwrap_or_else(|| self.equip_cursor.min(list.len().saturating_sub(1)));
+                self.message = alloc::format!(
+                    "枠 #{} に {} ID {} Lv{} を新規作成しました",
+                    index,
+                    crate::equip::type_name(e.kind),
+                    e.id,
+                    e.level
+                );
+            }
+            Err(err) => self.message = err.text(),
+        }
     }
 
     /// Decoration ids whose name matches the current filter.
@@ -2397,8 +2705,8 @@ impl Editor {
                 let matches = self.jewel_pick_matches();
                 if let Some(&id) = matches.get(self.jewel_pick_cursor) {
                     if let Some(e) = &mut self.equip_edit {
-                        if (4..EQUIP_EDIT_ROWS).contains(&e.field) {
-                            e.decorations[e.field - 4] = id;
+                        if let Some(socket) = e.decoration_socket(e.field) {
+                            e.decorations[socket] = id;
                         }
                     }
                     self.message = alloc::format!(
@@ -4052,16 +4360,29 @@ impl Editor {
                         i == self.equip_cursor,
                     );
                 }
-                // The row above the key guide says what this screen cannot do:
-                // it edits the records already in the box, and the flows that
-                // would move what the worn slots and saved sets point at are
-                // deliberately not here.
-                push(
-                    &mut out,
-                    String::from("  削除・差し替え・新規追加は未対応（既存レコードの編集のみ）"),
-                    false,
-                    false,
-                );
+                // What the key guide below cannot say in one line: a delete
+                // is two presses, and the first one names what still points at
+                // the record.
+                if let Some((idx, refs, _)) = self.equip_delete_pending() {
+                    push(
+                        &mut out,
+                        format!(
+                            "  削除の確認中: 枠 #{} / 参照 {} 件 / もう一度 [-] で{}",
+                            idx,
+                            refs,
+                            if refs == 0 { "削除" } else { "強制削除" }
+                        ),
+                        false,
+                        false,
+                    );
+                } else {
+                    push(
+                        &mut out,
+                        String::from("  [-] 2回で削除 / [+] 新規追加 / [A] 編集（種別・IDを変えると差し替え）"),
+                        false,
+                        false,
+                    );
+                }
                 push(
                     &mut out,
                     String::from("  Up/Down row  A 編集  Y filter  X clear  B back"),
@@ -4070,61 +4391,84 @@ impl Editor {
                 );
             }
             Screen::EquipEdit => {
-                push(&mut out, String::from("装備の編集"), false, false);
                 let e = self.equip_edit.unwrap_or_default();
-                let kind = self
-                    .save
-                    .as_ref()
-                    .and_then(|s| s.equipment_at(self.slot, e.index))
-                    .map(|q| q.kind)
-                    .unwrap_or(0);
-                // Seven rows, the same shape as the talisman form, so the
-                // highlight and the value it edits stay on the same row.
-                let rows: [(alloc::string::String, alloc::string::String); EQUIP_EDIT_ROWS] = [
-                    (
-                        String::from("枠"),
-                        format!("{}  （{}）", e.index, crate::equip::type_name(kind)),
-                    ),
-                    (String::from("レベル"), format!("{}", e.level)),
-                    (String::from("着せ替えID"), format!("{}", e.transmog_id)),
-                    (
-                        String::from("着せ替え元Lv"),
-                        format!("{}", e.transmog_level),
-                    ),
-                    (
-                        String::from("装飾品1"),
-                        format!(
-                            "{}  {}",
-                            e.decorations[0],
-                            decoration_name_of(e.decorations[0])
+                if e.new {
+                    // Three rows: the three values equipops::create writes.
+                    push(&mut out, String::from("新規装備の作成"), false, false);
+                    let rows = [
+                        (
+                            String::from("種別"),
+                            format!("{}  {}", e.kind, crate::equip::type_name(e.kind)),
                         ),
-                    ),
-                    (
-                        String::from("装飾品2"),
-                        format!(
-                            "{}  {}",
-                            e.decorations[1],
-                            decoration_name_of(e.decorations[1])
+                        (String::from("ID"), format!("{}", e.id)),
+                        (String::from("レベル"), format!("{}", e.level)),
+                    ];
+                    for (i, (k, v)) in rows.iter().enumerate() {
+                        push(&mut out, format!("  {:<14} {}", k, v), true, i == e.field);
+                    }
+                    push(
+                        &mut out,
+                        String::from("  Up/Down row  Left/Right value  A 作成  B 戻る"),
+                        false,
+                        false,
+                    );
+                } else {
+                    push(&mut out, String::from("装備の編集"), false, false);
+                    // Nine rows, the same shape as the talisman form, so the
+                    // highlight and the value it edits stay on the same row.
+                    // The type and the id sit at the bottom: moving them is
+                    // what makes A replace the record.
+                    let rows = [
+                        (
+                            String::from("枠"),
+                            format!("{}  （{}）", e.index, crate::equip::type_name(e.kind)),
                         ),
-                    ),
-                    (
-                        String::from("装飾品3"),
-                        format!(
-                            "{}  {}",
-                            e.decorations[2],
-                            decoration_name_of(e.decorations[2])
+                        (String::from("レベル"), format!("{}", e.level)),
+                        (String::from("着せ替えID"), format!("{}", e.transmog_id)),
+                        (
+                            String::from("着せ替え元Lv"),
+                            format!("{}", e.transmog_level),
                         ),
-                    ),
-                ];
-                for (i, (k, v)) in rows.iter().enumerate() {
-                    push(&mut out, format!("  {:<14} {}", k, v), true, i == e.field);
+                        (
+                            String::from("装飾品1"),
+                            format!(
+                                "{}  {}",
+                                e.decorations[0],
+                                decoration_name_of(e.decorations[0])
+                            ),
+                        ),
+                        (
+                            String::from("装飾品2"),
+                            format!(
+                                "{}  {}",
+                                e.decorations[1],
+                                decoration_name_of(e.decorations[1])
+                            ),
+                        ),
+                        (
+                            String::from("装飾品3"),
+                            format!(
+                                "{}  {}",
+                                e.decorations[2],
+                                decoration_name_of(e.decorations[2])
+                            ),
+                        ),
+                        (
+                            String::from("種別"),
+                            format!("{}  {}", e.kind, crate::equip::type_name(e.kind)),
+                        ),
+                        (String::from("ID"), format!("{}", e.id)),
+                    ];
+                    for (i, (k, v)) in rows.iter().enumerate() {
+                        push(&mut out, format!("  {:<14} {}", k, v), true, i == e.field);
+                    }
+                    push(
+                        &mut out,
+                        String::from("  Up/Down row  Left/Right value  Y 装飾品  X 刻み  A 反映/差し替え  B 戻る"),
+                        false,
+                        false,
+                    );
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down row  Left/Right value  Y 装飾品を選ぶ  X 刻み  A 書き込み  B 戻る"),
-                    false,
-                    false,
-                );
             }
             Screen::JewelPick => {
                 let matches = self.jewel_pick_matches();

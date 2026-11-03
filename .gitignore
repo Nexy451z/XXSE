@@ -4,6 +4,7 @@
 
 # Scratch space and generated data
 /.work
+*.log
 /out
 /dist/quests_all
 /dist/quests_out

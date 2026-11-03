@@ -130,19 +130,23 @@ fn save_flow_edits_an_item_count() {
     let vis = ed.visible_items();
     assert!(!vis.is_empty(), "the dump has non-empty item slots");
 
-    // Pick a slot with room for the +11 the test adds, whatever the dump holds.
+    // The cursor starts on the first visible slot, so that is the one the
+    // three presses below edit. Whatever count it holds, the result has to
+    // stop at the game's own ceiling of 99: that is the clamp the console
+    // shares with the PC build.
     let boxes = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
-    let first = *vis
-        .iter()
-        .find(|i| boxes[**i].count < 100)
-        .expect("a slot with room for 11 more");
+    let first = vis[0];
     let before = boxes[first].count;
     // Default step is 1; X cycles it to 10.
     ed.input(Key::Right);
     ed.input(Key::X);
     ed.input(Key::Right);
     let after = ed.save.as_ref().unwrap().read_item_box(0).unwrap()[first].count;
-    assert_eq!(after, before + 11);
+    assert_eq!(
+        after,
+        (before as u16 + 11).min(99) as u8,
+        "the item count is capped at 99, not 127"
+    );
 
     ed.input(Key::A);
     match ed.take_write() {

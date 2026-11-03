@@ -28,7 +28,7 @@ use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
     decoration_name_of, item_name_of, monster_name, Editor, Key, Screen, CHAR_FIELDS,
-    CONSOLE_SAVE, EQUIP_EDIT_ROWS, STEPS,
+    CONSOLE_SAVE, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -2073,7 +2073,10 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::CharmEdit => 7,
         Screen::SkillPick => ed.skill_pick_matches().len(),
         Screen::Equip => ed.equipment().len(),
-        Screen::EquipEdit => EQUIP_EDIT_ROWS,
+        // The form has two shapes: 9 rows for an existing record and 3 for a
+        // new one. The count comes from the form itself so the cursor and the
+        // renderer can never disagree about it.
+        Screen::EquipEdit => ed.equip_edit.map(|e| e.rows()).unwrap_or(0),
         Screen::JewelPick => ed.jewel_pick_matches().len(),
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => 3,
@@ -2159,7 +2162,12 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         }
         Screen::ItemPick => ed.item_pick_cursor = clamped,
         Screen::SkillPick => ed.skill_pick_cursor = clamped,
-        Screen::Equip => ed.equip_cursor = clamped,
+        Screen::Equip => {
+            ed.equip_cursor = clamped;
+            // A tap on another row is a cursor move: the pending delete
+            // belongs to the row it was armed on, not to the new one.
+            ed.equip_delete_armed = None;
+        }
         Screen::EquipEdit => {
             if let Some(mut ee) = ed.equip_edit {
                 ee.field = clamped;
@@ -2800,9 +2808,11 @@ impl GuiState {
             Screen::CharmEdit => {
                 "[A] BOXへ反映  [▲/▼] 行  [◀/▶] 値  [Y] スキル選択  [X] 刻み  [B] 戻る"
             }
-            Screen::Equip => "[A] 編集  [▲/▼] 行  [Y] 絞る  [X] クリア  [B] 戻る",
+            Screen::Equip => {
+                "[A] 編集  [▲/▼] 行  [Y] 絞る  [-] 削除×2  [＋] 新規  [X] 保存  [B] 戻る"
+            }
             Screen::EquipEdit => {
-                "[A] BOXへ反映  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品選択  [X] 保存  [B] 戻る"
+                "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品  [X] 保存  [B] 戻る"
             }
             Screen::JewelPick => {
                 "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [▲/▼] 行  [B] 戻る"
@@ -3372,6 +3382,39 @@ impl GuiState {
                 let p3 = format!("通常6 達人10 S{}", max_s);
                 self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, &p2, UiAction::CharmPreset(2));
                 self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, &p3, UiAction::CharmPreset(3));
+            }
+            Screen::Equip => {
+                // Both buttons go through the same key path the pad uses, so
+                // the touch build cannot delete anything the pad would refuse.
+                c.text_sized(ix + 20, cur_y, "装備の操作", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                let armed_index = ed.equip_delete_pending().map(|(index, _, _)| index);
+                let cursor_index = ed.equipment().get(ed.equip_cursor).map(|e| e.index);
+                let armed = armed_index.is_some() && armed_index == cursor_index;
+                let del_label = if armed {
+                    "削除する? もう一度タップ"
+                } else {
+                    "[-] 選択中の装備を削除（2回）"
+                };
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    del_label,
+                    UiAction::Key(Key::Minus),
+                );
+                cur_y += 44;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[＋] 新規装備を追加",
+                    UiAction::Key(Key::Plus),
+                );
             }
             Screen::Roster => {
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
@@ -4117,12 +4160,26 @@ impl GuiState {
                 tname.to_string(),
             ));
         }
-        // The whole screen edits existing records only. Deleting, swapping and
-        // adding one moves what the worn slots and the saved sets point at, so
-        // those flows are left out and the limit is stated instead of hidden.
-        let notice = alloc::vec![String::from(
-            "削除・差し替え・新規追加は未対応（既存レコードの編集のみ）",
-        )];
+        // The amber strip is where a pending delete explains itself: the key
+        // guide cannot say which record is armed, and a delete that fires on
+        // one press is exactly what this screen must not do.
+        let notice = match ed.equip_delete_pending() {
+            Some((index, refs, _)) => {
+                let mut v = alloc::vec![format!(
+                    "削除の確認中: 枠 #{:04} / 参照 {} 件",
+                    index, refs
+                )];
+                v.push(if refs == 0 {
+                    String::from("もう一度 [-] で削除確定 / [B] で取りやめ")
+                } else {
+                    String::from("もう一度 [-] で強制削除 / 参照は下のメッセージ")
+                });
+                v
+            }
+            None => alloc::vec![String::from(
+                "[-] 2回で削除 / [＋] 新規追加 / [A] 編集・種別やIDを変えると差し替え",
+            )],
+        };
         self.draw_adaptive_rows_warn(
             c,
             ed,
@@ -4135,9 +4192,10 @@ impl GuiState {
         );
     }
 
-    /// Seven-row form for one equipment record, the same shape as the talisman
-    /// form: one row per field, the value on the right, the hint in the meta
-    /// column, so no row needs two lines and nothing can overlap.
+    /// The equipment form. Nine rows when an existing record is edited, three
+    /// when a new one is being written: one row per field, the value on the
+    /// right, the hint in the meta column, so no row needs two lines and
+    /// nothing can overlap.
     fn draw_equip_edit(&mut self, c: &mut Canvas, ed: &Editor) {
         let Some(ee) = ed.equip_edit else {
             return;
@@ -4146,7 +4204,6 @@ impl GuiState {
             .save
             .as_ref()
             .and_then(|s| s.equipment_at(ed.slot, ee.index));
-        let kind = eq.map(|q| q.kind).unwrap_or(0);
         let ename = eq
             .as_ref()
             .map(|q| mhnx_core::equip::name(q).to_string())
@@ -4163,11 +4220,60 @@ impl GuiState {
             format!("◀ ▶ で切替 / ID {}", ee.decorations[sock])
         };
 
+        if ee.new {
+            // A record that does not exist yet has no level word, layer or
+            // sockets to preserve: ask for the three values create() writes.
+            let rows = alloc::vec![
+                (
+                    0,
+                    String::from("種別"),
+                    String::from("◀ ▶ で選択（1 〜 21）"),
+                    format!("{} {}", ee.kind, mhnx_core::equip::type_name(ee.kind)),
+                    String::from("#01"),
+                ),
+                (
+                    1,
+                    String::from("アイテムID"),
+                    String::from("◀ ▶ で増減 / 武器・防具のID"),
+                    format!("{}", ee.id),
+                    String::from("#02"),
+                ),
+                (
+                    2,
+                    String::from("レベル"),
+                    String::from("1 〜 32"),
+                    format!("{}", ee.level),
+                    String::from("#03"),
+                ),
+            ];
+            let notice = alloc::vec![String::from(
+                "決めた種別・ID・レベルで空き枠に作成します（[B] で中止）",
+            )];
+            self.draw_adaptive_rows_warn(
+                c,
+                ed,
+                "装備を新規作成",
+                &rows,
+                ee.field.min(rows.len().saturating_sub(1)),
+                true,
+                "作成",
+                &notice,
+            );
+            return;
+        }
+
+        // Nine rows, the same shape as the talisman form. 種別 and ID sit at
+        // the bottom because moving either of them turns [A] into
+        // equipops::replace, which empties the three sockets.
         let rows = alloc::vec![
             (
                 0,
                 String::from("装備枠"),
-                format!("◀ ▶ で移動 / {} {}", mhnx_core::equip::type_name(kind), ename),
+                format!(
+                    "◀ ▶ で移動 / {} {}",
+                    mhnx_core::equip::type_name(ee.kind),
+                    ename
+                ),
                 format!("#{:04}", ee.index),
                 String::from("#01"),
             ),
@@ -4213,11 +4319,37 @@ impl GuiState {
                 deco(2),
                 String::from("#07"),
             ),
+            (
+                7,
+                String::from("種別"),
+                String::from("◀ ▶ で選択（1 〜 21）"),
+                format!("{} {}", ee.kind, mhnx_core::equip::type_name(ee.kind)),
+                String::from("#08"),
+            ),
+            (
+                8,
+                String::from("アイテムID"),
+                String::from("◀ ▶ で増減 / 変えると差し替え"),
+                format!("{}", ee.id),
+                String::from("#09"),
+            ),
         ];
 
-        let notice = alloc::vec![String::from(
-            "削除・差し替え・新規追加は未対応（既存レコードの編集のみ）",
-        )];
+        // Whether [A] patches the record or replaces it is decided by these
+        // two fields, so the strip says which one is about to happen.
+        let identity_changed = eq
+            .as_ref()
+            .map(|q| q.kind != ee.kind || q.id != ee.id)
+            .unwrap_or(false);
+        let notice = if identity_changed {
+            alloc::vec![String::from(
+                "種別/ID を変えて [A]: 差し替えます（装飾品3枠は外れます）",
+            )]
+        } else {
+            alloc::vec![String::from(
+                "[A] でレベル・着せ替え・装飾品を書き込みます（種別/ID 変更で差し替え）",
+            )]
+        };
 
         // [A] writes the form into the box; the save file is written with X,
         // the same split the talisman form uses.
@@ -4226,9 +4358,13 @@ impl GuiState {
             ed,
             "装備編集",
             &rows,
-            ee.field.min(EQUIP_EDIT_ROWS - 1),
+            ee.field.min(rows.len().saturating_sub(1)),
             true,
-            "BOXへ反映",
+            if identity_changed {
+                "差し替え"
+            } else {
+                "BOXへ反映"
+            },
             &notice,
         );
     }

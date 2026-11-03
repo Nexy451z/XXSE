@@ -852,16 +852,18 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Equip => &[
             ("A", "編集"),
             ("Y", "絞る"),
-            ("X", "クリア"),
+            ("-", "削除(2回)"),
+            ("+", "新規"),
+            ("X", "保存"),
             ("L", "ギルド"),
             ("R", "オトモ"),
             ("B", "戻る"),
         ],
         EquipEdit => &[
-            ("A", "BOXへ反映"),
+            ("A", "反映/作成"),
             ("</>", "値"),
             ("Y", "装飾品"),
-            ("X", "刻み"),
+            ("X", "保存"),
             ("B", "戻る"),
         ],
         JewelPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
@@ -1270,7 +1272,10 @@ pub fn run() -> i32 {
                     }
                 }
             } else {
-                if down & BTN_PLUS != 0 {
+                // Plus quits everywhere except the equipment list, where the
+                // state machine uses it to open the new-record form. The key
+                // still reaches the screen below.
+                if down & BTN_PLUS != 0 && ed.screen != mhnx_core::hbedit::Screen::Equip {
                     break;
                 }
 

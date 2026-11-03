@@ -8,6 +8,8 @@ use egui_extras::{Column, TableBuilder};
 use mhnx_core::arc::{extension_for, Arc};
 use mhnx_core::check::{self, Finding, Severity};
 use mhnx_core::dlc;
+use mhnx_core::equipops::{self, EquipError};
+use mhnx_core::equiprefs::EquipRef;
 use mhnx_core::gamedata::LAST_ITEM_ID;
 use mhnx_core::itembox::ItemSlot;
 use mhnx_core::quest::{Gmd, Mib};
@@ -48,6 +50,28 @@ pub enum Confirm {
     ClearDlc,
     /// Delete one charm.
     Charm(usize),
+    /// Clear one equipment record. The first ask, before the reference check
+    /// has run: the dialog cannot say yet whether anything points at it.
+    EquipClear(usize),
+    /// Clear it although these still name it. The second ask, shown only after
+    /// clear() came back with the references it refused to break.
+    EquipClearReferenced {
+        /// Box index of the record.
+        index: usize,
+        /// Every place that still names it.
+        refs: Vec<EquipRef>,
+    },
+    /// Put a different item in one record, emptying its decorations.
+    EquipReplace {
+        /// Box index of the record.
+        index: usize,
+        /// New type.
+        kind: u8,
+        /// New item id.
+        id: u16,
+        /// Level to write.
+        level: u16,
+    },
 }
 
 /// Two-step confirmation for the destructive charm delete.
@@ -151,6 +175,17 @@ pub struct MhnxEditor {
     pub equip_show_empty: bool,
     /// Search text of the three decoration pickers, one per socket.
     pub equip_deco_search: [String; 3],
+    /// Type, id and level the "空き枠に作成" row is set to.
+    pub equip_new_kind: u8,
+    pub equip_new_id: u16,
+    pub equip_new_level: u16,
+    /// Type, id and level the replace row in the editor is set to, and which
+    /// record they were seeded from: the row shows the record it will replace,
+    /// not whatever was left there by the last record that was looked at.
+    pub equip_rep_for: Option<usize>,
+    pub equip_rep_kind: u8,
+    pub equip_rep_id: u16,
+    pub equip_rep_level: u16,
     pub item_pick_keep_filter: bool,
     /// Row selected inside the .rem / .sup reward table.
     pub entry_item_sel: Option<usize>,
@@ -228,6 +263,13 @@ impl Default for MhnxEditor {
             equip_selected: None,
             equip_show_empty: false,
             equip_deco_search: [String::new(), String::new(), String::new()],
+            equip_new_kind: 7,
+            equip_new_id: 1,
+            equip_new_level: 1,
+            equip_rep_for: None,
+            equip_rep_kind: 7,
+            equip_rep_id: 1,
+            equip_rep_level: 1,
             item_pick_keep_filter: true,
             entry_item_sel: None,
             charm_filter: String::new(),
@@ -1812,6 +1854,44 @@ impl MhnxEditor {
                 format!("枠 {} のお守りを削除します。元に戻せません。", n),
                 "削除する",
             ),
+            Confirm::EquipClear(n) => (
+                "装備を削除します",
+                format!(
+                    "枠 {} の装備を削除します。元に戻せません。\n\
+                     装備中やマイセットがこの枠を指していると、その参照は空の枠を指したまま残ります。\n\
+                     指している場合は、この次の確認で一覧を出してもう一度聞きます。",
+                    n
+                ),
+                "削除する",
+            ),
+            Confirm::EquipClearReferenced { index, refs } => {
+                let mut body =
+                    format!("枠 {} の装備は、まだ次の場所から参照されています。\n", index);
+                for r in refs.iter() {
+                    body += &format!("・{}\n", r.text());
+                }
+                body += "\nそれでも削除すると、その参照は空の枠を指したまま残ります。\n\
+                         このツールでは直せないので、ゲーム側で装備し直す必要があります。";
+                ("装備はまだ参照されています", body, "それでも削除")
+            }
+            Confirm::EquipReplace {
+                index,
+                kind,
+                id,
+                level,
+            } => (
+                "装備を差し替えます",
+                format!(
+                    "枠 {} を「{}」ID {}（Lv{}）に差し替えます。\n\
+                     装飾品 3 枠は空になります（前の装備のものなので残しません）。\n\
+                     +0x0C 以降の持ち物はそのまま残ります。",
+                    index,
+                    mhnx_core::equip::type_name(*kind),
+                    id,
+                    level
+                ),
+                "差し替える",
+            ),
         };
         let mut answer: Option<bool> = None;
         egui::Window::new(title)
@@ -1839,6 +1919,20 @@ impl MhnxEditor {
                     Confirm::DiscardForOpen(p) => self.open_save(p),
                     Confirm::ClearDlc => self.clear_dlc(),
                     Confirm::Charm(n) => self.delete_charm(n),
+                    // The first "yes" only starts the check: a record that is
+                    // still named by something comes back as a second dialog.
+                    Confirm::EquipClear(n) => self.equip_delete_checked(n),
+                    Confirm::EquipClearReferenced { index, .. } => {
+                        let _ = self.equip_delete(index, true);
+                    }
+                    Confirm::EquipReplace {
+                        index,
+                        kind,
+                        id,
+                        level,
+                    } => {
+                        self.equip_replace(index, kind, id, level);
+                    }
                     Confirm::None => {}
                 }
             }
@@ -3269,10 +3363,11 @@ impl MhnxEditor {
     /// The equipment box: the list on the left, the editor for the selected
     /// record on the right.
     ///
-    /// Only existing records are edited. Deleting one, or replacing its type or
-    /// id, would move a reference onto a different item (worn gear and every
-    /// My Set hold box indices), and nothing here can check or repair that, so
-    /// those two operations are not offered at all.
+    /// Records are edited, created, replaced and cleared. Both of the
+    /// operations that move a reference go through equipops, which asks the
+    /// reference checker first: deleting a named record comes back with the
+    /// list of what still points at it, and the dialog shows that list before
+    /// it offers the forced delete.
     fn tab_equip(&mut self, ui: &mut egui::Ui) {
         ui.heading("装備ボックス");
         if self.save.is_none() {
@@ -3309,10 +3404,37 @@ impl MhnxEditor {
             ui.checkbox(&mut self.equip_show_empty, "空き枠を表示")
                 .on_hover_text("既定では使用中の枠だけを一覧します");
             ui.separator();
-            // One line, by design: this tab edits records, and anything that
-            // would move a reference is out of scope until the check exists.
-            ui.label(egui::RichText::new("削除・差し替えは未対応（編集のみ）").weak().small());
+            // The three operations that move a reference exist now; they all
+            // pass through a dialog, so the line says that rather than 未対応.
+            ui.label(
+                egui::RichText::new("作成・差し替え・削除も可（削除と差し替えは確認あり）")
+                    .weak()
+                    .small(),
+            );
         });
+        // New records: type, id and level, then one button. The row lives above
+        // the list so it can be reached without first finding an empty slot,
+        // and the box decides which blank record is used.
+        let mut create = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("新規作成").strong());
+            Self::equip_kind_combo(ui, "equipnewkind", &mut self.equip_new_kind);
+            ui.label("ID");
+            ui.add(
+                egui::DragValue::new(&mut self.equip_new_id)
+                    .range(0..=0xFFFF)
+                    .speed(1.0),
+            );
+            ui.label("Lv");
+            ui.add(egui::DragValue::new(&mut self.equip_new_level).range(1..=32));
+            create = ui
+                .button("空き枠に作成")
+                .on_hover_text("最初の空きレコードに書き込み、その行を選びます")
+                .clicked();
+        });
+        if create {
+            self.equip_create(self.equip_new_kind, self.equip_new_id, self.equip_new_level);
+        }
         let needle = self.equip_filter.trim().to_lowercase();
         let show_empty = self.equip_show_empty;
         let rows: Vec<_> = all
@@ -3439,11 +3561,11 @@ impl MhnxEditor {
         };
         ui.label(egui::RichText::new(format!("枠 {} の編集", index)).strong());
         if eq.kind == 0 {
-            // An empty slot is not something this editor creates: a new record
-            // needs a type and an id from a table whose ranges are not verified
-            // yet, so only existing records are offered here.
+            // A new record always lands in the first blank slot, which is not
+            // necessarily this one, so the editor points at the row above
+            // instead of offering a button that would fill a different index.
             ui.label(
-                egui::RichText::new("空き枠です（新規追加は未対応）")
+                egui::RichText::new("空き枠です。上の「新規作成」→「空き枠に作成」で作れます。")
                     .weak()
                     .small(),
             );
@@ -3546,6 +3668,54 @@ impl MhnxEditor {
             .weak()
             .small(),
         );
+        ui.separator();
+        // Seeded from the record the first time it is drawn, so the row starts
+        // out as "this very item" and only differs once the user changes it.
+        // Without the seeding, switching rows would leave the previous
+        // record's id in the box and one click would write it here.
+        if self.equip_rep_for != Some(index) {
+            self.equip_rep_for = Some(index);
+            self.equip_rep_kind = eq.kind;
+            self.equip_rep_id = eq.id;
+            self.equip_rep_level = eq.level;
+        }
+        ui.label(egui::RichText::new("差し替え").strong());
+        ui.horizontal_wrapped(|ui| {
+            Self::equip_kind_combo(ui, "equiprepkind", &mut self.equip_rep_kind);
+            ui.label("ID");
+            ui.add(
+                egui::DragValue::new(&mut self.equip_rep_id)
+                    .range(0..=0xFFFF)
+                    .speed(1.0),
+            );
+            ui.label("Lv");
+            ui.add(egui::DragValue::new(&mut self.equip_rep_level).range(1..=32));
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("差し替える")
+                .on_hover_text("種別と ID を入れ替え、装飾品 3 枠を空にします")
+                .clicked()
+            {
+                self.confirm = Confirm::EquipReplace {
+                    index,
+                    kind: self.equip_rep_kind,
+                    id: self.equip_rep_id,
+                    level: self.equip_rep_level,
+                };
+            }
+            ui.label(
+                egui::RichText::new("装飾品は空になります")
+                    .weak()
+                    .small(),
+            );
+        });
+        if Self::danger_button(ui, "この枠を削除")
+            .on_hover_text("確認ダイアログを挟んでから消します")
+            .clicked()
+        {
+            self.confirm = Confirm::EquipClear(index);
+        }
         if rec[..] != rec0[..] {
             if self.store_equipment_record(index, &rec) {
                 self.message =
@@ -3576,6 +3746,107 @@ impl MhnxEditor {
             .copy_from_slice(&rec[..mhnx_core::equip::EQUIP_RECORD]);
         self.dirty = true;
         true
+    }
+
+    /// Write a new item into the first blank record and select that row.
+    ///
+    /// The index is whatever the box gave back: the operation goes through
+    /// equipops::create, which owns the search for a blank record and returns
+    /// the one it filled.
+    pub fn equip_create(&mut self, kind: u8, id: u16, level: u16) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        match equipops::create(save, slot, kind, id, level) {
+            Ok(index) => {
+                self.dirty = true;
+                self.equip_selected = Some(index);
+                self.message = format!(
+                    "装備を作成しました（枠 {}・{} ID {}・Lv{}）",
+                    index,
+                    mhnx_core::equip::type_name(kind),
+                    id,
+                    level
+                );
+                true
+            }
+            Err(e) => {
+                self.message = e.text();
+                false
+            }
+        }
+    }
+
+    /// Put a different item in an existing record.
+    pub fn equip_replace(&mut self, index: usize, kind: u8, id: u16, level: u16) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        match equipops::replace(save, slot, index, kind, id, level) {
+            Ok(()) => {
+                self.dirty = true;
+                self.message = format!(
+                    "装備 {} を「{}」ID {} に差し替えました（装飾品は空にしました）",
+                    index,
+                    mhnx_core::equip::type_name(kind),
+                    id
+                );
+                true
+            }
+            Err(e) => {
+                self.message = e.text();
+                false
+            }
+        }
+    }
+
+    /// Clear one record. With force = false this refuses while anything still
+    /// names the record, and hands those references back in the error.
+    pub fn equip_delete(&mut self, index: usize, force: bool) -> Result<(), EquipError> {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            return Err(EquipError::OutOfRange);
+        };
+        let out = equipops::clear(save, slot, index, force);
+        match &out {
+            Ok(()) => {
+                self.dirty = true;
+                if self.equip_selected == Some(index) {
+                    self.equip_selected = None;
+                }
+                self.message =
+                    format!("装備 {} を削除しました（「上書き保存」で書き出します）", index);
+            }
+            Err(e) => self.message = e.text(),
+        }
+        out
+    }
+
+    /// The first "yes" of the delete dialog.
+    ///
+    /// It tries the unforced clear, and when the record is still named by
+    /// something it turns the same dialog into the second ask, which lists
+    /// those references and offers the forced delete as a separate button.
+    pub fn equip_delete_checked(&mut self, index: usize) {
+        if let Err(EquipError::Referenced(refs)) = self.equip_delete(index, false) {
+            self.confirm = Confirm::EquipClearReferenced { index, refs };
+        }
+    }
+
+    /// Pick one of the 21 hunter equipment types.
+    fn equip_kind_combo(ui: &mut egui::Ui, salt: &str, kind: &mut u8) {
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(mhnx_core::equip::type_name(*kind))
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                for k in 1..=21u8 {
+                    ui.selectable_value(kind, k, mhnx_core::equip::type_name(k));
+                }
+            });
     }
 
     /// Searchable decoration picker: item ids 2638 + k, named from gamedata.
@@ -5155,6 +5426,151 @@ mod tests {
         assert!(!app.store_equipment_record(2000, &[0u8; mhnx_core::equip::EQUIP_RECORD]));
         assert!(!app.store_equipment_record(0, &[0u8; 3]));
         assert!(!app.dirty, "a refused write must not make the save look edited");
+    }
+
+    #[test]
+    fn a_new_record_lands_in_a_blank_slot_and_is_selected() {
+        let dir = Scratch::new("equipnew");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        assert!(app.equip_create(9, 123, 7));
+        assert!(app.dirty, "creating a record has to mark the save dirty");
+        let index = app.equip_selected.expect("the created row is selected");
+        let eq = app
+            .save
+            .as_ref()
+            .expect("save")
+            .equipment_at(0, index)
+            .expect("record");
+        assert_eq!((eq.kind, eq.id, eq.level), (9, 123, 7));
+        assert!(app.message.contains("作成しました"), "{}", app.message);
+
+        // The next one takes the next blank slot, not the same one again.
+        assert!(app.equip_create(1, 5, 1));
+        let second = app.equip_selected.expect("selected");
+        assert!(second > index, "{} then {}", index, second);
+        let used = app
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_box(0))
+            .map(|b| mhnx_core::equip::decode_box(b))
+            .map(|all| all.iter().filter(|e| !e.is_empty()).count())
+            .unwrap_or(0);
+        assert_eq!(used, 2);
+    }
+
+    #[test]
+    fn deleting_a_worn_record_is_refused_until_it_is_forced() {
+        let dir = Scratch::new("equipdel");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        // Written straight in: a created record lands in slot 0, and this
+        // fixture leaves every My Set pointing at index 0, so the reference
+        // list would be every set rather than the one worn item.
+        let index = 9;
+        let mut rec = [0u8; mhnx_core::equip::EQUIP_RECORD];
+        rec[0] = 7; // 大剣
+        rec[2] = 40;
+        app.save
+            .as_mut()
+            .and_then(|s| s.equipment_record_mut(0, index))
+            .expect("record 9")
+            .copy_from_slice(&rec);
+        app.equip_selected = Some(index);
+        app.dirty = false;
+
+        // Wear it: part 0 of the seven worn indices is the weapon.
+        let base = app
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        let at = base + mhnx_core::equiprefs::WORN_OFFSET;
+        app.save.as_mut().expect("save").body_mut()[at..at + 2]
+            .copy_from_slice(&(index as u16).to_le_bytes());
+
+        match app.equip_delete(index, false) {
+            Err(EquipError::Referenced(refs)) => {
+                assert_eq!(refs, vec![EquipRef::Worn { part: 0 }]);
+            }
+            other => panic!("a worn record has to be refused, got {:?}", other),
+        }
+        assert!(!app.dirty, "a refused delete must not dirty the save");
+        let still_there = app
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_at(0, index))
+            .expect("record");
+        assert_eq!(still_there.kind, 7);
+
+        // The dialog turns the refusal into the second ask, with the list.
+        app.equip_delete_checked(index);
+        assert!(
+            matches!(app.confirm, Confirm::EquipClearReferenced { index: i, .. } if i == index),
+            "the second dialog has to list the references"
+        );
+        app.confirm = Confirm::None;
+
+        assert!(app.equip_delete(index, true).is_ok());
+        assert!(app.dirty);
+        let gone = app
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_at(0, index))
+            .expect("record");
+        assert!(gone.is_empty(), "the record is zeroed");
+        assert_eq!(app.equip_selected, None, "the deleted row is no longer shown");
+    }
+
+    #[test]
+    fn replacing_an_item_empties_its_decorations_and_keeps_the_tail() {
+        let dir = Scratch::new("equipreplace");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        let mut rec = [0u8; mhnx_core::equip::EQUIP_RECORD];
+        rec[0] = 7; // 大剣
+        rec[2] = 40;
+        let tail: Vec<u8> = (0..mhnx_core::equip::EQUIP_RECORD - 0x0C)
+            .map(|i| (i as u8) + 1)
+            .collect();
+        rec[0x0C..].copy_from_slice(&tail);
+        assert!(mhnx_core::equip::set_decoration(&mut rec, 0, 2638));
+        app.save
+            .as_mut()
+            .and_then(|s| s.equipment_record_mut(0, 9))
+            .expect("record 9")
+            .copy_from_slice(&rec);
+        app.dirty = false;
+
+        assert!(app.equip_replace(9, 13, 77, 3));
+        assert!(app.dirty);
+        let eq = app
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_at(0, 9))
+            .expect("record");
+        assert_eq!((eq.kind, eq.id, eq.level), (13, 77, 3));
+        let box_bytes = app.save.as_ref().and_then(|s| s.equipment_box(0)).expect("box");
+        let at = 9 * mhnx_core::equip::EQUIP_RECORD;
+        let got = &box_bytes[at..at + mhnx_core::equip::EQUIP_RECORD];
+        assert_eq!(
+            mhnx_core::equip::Equipment::decorations(9, got),
+            [0, 0, 0],
+            "the old decorations belonged to the item that was replaced"
+        );
+        assert_eq!(&got[0x0C..], &tail[..], "the tail is not the replace's to touch");
+
+        // A blank record is not something replace may fill: create does that.
+        assert!(!app.equip_replace(10, 7, 1, 1));
+        assert!(app.message.contains("すでに空き枠"), "{}", app.message);
     }
 
     #[test]
