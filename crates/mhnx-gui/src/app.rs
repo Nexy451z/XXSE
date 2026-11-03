@@ -211,6 +211,10 @@ pub enum Confirm {
     /// changed after it was read. What was about to be written waits in
     /// [MhnxEditor::write_stopped]; 「承知のうえで続ける」 runs that very write.
     UnsafeWrite,
+    /// A write that passed the safety check, waiting for the user to agree to
+    /// what it changes. The difference waits in [MhnxEditor::review];
+    /// 「保存する」 runs that very write, 「やめる」 drops it.
+    ReviewWrite,
 }
 
 /// Two-step confirmation for the destructive charm delete.
@@ -290,6 +294,570 @@ pub struct StoppedWrite {
     pub target: WriteTarget,
     /// Why it was stopped, one sentence per reason, as the core words them.
     pub reasons: Vec<String>,
+}
+
+/// One step of the all-tab undo: the whole save as it was before an edit.
+///
+/// The per-tab stacks (アイテムボックス / ポーチ / 進行状況) each kept only the
+/// bytes their own tab owns, so every new tab needed its own undo and the other
+/// nine tabs had none. A step here is the whole parsed save instead, which
+/// every tab shares. A step is 4,726,188 bytes (the 4,726,152 byte body plus
+/// the 36 byte Switch header), so the 16 step cap is 75,619,008 bytes, about
+/// 72 MiB of RAM; see [MhnxEditor::UNDO_STEPS].
+pub struct SaveUndo {
+    /// What the edit was called, for the status line and the tooltip.
+    pub label: String,
+    /// Character slot that was open when the snapshot was taken, put back with
+    /// the bytes so the working copies are rebuilt from the right slot.
+    pub slot: usize,
+    /// The save before the edit.
+    pub save: Save,
+}
+
+/// One named part of the save layout, so a changed offset can be worded.
+struct Layout {
+    /// Offset from the slot base, or from the body start for the body parts.
+    start: usize,
+    end: usize,
+    /// What the part holds.
+    name: &'static str,
+    /// Bytes per record when the part is an array, 0 when it is not.
+    unit: usize,
+    /// What one record is called, e.g. "枠".
+    unit_name: &'static str,
+}
+
+/// The parts of one character slot, relative to its base.
+///
+/// Every boundary is an existing constant from mhnx-core, so the names cannot
+/// drift away from the offsets the writers use. Ranges nothing in this crate
+/// writes are left out; a change there is reported as 「その他」.
+const SLOT_LAYOUT: &[Layout] = &[
+    Layout { start: 0x0000, end: 0x0080, name: "キャラクター情報", unit: 0, unit_name: "" },
+    Layout {
+        start: mhnx_core::save::OFF_ITEM_BOX,
+        end: mhnx_core::myset::OFF_ITEM_SETS,
+        name: "アイテムボックス",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::myset::OFF_ITEM_SETS,
+        end: mhnx_core::myset::OFF_POUCH,
+        name: "アイテムマイセット",
+        unit: mhnx_core::myset::ITEM_SET_SIZE,
+        unit_name: "セット",
+    },
+    Layout {
+        start: mhnx_core::myset::OFF_POUCH,
+        end: mhnx_core::save::OFF_HR_POINTS,
+        name: "ポーチ",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::save::OFF_HR_POINTS,
+        end: mhnx_core::questprogress::OFF_CLEARED,
+        name: "所持金・HR ポイント",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::questprogress::OFF_CLEARED,
+        end: mhnx_core::awards::MAP_OFF,
+        name: "クエスト進行状況",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::awards::MAP_OFF,
+        end: mhnx_core::awards::MAP_OFF + mhnx_core::awards::MAP_LEN,
+        name: "勲章（解禁マップ）",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::awards::NOTICE_OFF,
+        end: mhnx_core::awards::NOTICE_OFF + mhnx_core::awards::NOTICE_LEN,
+        name: "勲章（通知）",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::save::OFF_MONSTER_HUNT,
+        end: mhnx_core::save::OFF_MONSTER_SIZE + mhnx_core::save::MONSTER_SIZE_TABLE_SIZE,
+        name: "狩猟記録",
+        unit: 2,
+        unit_name: "匹",
+    },
+    Layout {
+        start: mhnx_core::save::OFF_EQUIPMENT_BOX,
+        end: mhnx_core::save::OFF_EQUIPMENT_BOX + mhnx_core::save::EQUIPMENT_BOX_SIZE,
+        name: "装備ボックス",
+        unit: mhnx_core::save::EQUIPMENT_RECORD,
+        unit_name: "枠",
+    },
+    Layout {
+        start: mhnx_core::palicogear::PALICO_EQUIP_OFFSET,
+        end: mhnx_core::palicogear::PALICO_EQUIP_OFFSET + mhnx_core::save::PALICO_EQUIPMENT_SIZE,
+        name: "オトモ装備ボックス",
+        unit: mhnx_core::save::EQUIPMENT_RECORD,
+        unit_name: "枠",
+    },
+    Layout {
+        start: mhnx_core::myset::OFF_EQUIP_SETS,
+        end: mhnx_core::myset::OFF_EQUIP_SETS
+            + mhnx_core::myset::EQUIP_SETS * mhnx_core::myset::EQUIP_SET_SIZE,
+        name: "装備マイセット",
+        unit: mhnx_core::myset::EQUIP_SET_SIZE,
+        unit_name: "セット",
+    },
+    Layout {
+        start: mhnx_core::save::OFF_NAME,
+        end: mhnx_core::save::OFF_NAME + 32,
+        name: "名前",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::palico::OFF_ROSTER,
+        end: mhnx_core::palico::OFF_ROSTER + mhnx_core::palico::SLOTS * mhnx_core::palico::RECORD,
+        name: "オトモ",
+        unit: mhnx_core::palico::RECORD,
+        unit_name: "匹",
+    },
+    Layout {
+        start: mhnx_core::guildcard::OFF_GUILD_CARD,
+        end: mhnx_core::guildcard::OFF_GUILD_CARD + mhnx_core::guildcard::GC_SIZE,
+        name: "ギルドカード",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::awards::CARD_OFF,
+        end: mhnx_core::awards::CARD_OFF + mhnx_core::awards::CARD_LEN,
+        name: "勲章（カード側）",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: mhnx_core::guildcard::OFF_ARENA,
+        end: mhnx_core::guildcard::OFF_ARENA
+            + mhnx_core::guildcard::ARENA_COUNT
+                * mhnx_core::guildcard::ARENA_RANKS
+                * mhnx_core::guildcard::ARENA_ENTRY,
+        name: "闘技大会の記録",
+        unit: mhnx_core::guildcard::ARENA_ENTRY,
+        unit_name: "件",
+    },
+    Layout {
+        start: mhnx_core::guildcard::GC_CARDS_INFO,
+        end: mhnx_core::guildcard::GC_INBOX,
+        name: "受信カード一覧",
+        unit: mhnx_core::guildcard::CARD_INFO_LEN,
+        unit_name: "枚",
+    },
+    Layout {
+        start: mhnx_core::guildcard::GC_INBOX_INFO,
+        end: mhnx_core::guildcard::GC_INBOX_INFO
+            + mhnx_core::guildcard::INBOX_LIST_LEN * mhnx_core::guildcard::INBOX_INFO_LEN,
+        name: "受信箱の情報",
+        unit: mhnx_core::guildcard::INBOX_INFO_LEN,
+        unit_name: "枚",
+    },
+    Layout {
+        start: mhnx_core::save::OFF_MANUAL_SHOUTOUTS,
+        end: mhnx_core::save::OFF_AUTO_SHOUTOUTS,
+        name: "定型文（手動）",
+        unit: mhnx_core::save::SHOUTOUT_ENTRY,
+        unit_name: "件",
+    },
+    Layout {
+        start: mhnx_core::save::OFF_AUTO_SHOUTOUTS,
+        end: mhnx_core::save::OFF_AUTO_SHOUTOUTS + mhnx_core::save::AUTO_SHOUTOUT_SIZE,
+        name: "定型文（自動）",
+        unit: mhnx_core::save::SHOUTOUT_ENTRY,
+        unit_name: "件",
+    },
+];
+
+/// The parts that sit in the body itself rather than in a character slot.
+const BODY_LAYOUT: &[Layout] = &[
+    Layout { start: 0x00, end: 0x04, name: "本体ヘッダ", unit: 0, unit_name: "" },
+    Layout { start: 0x04, end: 0x07, name: "スロット使用フラグ", unit: 0, unit_name: "" },
+    Layout { start: 0x0C, end: 0x10, name: "DLC セクションの位置", unit: 0, unit_name: "" },
+    Layout { start: 0x10, end: 0x1C, name: "スロット基点", unit: 0, unit_name: "" },
+    Layout {
+        start: mhnx_core::save::OFF_BRIGHTNESS,
+        end: mhnx_core::save::OFF_DLC_PALICO + 1,
+        name: "本体オプションと DLC オトモ枠",
+        unit: 0,
+        unit_name: "",
+    },
+];
+
+/// The download-quest section, whose offset the save itself carries.
+///
+/// Its length is fixed: the quest array, then the 45 challenge-quest loadouts,
+/// end exactly where the first character slot begins.
+static DLC_SECTION: Layout = Layout {
+    start: 0,
+    end: mhnx_core::dlc::EQUIP_ARRAY_OFFSET
+        + mhnx_core::dlc::EQUIP_SLOTS * mhnx_core::dlc::EQUIP_SLOT_SIZE,
+    name: "DLC セクション",
+    unit: 0,
+    unit_name: "",
+};
+
+/// One stretch of bytes a write changes, named by what lives there.
+pub struct DiffRange {
+    /// Character slot this belongs to, None for the body-wide parts.
+    pub slot: Option<usize>,
+    /// What the layout calls this place, e.g. "装備ボックス".
+    pub name: &'static str,
+    /// Distance from the start of the named part.
+    pub rel: usize,
+    /// How many bytes differ inside the stretch.
+    pub len: usize,
+    /// Records the stretch touches, when the part has a known record size.
+    pub records: Option<(usize, &'static str)>,
+}
+
+impl DiffRange {
+    /// The line the review dialog prints for this stretch.
+    pub fn line(&self) -> String {
+        let head = match self.slot {
+            Some(i) => format!("スロット{} {}", i + 1, self.name),
+            None => self.name.to_owned(),
+        };
+        let mut out = format!("{} +0x{:X} 付近 {} バイト", head, self.rel, self.len);
+        if let Some((n, what)) = self.records {
+            out += &format!("（{} {}）", n, what);
+        }
+        out
+    }
+}
+
+/// What one write would change: the named stretches and a feature summary.
+#[derive(Default)]
+pub struct WriteDiff {
+    /// How many bytes differ from the file on disk.
+    pub changed: usize,
+    /// Feature level lines, e.g. "スロット1: 名前、装備ボックス 1 枠".
+    pub summary: Vec<String>,
+    /// The stretches themselves, in file order.
+    pub ranges: Vec<DiffRange>,
+}
+
+/// A write that is waiting for the user to agree to what it changes.
+pub struct WriteReview {
+    /// What is about to be written, so the answer can run the same write.
+    pub target: WriteTarget,
+    /// The file the bytes land in.
+    pub path: PathBuf,
+    /// Size of what is on disk now.
+    pub disk_len: usize,
+    /// Size of what the write would put there.
+    pub new_len: usize,
+    /// The difference between the two.
+    pub diff: WriteDiff,
+}
+
+/// The layout entry that contains `body_off`, if any.
+///
+/// Overlapping entries are resolved by taking the narrowest one: the 闘技大会の
+/// 記録 and the award map both sit inside the guild card block, and naming a
+/// change after the narrowest piece is what tells the user which one moved.
+fn region_at(save: &Save, body_off: usize) -> Option<(Option<usize>, &'static Layout)> {
+    fn consider(
+        best: &mut Option<(usize, Option<usize>, &'static Layout)>,
+        body_off: usize,
+        slot: Option<usize>,
+        layout: &'static Layout,
+        start: usize,
+    ) {
+        let end = start + (layout.end - layout.start);
+        if body_off >= start && body_off < end {
+            let span = end - start;
+            if best.map(|(s, _, _)| span < s).unwrap_or(true) {
+                *best = Some((span, slot, layout));
+            }
+        }
+    }
+    let mut best: Option<(usize, Option<usize>, &'static Layout)> = None;
+    for layout in BODY_LAYOUT {
+        consider(&mut best, body_off, None, layout, layout.start);
+    }
+    for slot in 0..mhnx_core::save::MAX_SLOTS {
+        let Some(base) = save.slot_base(slot) else {
+            continue;
+        };
+        for layout in SLOT_LAYOUT {
+            consider(&mut best, body_off, Some(slot), layout, base as usize + layout.start);
+        }
+    }
+    let dlc = save.dlc_section_offset() as usize;
+    let dlc_end = dlc + mhnx_core::dlc::EQUIP_ARRAY_OFFSET
+        + mhnx_core::dlc::EQUIP_SLOTS * mhnx_core::dlc::EQUIP_SLOT_SIZE;
+    if dlc > 0 && dlc_end <= save.body().len() {
+        consider(&mut best, body_off, None, &DLC_SECTION, dlc);
+    }
+    best.map(|(_, slot, layout)| (slot, layout))
+}
+
+/// Where the named parts start, so an unnamed gap can end where the next one
+/// begins instead of swallowing it.
+fn region_starts(save: &Save) -> Vec<usize> {
+    let mut starts: Vec<usize> = BODY_LAYOUT.iter().map(|l| l.start).collect();
+    for slot in 0..mhnx_core::save::MAX_SLOTS {
+        if let Some(base) = save.slot_base(slot) {
+            starts.extend(SLOT_LAYOUT.iter().map(|l| base as usize + l.start));
+        }
+    }
+    let dlc = save.dlc_section_offset() as usize;
+    if dlc > 0 {
+        starts.push(dlc);
+    }
+    starts
+}
+
+/// The differing stretches of two files, named with the save layout.
+///
+/// `header_len` is the Switch header the body does not contain: bytes before
+/// it are reported as the file header, everything after it is translated into
+/// a body offset before the layout is consulted. Returns how many bytes differ
+/// and the stretches, in file order. Differences closer together than 32 bytes
+/// are reported as one stretch: a record that has been rewritten is one line,
+/// not thirty.
+pub fn diff_ranges(
+    old: &[u8],
+    new: &[u8],
+    header_len: usize,
+    save: &Save,
+) -> (usize, Vec<DiffRange>) {
+    const GAP: usize = 32;
+    let common = old.len().min(new.len());
+    let mut changed = 0usize;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for i in 0..common {
+        if old[i] == new[i] {
+            continue;
+        }
+        changed += 1;
+        open = match open {
+            Some((s, e)) if i <= e + GAP => Some((s, i + 1)),
+            Some((s, e)) => {
+                runs.push((s, e));
+                Some((i, i + 1))
+            }
+            None => Some((i, i + 1)),
+        };
+    }
+    if let Some(run) = open {
+        runs.push(run);
+    }
+    if old.len() != new.len() {
+        let trailing = old.len().max(new.len());
+        changed += trailing - common;
+        match runs.last_mut() {
+            Some((_, end)) if common <= *end + GAP => *end = trailing,
+            _ => runs.push((common, trailing)),
+        }
+    }
+
+    let mut out: Vec<DiffRange> = Vec::new();
+    for (run_start, run_end) in runs {
+        let mut at = run_start;
+        while at < run_end {
+            if at < header_len {
+                let end = run_end.min(header_len);
+                out.push(DiffRange {
+                    slot: None,
+                    name: "ファイルヘッダ",
+                    rel: at,
+                    len: end - at,
+                    records: None,
+                });
+                at = end;
+                continue;
+            }
+            let body = at - header_len;
+            match region_at(save, body) {
+                Some((slot, layout)) => {
+                    let start = match slot {
+                        Some(i) => save.slot_base(i).map(|b| b as usize).unwrap_or(0) + layout.start,
+                        None => layout.start,
+                    };
+                    let region_end = start + (layout.end - layout.start);
+                    let end = region_end.min(body + (run_end - at));
+                    let stop = (header_len + end).min(run_end);
+                    let len = stop - at;
+                    let records = if layout.unit > 0 {
+                        Some(((len + layout.unit - 1) / layout.unit, layout.unit_name))
+                    } else {
+                        None
+                    };
+                    out.push(DiffRange {
+                        slot,
+                        name: layout.name,
+                        rel: body.saturating_sub(start),
+                        len,
+                        records,
+                    });
+                    at = stop;
+                }
+                None => {
+                    let next = region_starts(save)
+                        .into_iter()
+                        .filter(|s| *s > body)
+                        .min()
+                        .unwrap_or(run_end - header_len);
+                    let stop = (header_len + next).min(run_end);
+                    out.push(DiffRange {
+                        slot: None,
+                        name: "その他",
+                        rel: body,
+                        len: stop - at,
+                        records: None,
+                    });
+                    at = stop;
+                }
+            }
+        }
+    }
+    (changed, out)
+}
+
+/// Which character fields differ between the file on disk and the new save.
+fn character_fields_changed(old: &Save, new: &Save, slot: usize) -> Vec<&'static str> {
+    let (Some(a), Some(b)) = (old.read_character(slot), new.read_character(slot)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if a.name != b.name || a.name_preview != b.name_preview {
+        out.push("名前");
+    }
+    if a.play_time != b.play_time {
+        out.push("プレイ時間");
+    }
+    if a.funds != b.funds {
+        out.push("所持金");
+    }
+    if a.hunter_rank != b.hunter_rank {
+        out.push("ハンターランク");
+    }
+    if a.hr_points != b.hr_points {
+        out.push("HR ポイント");
+    }
+    if a.academy_points != b.academy_points {
+        out.push("学園ポイント");
+    }
+    if a.village_points != b.village_points {
+        out.push("村ポイント");
+    }
+    if a.voice != b.voice
+        || a.eye_color != b.eye_color
+        || a.clothing != b.clothing
+        || a.gender != b.gender
+        || a.hairstyle != b.hairstyle
+        || a.face != b.face
+        || a.features != b.features
+        || a.skin_color != b.skin_color
+        || a.hair_color != b.hair_color
+        || a.features_color != b.features_color
+        || a.clothing_color != b.clothing_color
+    {
+        out.push("外見");
+    }
+    out
+}
+
+/// How many download quests the write adds, removes or rewrites.
+fn quests_changed(old: &Save, new: &Save) -> usize {
+    let before: std::collections::HashMap<i32, Vec<u8>> = mhnx_core::dlc::list_quests(old)
+        .into_iter()
+        .map(|q| (q.quest_id, q.data))
+        .collect();
+    let after = mhnx_core::dlc::list_quests(new);
+    let mut n = 0usize;
+    for q in &after {
+        match before.get(&q.quest_id) {
+            Some(data) if *data == q.data => {}
+            _ => n += 1,
+        }
+    }
+    let ids: std::collections::HashSet<i32> = after.iter().map(|q| q.quest_id).collect();
+    n + before.keys().filter(|id| !ids.contains(id)).count()
+}
+
+/// The feature level lines shown above the byte ranges.
+///
+/// The example the audit asked for is "キャラ1: 名前、装備3枠" and "DLC:
+/// クエスト2件": one line per character slot naming what changed there, one
+/// line for the body parts. A write whose old file cannot be parsed as a save
+/// gets no summary at all, and the dialog falls back to the ranges alone.
+pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String> {
+    let mut per_slot: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut body: Vec<String> = Vec::new();
+    let mut dlc: Vec<String> = Vec::new();
+    for range in ranges {
+        let part = match (range.slot, range.name) {
+            (Some(slot), "キャラクター情報") => {
+                let fields = character_fields_changed(old, new, slot);
+                if fields.is_empty() {
+                    String::from("キャラクター情報")
+                } else {
+                    fields.join("、")
+                }
+            }
+            (Some(_), name) => match range.records {
+                Some((n, what)) => format!("{} {} {}", name, n, what),
+                None => name.to_owned(),
+            },
+            (None, "DLC セクション") => {
+                let n = quests_changed(old, new);
+                if n > 0 {
+                    format!("クエスト {} 件", n)
+                } else {
+                    String::from("クエスト")
+                }
+            }
+            (None, "ファイルヘッダ") => String::from("ファイルヘッダ（名前のハッシュなど）"),
+            (None, name) => name.to_owned(),
+        };
+        match range.slot {
+            Some(slot) => match per_slot.iter_mut().find(|(s, _)| *s == slot) {
+                Some((_, parts)) => {
+                    if !parts.contains(&part) {
+                        parts.push(part);
+                    }
+                }
+                None => per_slot.push((slot, vec![part])),
+            },
+            None => {
+                let list = if matches!(range.name, "DLC セクション") {
+                    &mut dlc
+                } else {
+                    &mut body
+                };
+                if !list.contains(&part) {
+                    list.push(part);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (slot, parts) in per_slot {
+        out.push(format!("スロット{}: {}", slot + 1, parts.join("、")));
+    }
+    if !dlc.is_empty() {
+        out.push(format!("DLC: {}", dlc.join("、")));
+    }
+    if !body.is_empty() {
+        out.push(format!("本体: {}", body.join("、")));
+    }
+    out
 }
 
 /// One received guild card, as the ギルド tab lists it.
@@ -579,6 +1147,17 @@ pub struct MhnxEditor {
     /// Granted by 「承知のうえで続ける」 and consumed by the very next gated
     /// write, so one answer cannot cover a later save too.
     pub write_force: bool,
+    /// Granted by 「保存する」 in the review dialog and consumed by the very
+    /// next write, so one answer cannot cover a later save too.
+    pub write_reviewed: bool,
+    /// The write that passed the safety check and is waiting for its review.
+    pub review: Option<WriteReview>,
+
+    // ---- undo: the whole save, shared by every tab ----
+    /// Steps of the all-tab undo, newest last. Each one is a whole parsed save
+    /// (`save::BODY_SIZE` plus the Switch header, 4,726,188 bytes), so 16 of
+    /// them are about 75 MB; see [MhnxEditor::push_undo].
+    pub undo: Vec<SaveUndo>,
 
     // ---- guild card: the cards received from other hunters ----
     /// Which of the two lists (kept cards / courier inbox) is on screen.
@@ -726,6 +1305,9 @@ impl Default for MhnxEditor {
             known_files: Vec::new(),
             write_stopped: None,
             write_force: false,
+            write_reviewed: false,
+            review: None,
+            undo: Vec::new(),
             card_list: mhnx_core::guildcard::CardList::Stored,
             card_selected: None,
             scroll_to_cards: 0,
@@ -776,6 +1358,10 @@ impl MhnxEditor {
                 // this a save that the game (or an emulator) wrote between the
                 // read and the write was overwritten without a word.
                 self.remember_file(&path);
+                // The undo steps are whole saves of the file that was open
+                // before this one; putting one back would replace this save with
+                // another character's data.
+                self.undo.clear();
                 self.message = if mhgu {
                     format!(
                         "読み込みましたが MHGU のセーブです: {}（このツールは MHXX 用なので保存できません）",
@@ -1279,6 +1865,233 @@ impl MhnxEditor {
         )
     }
 
+    // ------------------------------------------- reviewing what will change
+
+    /// The save as a write would land it, without touching the open one.
+    ///
+    /// [MhnxEditor::apply_to_save] folds the same working copies into the real
+    /// save later; this does it on a copy so the review can be built before
+    /// anything is decided. The two produce the same bytes: everything below is
+    /// exactly what apply_to_save and apply_hunts do.
+    fn planned_save(&self) -> Option<Save> {
+        let mut save = self.save.clone()?;
+        let slot = self.slot;
+        let mut edit = self.edit.clone();
+        edit.slot = slot;
+        if !save.slot_used(slot) {
+            save.set_slot_used(slot, true);
+        }
+        save.write_character(&edit).ok()?;
+        if !self.items.is_empty() {
+            save.write_item_box(slot, &self.items).ok()?;
+        }
+        for i in 0..self.hunt_slay.len() {
+            save.set_hunt_count(slot, i, self.hunt_slay[i]);
+            if i < self.hunt_capture.len() {
+                save.set_capture_count(slot, i, self.hunt_capture[i]);
+            }
+            if i < self.hunt_size.len() {
+                let (a, b) = self.hunt_size[i];
+                let (a, b) = if a > b { (b, a) } else { (a, b) };
+                save.set_monster_size(slot, i, a, b);
+            }
+        }
+        Some(save)
+    }
+
+    /// The file a write lands in, its bytes and where its body starts.
+    ///
+    /// Returned as (path, bytes, header length, the save they came from) so the
+    /// review can name offsets with the same layout the writers use.
+    fn planned_write(&self, target: &WriteTarget) -> Option<(PathBuf, Vec<u8>, usize, Save)> {
+        match target {
+            WriteTarget::Current(p) => {
+                let mut save = self.planned_save()?;
+                if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+                    save.refresh_header(name);
+                }
+                let header = if save.kind().has_header() {
+                    mhnx_core::save::SWITCH_HEADER_SIZE
+                } else {
+                    0
+                };
+                let bytes = save.to_bytes();
+                Some((p.clone(), bytes, header, save))
+            }
+            // The pair says the same thing twice; the check and the review both
+            // look at the `system` half, which is what the console loads.
+            WriteTarget::SwitchPair(dir) => {
+                let save = self.planned_save()?;
+                let body = save.body();
+                let mut bytes =
+                    mhnx_core::save::switch_header("system", body.len()).to_vec();
+                bytes.extend_from_slice(body);
+                Some((dir.join("system"), bytes, mhnx_core::save::SWITCH_HEADER_SIZE, save))
+            }
+            WriteTarget::Export3ds(p) => {
+                let save = self.planned_save()?;
+                let bytes = save.to_3ds_bytes();
+                Some((p.clone(), bytes, 0, save))
+            }
+        }
+    }
+
+    /// What a write would change, or None when there is nothing to show.
+    ///
+    /// None means "write it": the file does not exist yet (名前を付けて保存 and
+    /// the first export), it cannot be read, or it already holds exactly these
+    /// bytes. Only a write that would really change something gets a dialog.
+    fn review_of(&self, target: &WriteTarget) -> Option<WriteReview> {
+        let (path, new, header, save) = self.planned_write(target)?;
+        let old = std::fs::read(&path).ok()?;
+        if old == new {
+            return None;
+        }
+        let (changed, ranges) = diff_ranges(&old, &new, header, &save);
+        // The summary compares two saves, which needs the old file to be one and
+        // to be the same kind: saving a Switch file over a 3DS one has no
+        // character slots to compare, so the ranges stand alone.
+        let summary = match Save::from_bytes(&old) {
+            Ok(previous) if previous.kind() == save.kind() => {
+                diff_summary(&ranges, &previous, &save)
+            }
+            _ => Vec::new(),
+        };
+        Some(WriteReview {
+            target: target.clone(),
+            path,
+            disk_len: old.len(),
+            new_len: new.len(),
+            diff: WriteDiff {
+                changed,
+                summary,
+                ranges,
+            },
+        })
+    }
+
+    /// Show what the write would change and wait for the answer.
+    ///
+    /// True means the write may run now. The grant 「保存する」 gives is one
+    /// shot: it is taken here, so a later save asks again. A write that changes
+    /// nothing goes through without a dialog, as it always did.
+    fn passes_review(&mut self, target: WriteTarget) -> bool {
+        if std::mem::take(&mut self.write_reviewed) {
+            self.review = None;
+            return true;
+        }
+        let Some(review) = self.review_of(&target) else {
+            self.review = None;
+            return true;
+        };
+        self.message = format!(
+            "保存前に確認してください（{}）: {} バイトが変わります",
+            target.label(),
+            review.diff.changed
+        );
+        self.review = Some(review);
+        self.confirm = Confirm::ReviewWrite;
+        false
+    }
+
+    /// The body of the review dialog: what would change, in words and ranges.
+    fn review_text(&self) -> String {
+        // A box that changes hundreds of places would otherwise push the two
+        // buttons off the bottom of the window.
+        const SHOWN: usize = 12;
+        let Some(review) = &self.review else {
+            return String::from("保存しますか？");
+        };
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("{}を書き込みます。", review.target.label()));
+        lines.push(review.path.display().to_string());
+        lines.push(String::new());
+        let size = if review.disk_len == review.new_len {
+            format!("（サイズは {} バイトのまま）", review.new_len)
+        } else {
+            format!("（サイズ {} → {} バイト）", review.disk_len, review.new_len)
+        };
+        lines.push(format!(
+            "ディスク上の内容と比べて {} バイトが変わります{}。",
+            review.diff.changed, size
+        ));
+        lines.push(String::from("+0x… はその機能の先頭からの位置です。"));
+        if !review.diff.summary.is_empty() {
+            lines.push(String::new());
+            lines.push(String::from("■ 変更される内容"));
+            for line in &review.diff.summary {
+                lines.push(format!("・{}", line));
+            }
+        }
+        lines.push(String::new());
+        lines.push(String::from("■ 変更される範囲"));
+        for range in review.diff.ranges.iter().take(SHOWN) {
+            lines.push(format!("・{}", range.line()));
+        }
+        if review.diff.ranges.len() > SHOWN {
+            lines.push(format!("・ほか {} 件", review.diff.ranges.len() - SHOWN));
+        }
+        lines.push(String::new());
+        lines.push(String::from("この内容で保存しますか？"));
+        lines.push(String::from(
+            "（元のファイルは .bak と snapshots/ に退避してから上書きします）",
+        ));
+        lines.join("\n")
+    }
+
+    // -------------------------------------------------- undo, shared by tabs
+
+    /// How many steps the all-tab undo keeps.
+    ///
+    /// Memory: a step is one whole save, `save::BODY_SIZE` = 4,726,152 bytes
+    /// plus the 36 byte Switch header, so the stack tops out at 75,619,008
+    /// bytes (about 72 MiB; one step prints as "4.51 MB"). The steps are
+    /// dropped oldest first, the same way the item and progress stacks work; a
+    /// new file or a slot switch clears them all, because a step names the slot
+    /// it belonged to.
+    const UNDO_STEPS: usize = 16;
+
+    /// Keep the save as it is now, before an edit changes it.
+    ///
+    /// Called from every writer, so a tab never has to grow its own undo.
+    pub fn push_undo(&mut self, label: impl Into<String>) {
+        let Some(save) = self.save.clone() else {
+            return;
+        };
+        self.undo.push(SaveUndo {
+            label: label.into(),
+            slot: self.slot,
+            save,
+        });
+        while self.undo.len() > Self::UNDO_STEPS {
+            self.undo.remove(0);
+        }
+    }
+
+    /// What the next 元に戻す would take back, if anything.
+    pub fn undo_label(&self) -> Option<&str> {
+        self.undo.last().map(|step| step.label.as_str())
+    }
+
+    /// Put the whole save, and the slot it belonged to, back the way it was.
+    ///
+    /// The working copies are rebuilt from the restored save with
+    /// [MhnxEditor::reload_from_save], which also drops the per-tab stacks and
+    /// selections that named the old contents. The save is marked dirty: the
+    /// file on disk is no longer what this editor holds, which is exactly the
+    /// state the next 上書き保存 has to write.
+    pub fn undo_last(&mut self) {
+        let Some(step) = self.undo.pop() else {
+            self.message = String::from("戻せる操作がありません");
+            return;
+        };
+        self.slot = step.slot.min(mhnx_core::save::MAX_SLOTS - 1);
+        self.save = Some(step.save);
+        self.dirty = true;
+        self.reload_from_save();
+        self.message = format!("元に戻しました: {}", step.label);
+    }
+
     pub fn write_current(&mut self, path: PathBuf) {
         // See open_save: the offsets are MHXX's, so writing an MHGU save back
         // would corrupt it.
@@ -1291,6 +2104,12 @@ impl MhnxEditor {
         // the working copies are pushed into the save, so a refused write
         // leaves the file and the editor exactly as they were.
         if !self.passes_write_check(WriteTarget::Current(path.clone())) {
+            return;
+        }
+        // Only then the second question: what would this change? The dialog is
+        // built from a copy of the save, so answering やめる leaves the editor
+        // and the file exactly as they are.
+        if !self.passes_review(WriteTarget::Current(path.clone())) {
             return;
         }
         self.apply_to_save();
@@ -1339,9 +2158,18 @@ impl MhnxEditor {
 
     /// Write a Switch save as both system and system_backup into a directory.
     pub fn write_switch_pair(&mut self, dir: PathBuf) {
+        // A 3DS save has no Switch header to pair up; say so before anything
+        // else asks a question about it.
+        if matches!(&self.save, Some(s) if s.kind() == SaveKind::ThreeDs) {
+            self.message = "3DS セーブのままです。先に Switch 形式へ変換してください".to_owned();
+            return;
+        }
         // The check looks at the folder's own `system`: that is the file the
         // console loads, and the one an emulator has open.
         if !self.passes_write_check(WriteTarget::SwitchPair(dir.clone())) {
+            return;
+        }
+        if !self.passes_review(WriteTarget::SwitchPair(dir.clone())) {
             return;
         }
         self.apply_to_save();
@@ -1349,10 +2177,6 @@ impl MhnxEditor {
         // silently wrote the values from disk instead of the ones on screen.
         self.apply_hunts();
         let Some(s) = &self.save else { return };
-        if s.kind() == SaveKind::ThreeDs {
-            self.message = "3DS セーブのままです。先に Switch 形式へ変換してください".to_owned();
-            return;
-        }
         let body = s.body().to_vec();
         let sys = mhnx_core::save::switch_header("system", body.len());
         let bak = mhnx_core::save::switch_header("system_backup", body.len());
@@ -1409,6 +2233,9 @@ impl MhnxEditor {
     /// Export the body as a 3DS save.
     pub fn export_3ds(&mut self, path: PathBuf) {
         if !self.passes_write_check(WriteTarget::Export3ds(path.clone())) {
+            return;
+        }
+        if !self.passes_review(WriteTarget::Export3ds(path.clone())) {
             return;
         }
         self.apply_to_save();
@@ -1514,6 +2341,7 @@ impl MhnxEditor {
                 return;
             }
         };
+        self.push_undo(String::from("3DS の本体取り込み"));
         let Some(s) = &mut self.save else {
             self.message = "先に Switch セーブを開いてください".to_owned();
             return;
@@ -1530,6 +2358,7 @@ impl MhnxEditor {
 
     /// Turn the current 3DS save into a Switch save (header is synthesised).
     pub fn convert_to_switch(&mut self) {
+        self.push_undo(String::from("Switch 形式への変換"));
         let Some(s) = &self.save else { return };
         if s.kind() != SaveKind::ThreeDs {
             self.message = "すでに Switch 形式です".to_owned();
@@ -1646,6 +2475,7 @@ impl MhnxEditor {
             self.message = "クエストIDが読めません（.mib がない）".to_owned();
             return;
         };
+        self.push_undo(String::from("クエストの追加"));
         let Some(save) = &mut self.save else {
             self.message = "先にセーブを開いてください".to_owned();
             return;
@@ -1682,6 +2512,7 @@ impl MhnxEditor {
             }
             None => return,
         };
+        self.push_undo(String::from("クエストの書き戻し"));
         let Some(save) = &mut self.save else {
             self.message = "先にセーブを開いてください".to_owned();
             return;
@@ -1832,6 +2663,17 @@ impl eframe::App for MhnxEditor {
         // The hooks main.rs does not know about are resolved here; see
         // apply_launch_env.
         self.apply_launch_env();
+        // Ctrl+Z takes back the last edit of whichever tab made it. A text
+        // field keeps its own Ctrl+Z while it has focus, and a dialog is
+        // answering a question that undo must not race, so both are skipped.
+        if matches!(self.confirm, Confirm::None)
+            && !ctx.wants_keyboard_input()
+            && ctx.input(|i| {
+                i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z)
+            })
+        {
+            self.undo_last();
+        }
         // Closing the window with unwritten edits used to lose them silently.
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.discard_ok {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1975,6 +2817,29 @@ impl MhnxEditor {
                     {
                         self.export_3ds(p);
                     }
+                }
+                ui.separator();
+                // The whole save is the step, so this one button covers every
+                // tab; the tooltip says what the next press would take back and
+                // how much memory the stack is holding.
+                let depth = self.undo.len();
+                let last = self.undo_label().map(|s| s.to_owned());
+                let hover = match &last {
+                    Some(label) => format!(
+                        "{} を取り消します（Ctrl+Z）\n保持している段数: {} / {}（1 段 = {}）",
+                        label,
+                        depth,
+                        Self::UNDO_STEPS,
+                        Self::human_size(mhnx_core::save::SWITCH_SIZE as u64)
+                    ),
+                    None => String::from("戻せる操作がありません（Ctrl+Z）"),
+                };
+                if ui
+                    .add_enabled(depth > 0, egui::Button::new("元に戻す"))
+                    .on_hover_text(hover)
+                    .clicked()
+                {
+                    self.undo_last();
                 }
                 ui.separator();
                 if ui.button(".arc を開く").clicked() {
@@ -2158,6 +3023,10 @@ impl MhnxEditor {
                         }
                         self.apply_hunts();
                         self.slot = i;
+                        // A step names the slot it was taken in; keeping the
+                        // stack across a switch would put one character's save
+                        // under another character's screen.
+                        self.undo.clear();
                         self.reload_from_save();
                         self.message = format!("スロット {} に切り替えました", i + 1);
                     }
@@ -2415,9 +3284,11 @@ impl MhnxEditor {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 if ui.button("編集内容を反映 (メモリのみ)").clicked() {
+                    self.push_undo(String::from("キャラクター情報"));
                     self.apply_to_save();
                 }
                 if ui.button("このスロットを使う/使わない 切替").clicked() {
+                    self.push_undo(String::from("スロット使用フラグ"));
                     let used = self.save.as_ref().map(|s| s.slot_used(self.slot)).unwrap_or(false);
                     if let Some(s) = &mut self.save {
                         s.set_slot_used(self.slot, !used);
@@ -2436,6 +3307,7 @@ impl MhnxEditor {
         let Some(slot) = self.pending_dlc_slot.take() else {
             return;
         };
+        self.push_undo(String::from("クエストの削除"));
         if let Some(s) = &mut self.save {
             match dlc::uninstall_quest(s, slot) {
                 Ok(()) => {
@@ -2453,6 +3325,7 @@ impl MhnxEditor {
     /// The charm tab arms its own button instead of opening a modal, so this is
     /// reached from there rather than from [Confirm].
     pub fn delete_charm(&mut self, index: usize) {
+        self.push_undo(format!("お守り {} の削除", index));
         if let Some(s) = &mut self.save {
             if s.clear_charm(self.slot, index) {
                 self.dirty = true;
@@ -2468,6 +3341,7 @@ impl MhnxEditor {
     /// panel writes them together. Marking `dirty` is all the overwrite path
     /// needs: 書き出し copies the body that was just updated.
     pub fn apply_options(&mut self, o: &mhnx_core::save::Options) -> bool {
+        self.push_undo(String::from("本体オプション"));
         let Some(save) = &mut self.save else {
             return false;
         };
@@ -2483,6 +3357,7 @@ impl MhnxEditor {
     /// the same field both records and erases a time. Only the two time bytes
     /// are touched; the two that follow them are left as they were.
     pub fn set_arena_time(&mut self, arena: usize, rank: usize, centis: u16) -> bool {
+        self.push_undo(format!("アリーナ {} の記録", arena));
         let Some(save) = &mut self.save else {
             return false;
         };
@@ -2807,6 +3682,9 @@ impl MhnxEditor {
                 };
                 ("保存を止めました", body, "承知のうえで続ける")
             }
+            // Not red: passing the safety check already said the file is ours
+            // to write. This dialog is about what changes, not about danger.
+            Confirm::ReviewWrite => ("保存前の確認", self.review_text(), "保存する"),
             Confirm::SetClear(n) => {
                 // The name is read now, so the dialog says which set it means
                 // rather than only a number.
@@ -2931,6 +3809,19 @@ impl MhnxEditor {
                             }
                         }
                     }
+                    // ... and the reviewed one, with the grant that skips the
+                    // second ask. The bytes are rebuilt from the same save, so
+                    // what lands is what the dialog listed.
+                    Confirm::ReviewWrite => {
+                        if let Some(review) = self.review.take() {
+                            self.write_reviewed = true;
+                            match review.target {
+                                WriteTarget::Current(p) => self.write_current(p),
+                                WriteTarget::SwitchPair(d) => self.write_switch_pair(d),
+                                WriteTarget::Export3ds(p) => self.export_3ds(p),
+                            }
+                        }
+                    }
                     Confirm::None => {}
                 }
             }
@@ -2945,6 +3836,13 @@ impl MhnxEditor {
                 if matches!(self.confirm, Confirm::UnsafeWrite) {
                     self.write_stopped = None;
                     self.message = String::from("書き込みをやめました");
+                }
+                // やめる on a reviewed write drops it: the file is not touched,
+                // and the edits stay in the editor for another try.
+                if matches!(self.confirm, Confirm::ReviewWrite) {
+                    self.review = None;
+                    self.message =
+                        String::from("書き込みをやめました（変更はアプリの中に残っています）");
                 }
                 self.confirm = Confirm::None;
             }
@@ -3168,6 +4066,8 @@ impl MhnxEditor {
     /// push it off the screen.
     /// Remember the box before a change so it can be undone.
     fn push_item_undo(&mut self) {
+        // One whole-save step as well, so Ctrl+Z works here too.
+        self.push_undo("アイテムボックス");
         self.item_undo.push(self.items.clone());
         if self.item_undo.len() > 32 {
             self.item_undo.remove(0);
@@ -5152,6 +6052,7 @@ impl MhnxEditor {
 
     /// Rename a saved equipment set.
     pub fn set_name_write(&mut self, index: usize, name: &str) -> bool {
+        self.push_undo(format!("セット {} の名前", index));
         let slot = self.slot;
         let Some(save) = &mut self.save else {
             return false;
@@ -5175,6 +6076,7 @@ impl MhnxEditor {
             .get(part)
             .copied()
             .unwrap_or("?");
+        self.push_undo(format!("セット {} の{}", set, name));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5203,6 +6105,7 @@ impl MhnxEditor {
             .get(part)
             .copied()
             .unwrap_or("?");
+        self.push_undo(format!("セット {} の{}を解除", set, name));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5224,6 +6127,7 @@ impl MhnxEditor {
     /// the talisman have no colour of their own.
     pub fn set_colour_write(&mut self, set: usize, part: usize, colour: [u8; 4]) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("セット {} の色", set));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5249,6 +6153,7 @@ impl MhnxEditor {
     /// Destructive, and the caller owns the confirmation.
     pub fn set_clear(&mut self, index: usize) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("セット {} を空にする", index));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5450,6 +6355,8 @@ impl MhnxEditor {
         let pending = self.csv_pending.take()?;
         let slot = self.slot;
         let items_file = matches!(pending.kind, CsvKind::Items);
+        // One step for the whole file, whichever box it fills.
+        self.push_undo(format!("CSV（{}）の適用", pending.kind.label()));
         if items_file {
             // The item tab's 元に戻す has to be able to take the file back.
             self.push_item_undo();
@@ -5488,6 +6395,7 @@ impl MhnxEditor {
     /// Rename one of the twenty-four item sets.
     pub fn item_set_name_write(&mut self, index: usize, name: &str) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("セット {} の名前", index));
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5513,6 +6421,7 @@ impl MhnxEditor {
         count: u16,
     ) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("セット {} の {} 番目", set, entry));
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5551,6 +6460,7 @@ impl MhnxEditor {
     /// status line says which.
     pub fn item_set_from_pouch(&mut self, set: usize) -> usize {
         let slot = self.slot;
+        self.push_undo(format!("ポーチをセット {} に取り込み", set));
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return 0;
@@ -5611,9 +6521,19 @@ impl MhnxEditor {
             );
             return 0;
         }
+        // The step needs the whole editor, so the borrow ends here and is taken
+        // again below; the bytes it keeps are the ones `before` was read from.
+        // Ends the borrow of `self.save` so the step can be taken below.
+        let _ = save;
+        self.push_undo(format!("ポーチをセット {} の内容に置き換え", set));
+        let Some(save) = self.save.as_mut() else {
+            return 0;
+        };
         let used = mhnx_core::myset::apply_to_pouch(save, slot, set);
         if used == 0 {
-            // Refused by the core, or the 76 bytes could not be written.
+            // Refused by the core, or the 76 bytes could not be written: the
+            // step that was just pushed never happened, so it goes away again.
+            self.undo.pop();
             self.message = format!(
                 "セット {} をポーチへ適用できませんでした（ポーチはそのままです）",
                 set
@@ -5636,6 +6556,7 @@ impl MhnxEditor {
             return false;
         };
         let slot = self.slot;
+        self.push_undo(String::from("ポーチを戻す"));
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5665,6 +6586,7 @@ impl MhnxEditor {
         // The core refuses an empty entry that carries a count; dropping the
         // count here is what makes "set the id to 0" mean "clear this one".
         let (id, count) = if id == 0 { (0, 0) } else { (id, count) };
+        self.push_undo(format!("ポーチの {} 番目", entry));
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -5767,23 +6689,22 @@ impl MhnxEditor {
                                 self.palico_selected = Some(p.index);
                             }
                             let mut name = p.name.clone();
-                            if ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut name)
-                                        .desired_width(140.0),
-                                )
-                                .changed()
-                            {
+                            let name_edit = ui.add(
+                                egui::TextEdit::singleline(&mut name).desired_width(140.0),
+                            );
+                            // The step is taken before the first byte moves, so
+                            // one Ctrl+Z puts the name back the way it was.
+                            if name_edit.changed() {
+                                self.push_undo(format!("オトモ {} の名前", p.index));
                                 if let Some(s) = &mut self.save {
                                     mhnx_core::palico::set_name(s, self.slot, p.index, &name);
                                 }
                                 changed = true;
                             }
                             let mut lvl = p.level as i32;
-                            if ui
-                                .add(egui::DragValue::new(&mut lvl).range(1..=99))
-                                .changed()
-                            {
+                            let level_edit = ui.add(egui::DragValue::new(&mut lvl).range(1..=99));
+                            if level_edit.changed() {
+                                self.push_undo(format!("オトモ {} のレベル", p.index));
                                 if let Some(s) = &mut self.save {
                                     mhnx_core::palico::set_level(
                                         s,
@@ -5795,10 +6716,9 @@ impl MhnxEditor {
                                 changed = true;
                             }
                             let mut ent = p.enthusiasm as i32;
-                            if ui
-                                .add(egui::DragValue::new(&mut ent).range(0..=100))
-                                .changed()
-                            {
+                            let ent_edit = ui.add(egui::DragValue::new(&mut ent).range(0..=100));
+                            if ent_edit.changed() {
+                                self.push_undo(format!("オトモ {} のなつき", p.index));
                                 if let Some(s) = &mut self.save {
                                     mhnx_core::palico::set_enthusiasm(
                                         s,
@@ -6111,6 +7031,11 @@ impl MhnxEditor {
         index: Option<usize>,
         id: u8,
     ) -> bool {
+        self.push_undo(if moves {
+            String::from("オトモのサポート行動")
+        } else {
+            String::from("オトモのスキル")
+        });
         let slot = self.slot;
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
@@ -6153,6 +7078,7 @@ impl MhnxEditor {
     /// Set the support tendency of one palico.
     pub fn set_palico_type(&mut self, palico: usize, system: u8) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("オトモ {} の系統", palico));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -6173,6 +7099,7 @@ impl MhnxEditor {
     /// Set the attack tendency of one palico.
     pub fn set_palico_attack(&mut self, palico: usize, attack: u8) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("オトモ {} の攻撃傾向", palico));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -6532,6 +7459,12 @@ impl MhnxEditor {
             );
             return false;
         }
+        // Ends the borrow of `self.save` so the step can be taken below.
+        let _ = save;
+        self.push_undo(format!("オトモ {} の{}", palico, part_name));
+        let Some(save) = self.save.as_mut() else {
+            return false;
+        };
         if !Self::write_palico_equip(save, slot, palico, part, box_index) {
             self.message = format!("枠 {} の{}を書き換えられませんでした", palico, part_name);
             return false;
@@ -6567,6 +7500,12 @@ impl MhnxEditor {
             self.message = format!("枠 {} の{}はすでに外れています", palico, part_name);
             return false;
         }
+        // Ends the borrow of `self.save` so the step can be taken below.
+        let _ = save;
+        self.push_undo(format!("オトモ {} の{}を外す", palico, part_name));
+        let Some(save) = self.save.as_mut() else {
+            return false;
+        };
         if !Self::write_palico_equip(save, slot, palico, part, u16::MAX) {
             self.message = format!("枠 {} の{}を外せませんでした", palico, part_name);
             return false;
@@ -6608,6 +7547,7 @@ impl MhnxEditor {
     /// Rewrite the level of one otomo gear record.
     pub fn palico_gear_level(&mut self, index: usize, level: u16) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("オトモ装備 {} のレベル", index));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -6629,6 +7569,7 @@ impl MhnxEditor {
     /// Rewrite one decoration socket of an otomo gear record.
     pub fn palico_gear_decoration(&mut self, index: usize, socket: usize, id: u16) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("オトモ装備 {} の装飾品", index));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -6846,6 +7787,9 @@ impl MhnxEditor {
                             ui.end_row();
                         }
                         if changed {
+                            // The hunt tables are working copies; the save still
+                            // holds the old numbers, so the step belongs here.
+                            self.push_undo(String::from("狩猟記録"));
                             self.dirty = true;
                         }
                     });
@@ -6923,6 +7867,7 @@ impl MhnxEditor {
             ui.end_row();
         });
         if changed {
+            self.push_undo(String::from("ギルドカードの基本情報"));
             if let Some(save) = &mut self.save {
                 if new_hr != hr {
                     mhnx_core::guildcard::set_hunter_rank(save, slot, new_hr);
@@ -7629,6 +8574,7 @@ impl MhnxEditor {
         count: u16,
     ) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("武器使用数 {} 番", weapon));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -7651,6 +8597,7 @@ impl MhnxEditor {
     /// the picker's business, and a title the game itself wrote is not refused.
     pub fn set_title_ids(&mut self, title: mhnx_core::guildcard::Title) -> bool {
         let slot = self.slot;
+        self.push_undo(String::from("称号"));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -8072,10 +9019,13 @@ impl MhnxEditor {
             return false;
         }
         let slot = self.slot;
+        self.push_undo(format!("装備 {} の編集", index));
         let Some(save) = &mut self.save else {
+            self.undo.pop();
             return false;
         };
         let Some(dst) = save.equipment_record_mut(slot, index) else {
+            self.undo.pop();
             return false;
         };
         dst[..mhnx_core::equip::EQUIP_RECORD]
@@ -8091,6 +9041,7 @@ impl MhnxEditor {
     /// the one it filled.
     pub fn equip_create(&mut self, kind: u8, id: u16, level: u16) -> bool {
         let slot = self.slot;
+        self.push_undo(String::from("装備の作成"));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -8118,6 +9069,7 @@ impl MhnxEditor {
     /// Put a different item in an existing record.
     pub fn equip_replace(&mut self, index: usize, kind: u8, id: u16, level: u16) -> bool {
         let slot = self.slot;
+        self.push_undo(format!("装備 {} の差し替え", index));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -8144,7 +9096,9 @@ impl MhnxEditor {
     /// names the record, and hands those references back in the error.
     pub fn equip_delete(&mut self, index: usize, force: bool) -> Result<(), EquipError> {
         let slot = self.slot;
+        self.push_undo(format!("装備 {} の削除", index));
         let Some(save) = &mut self.save else {
+            self.undo.pop();
             return Err(EquipError::OutOfRange);
         };
         let out = equipops::clear(save, slot, index, force);
@@ -8466,6 +9420,7 @@ impl MhnxEditor {
                         });
                 });
             if let Some((list, index, record, item, count)) = write {
+                self.push_undo(String::from("DLC の補給・弾"));
                 if let Some(save) = &mut self.save {
                     match dlc::set_quest_equipment_item(
                         save, slot, record, list, index, item, count,
@@ -8525,6 +9480,7 @@ impl MhnxEditor {
                                 }
                             });
                         if let (Some(id), Some(t)) = (hit, target) {
+                            self.push_undo(String::from("DLC のアイテム差し替え"));
                             if let Some(save) = &mut self.save {
                                 let count = if t.count == 0 { 1 } else { t.count };
                                 match dlc::set_quest_equipment_item(
@@ -8864,6 +9820,7 @@ impl MhnxEditor {
                         }
                     });
                     if let Some(g) = apply_grade {
+                        self.push_undo(format!("お守り {} のレア度", self.charm_index));
                         let mut ok = false;
                         if let Some(s) = &mut self.save {
                             if let Some(b) = s.equipment_box_mut(self.slot) {
@@ -8973,6 +9930,7 @@ impl MhnxEditor {
                         // the five edited fields, so what is on screen is what
                         // lands in the box.
                         let grade = cur_grade.unwrap_or(self.charm_new_grade);
+                        self.push_undo(format!("お守り {} の更新", c.index));
                         let written = match &mut self.save {
                             Some(s) => s.set_charm_with_grade(self.slot, &c, grade),
                             None => false,
@@ -9018,6 +9976,7 @@ impl MhnxEditor {
                             points2: 0,
                         };
                         let grade = self.charm_new_grade;
+                        self.push_undo(format!("お守り {} の作成", self.charm_index));
                         if let Some(s) = &mut self.save {
                             if s.set_charm_with_grade(self.slot, &new, grade) {
                                 self.dirty = true;
@@ -9492,6 +10451,7 @@ impl MhnxEditor {
             self.apply_options(&o);
         }
         if let Some((lang, idx)) = add_cat {
+            self.push_undo(String::from("配信オトモの追加"));
             let ls = if lang == 0 {
                 mhnx_core::dlcats::Lang::Jp
             } else {
@@ -9511,6 +10471,7 @@ impl MhnxEditor {
             }
         }
         if let Some(i) = drop_cat {
+            self.push_undo(format!("配信オトモ {} の削除", i));
             if let Some(s) = &mut self.save {
                 if s.remove_dlc_palico(i) {
                     self.dirty = true;
@@ -9519,6 +10480,7 @@ impl MhnxEditor {
             }
         }
         if let Some(i) = drop_charm {
+            self.push_undo(format!("お守り {} の削除", i));
             if let Some(s) = &mut self.save {
                 if s.clear_charm(self.slot, i) {
                     self.dirty = true;
@@ -9527,6 +10489,7 @@ impl MhnxEditor {
             }
         }
         if write_charm {
+            self.push_undo(format!("お守り {} の更新", self.charm_index));
             let c = mhnx_core::charm::Charm {
                 index: self.charm_index,
                 slots: self.charm_slots,
@@ -9565,6 +10528,7 @@ impl MhnxEditor {
             {
                 match std::fs::read(&p) {
                     Ok(bytes) => {
+                        self.push_undo(String::from("スロットの読み込み"));
                         let mut err = None;
                         if let Some(s) = &mut self.save {
                             if let Err(e) = s.import_slot(self.slot, &bytes) {
@@ -10021,6 +10985,8 @@ impl MhnxEditor {
             self.message = "先にセーブを開いてください（未使用のスロットは編集できません）".to_owned();
             return;
         };
+        // The whole-save step goes in before the bytes move.
+        self.push_undo(step.label.clone());
         let slot = self.slot;
         let ok = match &mut self.save {
             Some(save) => awards::set(save, slot, award, on),
@@ -10059,6 +11025,7 @@ impl MhnxEditor {
             self.message = "先にセーブを開いてください".to_owned();
             return;
         };
+        self.push_undo(step.label.clone());
         let slot = self.slot;
         let ok = match &mut self.save {
             Some(save) => requests::set(save, slot, flag, on),
@@ -10111,6 +11078,7 @@ impl MhnxEditor {
             self.message = "先にセーブを開いてください".to_owned();
             return;
         };
+        self.push_undo(step.label.clone());
         let slot = self.slot;
         let Some(save) = &mut self.save else {
             self.message = "先にセーブを開いてください".to_owned();
@@ -10166,6 +11134,7 @@ impl MhnxEditor {
             self.message = "先にセーブを開いてください".to_owned();
             return;
         };
+        self.push_undo(step.label.clone());
         let slot = self.slot;
         let ok = match &mut self.save {
             Some(save) => questprogress::set(save, slot, kind, index, on),
@@ -12960,9 +13929,12 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("read"), newer, "nothing was written");
         assert!(!app.dirty, "the edits were not pushed into the save either");
 
-        // 「承知のうえで続ける」 runs that very write.
+        // 「承知のうえで続ける」 runs that very write. The review that follows
+        // the safety check is answered by the same one-shot grant its own
+        // dialog sets; this test is about the safety answer.
         app.confirm = Confirm::None;
         app.write_force = true;
+        app.write_reviewed = true;
         app.write_current(path.clone());
         assert!(app.message.contains("照合OK"), "{}", app.message);
         assert!(!app.dirty);
@@ -13053,8 +14025,10 @@ xjksv_readysystem");
             );
         }
         // The guard would refuse the write because an emulator is open on this
-        // machine, which is exactly what the answer to that dialog grants.
+        // machine, which is exactly what the answer to that dialog grants. The
+        // review in front of the write is answered the same way.
         app.write_force = true;
+        app.write_reviewed = true;
         app.write_current(copy.clone());
         assert!(app.message.contains("照合OK"), "{}", app.message);
         let written = std::fs::read(&copy).expect("read what was written");
@@ -13091,6 +14065,283 @@ xjksv_readysystem");
         assert_eq!(detail.comment, "見ちゃやーよww");
         assert!(!detail.weapons.is_empty(), "the card shows weapon usage");
         assert!(!detail.history.is_empty(), "the card carries its history");
+    }
+
+    /// The two halves of what the audit said was missing: the review that names
+    /// what a save would change, and the whole-save diff it is built from.
+    #[test]
+    fn the_diff_names_the_layout_and_counts_the_records() {
+        let save = mhnx_core::save::empty_switch_save();
+        let old = save.to_bytes();
+        let mut new = old.clone();
+        let base = mhnx_core::save::FIRST_SLOT_BASE as usize + mhnx_core::save::OFF_EQUIPMENT_BOX;
+        let at = mhnx_core::save::SWITCH_HEADER_SIZE
+            + base
+            + 5 * mhnx_core::save::EQUIPMENT_RECORD;
+        for byte in &mut new[at..at + mhnx_core::save::EQUIPMENT_RECORD] {
+            *byte = 0x7F;
+        }
+        let (changed, ranges) = diff_ranges(&old, &new, mhnx_core::save::SWITCH_HEADER_SIZE, &save);
+        assert_eq!(changed, mhnx_core::save::EQUIPMENT_RECORD);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].slot, Some(0), "the first slot owns +0x62EE");
+        assert_eq!(ranges[0].name, "装備ボックス");
+        assert_eq!(ranges[0].rel, 5 * mhnx_core::save::EQUIPMENT_RECORD);
+        assert_eq!(ranges[0].records, Some((1, "枠")));
+        assert!(
+            ranges[0].line().starts_with("スロット1 装備ボックス +0x"),
+            "{}",
+            ranges[0].line()
+        );
+        let summary = diff_summary(&ranges, &save, &save);
+        assert!(
+            summary.iter().any(|line| line == "スロット1: 装備ボックス 1 枠"),
+            "{:?}",
+            summary
+        );
+
+        // A quest payload lives in the DLC section, which sits in front of the
+        // first character slot and is named for it.
+        let mut quest = old.clone();
+        let dlc = save.dlc_section_offset() as usize;
+        let qat = mhnx_core::save::SWITCH_HEADER_SIZE + dlc + mhnx_core::dlc::QUEST_ARRAY_OFFSET;
+        for byte in &mut quest[qat..qat + 8] {
+            *byte = 0x5A;
+        }
+        let (changed, ranges) = diff_ranges(&old, &quest, mhnx_core::save::SWITCH_HEADER_SIZE, &save);
+        assert_eq!(changed, 8);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].slot, None);
+        assert_eq!(ranges[0].name, "DLC セクション");
+    }
+
+    /// A write that passes the safety check but changes nothing on disk skips
+    /// the dialog, the way it always did.
+    #[test]
+    fn a_write_that_changes_nothing_goes_through_without_the_review() {
+        let dir = Scratch::new("nodiff");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        // Put on disk exactly what the write would produce, so the review has
+        // nothing to show. The used flag is part of that: apply_to_save sets it.
+        app.save.as_mut().expect("save").set_slot_used(app.slot, true);
+        let planned = app.planned_save().expect("a planned save").to_bytes();
+        std::fs::write(&path, &planned).expect("write the planned bytes");
+        app.remember_file(&path);
+        app.write_force = true;
+        app.write_current(path.clone());
+        assert!(!matches!(app.confirm, Confirm::ReviewWrite), "{}", app.message);
+        assert!(app.message.contains("照合OK"), "{}", app.message);
+        assert!(app.review.is_none());
+        assert_eq!(app.review_text(), "保存しますか？");
+    }
+
+    /// The review dialog: the feature summary and the byte ranges, and nothing
+    /// written until 「保存する」.
+    #[test]
+    fn the_review_lists_the_feature_and_the_bytes_a_save_would_change() {
+        let dir = Scratch::new("review");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let before = std::fs::read(&path).expect("read");
+        // ギルド tab: one arena time, which lives in 闘技大会の記録.
+        assert!(app.set_arena_time(0, 0, 1234));
+
+        app.write_force = true;
+        app.write_current(path.clone());
+        assert!(matches!(app.confirm, Confirm::ReviewWrite), "{}", app.message);
+        assert!(app.review.is_some(), "the difference waits for the answer");
+        assert_eq!(
+            std::fs::read(&path).expect("read"),
+            before,
+            "nothing was written before the answer"
+        );
+        assert!(app.dirty, "the edits are still only in memory");
+        assert!(app.message.contains("保存前に確認"), "{}", app.message);
+
+        let text = app.review_text();
+        assert!(text.contains("■ 変更される内容"), "{}", text);
+        assert!(text.contains("闘技大会の記録"), "{}", text);
+        assert!(text.contains("■ 変更される範囲"), "{}", text);
+        assert!(text.contains("闘技大会の記録 +0x"), "{}", text);
+        assert!(text.contains("この内容で保存しますか？"), "{}", text);
+
+        // 「保存する」 is the one-shot grant its own dialog sets.
+        app.confirm = Confirm::None;
+        app.write_force = true;
+        app.write_reviewed = true;
+        app.write_current(path.clone());
+        assert!(app.message.contains("照合OK"), "{}", app.message);
+        assert!(!app.dirty);
+        let written = std::fs::read(&path).expect("read");
+        assert_ne!(written, before, "the edit landed");
+        assert_eq!(written.len(), SWITCH_SIZE);
+    }
+
+    /// 元に戻す covers the tabs that never had one: 装備 and ギルド here, one
+    /// press per edit, newest first.
+    #[test]
+    fn the_undo_step_covers_every_tab_not_only_the_item_box() {
+        let dir = Scratch::new("alltab");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let record = |app: &MhnxEditor| {
+            app.save
+                .as_ref()
+                .expect("save")
+                .equipment_box(0)
+                .expect("equipment box")[..mhnx_core::save::EQUIPMENT_RECORD]
+                .to_vec()
+        };
+        assert!(record(&app).iter().all(|b| *b == 0));
+        assert!(app.equip_create(7, 40, 1));
+        assert_eq!(app.undo.len(), 1);
+        assert_eq!(app.undo_label(), Some("装備の作成"));
+        assert!(record(&app).iter().any(|b| *b != 0));
+
+        assert!(app.set_arena_time(0, 0, 1234));
+        assert_eq!(app.undo.len(), 2);
+        assert_eq!(app.undo_label(), Some("アリーナ 0 の記録"));
+
+        // One press takes the arena time back; the record below it stays.
+        app.undo_last();
+        assert_eq!(app.undo.len(), 1);
+        assert!(app.dirty, "a restored save has to be written again");
+        assert!(
+            app.message.contains("元に戻しました: アリーナ 0 の記録"),
+            "{}",
+            app.message
+        );
+        assert!(
+            record(&app).iter().any(|b| *b != 0),
+            "the older step is still there"
+        );
+
+        // ... and the next press empties the equipment record again.
+        app.undo_last();
+        assert!(record(&app).iter().all(|b| *b == 0));
+        assert!(app.undo.is_empty());
+        assert_eq!(app.undo_label(), None);
+
+        app.undo_last();
+        assert!(app.message.contains("戻せる操作がありません"), "{}", app.message);
+    }
+
+    /// The cap, and the memory it stands for: 16 whole saves.
+    #[test]
+    fn the_undo_stack_keeps_sixteen_steps_and_drops_the_oldest() {
+        let dir = Scratch::new("undocap");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        for i in 0..20 {
+            app.push_undo(format!("手順 {}", i));
+        }
+        assert_eq!(app.undo.len(), MhnxEditor::UNDO_STEPS);
+        assert_eq!(app.undo_label(), Some("手順 19"));
+        assert_eq!(
+            app.undo.first().map(|step| step.label.as_str()),
+            Some("手順 4"),
+            "the oldest steps go first"
+        );
+        let bytes = (mhnx_core::save::SWITCH_SIZE * MhnxEditor::UNDO_STEPS) as u64;
+        assert_eq!(bytes, 75_619_008, "16 × 4,726,188 bytes");
+        assert!(
+            MhnxEditor::human_size(bytes).ends_with("MB"),
+            "{}",
+            MhnxEditor::human_size(bytes)
+        );
+    }
+
+    /// The review as the real save on this machine produces it: one equipment
+    /// record and one arena time, printed so the wording can be checked by eye.
+    /// Skipped when the sample is not there, the way the core tests do it.
+    #[test]
+    fn the_review_of_the_sample_save_names_what_changes() {
+        let sample = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
+        if !sample.exists() {
+            return;
+        }
+        let dir = Scratch::new("reviewreal");
+        let original = std::fs::read(&sample).expect("read the sample");
+        let copy = dir.path().join("system");
+        std::fs::write(&copy, &original).expect("copy");
+        let mut app = MhnxEditor::default();
+        app.open_save(copy.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(app.equip_create(7, 40, 12), "a blank record exists");
+        let created = app.equip_selected.expect("the record the box filled");
+        let expected = app
+            .save
+            .as_ref()
+            .expect("save")
+            .equipment_box(0)
+            .expect("box")[created * mhnx_core::save::EQUIPMENT_RECORD
+            ..(created + 1) * mhnx_core::save::EQUIPMENT_RECORD]
+            .to_vec();
+        assert!(expected.iter().any(|b| *b != 0), "the record is no longer blank");
+        assert!(app.set_arena_time(0, 0, 9_344));
+        app.write_force = true;
+        app.write_current(copy.clone());
+        assert!(matches!(app.confirm, Confirm::ReviewWrite), "{}", app.message);
+        let text = app.review_text();
+        println!("{}", text);
+        assert!(text.contains("装備ボックス"), "{}", text);
+        assert!(text.contains("闘技大会の記録"), "{}", text);
+        assert!(text.contains("■ 変更される内容"), "{}", text);
+        // The review itself never writes ...
+        assert_eq!(std::fs::read(&copy).expect("read"), original, "the review never writes");
+
+        // ... and the answer does, into the copy only.
+        app.confirm = Confirm::None;
+        app.write_force = true;
+        app.write_reviewed = true;
+        app.write_current(copy.clone());
+        assert!(app.message.contains("照合OK"), "{}", app.message);
+        let written = std::fs::read(&copy).expect("read what was written");
+        let back = Save::from_bytes(&written).expect("the written copy still parses");
+        assert_eq!(
+            &back.equipment_box(0).expect("box")[created * mhnx_core::save::EQUIPMENT_RECORD
+                ..(created + 1) * mhnx_core::save::EQUIPMENT_RECORD],
+            expected.as_slice(),
+            "the record the review listed is the one that landed"
+        );
+        assert_eq!(std::fs::read(&sample).expect("the sample"), original);
+    }
+
+    /// The new pieces draw a frame: the 元に戻す button in the top bar and the
+    /// review dialog with its summary. A duplicate egui id or a window the
+    /// layout cannot fit would panic here.
+    #[test]
+    fn the_review_dialog_and_the_undo_button_draw_a_frame() {
+        let dir = Scratch::new("drawreview");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(app.set_arena_time(0, 0, 1234));
+        assert_eq!(app.undo.len(), 1);
+        app.write_force = true;
+        app.write_current(path);
+        assert!(matches!(app.confirm, Confirm::ReviewWrite), "{}", app.message);
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        let output = ctx.run(input, |ctx| {
+            app.top_bar(ctx);
+            app.confirm_dialog(ctx);
+        });
+        assert!(!output.shapes.is_empty(), "the top bar and dialog drew nothing");
     }
 }
 
