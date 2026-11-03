@@ -324,9 +324,9 @@ pub struct KnownFile {
 
 /// A write the safety check is about to make.
 ///
-/// The three paths the GUI writes a save through, kept apart so the refusal
-/// can name the one the user pressed and the "continue anyway" answer can run
-/// exactly that one again.
+/// The four paths the GUI writes a save file through, kept apart so the
+/// refusal can name the one the user pressed and the "continue anyway" answer
+/// can run exactly that one again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteTarget {
     /// 上書き保存 / 名前を付けて保存.
@@ -335,6 +335,13 @@ pub enum WriteTarget {
     SwitchPair(PathBuf),
     /// 3DS 形式で書き出す.
     Export3ds(PathBuf),
+    /// スナップショットからの復元: the save at `path`, put back to `name`.
+    ///
+    /// The restore replaces the file with bytes that are already on disk, so
+    /// it looked like it needed no question; it needs the same two. The
+    /// snapshot name travels with the target so the answer runs the very
+    /// restore that was stopped, on the very file that was checked.
+    RestoreSnapshot { path: PathBuf, name: String },
 }
 
 impl WriteTarget {
@@ -346,6 +353,7 @@ impl WriteTarget {
         match self {
             WriteTarget::Current(p) | WriteTarget::Export3ds(p) => p.clone(),
             WriteTarget::SwitchPair(dir) => dir.join("system"),
+            WriteTarget::RestoreSnapshot { path, .. } => path.clone(),
         }
     }
 
@@ -355,6 +363,7 @@ impl WriteTarget {
             WriteTarget::Current(_) => "上書き保存",
             WriteTarget::SwitchPair(_) => "Switch 用の 2 ファイル",
             WriteTarget::Export3ds(_) => "3DS 形式の書き出し",
+            WriteTarget::RestoreSnapshot { .. } => "スナップショットからの復元",
         }
     }
 }
@@ -2126,6 +2135,10 @@ impl MhnxEditor {
                 let bytes = save.to_3ds_bytes();
                 Some((p.clone(), bytes, 0, save))
             }
+            // A restore does not go through the review: the bytes come from a
+            // snapshot file, not from the save this editor holds, so there is
+            // no planned write to describe. Only the safety questions apply.
+            WriteTarget::RestoreSnapshot { .. } => None,
         }
     }
 
@@ -2446,11 +2459,34 @@ impl MhnxEditor {
     ///
     /// Whatever is there now goes into the list first, so the restore itself
     /// can be undone from the same panel.
+    ///
+    /// The restore is a write like any other and takes the same safety
+    /// questions; see [MhnxEditor::restore_snapshot_from].
     pub fn restore_snapshot(&mut self, name: String) {
         let Some(path) = self.save_path.clone() else {
             self.message = "先にセーブを開いてください".to_owned();
             return;
         };
+        self.restore_snapshot_from(path, name);
+    }
+
+    /// The restore itself, over the file the snapshot belongs to.
+    ///
+    /// Writing a snapshot back used to be the one path that skipped the guard
+    /// the three save paths go through, so a restore could land on a save an
+    /// emulator had open, or over a file that had changed since it was read.
+    /// It now asks the same questions first:
+    ///
+    /// * the snapshot has to parse (a truncated copy would replace a working
+    ///   save with a file nothing can open);
+    /// * `passes_write_check` has to allow the destination, and a refusal sets
+    ///   up the same [Confirm::UnsafeWrite] dialog the saves use, with the
+    ///   restore kept in [MhnxEditor::write_stopped] so 「承知のうえで続ける」
+    ///   runs this very restore once.
+    ///
+    /// Both refusals happen before the current contents are kept, so a stopped
+    /// restore writes nothing and leaves no snapshot behind.
+    fn restore_snapshot_from(&mut self, path: PathBuf, name: String) {
         let src = Self::snapshot_dir(&path).join(&name);
         let bytes = match std::fs::read(&src) {
             Ok(b) => b,
@@ -2466,6 +2502,14 @@ impl MhnxEditor {
                 "スナップショット {} はセーブとして読めないので戻しません: {}",
                 name, e
             );
+            return;
+        }
+        // The same question a save asks, on the file this restore replaces.
+        // Nothing above this line has changed the disk or the snapshots folder.
+        if !self.passes_write_check(WriteTarget::RestoreSnapshot {
+            path: path.clone(),
+            name: name.clone(),
+        }) {
             return;
         }
         // The current contents are kept before they are replaced.
@@ -4043,12 +4087,24 @@ impl MhnxEditor {
                 // Red: this dialog is the last thing between the user and a
                 // save that something else may own.
                 warn = true;
+                // A restore replaces the file with bytes that already exist,
+                // so what the answer does to the disk is not the same as a
+                // save's: no .bak, and the contents it replaces go to
+                // snapshots/. The dialog says which of the two this is.
+                let restore = matches!(
+                    self.write_stopped.as_ref().map(|stopped| &stopped.target),
+                    Some(WriteTarget::RestoreSnapshot { .. })
+                );
                 let label = self
                     .write_stopped
                     .as_ref()
                     .map(|stopped| stopped.target.label())
                     .unwrap_or("保存");
-                let mut body = format!("{} を書き込みませんでした。\n次の理由があります。\n", label);
+                let mut body = if restore {
+                    format!("{}を止めました。\n次の理由があります。\n", label)
+                } else {
+                    format!("{} を書き込みませんでした。\n次の理由があります。\n", label)
+                };
                 let mut emulator = false;
                 if let Some(stopped) = &self.write_stopped {
                     for reason in &stopped.reasons {
@@ -4056,14 +4112,24 @@ impl MhnxEditor {
                         emulator |= reason.contains("エミュレータ");
                     }
                 }
-                body += "\nこのまま書き込むと、いまディスクにある内容は .bak に退避してから上書きします。\n";
-                body += "スナップショットは書き込みの後に作ります（この確認では止めていません）。\n";
-                // The safer way out depends on which question said no.
-                body += if emulator {
-                    "エミュレータを終了してから保存し直すのが安全です。"
+                // The safer way out depends on which question said no, and on
+                // what the write would have done.
+                if restore {
+                    body += "\nこのまま戻すと、いまディスクにある内容は snapshots/ に退避してから置き換えます。\n";
+                    body += if emulator {
+                        "エミュレータを終了してから戻すのが安全です。"
+                    } else {
+                        "ゲーム側のセーブを読み直してから戻すのが安全です。"
+                    };
                 } else {
-                    "ゲーム側のセーブを読み直してから編集し直すのが安全です。"
-                };
+                    body += "\nこのまま書き込むと、いまディスクにある内容は .bak に退避してから上書きします。\n";
+                    body += "スナップショットは書き込みの後に作ります（この確認では止めていません）。\n";
+                    body += if emulator {
+                        "エミュレータを終了してから保存し直すのが安全です。"
+                    } else {
+                        "ゲーム側のセーブを読み直してから編集し直すのが安全です。"
+                    };
+                }
                 ("保存を止めました", body, "承知のうえで続ける")
             }
             // Not red: passing the safety check already said the file is ours
@@ -4190,7 +4256,18 @@ impl MhnxEditor {
                                 WriteTarget::Current(p) => self.write_current(p),
                                 WriteTarget::SwitchPair(d) => self.write_switch_pair(d),
                                 WriteTarget::Export3ds(p) => self.export_3ds(p),
+                                // The target carries the snapshot name, so the
+                                // very restore that was stopped runs once.
+                                WriteTarget::RestoreSnapshot { path, name } => {
+                                    self.restore_snapshot_from(path, name);
+                                }
                             }
+                            // The grant was for this one operation. A path that
+                            // turned back before the check looked at it (a save
+                            // that became MHGU, a snapshot that no longer reads)
+                            // must not leave the grant standing for the next
+                            // save, so it is dropped here either way.
+                            self.write_force = false;
                         }
                     }
                     // ... and the reviewed one, with the grant that skips the
@@ -4203,7 +4280,14 @@ impl MhnxEditor {
                                 WriteTarget::Current(p) => self.write_current(p),
                                 WriteTarget::SwitchPair(d) => self.write_switch_pair(d),
                                 WriteTarget::Export3ds(p) => self.export_3ds(p),
+                                // A restore never reaches the review: its
+                                // bytes come from a snapshot, not from the save
+                                // this editor holds (see planned_write).
+                                WriteTarget::RestoreSnapshot { .. } => {}
                             }
+                            // Same as the safety grant: the review answer is
+                            // for this write only.
+                            self.write_reviewed = false;
                         }
                     }
                     Confirm::None => {}
@@ -12127,6 +12211,25 @@ mod tests {
         path
     }
 
+    /// The sample save on this machine, when it is there.
+    ///
+    /// The path used to be spelled out in each test that reads it, and one of
+    /// those copies had been broken by a line break inside the raw string, so
+    /// that test passed without ever reading a byte. One definition is one
+    /// place to be wrong, and a missing sample now says so instead of passing
+    /// as if the test had run.
+    fn sample_save() -> Option<PathBuf> {
+        let path = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
+        if !path.is_file() {
+            eprintln!(
+                "sample save is not on this machine ({}): the test is skipped",
+                path.display()
+            );
+            return None;
+        }
+        Some(path)
+    }
+
     /// The same, with the three slot bases filled in: without them every
     /// character-slot accessor returns None and the equipment box is empty.
     fn write_a_save_with_slots(dir: &std::path::Path, name: &str) -> PathBuf {
@@ -12216,6 +12319,11 @@ mod tests {
         std::fs::create_dir_all(&snaps).expect("folder");
         let name = snapshot::name("system", 1_760_000_000);
         std::fs::write(snaps.join(&name), &older).expect("snapshot");
+        // The restore asks the same safety questions a save does. The file was
+        // just read and nothing else wrote it, so only the emulator question
+        // can say no here; this test is about the restore itself, and the
+        // guard has its own tests.
+        app.write_force = true;
         app.restore_snapshot(name.clone());
         assert_eq!(std::fs::read(&path).expect("read"), older);
         assert!(app.message.contains("の時点に戻しました"), "{}", app.message);
@@ -12230,6 +12338,137 @@ mod tests {
             original
         );
         assert!(!app.dirty);
+    }
+
+    /// A restore replaces the save, so it asks the same question a save asks:
+    /// has the file changed since it was read? Stopped, nothing lands and the
+    /// "what was there before" snapshot is not made either.
+    ///
+    /// The changed file is what makes this machine-independent: the emulator
+    /// question depends on what is running, this one does not.
+    #[test]
+    fn a_restore_is_stopped_when_the_save_changed_after_it_was_read() {
+        let dir = Scratch::new("restorestop");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let original = std::fs::read(&path).expect("read");
+        let mut older = original.clone();
+        older[SWITCH_SIZE - 1] ^= 0xFF;
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = snapshot::name("system", 1_760_000_002);
+        std::fs::write(snaps.join(&name), &older).expect("snapshot");
+        // Something else wrote the save after this editor read it.
+        let mut newer = original.clone();
+        newer[SWITCH_SIZE - 2] ^= 0x01;
+        std::fs::write(&path, &newer).expect("a newer save");
+
+        app.restore_snapshot(name.clone());
+        assert!(matches!(app.confirm, Confirm::UnsafeWrite), "{}", app.message);
+        assert!(
+            app.message
+                .starts_with("書き込みませんでした（スナップショットからの復元）"),
+            "{}",
+            app.message
+        );
+        assert!(
+            MhnxEditor::message_is_failure(&app.message),
+            "a refusal is drawn in red: {}",
+            app.message
+        );
+        let stopped = app
+            .write_stopped
+            .as_ref()
+            .expect("the restore waits for an answer");
+        assert_eq!(
+            stopped.target,
+            WriteTarget::RestoreSnapshot {
+                path: path.clone(),
+                name: name.clone()
+            }
+        );
+        assert!(
+            stopped
+                .reasons
+                .iter()
+                .any(|r| r.contains("読み込んだ後でファイルが変わっています")),
+            "{:?}",
+            stopped.reasons
+        );
+        // Nothing was replaced, and no snapshot of the current contents was
+        // made: a stopped restore does not get as far as touching the disk.
+        assert_eq!(std::fs::read(&path).expect("read"), newer);
+        let names: Vec<String> = std::fs::read_dir(&snaps)
+            .expect("folder")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec![name], "a stopped restore keeps no snapshot");
+        // The editor still holds the save it read, not the snapshot's bytes.
+        assert_eq!(app.save.as_ref().expect("save").to_bytes(), original);
+    }
+
+    /// 「承知のうえで続ける」 runs the very restore that was stopped, once, and
+    /// leaves the fingerprint on the bytes it just wrote: the next save must
+    /// not be refused as "changed since it was read".
+    #[test]
+    fn the_answer_to_a_stopped_restore_runs_it_once() {
+        let dir = Scratch::new("restoreanswer");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let original = std::fs::read(&path).expect("read");
+        let mut older = original.clone();
+        older[SWITCH_SIZE - 1] ^= 0xFF;
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = snapshot::name("system", 1_760_000_003);
+        std::fs::write(snaps.join(&name), &older).expect("snapshot");
+        let mut newer = original.clone();
+        newer[SWITCH_SIZE - 2] ^= 0x01;
+        std::fs::write(&path, &newer).expect("a newer save");
+
+        app.restore_snapshot(name.clone());
+        assert!(matches!(app.confirm, Confirm::UnsafeWrite), "{}", app.message);
+
+        // The dialog's answer: the target it kept names the file and the
+        // snapshot, and the one-shot grant lets the check through.
+        app.confirm = Confirm::None;
+        let stopped = app.write_stopped.take().expect("the restore waits");
+        app.write_force = true;
+        match stopped.target {
+            WriteTarget::RestoreSnapshot { path, name } => {
+                app.restore_snapshot_from(path, name)
+            }
+            other => panic!("a restore was stopped, not {:?}", other),
+        }
+        assert!(app.message.contains("の時点に戻しました"), "{}", app.message);
+        assert_eq!(std::fs::read(&path).expect("read"), older);
+        assert!(!app.dirty);
+        assert!(app.write_stopped.is_none(), "the stopped restore is gone");
+
+        // The contents it replaced are kept, once, so the restore itself can
+        // be undone from the same panel.
+        let kept: Vec<Vec<u8>> = std::fs::read_dir(&snaps)
+            .expect("folder")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy() != name)
+            .map(|e| std::fs::read(e.path()).expect("read the kept copy"))
+            .collect();
+        assert_eq!(kept.len(), 1, "one copy of what was replaced");
+        assert_eq!(kept[0], newer);
+
+        // The fingerprint moved with the write, so the restored file is the
+        // known state rather than a file that changed behind the editor.
+        let known = app.known_for(&path).expect("a fingerprint");
+        assert_eq!(known, safety::fingerprint(&path).expect("fingerprint"));
+        assert!(
+            app.write_problems_given(&path, Ok(Vec::new())).is_empty(),
+            "the restored file is the state the editor holds"
+        );
     }
 
     #[test]
@@ -14390,13 +14629,14 @@ mod tests {
     /// on disk parses back, carries the edit, and the file it was copied from
     /// is not touched. The sample is only ever read; everything is written to
     /// a scratch folder.
+    ///
+    /// Skipped when the sample save is not on the machine, the way the core
+    /// tests do it; [sample_save] says when it does.
     #[test]
     fn a_copy_of_the_sample_save_is_written_and_reads_back() {
-        let sample = PathBuf::from(r"C:anyWorkspace
-xjksv_readysystem");
-        if !sample.exists() {
+        let Some(sample) = sample_save() else {
             return;
-        }
+        };
         let original = std::fs::read(&sample).expect("read the sample");
         let dir = Scratch::new("realsave");
         let copy = dir.path().join("system");
@@ -14420,6 +14660,14 @@ xjksv_readysystem");
         assert!(app.message.contains("照合OK"), "{}", app.message);
         let written = std::fs::read(&copy).expect("read what was written");
         assert_eq!(written.len(), SWITCH_SIZE);
+        // Printed so a run that read the sample is told apart from one that
+        // skipped because the sample is not on the machine (sample_save says
+        // so too, but only the run that got this far proves the file was read).
+        println!(
+            "sample save {} バイトを読み、コピーに {} バイト書いて読み戻しました",
+            original.len(),
+            written.len()
+        );
         let back = Save::from_bytes(&written).expect("the written copy still parses");
         assert_eq!(
             mhnx_core::guildcard::comment(&back, 0),
@@ -14434,10 +14682,9 @@ xjksv_readysystem");
     /// not there, the way the core tests do it.
     #[test]
     fn the_card_panel_reads_the_received_cards_of_the_sample_save() {
-        let sample = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
-        if !sample.exists() {
+        let Some(sample) = sample_save() else {
             return;
-        }
+        };
         let mut app = MhnxEditor::default();
         app.open_save(sample);
         assert!(app.save.is_some(), "{}", app.message);
@@ -14928,10 +15175,9 @@ xjksv_readysystem");
     /// Skipped when the sample is not there, the way the core tests do it.
     #[test]
     fn the_review_of_the_sample_save_names_what_changes() {
-        let sample = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
-        if !sample.exists() {
+        let Some(sample) = sample_save() else {
             return;
-        }
+        };
         let dir = Scratch::new("reviewreal");
         let original = std::fs::read(&sample).expect("read the sample");
         let copy = dir.path().join("system");
