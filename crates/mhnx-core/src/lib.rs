@@ -55,6 +55,8 @@ pub mod dlcats;
 pub mod equip;
 /// Who points at an equipment record, before anything clears it.
 pub mod equiprefs;
+/// Adding, replacing and clearing equipment records.
+pub mod equipops;
 pub mod guildcard;
 pub mod myset;
 pub mod palico;
