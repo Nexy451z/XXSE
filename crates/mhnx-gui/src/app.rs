@@ -19,6 +19,7 @@ use mhnx_core::questfields::FieldKind;
 use mhnx_core::questprogress::{self, Progress};
 use mhnx_core::requests;
 use mhnx_core::romfstables::{self, RequestRecord};
+use mhnx_core::safety;
 use mhnx_core::save::{Character, Save, SaveKind};
 use mhnx_core::snapshot;
 use mhnx_core::verify;
@@ -206,6 +207,10 @@ pub enum Confirm {
     /// Replace the pouch with this item set. Nothing of the pouch the
     /// character carries now survives except the copy kept for 元に戻す.
     SetToPouch(usize),
+    /// A write the safety check stopped: an emulator is running, or the file
+    /// changed after it was read. What was about to be written waits in
+    /// [MhnxEditor::write_stopped]; 「承知のうえで続ける」 runs that very write.
+    UnsafeWrite,
 }
 
 /// Two-step confirmation for the destructive charm delete.
@@ -226,6 +231,105 @@ pub struct SnapshotEntry {
     pub name: String,
     /// Size on disk, for the list.
     pub size: u64,
+}
+
+/// What a file looked like the last time this editor read or wrote it.
+///
+/// The path is kept with the fingerprint on purpose: a save can be written
+/// out under another name, and a fingerprint of one file must never be
+/// compared with another file that happens to sit at the same place later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownFile {
+    /// Which file this is the fingerprint of.
+    pub path: PathBuf,
+    /// Its size, update time and content hash.
+    pub print: safety::Fingerprint,
+}
+
+/// A write the safety check is about to make.
+///
+/// The three paths the GUI writes a save through, kept apart so the refusal
+/// can name the one the user pressed and the "continue anyway" answer can run
+/// exactly that one again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// 上書き保存 / 名前を付けて保存.
+    Current(PathBuf),
+    /// The Switch pair, system and system_backup, into this folder.
+    SwitchPair(PathBuf),
+    /// 3DS 形式で書き出す.
+    Export3ds(PathBuf),
+}
+
+impl WriteTarget {
+    /// The file the check looks at.
+    ///
+    /// For the pair that is the `system` half: it is the file the console
+    /// loads and the one an emulator keeps open.
+    pub fn path(&self) -> PathBuf {
+        match self {
+            WriteTarget::Current(p) | WriteTarget::Export3ds(p) => p.clone(),
+            WriteTarget::SwitchPair(dir) => dir.join("system"),
+        }
+    }
+
+    /// What the dialog and the status line call this write.
+    pub fn label(&self) -> &'static str {
+        match self {
+            WriteTarget::Current(_) => "上書き保存",
+            WriteTarget::SwitchPair(_) => "Switch 用の 2 ファイル",
+            WriteTarget::Export3ds(_) => "3DS 形式の書き出し",
+        }
+    }
+}
+
+/// A write the safety check stopped, waiting for the user to answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoppedWrite {
+    /// What was about to be written.
+    pub target: WriteTarget,
+    /// Why it was stopped, one sentence per reason, as the core words them.
+    pub reasons: Vec<String>,
+}
+
+/// One received guild card, as the ギルド tab lists it.
+///
+/// The card itself stays compressed in the save; this is only what the list
+/// column prints, read from the element trailer and the info record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardRow {
+    /// Which of the two lists it sits in.
+    pub list: mhnx_core::guildcard::CardList,
+    /// Its index in that list.
+    pub slot: usize,
+    /// Name from the trailer.
+    pub name: String,
+    /// Hunter rank from the trailer.
+    pub hunter_rank: u16,
+    /// The owner's 8 byte card id, as hex.
+    pub id: String,
+    /// Received (kept list) or updated (inbox) date, YYYY/MM/DD.
+    pub date: String,
+    /// The owner's play time, in seconds.
+    pub play_time: u32,
+}
+
+/// One card inflated with card_data, decoded for the read-only detail panel.
+///
+/// Nothing here is written back: editing another hunter's card has not been
+/// verified against a real save, so the tab only shows what the card holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardDetail {
+    /// 称号, spelled out with the romfs title tables when they are loaded.
+    pub title: String,
+    /// The card's own greeting, not the receiver's comment.
+    pub comment: String,
+    /// Weapon usage over all three venues, only the types that were used.
+    pub weapons: Vec<(String, u32)>,
+    /// The card's quest history, newest first, one line each.
+    pub history: Vec<String>,
+    /// Size of the inflated block, for the note under the panel.
+    pub bytes: usize,
 }
 
 /// What the 進行状況 tab is showing.
@@ -458,6 +562,36 @@ pub struct MhnxEditor {
     /// Support move id the add row will teach.
     pub palico_move_add: u8,
 
+    // ---- writing, behind the two safety checks ----
+    /// What the files this editor read or wrote looked like at that moment,
+    /// newest first.
+    ///
+    /// Taken in open_save and refreshed after every write that lands, so a
+    /// save that changed on disk between the read and the write is refused
+    /// instead of being overwritten with the older contents. The list is per
+    /// path rather than a single fingerprint because 名前を付けて保存 and the
+    /// two exports write other files: those must not discard what the loaded
+    /// save looked like, and an export written twice must not be refused as
+    /// "changed since it was read" the second time.
+    pub known_files: Vec<KnownFile>,
+    /// The write a safety check stopped, waiting for the user to answer.
+    pub write_stopped: Option<StoppedWrite>,
+    /// Granted by 「承知のうえで続ける」 and consumed by the very next gated
+    /// write, so one answer cannot cover a later save too.
+    pub write_force: bool,
+
+    // ---- guild card: the cards received from other hunters ----
+    /// Which of the two lists (kept cards / courier inbox) is on screen.
+    pub card_list: mhnx_core::guildcard::CardList,
+    /// Slot in that list whose card the detail panel has inflated.
+    pub card_selected: Option<usize>,
+    /// Frames still to ask for: bring the received-card list into view. The
+    /// section sits far down the ギルド tab and the screenshot harness has no
+    /// way to scroll, so this is the hook that reaches it. Counted rather than
+    /// a one-shot flag because the scroll area applies the request on the next
+    /// frame and restarts the request if the image is taken before it lands.
+    pub scroll_to_cards: u8,
+
     // ---- snapshots ----
     /// Snapshots next to the open save, newest first.
     pub snapshots: Vec<SnapshotEntry>,
@@ -589,6 +723,12 @@ impl Default for MhnxEditor {
             crown_gold: String::new(),
             palico_skill_add: 1,
             palico_move_add: 1,
+            known_files: Vec::new(),
+            write_stopped: None,
+            write_force: false,
+            card_list: mhnx_core::guildcard::CardList::Stored,
+            card_selected: None,
+            scroll_to_cards: 0,
             snapshots: Vec::new(),
             romfs_path: String::new(),
             romfs_status: String::new(),
@@ -632,6 +772,10 @@ impl MhnxEditor {
                 self.save = Some(s);
                 self.save_path = Some(path.clone());
                 self.dirty = false;
+                // What the file looked like at the moment it was read. Without
+                // this a save that the game (or an emulator) wrote between the
+                // read and the write was overwritten without a word.
+                self.remember_file(&path);
                 self.message = if mhgu {
                     format!(
                         "読み込みましたが MHGU のセーブです: {}（このツールは MHXX 用なので保存できません）",
@@ -676,6 +820,9 @@ impl MhnxEditor {
         // gear box, so neither number means anything in another slot.
         self.palico_selected = None;
         self.palico_gear_selected = None;
+        // A received card belongs to the slot that received it; the same index
+        // in another slot is a different hunter's card.
+        self.card_selected = None;
         let Some(s) = &self.save else { return };
         if let Some(c) = s.read_character(self.slot) {
             self.edit = c;
@@ -953,12 +1100,197 @@ impl MhnxEditor {
         }
     }
 
+    // ------------------------------------------- writing, behind the checks
+
+    /// How many files the guard remembers the state of.
+    ///
+    /// A session touches the save it opened, the file it was saved as and the
+    /// folder it was exported to. A handful covers that; the oldest goes first
+    /// so the list cannot grow with every Save As.
+    const KNOWN_FILES: usize = 8;
+
+    /// What this editor last saw at `path`, if it has seen it at all.
+    fn known_for(&self, path: &std::path::Path) -> Option<safety::Fingerprint> {
+        self.known_files
+            .iter()
+            .find(|known| known.path == path)
+            .map(|known| known.print.clone())
+    }
+
+    /// Remember `print` as the state of `path`, newest first.
+    fn remember_fingerprint(&mut self, path: &std::path::Path, print: safety::Fingerprint) {
+        self.known_files.retain(|known| known.path != path);
+        self.known_files.insert(
+            0,
+            KnownFile {
+                path: path.to_path_buf(),
+                print,
+            },
+        );
+        self.known_files.truncate(Self::KNOWN_FILES);
+    }
+
+    /// Remember what `path` looks like now.
+    ///
+    /// Called after the read in open_save and after every write that landed.
+    /// A file that cannot be fingerprinted drops its record rather than keeping
+    /// a stale one: the next write then takes a fresh fingerprint instead of
+    /// comparing against a state that is known to be out of date.
+    fn remember_file(&mut self, path: &std::path::Path) {
+        match safety::fingerprint(path) {
+            Ok(print) => self.remember_fingerprint(path, print),
+            Err(_) => self.known_files.retain(|known| known.path != path),
+        }
+    }
+
+    /// The refusal line for a process list, or None when no emulator is in it.
+    ///
+    /// The product name is printed next to the process name: "yuzu" alone does
+    /// not tell a user which of two running builds to close, and the check
+    /// matches forks by substring.
+    fn emulator_line(running: &[String]) -> Option<String> {
+        let named: Vec<String> = running
+            .iter()
+            .filter_map(|process| {
+                let name = safety::emulator_name(process)?;
+                Some(format!("{}（{}）", name, process))
+            })
+            .collect();
+        if named.is_empty() {
+            return None;
+        }
+        Some(format!("エミュレータが起動中です: {}", named.join(", ")))
+    }
+
+    /// Why a write of `path` must not run, in the words the dialog shows.
+    ///
+    /// Empty when nothing is in the way. The two situations the reference
+    /// editor refuses are here:
+    ///
+    /// * an emulator is running - it holds the save open and writes its own
+    ///   copy back on its next save, so the edit would disappear;
+    /// * the file changed after it was read - writing would put the older
+    ///   contents back and lose whatever wrote in between.
+    ///
+    /// A file that was never fingerprinted is not a refusal: one is taken now
+    /// and kept, which is what happens on the first save to a path this editor
+    /// did not read. try_running_emulators answering with an error is a
+    /// refusal, because "I could not look" is not "nothing is running".
+    fn write_problems(&mut self, path: &std::path::Path) -> Vec<String> {
+        self.write_problems_given(path, safety::try_running_emulators())
+    }
+
+    /// The same, with the process table handed in.
+    ///
+    /// The report is an argument so both refusals can be checked without an
+    /// emulator running on the machine that runs the tests: a real process
+    /// table decides the answer in the product, and a list built by the test
+    /// decides it here.
+    fn write_problems_given(
+        &mut self,
+        path: &std::path::Path,
+        running: std::io::Result<Vec<String>>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        match running {
+            Ok(running) => {
+                if let Some(line) = Self::emulator_line(&running) {
+                    out.push(line);
+                }
+            }
+            Err(e) => out.push(format!(
+                "起動中のエミュレータを確認できません: {}（確かめられないので書きません）",
+                e
+            )),
+        }
+        if !path.exists() {
+            // A new file: there is nothing on disk to overwrite and nothing to
+            // compare with, so only the emulator question applies.
+            return out;
+        }
+        let now = match safety::fingerprint(path) {
+            Ok(print) => print,
+            Err(e) => {
+                out.push(format!(
+                    "いまのファイルの状態を確認できません: {}: {}",
+                    path.display(),
+                    e
+                ));
+                return out;
+            }
+        };
+        let loaded = self.known_for(path);
+        match loaded {
+            Some(loaded) => {
+                if safety::is_stale(&loaded, &now) {
+                    // changes() is what turns the difference into "サイズ X → Y"
+                    // and "更新時刻 …"; an empty list can only mean two states
+                    // this build cannot describe, so a plain line stands in.
+                    let mut detail = safety::changes(&loaded, &now);
+                    if detail.is_empty() {
+                        detail.push(String::from(
+                            "サイズ・内容のハッシュ・更新時刻のどれかが読み込み時と違います",
+                        ));
+                    }
+                    out.push(format!(
+                        "読み込んだ後でファイルが変わっています（{}）",
+                        detail.join(" / ")
+                    ));
+                }
+            }
+            // No fingerprint for this file: take one now and keep it, so the
+            // next save has something to compare against. This is the "読み込み
+            // 時に指紋を取っていない" case, and it is not a refusal.
+            None => self.remember_fingerprint(path, now),
+        }
+        out
+    }
+
+    /// Run the safety questions before a write, and set the dialog up when
+    /// either of them says no.
+    ///
+    /// True means the write may run. The override 「承知のうえで続ける」 grants
+    /// is one shot: it is taken here, so a later save asks again.
+    fn passes_write_check(&mut self, target: WriteTarget) -> bool {
+        if std::mem::take(&mut self.write_force) {
+            self.write_stopped = None;
+            return true;
+        }
+        let problems = self.write_problems(&target.path());
+        if problems.is_empty() {
+            self.write_stopped = None;
+            return true;
+        }
+        self.message = Self::refusal_message(&target, &problems);
+        self.write_stopped = Some(StoppedWrite {
+            target,
+            reasons: problems,
+        });
+        self.confirm = Confirm::UnsafeWrite;
+        false
+    }
+
+    /// What the bottom bar says when a write was stopped.
+    fn refusal_message(target: &WriteTarget, problems: &[String]) -> String {
+        format!(
+            "書き込みませんでした（{}）: {}。終了してからやり直すか、確認ダイアログで「承知のうえで続ける」を選んでください",
+            target.label(),
+            problems.join(" / ")
+        )
+    }
+
     pub fn write_current(&mut self, path: PathBuf) {
         // See open_save: the offsets are MHXX's, so writing an MHGU save back
         // would corrupt it.
         if matches!(&self.save, Some(s) if s.kind() == SaveKind::Mhgu) {
             self.message =
                 "MHGU のセーブは保存できません（このツールのオフセットは MHXX 用です）".to_owned();
+            return;
+        }
+        // The two safety questions come before anything is written and before
+        // the working copies are pushed into the save, so a refused write
+        // leaves the file and the editor exactly as they were.
+        if !self.passes_write_check(WriteTarget::Current(path.clone())) {
             return;
         }
         self.apply_to_save();
@@ -982,6 +1314,9 @@ impl MhnxEditor {
             Ok((backup, check)) => {
                 self.dirty = false;
                 self.save_path = Some(path.clone());
+                // The file on disk is now what this editor holds, so the next
+                // save compares against this state and not against the read.
+                self.remember_file(&path);
                 // The snapshot is the very bytes that were just proven to be
                 // on disk, so every entry in the list is a save that happened.
                 let stamped = Self::push_snapshot(&path, &Self::snapshot_stem(&path), &bytes);
@@ -1004,6 +1339,11 @@ impl MhnxEditor {
 
     /// Write a Switch save as both system and system_backup into a directory.
     pub fn write_switch_pair(&mut self, dir: PathBuf) {
+        // The check looks at the folder's own `system`: that is the file the
+        // console loads, and the one an emulator has open.
+        if !self.passes_write_check(WriteTarget::SwitchPair(dir.clone())) {
+            return;
+        }
         self.apply_to_save();
         // The hunt tables live in their own buffers; without this the export
         // silently wrote the values from disk instead of the ones on screen.
@@ -1028,6 +1368,9 @@ impl MhnxEditor {
         match (r1, r2) {
             (Ok((saved_a, _)), Ok((saved_b, _))) => {
                 self.dirty = false;
+                // The pair is now what this editor holds; a second save into
+                // the same folder must not be refused as "changed since read".
+                self.remember_file(&dir.join("system"));
                 // system_backup carries the same body as system, so one
                 // snapshot of the pair is enough; a second copy would double
                 // the disk use for identical bytes.
@@ -1065,6 +1408,9 @@ impl MhnxEditor {
 
     /// Export the body as a 3DS save.
     pub fn export_3ds(&mut self, path: PathBuf) {
+        if !self.passes_write_check(WriteTarget::Export3ds(path.clone())) {
+            return;
+        }
         self.apply_to_save();
         self.apply_hunts();
         let Some(bytes) = self.save.as_ref().map(|s| s.to_3ds_bytes()) else {
@@ -1073,6 +1419,9 @@ impl MhnxEditor {
         match Self::write_and_verify(&path, &bytes) {
             Ok((backup, check)) => {
                 self.dirty = false;
+                // This path now holds a save this editor wrote; the next export
+                // over it must compare against these bytes.
+                self.remember_file(&path);
                 let mut m = format!("3DS 形式で書き出しました: {}", path.display());
                 m += &format!("（{}）", check);
                 if let Some(b) = backup {
@@ -1147,6 +1496,10 @@ impl MhnxEditor {
             self.save = Some(s);
         }
         self.dirty = false;
+        // The restore wrote the file, so the known state is these bytes and not
+        // what was read before; without this the next save would be refused as
+        // "changed since it was loaded".
+        self.remember_file(&path);
         self.reload_from_save();
         self.refresh_snapshots();
         self.message = format!("スナップショット {} の時点に戻しました{}", name, note);
@@ -1503,9 +1856,15 @@ impl eframe::App for MhnxEditor {
             let outer_scroll =
                 matches!(self.tab, Tab::Sets | Tab::Extras | Tab::Guild | Tab::Dlc);
             if outer_scroll {
-                egui::ScrollArea::vertical()
-                    .id_salt("outer")
-                    .show(ui, |ui| self.draw_tab(ui));
+                let mut area = egui::ScrollArea::vertical().id_salt("outer");
+                // A section reached with scroll_to_cursor is otherwise caught
+                // mid-animation: the screenshot harness takes its image three
+                // frames in, while a programmatic scroll spends 0.1 to 0.3
+                // seconds getting there.
+                if self.scroll_to_cards > 0 {
+                    area = area.animated(false);
+                }
+                area.show(ui, |ui| self.draw_tab(ui));
             } else {
                 self.draw_tab(ui);
             }
@@ -1934,13 +2293,15 @@ impl MhnxEditor {
         });
     }
 
-    /// Whether a status message reports a failed round trip.
+    /// Whether a status message reports a failed or refused write.
     ///
-    /// Only the messages that say a written file did not read back the way it
-    /// was meant are drawn in red; the wording is fixed by undo_bad_write, so
-    /// this cannot drift out of step with it silently.
+    /// Two wordings are drawn in red: a write that did not read back the way
+    /// it was meant (fixed by undo_bad_write) and one the safety check stopped
+    /// before it ran (fixed by refusal_message). Both are states where the
+    /// user must not read the line as an ordinary note; the strings are owned
+    /// by those two functions, so this cannot drift out of step silently.
     fn message_is_failure(message: &str) -> bool {
-        message.contains("照合に失敗")
+        message.contains("照合に失敗") || message.contains("書き込みませんでした")
     }
 
     /// A button that destroys something.
@@ -2419,6 +2780,33 @@ impl MhnxEditor {
                     .unwrap_or(false);
                 ("CSV を読み込みます", self.csv_confirm_text(), "適用する")
             }
+            Confirm::UnsafeWrite => {
+                // Red: this dialog is the last thing between the user and a
+                // save that something else may own.
+                warn = true;
+                let label = self
+                    .write_stopped
+                    .as_ref()
+                    .map(|stopped| stopped.target.label())
+                    .unwrap_or("保存");
+                let mut body = format!("{} を書き込みませんでした。\n次の理由があります。\n", label);
+                let mut emulator = false;
+                if let Some(stopped) = &self.write_stopped {
+                    for reason in &stopped.reasons {
+                        body += &format!("・{}\n", reason);
+                        emulator |= reason.contains("エミュレータ");
+                    }
+                }
+                body += "\nこのまま書き込むと、いまディスクにある内容は .bak に退避してから上書きします。\n";
+                body += "スナップショットは書き込みの後に作ります（この確認では止めていません）。\n";
+                // The safer way out depends on which question said no.
+                body += if emulator {
+                    "エミュレータを終了してから保存し直すのが安全です。"
+                } else {
+                    "ゲーム側のセーブを読み直してから編集し直すのが安全です。"
+                };
+                ("保存を止めました", body, "承知のうえで続ける")
+            }
             Confirm::SetClear(n) => {
                 // The name is read now, so the dialog says which set it means
                 // rather than only a number.
@@ -2531,6 +2919,18 @@ impl MhnxEditor {
                     Confirm::CsvApply => {
                         self.csv_commit();
                     }
+                    // Run the very write that was stopped, with the one-shot
+                    // override the answer just granted.
+                    Confirm::UnsafeWrite => {
+                        if let Some(stopped) = self.write_stopped.take() {
+                            self.write_force = true;
+                            match stopped.target {
+                                WriteTarget::Current(p) => self.write_current(p),
+                                WriteTarget::SwitchPair(d) => self.write_switch_pair(d),
+                                WriteTarget::Export3ds(p) => self.export_3ds(p),
+                            }
+                        }
+                    }
                     Confirm::None => {}
                 }
             }
@@ -2539,6 +2939,12 @@ impl MhnxEditor {
                 // waiting to be applied by a later answer.
                 if matches!(self.confirm, Confirm::CsvApply) {
                     self.csv_pending = None;
+                }
+                // The same for a write that was stopped: やめる means it does
+                // not run later, so the pending target goes with the dialog.
+                if matches!(self.confirm, Confirm::UnsafeWrite) {
+                    self.write_stopped = None;
+                    self.message = String::from("書き込みをやめました");
                 }
                 self.confirm = Confirm::None;
             }
@@ -6538,6 +6944,8 @@ impl MhnxEditor {
         ui.separator();
         self.guild_history(ui);
         ui.separator();
+        self.guild_cards(ui);
+        ui.separator();
         ui.label(egui::RichText::new("闘技大会の記録").strong());
         // The summary is read-only; the editor below writes through
         // set_arena_time. Both read the copy taken at the top of the tab, so
@@ -6922,6 +7330,295 @@ impl MhnxEditor {
             10 => "雇用".to_owned(),
             other => format!("不明 ({})", other),
         }
+    }
+
+    /// The cards other hunters sent, and the courier's inbox, read-only.
+    ///
+    /// Every card in the save is stored compressed, so the list reads only the
+    /// element trailer and the info record - name, rank, id, date - and one
+    /// card is inflated with card_data when it is picked. Nothing in this panel
+    /// writes: rewriting a card would mean replacing a variable length
+    /// compressed element in the middle of a 100 slot list, and neither that
+    /// nor what the game does with an edited received card has been checked
+    /// against a real save, so the tab shows what is there and says so.
+    fn guild_cards(&mut self, ui: &mut egui::Ui) {
+        use mhnx_core::guildcard::CardList;
+        if self.scroll_to_cards > 0 {
+            // The cursor is at the top of the section here, so this scrolls the
+            // tab the few screens down to it.
+            self.scroll_to_cards -= 1;
+            ui.scroll_to_cursor(Some(egui::Align::TOP));
+        }
+        ui.label(egui::RichText::new("受信したギルドカード（読み取り専用）").strong());
+        let stored = self.card_rows(CardList::Stored);
+        let inbox = self.card_rows(CardList::Inbox);
+        let mut list = self.card_list;
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut list,
+                CardList::Stored,
+                format!(
+                    "カード一覧 {} 枚 / {} 枠",
+                    stored.len(),
+                    CardList::Stored.count()
+                ),
+            );
+            ui.selectable_value(
+                &mut list,
+                CardList::Inbox,
+                format!(
+                    "受信箱 {} 枚 / {} 枠",
+                    inbox.len(),
+                    CardList::Inbox.count()
+                ),
+            );
+            ui.label(
+                egui::RichText::new("受信した内容をそのまま表示します。この画面からは書き換えません。")
+                    .weak()
+                    .small(),
+            );
+        });
+        // A card index means nothing in the other list, so the selection goes
+        // with the switch rather than pointing at the same number elsewhere.
+        if list != self.card_list {
+            self.card_list = list;
+            self.card_selected = None;
+        }
+        let rows: &Vec<CardRow> = if self.card_list == CardList::Stored {
+            &stored
+        } else {
+            &inbox
+        };
+        if rows.is_empty() {
+            ui.label(match self.card_list {
+                CardList::Stored => "カード一覧は空です（まだ誰からも受け取っていません）",
+                CardList::Inbox => "受信箱は空です",
+            });
+            return;
+        }
+        let mut pick: Option<usize> = None;
+        // The minimum matters: this section sits far down a tab that scrolls
+        // as a whole, so by the time it is reached the available height is
+        // nearly zero and the list would be drawn as a single 64pt sliver.
+        egui::ScrollArea::vertical()
+            .id_salt("cardlist")
+            .max_height(220.0)
+            .min_scrolled_height(220.0)
+            .show(ui, |ui| {
+                egui::Grid::new("cardgrid")
+                    .num_columns(6)
+                    .striped(true)
+                    .spacing([8.0, 3.0])
+                    .show(ui, |ui| {
+                        for header in ["枠", "名前", "HR", "カードID", "受信日", "プレイ時間"] {
+                            ui.strong(header);
+                        }
+                        ui.end_row();
+                        for row in rows.iter() {
+                            if ui
+                                .selectable_label(
+                                    self.card_selected == Some(row.slot),
+                                    format!("{}", row.slot + 1),
+                                )
+                                .clicked()
+                            {
+                                pick = Some(row.slot);
+                            }
+                            ui.label(if row.name.is_empty() {
+                                "(名前なし)"
+                            } else {
+                                row.name.as_str()
+                            });
+                            ui.label(format!("{}", row.hunter_rank));
+                            ui.label(egui::RichText::new(&row.id).monospace());
+                            ui.label(&row.date);
+                            ui.label(Self::clock_text(row.play_time));
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(slot) = pick {
+            self.card_selected = Some(slot);
+        }
+        ui.separator();
+        let Some(slot) = self.card_selected else {
+            ui.label("カードを選ぶと、称号・コメント・武器使用数・履歴を表示します");
+            return;
+        };
+        let row = rows.iter().find(|row| row.slot == slot);
+        let Some(detail) = self.card_detail(self.card_list, slot) else {
+            ui.label(format!(
+                "枠 {} のカードは展開できません（圧縮データが読めないか、空の枠です）",
+                slot + 1
+            ));
+            return;
+        };
+        if let Some(row) = row {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new(if row.name.is_empty() {
+                        "(名前なし)"
+                    } else {
+                        row.name.as_str()
+                    })
+                    .strong(),
+                );
+                ui.label(format!("HR {}", row.hunter_rank));
+                ui.label(egui::RichText::new(&row.id).monospace());
+                ui.label(format!("受信日 {}", row.date));
+                ui.label(format!("プレイ時間 {}", Self::clock_text(row.play_time)));
+            });
+        }
+        egui::Grid::new("carddetail")
+            .num_columns(2)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                ui.label("称号");
+                ui.label(if detail.title.is_empty() {
+                    String::from("(なし)")
+                } else {
+                    detail.title.clone()
+                });
+                ui.end_row();
+                ui.label("コメント");
+                ui.label(if detail.comment.is_empty() {
+                    String::from("(なし)")
+                } else {
+                    detail.comment.clone()
+                });
+                ui.end_row();
+                ui.label("展開後");
+                ui.label(format!(
+                    "{} バイト（{}）",
+                    detail.bytes,
+                    if self.title_table.is_empty() {
+                        "称号名は romfs 未読込"
+                    } else {
+                        "称号名は romfs の表から"
+                    }
+                ));
+                ui.end_row();
+            });
+        ui.label(
+            egui::RichText::new(format!("武器使用数（3 会場の合計・{} 種）", detail.weapons.len()))
+                .strong(),
+        );
+        if detail.weapons.is_empty() {
+            ui.label("使用記録はありません");
+        } else {
+            egui::Grid::new("cardweapons")
+                .num_columns(2)
+                .striped(true)
+                .spacing([8.0, 3.0])
+                .show(ui, |ui| {
+                    for (name, count) in &detail.weapons {
+                        ui.label(name);
+                        ui.label(format!("{}", count));
+                        ui.end_row();
+                    }
+                });
+        }
+        ui.label(
+            egui::RichText::new(format!("クエスト履歴（{} 件）", detail.history.len())).strong(),
+        );
+        if detail.history.is_empty() {
+            ui.label("記録はありません");
+        } else {
+            for line in &detail.history {
+                ui.label(line);
+            }
+        }
+    }
+
+    /// The cards in one of the two lists, as the list panel prints them.
+    ///
+    /// The two core readers are called directly so the tab cannot drift from
+    /// them: hunter_cards for the kept list, card_inbox for the courier's.
+    fn card_rows(&self, list: mhnx_core::guildcard::CardList) -> Vec<CardRow> {
+        use mhnx_core::guildcard::CardList;
+        let Some(save) = &self.save else {
+            return Vec::new();
+        };
+        let cards = match list {
+            CardList::Stored => mhnx_core::guildcard::hunter_cards(save, self.slot),
+            CardList::Inbox => mhnx_core::guildcard::card_inbox(save, self.slot),
+        };
+        cards
+            .into_iter()
+            .map(|card| CardRow {
+                list: card.list,
+                slot: card.slot,
+                name: card.name,
+                hunter_rank: card.hunter_rank,
+                id: card.id.iter().map(|b| format!("{:02X}", b)).collect(),
+                date: format!("{:04}/{:02}/{:02}", card.date.2, card.date.1, card.date.0),
+                play_time: card.play_time,
+            })
+            .collect()
+    }
+
+    /// One card inflated and decoded, for the read-only detail panel.
+    ///
+    /// card_data is the only thing that touches the compressed element. The
+    /// four decoded fields are the ones the card itself shows: the 称号, the
+    /// card's own comment (not the receiver's), weapon usage over all three
+    /// venues, and the quest history.
+    fn card_detail(
+        &self,
+        list: mhnx_core::guildcard::CardList,
+        slot: usize,
+    ) -> Option<CardDetail> {
+        let save = self.save.as_ref()?;
+        let data = mhnx_core::guildcard::card_data(save, self.slot, list, slot)?;
+        let title = mhnx_core::guildcard::title_in(&data)
+            .map(|title| self.title_table.text(title))
+            .unwrap_or_default();
+        let weapons = mhnx_core::guildcard::weapon_usage_in(&data)
+            .into_iter()
+            .enumerate()
+            .filter(|(_, count)| *count > 0)
+            .map(|(index, count)| {
+                let name = mhnx_core::gamedata::HUNT_WEAPONS
+                    .get(index)
+                    .copied()
+                    .unwrap_or("?");
+                (String::from(name), count)
+            })
+            .collect();
+        let history = mhnx_core::guildcard::history_in(&data)
+            .into_iter()
+            .map(|record| {
+                format!(
+                    "{:04}/{:02}/{:02} {} {}",
+                    record.year,
+                    record.month,
+                    record.day,
+                    Self::history_kind(record.kind),
+                    if record.name.is_empty() {
+                        "(名前なし)"
+                    } else {
+                        record.name.as_str()
+                    }
+                )
+            })
+            .collect();
+        Some(CardDetail {
+            title,
+            comment: mhnx_core::guildcard::comment_in(&data),
+            weapons,
+            history,
+            bytes: data.len(),
+        })
+    }
+
+    /// Seconds as h:mm:ss, for a play time the card stores in seconds.
+    fn clock_text(seconds: u32) -> String {
+        format!(
+            "{}:{:02}:{:02}",
+            seconds / 3600,
+            (seconds % 3600) / 60,
+            seconds % 60
+        )
     }
 
     /// Rewrite one cell of the 武器使用数 grid.
@@ -8201,16 +8898,15 @@ impl MhnxEditor {
                         }
                     }
                     // Everything about this record the game would not have
-                    // written for its grade: slots above the maximum, points
-                    // outside the grade's table, a skill the grade cannot
-                    // carry. The core owns that knowledge, so the UI only
-                    // prints what it returns, one line each, in the same
+                    // written: the grade's own rules (slots above the maximum,
+                    // points outside the table, a skill the grade cannot
+                    // carry) and the five structural shapes no grade allows.
+                    // Both sets are worded by the core, so a sentence the two
+                    // report twice is printed once; the UI only prints what
+                    // that merged list holds, one line each, in the same
                     // yellow the other out-of-range notes use.
-                    for warning in mhnx_core::charm::grade_warnings(
-                        &charm_box,
-                        self.charm_index,
-                        cur_grade.unwrap_or(self.charm_new_grade),
-                    ) {
+                    let grade = cur_grade.unwrap_or(self.charm_new_grade);
+                    for warning in self.charm_warning_lines(self.charm_index, grade) {
                         ui.colored_label(egui::Color32::from_rgb(235, 190, 90), warning);
                     }
                     let ty = charm_box.get(rec_at + 2).copied().unwrap_or(0);
@@ -8369,6 +9065,41 @@ impl MhnxEditor {
             // message, so the two cannot drift apart.
             self.delete_charm(i);
         }
+    }
+
+    /// The warning lines the 護石 tab prints under the grade buttons.
+    ///
+    /// Two sources, both owned by the core: what the record's grade allows
+    /// (grade_warnings) and the five shapes the game never writes
+    /// (structure_warnings - no skill, the same skill twice, only the second
+    /// slot filled, points with no skill, a skill with no points). They are
+    /// asked separately because they answer different questions, and merged
+    /// here because the screen has one warning area: a line that both sources
+    /// produce is kept once, so the same sentence is never printed twice.
+    ///
+    /// Nothing is written, and the record is read through the save, so the
+    /// list describes what is in the box now rather than what was there when
+    /// the frame started. An empty vector means the record is ordinary.
+    fn charm_warning_lines(
+        &self,
+        index: usize,
+        grade: mhnx_core::charm::TalismanGrade,
+    ) -> Vec<String> {
+        let Some(save) = &self.save else {
+            return Vec::new();
+        };
+        let mut out = match save.equipment_box(self.slot) {
+            Some(box_bytes) => mhnx_core::charm::grade_warnings(box_bytes, index, grade),
+            None => Vec::new(),
+        };
+        for line in mhnx_core::charm::structure_warnings(save, self.slot, index) {
+            // Trimmed comparison: both sources are fixed strings, so this can
+            // only drop a real repeat, never a different warning.
+            if !out.iter().any(|kept| kept.trim() == line.trim()) {
+                out.push(line);
+            }
+        }
+        out
     }
 
     /// Pull the five fields this editor owns back out of the record in the box.
@@ -8896,6 +9627,22 @@ impl MhnxEditor {
                 "quests" | "quest" | "クエスト" => ProgressSection::Quests,
                 _ => ProgressSection::Awards,
             };
+        }
+        // The received guild cards are the last section of the ギルド tab, so
+        // the harness needs a way to pick one and bring it on screen: the
+        // selection is the same state a click sets.
+        if let Ok(s) = std::env::var("MHNXEDITOR_CARD_LIST") {
+            self.card_list = if s.trim().eq_ignore_ascii_case("inbox") {
+                mhnx_core::guildcard::CardList::Inbox
+            } else {
+                mhnx_core::guildcard::CardList::Stored
+            };
+        }
+        if let Ok(s) = std::env::var("MHNXEDITOR_CARD_SELECT") {
+            if let Ok(index) = s.trim().parse::<usize>() {
+                self.card_selected = Some(index);
+                self.scroll_to_cards = 6;
+            }
         }
         if let Ok(p) = std::env::var("MHNXEDITOR_ROMFS") {
             // The line the window opened with (the font, or the file that was
@@ -10153,6 +10900,10 @@ mod tests {
         app.open_save(path);
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("out");
+        // This checks the write itself, not the safety questions in front of
+        // it: an emulator running on the machine that runs the tests would
+        // otherwise stop the write (the guard has its own tests).
+        app.write_force = true;
         app.write_switch_pair(out.clone());
         let a = std::fs::read(out.join("system")).expect("system");
         let b = std::fs::read(out.join("system_backup")).expect("system_backup");
@@ -10174,6 +10925,8 @@ mod tests {
         let mut app = MhnxEditor::default();
         app.open_save(path);
         let out = dir.path().join("system.3ds");
+        // See the pair test: the write mechanics are what this checks.
+        app.write_force = true;
         app.export_3ds(out.clone());
         // The export applies the working copies first, so the file has to be
         // compared against what the save holds after that, not before.
@@ -11599,6 +12352,9 @@ mod tests {
         // The usual overwrite carries them out and clears dirty.
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).expect("out");
+        // The options are what this checks; the guard would refuse the write
+        // only because an emulator happens to be running on the test machine.
+        app.write_force = true;
         app.write_switch_pair(out.clone());
         assert!(!app.dirty, "{}", app.message);
         let bytes = std::fs::read(out.join("system")).expect("system");
@@ -11968,6 +12724,373 @@ mod tests {
         app.crown_gold = String::from("0");
         assert!(app.crown_window().is_none());
         assert!(app.monster_crown(0).is_none());
+    }
+
+    /// Whether an emulator is running on this machine.
+    ///
+    /// The guard refuses every write while one is, which is its point; a test
+    /// that wants to see a write land on a machine where yuzu or Ryujinx
+    /// happens to be open has to go through the one-shot answer instead.
+    fn an_emulator_is_running() -> bool {
+        MhnxEditor::emulator_line(&safety::running_emulators()).is_some()
+    }
+
+    /// The two screens the audit said were built but never reached: the five
+    /// structural talisman rules and the list of cards other hunters sent.
+    ///
+    /// Both are checked through the functions the tabs themselves call - the
+    /// 護石 tab prints charm_warning_lines, the ギルド tab prints card_rows and
+    /// card_detail - so this fails if a tab stops asking the core for them and
+    /// the sentence never reaches the screen state.
+    #[test]
+    fn the_talisman_rules_and_the_card_list_reach_the_screens() {
+        let dir = Scratch::new("reach");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.slot = 0;
+
+        // Box slot 3: the same skill in both slots. That is shape 2 of
+        // structure_warnings, and nothing grade_warnings knows about.
+        {
+            let save = app.save.as_mut().expect("save");
+            let box_bytes = save.equipment_box_mut(0).expect("equipment box");
+            let at = 3 * mhnx_core::charm::CHARM_RECORD;
+            let rec = &mut box_bytes[at..at + mhnx_core::charm::CHARM_RECORD];
+            rec.fill(0);
+            rec[0] = mhnx_core::charm::CHARM_TYPE; // a talisman
+            rec[0x02] = 8; // 天の護石
+            rec[0x0C] = 1; // skill 1
+            rec[0x0D] = 1; // the same skill again
+            rec[0x0E] = 3;
+            rec[0x0F] = 3;
+            rec[0x10] = 1; // one decoration slot
+            rec[0x12] = 100; // rarity 100
+        }
+        app.charm_index = 3;
+        let lines = app.charm_warning_lines(3, mhnx_core::charm::TalismanGrade::Enduring);
+        assert!(
+            lines.iter().any(|line| line.contains("スキル1とスキル2が同じです")),
+            "the tab would print {:?}",
+            lines
+        );
+
+        // Box slot 4: points left behind with no skill - shape 5, the one the
+        // grade tables can never report because they only look at set skills.
+        {
+            let save = app.save.as_mut().expect("save");
+            let box_bytes = save.equipment_box_mut(0).expect("equipment box");
+            let at = 4 * mhnx_core::charm::CHARM_RECORD;
+            let rec = &mut box_bytes[at..at + mhnx_core::charm::CHARM_RECORD];
+            rec.fill(0);
+            rec[0] = mhnx_core::charm::CHARM_TYPE;
+            rec[0x02] = 8;
+            rec[0x0E] = 4; // points with nothing to attach them to
+            rec[0x12] = 100;
+        }
+        app.charm_index = 4;
+        let lines = app.charm_warning_lines(4, mhnx_core::charm::TalismanGrade::Enduring);
+        assert!(
+            lines.iter().any(|line| line.contains("ポイントだけ")),
+            "the tab would print {:?}",
+            lines
+        );
+        // The merge exists so the same sentence is not printed twice.
+        let mut unique = lines.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), lines.len(), "a line was printed twice: {:?}", lines);
+
+        // A received card: the element trailer carries name, rank and id, the
+        // info record the date, and the payload is the 29 byte zlib stream the
+        // game writes into an element it never filled - enough for the list and
+        // for card_data to inflate a (blank) card block.
+        {
+            const EMPTY_Z: [u8; 29] = [
+                0x78, 0x9c, 0xed, 0xc1, 0x31, 0x01, 0x00, 0x00, 0x00, 0xc2, 0xa0, 0xf5, 0x4f, 0x6d,
+                0x0d, 0x0f, 0xa0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3e, 0x0c, 0x18, 0xb8, 0x00,
+                0x01,
+            ];
+            let save = app.save.as_mut().expect("save");
+            let base = save.slot_base(0).expect("slot base") as usize;
+            let at = base + mhnx_core::guildcard::GC_CARDS;
+            let body = save.body_mut();
+            body[at..at + 4].copy_from_slice(&(EMPTY_Z.len() as u32).to_le_bytes());
+            body[at + 4..at + 4 + EMPTY_Z.len()].copy_from_slice(&EMPTY_Z);
+            let state = at + 4 + EMPTY_Z.len();
+            body[state..state + 4].copy_from_slice(&mhnx_core::guildcard::CARD_FILLED.to_le_bytes());
+            let trailer = state + 4;
+            let mut element = [0u8; mhnx_core::guildcard::CARD_TRAILER];
+            element[0..2].copy_from_slice(&42u16.to_le_bytes());
+            for (i, unit) in "Ann".encode_utf16().enumerate() {
+                element[2 + i * 2..2 + i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            element[24..32].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            element[32..36].copy_from_slice(&1234u32.to_le_bytes());
+            body[trailer..trailer + element.len()].copy_from_slice(&element);
+            // The info record: day, month, year.
+            let info = base + mhnx_core::guildcard::GC_CARDS_INFO;
+            let mut record = [0u8; mhnx_core::guildcard::CARD_INFO_LEN];
+            record[0] = 3;
+            record[1] = 4;
+            record[2..4].copy_from_slice(&2025u16.to_le_bytes());
+            body[info..info + record.len()].copy_from_slice(&record);
+        }
+        let rows = app.card_rows(mhnx_core::guildcard::CardList::Stored);
+        assert_eq!(rows.len(), 1, "one card was written");
+        assert_eq!(rows[0].name, "Ann");
+        assert_eq!(rows[0].hunter_rank, 42);
+        assert_eq!(rows[0].id, "0102030405060708");
+        assert_eq!(rows[0].date, "2025/04/03");
+        assert!(
+            app.card_rows(mhnx_core::guildcard::CardList::Inbox).is_empty(),
+            "the inbox is asked for separately"
+        );
+        // The detail panel's path: card_data inflates the element.
+        app.card_selected = Some(0);
+        let detail = app
+            .card_detail(mhnx_core::guildcard::CardList::Stored, 0)
+            .expect("the card inflates");
+        assert_eq!(detail.bytes, mhnx_core::guildcard::GC_SIZE);
+
+        // ... and the two tabs draw with that state, which is what "reaches
+        // the screen" means: a duplicate egui id or a grid whose rows and
+        // columns disagree would panic here.
+        for tab in [Tab::Charm, Tab::Guild] {
+            app.tab = tab;
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| app.draw_tab(ui));
+                });
+            });
+            assert!(!output.shapes.is_empty(), "{:?} drew nothing", tab);
+        }
+    }
+
+    /// The two refusals the guard makes, with the process table handed in so
+    /// neither needs an emulator (or its absence) on the test machine.
+    #[test]
+    fn a_save_in_use_or_changed_after_its_read_is_refused_with_the_reason() {
+        let dir = Scratch::new("guard");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(
+            app.known_for(&path).is_some(),
+            "the read keeps a fingerprint"
+        );
+
+        // Nothing running and nothing changed: no refusal at all.
+        assert!(
+            app.write_problems_given(&path, Ok(Vec::new())).is_empty(),
+            "a fresh save is not refused"
+        );
+
+        // An emulator is named with the process that matched, and its presence
+        // alone stops the write even when the file itself is untouched.
+        let lines = app.write_problems_given(&path, Ok(vec![String::from("yuzu-early-access.exe")]));
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert!(lines[0].contains("エミュレータが起動中です"), "{:?}", lines);
+        assert!(lines[0].contains("yuzu-early-access.exe"), "{:?}", lines);
+
+        // A process table that cannot be read is not an all clear.
+        let lines = app.write_problems_given(&path, Err(std::io::Error::other("no table")));
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert!(lines[0].contains("確認できません"), "{:?}", lines);
+
+        // Something else wrote the file after the read: the refusal has to say
+        // what changed, not just that something did.
+        let mut changed = std::fs::read(&path).expect("read");
+        let last = changed.len() - 1;
+        changed[last] ^= 0xFF;
+        std::fs::write(&path, &changed).expect("a newer save");
+        let lines = app.write_problems_given(&path, Ok(Vec::new()));
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert!(
+            lines[0].contains("読み込んだ後でファイルが変わっています"),
+            "{:?}",
+            lines
+        );
+        assert!(lines[0].contains("内容のハッシュ"), "{:?}", lines);
+
+        // Another file at another path is not "changed": its fingerprint is
+        // taken now instead of being compared with this file's.
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"not this save").expect("other");
+        assert!(
+            app.write_problems_given(&other, Ok(Vec::new())).is_empty(),
+            "another file is not the save that was read"
+        );
+    }
+
+    /// The whole write path: a stopped write lands nothing, the one-shot answer
+    /// runs it, and the state it remembers is the file it just wrote.
+    #[test]
+    fn a_stopped_write_lands_nothing_and_the_answer_writes_once() {
+        let dir = Scratch::new("stopped");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let mut changed = std::fs::read(&path).expect("read");
+        let last = changed.len() - 1;
+        changed[last] ^= 0x01;
+        std::fs::write(&path, &changed).expect("a newer save");
+        let newer = std::fs::read(&path).expect("read");
+
+        // The guard stops the write and records what it was about to do.
+        app.write_current(path.clone());
+        assert!(matches!(app.confirm, Confirm::UnsafeWrite), "{}", app.message);
+        assert!(
+            app.message.starts_with("書き込みませんでした（上書き保存）"),
+            "{}",
+            app.message
+        );
+        assert!(
+            MhnxEditor::message_is_failure(&app.message),
+            "a refusal is drawn in red, not as an ordinary note: {}",
+            app.message
+        );
+        let stopped = app.write_stopped.as_ref().expect("the write waits");
+        assert_eq!(stopped.target, WriteTarget::Current(path.clone()));
+        assert!(!stopped.reasons.is_empty());
+        assert_eq!(std::fs::read(&path).expect("read"), newer, "nothing was written");
+        assert!(!app.dirty, "the edits were not pushed into the save either");
+
+        // 「承知のうえで続ける」 runs that very write.
+        app.confirm = Confirm::None;
+        app.write_force = true;
+        app.write_current(path.clone());
+        assert!(app.message.contains("照合OK"), "{}", app.message);
+        assert!(!app.dirty);
+        assert!(app.write_stopped.is_none(), "the stopped write is gone");
+        let known = app.known_for(&path).expect("a fingerprint");
+        let on_disk = safety::fingerprint(&path).expect("fingerprint");
+        assert_eq!(known, on_disk, "the write moved the fingerprint with it");
+
+        // With nothing in the way a second save is not refused. Skipped when an
+        // emulator is running, because then it is refused for that reason - the
+        // machine-independent half is the test above.
+        if !an_emulator_is_running() {
+            app.write_current(path.clone());
+            assert!(!matches!(app.confirm, Confirm::UnsafeWrite), "{}", app.message);
+            assert!(app.message.contains("照合OK"), "{}", app.message);
+        }
+    }
+
+    /// A save that was never fingerprinted gets one at the write and keeps it,
+    /// which is the "指紋を取っていない" case rather than a refusal.
+    #[test]
+    fn a_write_without_a_loaded_fingerprint_takes_one_and_keeps_it() {
+        let dir = Scratch::new("takeone");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.known_for(&path).is_some());
+        // The state the audit described: the read left no fingerprint behind.
+        app.known_files.clear();
+        assert!(
+            app.write_problems_given(&path, Ok(Vec::new())).is_empty(),
+            "a missing fingerprint is not a refusal"
+        );
+        assert!(
+            app.known_for(&path).is_some(),
+            "a fingerprint was taken at the write"
+        );
+        // ... and it is used from then on: another byte in the same file is a
+        // change, not a fresh start.
+        let mut changed = std::fs::read(&path).expect("read");
+        let last = changed.len() - 1;
+        changed[last] ^= 0x10;
+        std::fs::write(&path, &changed).expect("a newer save");
+        let lines = app.write_problems_given(&path, Ok(Vec::new()));
+        assert_eq!(lines.len(), 1, "{:?}", lines);
+        assert!(lines[0].contains("変わっています"), "{:?}", lines);
+    }
+
+    /// The emulator line names the product and the process, and a list without
+    /// an emulator in it is not a refusal.
+    #[test]
+    fn an_emulator_is_named_with_the_process_that_matched() {
+        let line = MhnxEditor::emulator_line(&[
+            String::from("yuzu-early-access.exe"),
+            String::from("citra-qt.exe"),
+        ])
+        .expect("a refusal line");
+        assert!(line.starts_with("エミュレータが起動中です"), "{}", line);
+        assert!(line.contains("yuzu（yuzu-early-access.exe）"), "{}", line);
+        assert!(line.contains("Citra（citra-qt.exe）"), "{}", line);
+        assert!(MhnxEditor::emulator_line(&[String::from("explorer.exe")]).is_none());
+        assert!(MhnxEditor::emulator_line(&[]).is_none());
+    }
+
+    /// A copy of the real save goes through the guarded write path: what lands
+    /// on disk parses back, carries the edit, and the file it was copied from
+    /// is not touched. The sample is only ever read; everything is written to
+    /// a scratch folder.
+    #[test]
+    fn a_copy_of_the_sample_save_is_written_and_reads_back() {
+        let sample = PathBuf::from(r"C:anyWorkspace
+xjksv_readysystem");
+        if !sample.exists() {
+            return;
+        }
+        let original = std::fs::read(&sample).expect("read the sample");
+        let dir = Scratch::new("realsave");
+        let copy = dir.path().join("system");
+        std::fs::write(&copy, &original).expect("copy the sample save");
+        let mut app = MhnxEditor::default();
+        app.open_save(copy.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        {
+            let save = app.save.as_mut().expect("save");
+            assert!(
+                mhnx_core::guildcard::set_comment(save, 0, "コピーで試す"),
+                "the card comment is writable"
+            );
+        }
+        // The guard would refuse the write because an emulator is open on this
+        // machine, which is exactly what the answer to that dialog grants.
+        app.write_force = true;
+        app.write_current(copy.clone());
+        assert!(app.message.contains("照合OK"), "{}", app.message);
+        let written = std::fs::read(&copy).expect("read what was written");
+        assert_eq!(written.len(), SWITCH_SIZE);
+        let back = Save::from_bytes(&written).expect("the written copy still parses");
+        assert_eq!(
+            mhnx_core::guildcard::comment(&back, 0),
+            Some(String::from("コピーで試す"))
+        );
+        // The save the copy came from is untouched.
+        assert_eq!(std::fs::read(&sample).expect("read the sample"), original);
+    }
+
+    /// The sample save on this machine holds 24 received cards; the panel has
+    /// to show their values, not only their number. Skipped when the sample is
+    /// not there, the way the core tests do it.
+    #[test]
+    fn the_card_panel_reads_the_received_cards_of_the_sample_save() {
+        let sample = PathBuf::from(r"C:\anyWorkspace\nx\jksv_ready\system");
+        if !sample.exists() {
+            return;
+        }
+        let mut app = MhnxEditor::default();
+        app.open_save(sample);
+        assert!(app.save.is_some(), "{}", app.message);
+        let rows = app.card_rows(mhnx_core::guildcard::CardList::Stored);
+        assert_eq!(rows.len(), 24, "kept cards in the sample save");
+        assert_eq!(rows[0].name, "☆T&H☆");
+        assert_eq!(rows[0].hunter_rank, 693);
+        assert_eq!(rows[0].date, "2021/11/14");
+        let detail = app
+            .card_detail(mhnx_core::guildcard::CardList::Stored, 0)
+            .expect("the first card inflates");
+        assert_eq!(detail.comment, "見ちゃやーよww");
+        assert!(!detail.weapons.is_empty(), "the card shows weapon usage");
+        assert!(!detail.history.is_empty(), "the card carries its history");
     }
 }
 
