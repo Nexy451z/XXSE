@@ -4,9 +4,27 @@
 //! cells, `"` around any cell that holds a `,`, a `"` or a line break, and
 //! `\r\n` at the end of every line.
 //!
-//! Nothing but ids is written. The game data tables are not shipped with this
-//! crate, so a name column would be empty for everyone; an id is the part that
-//! can be checked against the save and it survives a round trip unchanged.
+//! Two equipment formats are read and the current one is written:
+//!
+//! * the current file appends `raw` (the 36 bytes of the record as hex) and
+//!   `name` (the Japanese name, for a human; it is never read back) to the
+//!   eight readable columns;
+//! * a file whose header has no `raw` cell is the old format, and it is read
+//!   exactly as it was before: the record is built from `kind`, `id`,
+//!   `level`, `transmog` and the three decoration ids. The header is the only
+//!   thing that tells the two apart.
+//!
+//! `raw` wins whenever it holds a record. The bytes below +0x0C - a talisman's
+//! skills, above all - are described by no readable column, so a file that
+//! carries `raw` is the only one that can reproduce such a record; a row whose
+//! readable columns disagree with its `raw` cell still writes `raw` and the
+//! report says so. Clearing the `raw` cell is how a row goes back to being
+//! built from its columns.
+//!
+//! The `name` cells are written from the tables the `gamedata` feature ships;
+//! without that feature they are empty. Either way they are for the reader and
+//! an import never looks at them, so a name that was edited (or is in another
+//! language) changes nothing.
 //!
 //! The two directions are deliberately not symmetric:
 //!
@@ -31,11 +49,19 @@ use crate::equipops;
 use crate::itembox::{ItemSlot, MAX_COUNT, TOTAL_ITEM_SLOTS};
 use crate::save::Save;
 
-/// Header of an item CSV: box position, item id, stack count.
-pub const ITEM_COLUMNS: [&str; 3] = ["slot", "id", "count"];
-/// Header of an equipment CSV.
-pub const EQUIP_COLUMNS: [&str; 8] = [
-    "index", "kind", "id", "level", "transmog", "deco1", "deco2", "deco3",
+/// Header of an item CSV: box position, item id, stack count, name.
+///
+/// The `name` cell is written for a human and never read back: [`parse_items`]
+/// stops after `count`, so a file of the old three column shape still parses.
+pub const ITEM_COLUMNS: [&str; 4] = ["slot", "id", "count", "name"];
+/// Header of the current equipment CSV.
+///
+/// The first eight columns are the old format, in the same positions, so an
+/// existing file keeps its meaning; `raw` and `name` are appended. `raw` is
+/// what [`parse_equipment`] looks for to tell the two formats apart, and it is
+/// the 36 bytes of the record as hex.
+pub const EQUIP_COLUMNS: [&str; 10] = [
+    "index", "kind", "id", "level", "transmog", "deco1", "deco2", "deco3", "raw", "name",
 ];
 
 /// Largest item id the 12 bit id field of a record holds.
@@ -78,6 +104,24 @@ pub enum CsvError {
         column: usize,
         name: &'static str,
     },
+    /// The `raw` cell holds something that is not hex digits.
+    NotHex {
+        line: usize,
+        column: usize,
+        value: String,
+    },
+    /// The `raw` cell does not hold exactly one record.
+    ///
+    /// A record is 36 bytes, so the cell has to be 72 hex digits: a short one
+    /// is a row that lost half its record, and a long one cannot be a single
+    /// record at all. `bytes` is what the cell decodes to (rounded up for a
+    /// cell with an odd number of digits).
+    RawLength {
+        line: usize,
+        column: usize,
+        bytes: usize,
+        expected: usize,
+    },
 }
 
 impl core::fmt::Display for CsvError {
@@ -111,6 +155,25 @@ impl core::fmt::Display for CsvError {
             CsvError::MissingColumn { line, column, name } => {
                 write!(f, "{} 行目の {} 列目 ({}) がありません", line, column, name)
             }
+            CsvError::NotHex {
+                line,
+                column,
+                value,
+            } => write!(
+                f,
+                "{} 行目の {} 列目の raw が 16 進数ではありません: {}",
+                line, column, value
+            ),
+            CsvError::RawLength {
+                line,
+                column,
+                bytes,
+                expected,
+            } => write!(
+                f,
+                "{} 行目の {} 列目の raw が {} バイトです（1 レコードは {} バイト）",
+                line, column, bytes, expected
+            ),
         }
     }
 }
@@ -146,6 +209,14 @@ pub struct EquipmentRow {
     pub transmog: u16,
     /// The three decoration sockets, 0 for an empty one.
     pub deco: [u16; 3],
+    /// The whole 36 byte record, when the file carried a `raw` cell.
+    ///
+    /// [`apply_equipment`] writes this as it stands whenever it is present,
+    /// because the bytes below +0x0C are described by no column and a
+    /// talisman only comes back whole from the record itself. `None` means
+    /// the row is built from the fields above, which is how a file of the old
+    /// format is read.
+    pub raw: Option<[u8; equip::EQUIP_RECORD]>,
 }
 
 /// What applying a file did.
@@ -383,15 +454,120 @@ fn is_header(row: &CsvRow, first: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// The raw column
+// ---------------------------------------------------------------------------
+
+/// Which column of a file holds `raw`, from its header.
+///
+/// The header is the only thing that tells the current format from the old
+/// one: a file whose header has no `raw` cell is read exactly as it was
+/// before, and its extra columns are ignored as they always were. The first
+/// header line decides, so a second header pasted lower down does not change
+/// the layout of the rows above it.
+fn raw_column(rows: &[CsvRow]) -> Option<usize> {
+    for row in rows {
+        if !is_header(row, EQUIP_COLUMNS[0]) {
+            continue;
+        }
+        return row
+            .fields
+            .iter()
+            .position(|f| f.trim().eq_ignore_ascii_case("raw"));
+    }
+    None
+}
+
+/// The `raw` cell of one row, decoded into a record.
+///
+/// The cell is the 36 bytes of the record as hex digits, either case, with
+/// spaces allowed between them: a hex dump pasted from a debugger keeps its
+/// spaces. An empty cell is `None`, which means the row is described by its
+/// columns instead. Anything that is not exactly one record is refused with
+/// the line it is on, because half a record written over a real one is data
+/// lost.
+fn raw_record(
+    row: &CsvRow,
+    column: usize,
+) -> Result<Option<[u8; equip::EQUIP_RECORD]>, CsvError> {
+    let text = cell(row, column);
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let mut nibbles = Vec::with_capacity(equip::EQUIP_RECORD * 2);
+    for c in text.chars() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        let Some(digit) = c.to_digit(16) else {
+            return Err(CsvError::NotHex {
+                line: row.line,
+                column: column + 1,
+                value: String::from(text),
+            });
+        };
+        nibbles.push(digit as u8);
+    }
+    // An odd digit count is half a byte, so it is counted up for the message
+    // and refused either way.
+    let bytes = nibbles.len().div_ceil(2);
+    if nibbles.len() % 2 != 0 || bytes != equip::EQUIP_RECORD {
+        return Err(CsvError::RawLength {
+            line: row.line,
+            column: column + 1,
+            bytes,
+            expected: equip::EQUIP_RECORD,
+        });
+    }
+    let mut out = [0u8; equip::EQUIP_RECORD];
+    for (i, pair) in nibbles.chunks(2).enumerate() {
+        out[i] = (pair[0] << 4) | pair[1];
+    }
+    Ok(Some(out))
+}
+
+/// The 36 bytes of a record as the text of the `raw` column.
+///
+/// Lower case, no separators: 72 characters, which is what [`raw_record`]
+/// reads back.
+fn raw_text(record: &[u8]) -> String {
+    use core::fmt::Write as _;
+    let mut out = String::with_capacity(equip::EQUIP_RECORD * 2);
+    for byte in record.iter().take(equip::EQUIP_RECORD) {
+        // Writing into a String cannot fail.
+        let _ = write!(out, "{:02x}", byte);
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Item box
 // ---------------------------------------------------------------------------
 
+/// Name of an item, for the `name` column.
+///
+/// Empty without the `gamedata` feature: the game tables are not part of the
+/// core crate, and a file without names still round trips unchanged. An id
+/// past the end of the table is empty too, never a panic.
+#[cfg(feature = "gamedata")]
+fn item_name(id: u16) -> &'static str {
+    crate::gamedata::ITEM_NAME_LIST
+        .get(id as usize)
+        .copied()
+        .unwrap_or("")
+}
+
+/// Name of an item, for the `name` column, when the tables are not built in.
+#[cfg(not(feature = "gamedata"))]
+fn item_name(_id: u16) -> &'static str {
+    ""
+}
+
 /// The item box of one character as CSV.
 ///
-/// Every one of the 2300 records is written, blank ones as `slot,0,0`, so
+/// Every one of the 2300 records is written, blank ones as `slot,0,0,`, so
 /// [`apply_items`] can reproduce the box - including where its holes are - from
 /// the file alone. A slot the save does not have yields the header and nothing
-/// else.
+/// else. The `name` cell is for a human and is never read back.
 pub fn items_to_csv(save: &Save, slot: usize) -> String {
     let mut out = csv_line(&ITEM_COLUMNS);
     let Some(items) = save.read_item_box(slot) else {
@@ -402,6 +578,7 @@ pub fn items_to_csv(save: &Save, slot: usize) -> String {
             &index.to_string(),
             &item.id.to_string(),
             &item.count.to_string(),
+            item_name(item.id),
         ]));
     }
     out
@@ -503,11 +680,28 @@ pub fn apply_items(save: &mut Save, slot: usize, rows: &[(u16, u16)]) -> ApplyRe
 // Equipment box
 // ---------------------------------------------------------------------------
 
+/// Name of an equipment record, for the `name` column.
+///
+/// Empty without the `gamedata` feature, like the item names: a save still
+/// round trips without the tables.
+#[cfg(feature = "gamedata")]
+fn equipment_name(equipment: &equip::Equipment) -> &'static str {
+    equip::name(equipment)
+}
+
+/// Name of an equipment record, for the `name` column, without the tables.
+#[cfg(not(feature = "gamedata"))]
+fn equipment_name(_equipment: &equip::Equipment) -> &'static str {
+    ""
+}
+
 /// The equipment box of one character as CSV.
 ///
 /// Only the records that hold something are written; the empty part of the box
 /// is 2000 rows of nothing and the box is written by position, not by packing
-/// the rows.
+/// the rows. Every row carries the whole record in `raw`, so a talisman
+/// (whose skills live below +0x0C, out of reach of the readable columns) comes
+/// back byte for byte. The `name` cell is for a human and never read back.
 pub fn equipment_to_csv(save: &Save, slot: usize) -> String {
     let mut out = csv_line(&EQUIP_COLUMNS);
     let Some(box_bytes) = save.equipment_box(slot) else {
@@ -537,6 +731,8 @@ pub fn equipment_to_csv(save: &Save, slot: usize) -> String {
             &deco[0].to_string(),
             &deco[1].to_string(),
             &deco[2].to_string(),
+            &raw_text(record),
+            equipment_name(&equipment),
         ]));
     }
     out
@@ -544,12 +740,18 @@ pub fn equipment_to_csv(save: &Save, slot: usize) -> String {
 
 /// Read an equipment file.
 ///
-/// All eight columns are needed: the level and the layered id are part of the
-/// record, and a row that left them out would overwrite them with whatever the
-/// default were. Extra columns are ignored and a header line is skipped.
+/// All eight readable columns are needed: the level and the layered id are part
+/// of the record, and a row that left them out would overwrite them with
+/// whatever the default were. The `raw` cell is optional - empty means the row
+/// is built from those columns - and the column itself exists only when the
+/// header names it, which is how the old format is told from the current one.
+/// `name` and any other extra column are ignored: a name that was edited or is
+/// in another language changes nothing.
 pub fn parse_equipment(csv: &str) -> Result<Vec<EquipmentRow>, CsvError> {
+    let rows = parse_rows(csv)?;
+    let raw_at = raw_column(&rows);
     let mut out = Vec::new();
-    for row in parse_rows(csv)? {
+    for row in rows {
         if is_header(&row, EQUIP_COLUMNS[0]) {
             continue;
         }
@@ -570,6 +772,10 @@ pub fn parse_equipment(csv: &str) -> Result<Vec<EquipmentRow>, CsvError> {
                 ranged(&row, 6, EQUIP_COLUMNS[6], 0, u16::MAX as i64)?,
                 ranged(&row, 7, EQUIP_COLUMNS[7], 0, u16::MAX as i64)?,
             ],
+            raw: match raw_at {
+                Some(column) => raw_record(&row, column)?,
+                None => None,
+            },
         });
     }
     Ok(out)
@@ -577,7 +783,16 @@ pub fn parse_equipment(csv: &str) -> Result<Vec<EquipmentRow>, CsvError> {
 
 /// Write parsed equipment rows back into a slot.
 ///
-/// A row for a record that already holds something goes through
+/// A row that carries `raw` is written as that whole record, at the index the
+/// row names, whether the record there was blank or not: the file describes
+/// the record itself, so a talisman's skills, its rarity byte and everything
+/// else below +0x0C come back byte for byte. A `raw` whose type byte is zero
+/// is refused like a row with no type, because 36 zero bytes over a used
+/// record is a delete this import was not asked for. The readable columns are
+/// only a description then; when they disagree with `raw` the row still
+/// writes `raw` and the report says so.
+///
+/// A row without `raw` for a record that already holds something goes through
 /// [`equipops::replace`] when its type or id moved, and through the field
 /// helpers of [`crate::equip`] otherwise, so the bytes below +0x0C (a
 /// talisman's skills, above all) are left as they were. The layered id's source
@@ -601,6 +816,50 @@ pub fn apply_equipment(save: &mut Save, slot: usize, rows: &[EquipmentRow]) -> A
                 row.index,
                 equip::EQUIP_COUNT - 1
             ));
+            continue;
+        }
+        if let Some(raw) = row.raw {
+            // The record itself, written as it stands. Nothing below +0x0C is
+            // in a column, so this is the only path that brings a talisman
+            // back whole.
+            let decoded = equip::decode_record(row.index, &raw);
+            if decoded.map(|d| d.kind == 0).unwrap_or(true) {
+                report.skipped += 1;
+                report.messages.push(format!(
+                    "枠 {} は raw の種類が空きなので書きませんでした",
+                    row.index
+                ));
+                continue;
+            }
+            if let Some(decoded) = decoded {
+                let same = decoded.kind == row.kind
+                    && decoded.id == row.id
+                    && decoded.level == row.level
+                    && decoded.transmog == row.transmog
+                    && equip::Equipment::decorations(row.index, &raw) == row.deco;
+                if !same {
+                    report.messages.push(format!(
+                        "枠 {} は列と raw が食い違うため raw を優先しました",
+                        row.index
+                    ));
+                }
+            }
+            let Some(record) = save.equipment_record_mut(slot, row.index) else {
+                report.skipped += 1;
+                report
+                    .messages
+                    .push(format!("枠 {} の装備ボックスが読めません", row.index));
+                continue;
+            };
+            if record.len() < equip::EQUIP_RECORD {
+                report.skipped += 1;
+                report
+                    .messages
+                    .push(format!("枠 {} に書き込めませんでした", row.index));
+                continue;
+            }
+            record[..equip::EQUIP_RECORD].copy_from_slice(&raw);
+            report.applied += 1;
             continue;
         }
         if row.kind == 0 {

@@ -11,6 +11,7 @@ use mhnx_core::arc::Arc;
 use mhnx_core::csvout::{self, ApplyReport};
 use mhnx_core::dlc;
 use mhnx_core::quest::{Gmd, Mib};
+use mhnx_core::safety::{self, Fingerprint};
 use mhnx_core::save::{self, Save, SaveKind};
 
 fn usage() {
@@ -26,7 +27,7 @@ USAGE:
   mhnx arc-mib <file.arc>              dump the .mib fields of a quest
   mhnx arc-gmd <file.arc>              dump the quest text
   mhnx arc-repack <in.arc> <out.arc>   decompress and recompress an archive
-  mhnx install <system> <file.arc>     install a quest into the save's DLC slots
+  mhnx install <system> <file.arc> [--force]     install a quest into the save's DLC slots
   mhnx dlc-list <system>               list installed download quests
   mhnx dlc-extract <system> <outdir> [id...]   write the quest arcs out of the save
   mhnx dlc-export <system> <outdir>    same, but every quest in the save
@@ -38,11 +39,11 @@ USAGE:
   mhnx charms <system> [slot]          list the charms of a character (slot 1-3)
   mhnx skills                          list every skill name and its id
   mhnx slot-export <system> <slot> <out>   write one character slot (.saveslot)
-  mhnx slot-import <system> <slot> <in>    read one character slot back
+  mhnx slot-import <system> <slot> <in> [--force]   read one character slot back
   mhnx items <system> [slot]           item box summary with item names
   mhnx cats                            list the downloadable Palicoes and their ids
-  mhnx cat-add <system> <jp|en> <id>   install a download Palico
-  mhnx cat-del <system> <index>        remove a download Palico from a slot
+  mhnx cat-add <system> <jp|en> <id> [--force]   install a download Palico
+  mhnx cat-del <system> <index> [--force]        remove a download Palico from a slot
   mhnx add-quest <system> <in.arc> <out>   add a quest the save does not list yet
   mhnx arc-compact <in.arc> <out.arc>  drop the romfs padding so it fits a slot
   mhnx hunts <system> [slot]           hunt records: slays, captures, sizes
@@ -57,17 +58,27 @@ USAGE:
   mhnx verify <system>                 compare the file with its own round trip, read only
   mhnx snapshot <system>               keep a copy of the save in snapshots/, newest 10 kept
   mhnx snapshots <system>              list the kept snapshots, newest first
-  mhnx restore <system> <name>         put a snapshot back, snapshotting the current save first
+  mhnx restore <system> <name> [--force]   put a snapshot back, snapshotting the current save first
   mhnx csv-items <save> <out.csv> [--slot N]        write the item box as CSV
   mhnx csv-equipment <save> <out.csv> [--slot N]    write the equipment box as CSV
   mhnx import-items <save> <in.csv> [--slot N] [--force]   read a CSV back into the item box
-  mhnx import-equipment <save> <in.csv> [--slot N]  read a CSV back into the equipment box
+  mhnx import-equipment <save> <in.csv> [--slot N] [--force]  read a CSV back into the equipment box
   mhnx pouch <save> [--slot N]         show the 32 pouch slots
   mhnx sets <save> [--slot N]          item sets and equipment sets, summarised
 
 Commands that rewrite a save in place keep a copy next to it as <file>.bak.
 Snapshots live in <save's directory>/snapshots/ and are named
 <stem>-YYYYMMDD-HHMMSS.sav.
+
+Before any of them writes, two checks run that the reference editor also runs:
+  * no emulator is running (yuzu, suyu, Sudachi, Citron, Torzu, Nuzu, Ryujinx,
+    Ryubing, Kenji-NX, Pomelo, Citra, Lime3DS, Azahar, Panda3DS, and the forks
+    that carry one of those names);
+  * the save still has the size, the timestamp and the contents it had when the
+    command read it.
+A command that fails either check writes nothing and says which process is
+running, or what changed and when. --force on the commands above continues
+anyway; it never gets past a read-only or a missing file.
 
 The CSV commands and the set commands take --slot N to choose the character:
 0, 1 or 2, defaulting to 0, and a slot the save has no character in is an
@@ -238,7 +249,8 @@ fn cmd_arc_repack(src: &str, out: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_install(save_path: &str, arc_path: &str) -> Result<(), String> {
+fn cmd_install(save_path: &str, arc_path: &str, force: bool) -> Result<(), String> {
+    let loaded = loaded_fingerprint(save_path);
     let mut s = Save::from_bytes(&read(save_path)?).map_err(|e| e.to_string())?;
     let raw = read(arc_path)?;
     let a = Arc::parse(&raw).map_err(|e| e.to_string())?;
@@ -251,7 +263,7 @@ fn cmd_install(save_path: &str, arc_path: &str) -> Result<(), String> {
         .ok_or("short .mib")?;
     let slot = dlc::install_quest(&mut s, id as i32, &raw).map_err(|e| e.to_string())?;
     let out = s.to_bytes();
-    write_in_place(save_path, &out)?;
+    write_in_place(save_path, &out, loaded.as_ref(), force)?;
     println!("installed quest {} into slot {} of {}", id, slot, save_path);
     println!("NOTE: write system_backup too - the game keeps the pair in sync");
     Ok(())
@@ -275,12 +287,170 @@ fn num<T: std::str::FromStr>(text: &str, what: &str) -> Result<T, String> {
         .map_err(|_| format!("{} must be a number, got {:?}", what, text))
 }
 
+/// The file's state at the moment a command read it, when it could be taken.
+///
+/// Taken before the bytes are read: a change that lands during the read then
+/// shows up as a difference at write time instead of being missed. A save whose
+/// state cannot be recorded is one the check below cannot clear, so the note
+/// printed here is the reason a later run needs --force.
+fn loaded_fingerprint(path: &str) -> Option<Fingerprint> {
+    match safety::fingerprint(Path::new(path)) {
+        Ok(fingerprint) => Some(fingerprint),
+        Err(e) => {
+            eprintln!("note: {} の読み込み時の状態を記録できません: {}", path, e);
+            None
+        }
+    }
+}
+
+/// What the checks could see, kept apart from the decision so the decision can
+/// be tested without a filesystem or a running emulator.
+struct Observed {
+    /// The file as it is now; the sentence to show when it cannot be read.
+    current: Result<Fingerprint, String>,
+    /// Emulator processes running now; the sentence to show when the process
+    /// table cannot be read at all.
+    emulators: Result<Vec<String>, String>,
+    /// The file is marked read-only, so the write would be refused by the OS.
+    read_only: bool,
+}
+
+/// Look at the file and at the process table, without judging anything yet.
+fn observe(path: &str) -> Observed {
+    let target = Path::new(path);
+    let current = match safety::fingerprint(target) {
+        Ok(fingerprint) => Ok(fingerprint),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(format!("書き込み先が見つかりません: {} ({})", path, e))
+        }
+        Err(e) => Err(format!("書き込み先の状態を確認できません: {} ({})", path, e)),
+    };
+    let emulators =
+        safety::try_running_emulators().map_err(|e| format!("プロセスの一覧を読めません: {}", e));
+    Observed {
+        current,
+        emulators,
+        read_only: safety::is_read_only(target),
+    }
+}
+
+/// Refuse the write, or let it through, from what was observed.
+///
+/// There are two classes of reason. --force may override the first: an emulator
+/// is running, the save changed after the command read it, or the checks could
+/// not look at all. It may not override the second: a read-only file or one
+/// that is not there cannot be written correctly, so forcing those would only
+/// produce a half-written save.
+fn decide(
+    path: &str,
+    loaded: Option<&Fingerprint>,
+    observed: &Observed,
+    force: bool,
+) -> Result<(), String> {
+    let mut soft: Vec<String> = Vec::new();
+    let mut hard: Vec<String> = Vec::new();
+
+    match &observed.emulators {
+        Err(e) => soft.push(format!("エミュレータが動いていないか確認できません: {}", e)),
+        Ok(names) if !names.is_empty() => soft.push(format!(
+            "エミュレータが起動しています: {}（開いたままのセーブに書き込むと、ゲーム側の保存で消えます）",
+            names.join(", ")
+        )),
+        Ok(_) => {}
+    }
+
+    match &observed.current {
+        Err(text) => hard.push(text.clone()),
+        Ok(current) => match loaded {
+            None => soft.push(format!(
+                "読み込み時の状態を記録できていないため、{} が読み込んだ後に変わっていないか確認できません",
+                path
+            )),
+            Some(loaded) if safety::is_stale(loaded, current) => {
+                soft.push(format!("{} は読み込んだ後に変わっています:", path));
+                soft.extend(safety::changes(loaded, current));
+                soft.push(String::from(
+                    "別のエディタかエミュレータが書き込んだ可能性があります",
+                ));
+            }
+            Some(_) => {}
+        },
+    }
+
+    if observed.read_only {
+        hard.push(format!(
+            "ファイルが読み取り専用です: {}（プロパティで読み取り専用を外してください）",
+            path
+        ));
+    }
+
+    if !hard.is_empty() {
+        return Err(blocked(path, &hard, false));
+    }
+    if !soft.is_empty() {
+        if !force {
+            return Err(blocked(path, &soft, true));
+        }
+        // Say which check was overridden, so the run does not look as if it
+        // passed them.
+        eprintln!(
+            "warning: 安全確認を --force で飛ばして書き込みます: {}",
+            path
+        );
+        for line in &soft {
+            eprintln!("  {}", line);
+        }
+    }
+    Ok(())
+}
+
+/// The sentence a refused write ends with.
+fn blocked(path: &str, reasons: &[String], forceable: bool) -> String {
+    let mut message = format!("書き込みませんでした: {}", path);
+    for reason in reasons {
+        message.push_str("\n  ");
+        message.push_str(reason);
+    }
+    if forceable {
+        message.push_str(
+            "\n理由を解消してからやり直してください（承知のうえで続けるなら --force を付けてください）。",
+        );
+    } else {
+        message.push_str("\n--force を付けても通りません。先にこの状態を直してください。");
+    }
+    message
+}
+
+/// Everything that has to hold before a save is replaced in place.
+fn check_write_allowed(
+    path: &str,
+    loaded: Option<&Fingerprint>,
+    force: bool,
+) -> Result<(), String> {
+    let observed = observe(path);
+    decide(path, loaded, &observed, force)
+}
+
 /// Write a save back over the file it came from, keeping a copy first.
 ///
 /// These commands take the save path and nothing else, so they rewrite the
 /// user's file in place. A tool that can do that without leaving a copy is one
-/// bad run away from losing a save.
-fn write_in_place(path: &str, bytes: &[u8]) -> Result<(), String> {
+/// bad run away from losing a save; the check in front of the write is about
+/// the same loss from the other side, where something else is holding the file
+/// or has already changed it.
+fn write_in_place(
+    path: &str,
+    bytes: &[u8],
+    loaded: Option<&Fingerprint>,
+    force: bool,
+) -> Result<(), String> {
+    check_write_allowed(path, loaded, force)?;
+    replace_save(path, bytes)
+}
+
+/// The write itself, for a caller that already ran the checks - the restore
+/// command, which has to refuse before its snapshot is taken.
+fn replace_save(path: &str, bytes: &[u8]) -> Result<(), String> {
     let bak = format!("{}.bak", path);
     if let Ok(old) = std::fs::read(path) {
         std::fs::write(&bak, &old).map_err(|e| format!("cannot keep a copy at {}: {}", bak, e))?;
@@ -808,10 +978,11 @@ fn cmd_slot_export(save: &str, slot: usize, out: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_slot_import(save: &str, slot: usize, inp: &str) -> Result<(), String> {
+fn cmd_slot_import(save: &str, slot: usize, inp: &str, force: bool) -> Result<(), String> {
     if !(1..=3).contains(&slot) {
         return Err(String::from("slot must be 1, 2 or 3"));
     }
+    let loaded = loaded_fingerprint(save);
     let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
     let data = read(inp)?;
     s.import_slot(slot - 1, &data).map_err(|e| e.to_string())?;
@@ -820,7 +991,7 @@ fn cmd_slot_import(save: &str, slot: usize, inp: &str) -> Result<(), String> {
         .map(|c| c.name)
         .unwrap_or_default();
     let out = s.to_bytes();
-    write_in_place(save, &out)?;
+    write_in_place(save, &out, loaded.as_ref(), force)?;
     println!(
         "imported {} bytes into slot {} (character {}) of {}",
         data.len(),
@@ -895,26 +1066,28 @@ fn cmd_cats() -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_cat_add(save: &str, lang: &str, id: u8) -> Result<(), String> {
+fn cmd_cat_add(save: &str, lang: &str, id: u8, force: bool) -> Result<(), String> {
     use mhnx_core::dlcats::Lang;
     let lang = match lang {
         "jp" | "JP" => Lang::Jp,
         "en" | "EN" => Lang::En,
         other => return Err(format!("language must be jp or en, got {}", other)),
     };
+    let loaded = loaded_fingerprint(save);
     let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
     let slot = s.install_dlc_palico(lang, id).map_err(|e| e.to_string())?;
-    write_in_place(save, &s.to_bytes())?;
+    write_in_place(save, &s.to_bytes(), loaded.as_ref(), force)?;
     let name = s.dlc_palicoes().get(slot).map(|c| c.name.clone()).unwrap_or_default();
     println!("installed {} (id 0x{:02X}) into slot {}", name, id, slot + 1);
     println!("NOTE: write system_backup too");
     Ok(())
 }
 
-fn cmd_cat_del(save: &str, index: usize) -> Result<(), String> {
+fn cmd_cat_del(save: &str, index: usize, force: bool) -> Result<(), String> {
     if !(1..=50).contains(&index) {
         return Err(String::from("index must be 1..50"));
     }
+    let loaded = loaded_fingerprint(save);
     let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
     let name = s
         .dlc_palicoes()
@@ -924,7 +1097,7 @@ fn cmd_cat_del(save: &str, index: usize) -> Result<(), String> {
     if !s.remove_dlc_palico(index - 1) {
         return Err(String::from("could not clear the slot"));
     }
-    write_in_place(save, &s.to_bytes())?;
+    write_in_place(save, &s.to_bytes(), loaded.as_ref(), force)?;
     println!("removed slot {} ({})", index, name);
     Ok(())
 }
@@ -1299,7 +1472,8 @@ fn cmd_snapshots(save: &str) -> Result<(), String> {
 }
 
 /// Put a snapshot back over the save, after snapshotting what is there now.
-fn cmd_restore(save: &str, name: &str) -> Result<(), String> {
+fn cmd_restore(save: &str, name: &str, force: bool) -> Result<(), String> {
+    let loaded = loaded_fingerprint(save);
     if name.is_empty()
         || name.contains('/')
         || name.contains('\\')
@@ -1338,10 +1512,13 @@ fn cmd_restore(save: &str, name: &str) -> Result<(), String> {
         ));
     }
 
+    // Refuse before the snapshot is taken: a refused restore must not rotate
+    // the snapshots of the save away.
+    check_write_allowed(save, loaded.as_ref(), force)?;
     let (made, dropped) = write_snapshot(save, Some(name))?;
     println!("現在の内容を {} に残しました", made.display());
     report_dropped(&dropped);
-    write_in_place(save, &wanted)?;
+    replace_save(save, &wanted)?;
     println!(
         "restored {} ({} bytes, {}) from {}",
         save,
@@ -1362,20 +1539,21 @@ struct Flags {
     /// so does --slot; the messages name the slot one higher, like the rest of
     /// this tool, so the two never look the same by accident.
     slot: usize,
-    /// Allow an import that would empty records holding something now.
-    force: bool,
     /// The arguments that are not options, in the order they were given.
     positional: Vec<String>,
 }
 
-/// Split `--slot N` and `--force` out of the argument list.
+/// Split --slot N out of the argument list.
+///
+/// --force is taken off before this runs: every command that rewrites a save
+/// in place accepts it and the others reject it, so here it would only be an
+/// unknown option.
 ///
 /// An unknown option is refused instead of skipped: these commands rewrite a
 /// save, so a mistyped `--slto 2` must not quietly work on slot 0.
 fn parse_flags(args: &[String]) -> Result<Flags, String> {
     let mut flags = Flags {
         slot: 0,
-        force: false,
         positional: Vec::new(),
     };
     let mut i = 0;
@@ -1390,12 +1568,9 @@ fn parse_flags(args: &[String]) -> Result<Flags, String> {
         } else if let Some(value) = arg.strip_prefix("--slot=") {
             flags.slot = num(value, "--slot")?;
             i += 1;
-        } else if arg == "--force" {
-            flags.force = true;
-            i += 1;
         } else if arg.starts_with("--") {
             return Err(format!(
-                "unknown option {} (these commands take --slot N and --force)",
+                "unknown option {} (these commands take --slot N)",
                 arg
             ));
         } else {
@@ -1415,7 +1590,7 @@ fn command_usage(name: &str) -> &'static str {
         "csv-items" => "mhnx csv-items <save> <out.csv> [--slot N]",
         "csv-equipment" => "mhnx csv-equipment <save> <out.csv> [--slot N]",
         "import-items" => "mhnx import-items <save> <in.csv> [--slot N] [--force]",
-        "import-equipment" => "mhnx import-equipment <save> <in.csv> [--slot N]",
+        "import-equipment" => "mhnx import-equipment <save> <in.csv> [--slot N] [--force]",
         "pouch" => "mhnx pouch <save> [--slot N]",
         "sets" => "mhnx sets <save> [--slot N]",
         _ => "mhnx",
@@ -1530,6 +1705,7 @@ fn cmd_csv_equipment(save: &str, out: &str, slot: usize) -> Result<(), String> {
 /// now, the command lists what would go and stops; `--force` is the only way
 /// past it. Nothing is written before that decision either way.
 fn cmd_import_items(save: &str, inp: &str, slot: usize, force: bool) -> Result<(), String> {
+    let loaded = loaded_fingerprint(save);
     let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
     let slot = checked_slot(&s, slot)?;
     let current = s
@@ -1582,7 +1758,7 @@ fn cmd_import_items(save: &str, inp: &str, slot: usize, force: bool) -> Result<(
     }
     let out = s.to_bytes();
     let label = slot_label(&s, slot);
-    write_in_place(save, &out)?;
+    write_in_place(save, &out, loaded.as_ref(), force)?;
     println!("{} applied to {} in {}", inp, label, save);
     println!("NOTE: write system_backup too - the game keeps the pair in sync");
     Ok(())
@@ -1593,7 +1769,8 @@ fn cmd_import_items(save: &str, inp: &str, slot: usize, force: bool) -> Result<(
 /// A row names the record it belongs to, so a record the file does not mention
 /// keeps what it had; nothing is emptied here. A row that would move a record
 /// other sets point at is refused by the core and reported, not forced.
-fn cmd_import_equipment(save: &str, inp: &str, slot: usize) -> Result<(), String> {
+fn cmd_import_equipment(save: &str, inp: &str, slot: usize, force: bool) -> Result<(), String> {
+    let loaded = loaded_fingerprint(save);
     let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
     let slot = checked_slot(&s, slot)?;
     if s.equipment_box(slot).is_none() {
@@ -1616,7 +1793,7 @@ fn cmd_import_equipment(save: &str, inp: &str, slot: usize) -> Result<(), String
     }
     let out = s.to_bytes();
     let label = slot_label(&s, slot);
-    write_in_place(save, &out)?;
+    write_in_place(save, &out, loaded.as_ref(), force)?;
     println!("{} applied to {} in {}", inp, label, save);
     println!("NOTE: write system_backup too - the game keeps the pair in sync");
     Ok(())
@@ -1727,11 +1904,40 @@ fn warning_tag(count: usize) -> String {
     }
 }
 
+/// The commands that can overwrite the save they were given.
+///
+/// The rest refuse --force: a flag that silently does nothing is worse than one
+/// that is rejected.
+fn rewrites_in_place(command: &str) -> bool {
+    matches!(
+        command,
+        "install"
+            | "slot-import"
+            | "cat-add"
+            | "cat-del"
+            | "restore"
+            | "import-items"
+            | "import-equipment"
+    )
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // --force is taken off before the command is looked at rather than parsed
+    // by each one: every command that rewrites a save in place accepts it, and
+    // the ones that do not must refuse it instead of quietly ignoring it.
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let force = args.iter().any(|arg| arg == "--force");
+    args.retain(|arg| arg != "--force");
     if args.is_empty() {
         usage();
         return ExitCode::SUCCESS;
+    }
+    if force && !rewrites_in_place(&args[0]) {
+        eprintln!(
+            "error: --force is only for the commands that rewrite a save in place: \
+             install, slot-import, cat-add, cat-del, restore, import-items, import-equipment"
+        );
+        return ExitCode::FAILURE;
     }
     let r = match args[0].as_str() {
         "info" if args.len() == 2 => cmd_info(&args[1]),
@@ -1742,7 +1948,7 @@ fn main() -> ExitCode {
         "arc-mib" if args.len() == 2 => cmd_arc_mib(&args[1]),
         "arc-gmd" if args.len() == 2 => cmd_arc_gmd(&args[1]),
         "arc-repack" if args.len() == 3 => cmd_arc_repack(&args[1], &args[2]),
-        "install" if args.len() == 3 => cmd_install(&args[1], &args[2]),
+        "install" if args.len() == 3 => cmd_install(&args[1], &args[2], force),
         "dlc-list" if args.len() == 2 => cmd_dlc_list(&args[1]),
         "dlc-extract" if args.len() >= 3 => cmd_dlc_extract(&args[1], &args[2], &args[3..]),
         "dlc-export" if args.len() == 3 => cmd_dlc_extract(&args[1], &args[2], &[]),
@@ -1791,16 +1997,16 @@ fn main() -> ExitCode {
             cmd_slot_export(&args[1], num(&args[2], "slot")?, &args[3])
         })(),
         "slot-import" if args.len() == 4 => (|| {
-            cmd_slot_import(&args[1], num(&args[2], "slot")?, &args[3])
+            cmd_slot_import(&args[1], num(&args[2], "slot")?, &args[3], force)
         })(),
         "items" if args.len() == 2 => cmd_items(&args[1], None),
         "items" if args.len() == 3 => cmd_items(&args[1], args[2].parse().ok()),
         "cats" if args.len() == 1 => cmd_cats(),
         "cat-add" if args.len() == 4 => match parse_id(&args[3]) {
-            Ok(id) => cmd_cat_add(&args[1], &args[2], id),
+            Ok(id) => cmd_cat_add(&args[1], &args[2], id, force),
             Err(e) => Err(e),
         },
-        "cat-del" if args.len() == 3 => (|| cmd_cat_del(&args[1], num(&args[2], "index")?))(),
+        "cat-del" if args.len() == 3 => (|| cmd_cat_del(&args[1], num(&args[2], "index")?, force))(),
         "verify" if args.len() == 2 => match cmd_verify(&args[1]) {
             Ok(true) => Ok(()),
             // A difference is a finding, so say it once and exit 1.
@@ -1809,18 +2015,12 @@ fn main() -> ExitCode {
         },
         "snapshot" if args.len() == 2 => cmd_snapshot(&args[1]),
         "snapshots" if args.len() == 2 => cmd_snapshots(&args[1]),
-        "restore" if args.len() == 3 => cmd_restore(&args[1], &args[2]),
+        "restore" if args.len() == 3 => cmd_restore(&args[1], &args[2], force),
         "csv-items" | "csv-equipment" | "import-items" | "import-equipment" | "pouch"
         | "sets" => {
             let name = args[0].as_str();
             (|| {
                 let flags = parse_flags(&args[1..])?;
-                if flags.force && name != "import-items" {
-                    return Err(format!(
-                        "--force is only for import-items\nusage: {}",
-                        command_usage(name)
-                    ));
-                }
                 let count = flags.positional.len();
                 let expected = match name {
                     "csv-items" | "csv-equipment" | "import-items" | "import-equipment" => 2,
@@ -1849,12 +2049,13 @@ fn main() -> ExitCode {
                         &flags.positional[0],
                         &flags.positional[1],
                         flags.slot,
-                        flags.force,
+                        force,
                     ),
                     "import-equipment" if count == 2 => cmd_import_equipment(
                         &flags.positional[0],
                         &flags.positional[1],
                         flags.slot,
+                        force,
                     ),
                     "pouch" if count == 1 => cmd_pouch(&flags.positional[0], flags.slot),
                     "sets" if count == 1 => cmd_sets(&flags.positional[0], flags.slot),
@@ -1873,6 +2074,272 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {}", e);
             ExitCode::FAILURE
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// A fingerprint with a fixed timestamp, for the comparisons.
+    fn at(size: u64, secs: u64, hash: u64) -> Fingerprint {
+        Fingerprint {
+            size,
+            modified: Some(UNIX_EPOCH + Duration::from_secs(secs)),
+            hash,
+        }
+    }
+
+    /// What a clean look at an unchanged file produces.
+    fn clean(current: Fingerprint) -> Observed {
+        Observed {
+            current: Ok(current),
+            emulators: Ok(Vec::new()),
+            read_only: false,
+        }
+    }
+
+    fn temp_path(tag: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "mhnx_cli_{}_{}_{}.sav",
+            std::process::id(),
+            tag,
+            now
+        ))
+    }
+
+    #[test]
+    fn an_unchanged_save_with_no_emulator_is_allowed() {
+        let fingerprint = at(100, 1_000, 7);
+        assert!(decide("save", Some(&fingerprint), &clean(fingerprint.clone()), false).is_ok());
+    }
+
+    #[test]
+    fn a_save_that_changed_after_the_read_needs_force() {
+        let loaded = at(100, 1_000, 7);
+        let observed = clean(at(100, 1_001, 7));
+        let error = decide("save", Some(&loaded), &observed, false).unwrap_err();
+        assert!(error.contains("変わっています"), "{}", error);
+        assert!(error.contains("--force"), "{}", error);
+        assert!(decide("save", Some(&loaded), &observed, true).is_ok());
+    }
+
+    #[test]
+    fn a_running_emulator_is_named_and_needs_force() {
+        let fingerprint = at(100, 1_000, 7);
+        let observed = Observed {
+            current: Ok(fingerprint.clone()),
+            emulators: Ok(vec![String::from("Ryujinx.exe")]),
+            read_only: false,
+        };
+        let error = decide("save", Some(&fingerprint), &observed, false).unwrap_err();
+        assert!(error.contains("Ryujinx.exe"), "{}", error);
+        assert!(decide("save", Some(&fingerprint), &observed, true).is_ok());
+    }
+
+    #[test]
+    fn a_process_table_that_cannot_be_read_needs_force() {
+        let fingerprint = at(100, 1_000, 7);
+        let observed = Observed {
+            current: Ok(fingerprint.clone()),
+            emulators: Err(String::from("Access is denied")),
+            read_only: false,
+        };
+        let error = decide("save", Some(&fingerprint), &observed, false).unwrap_err();
+        assert!(error.contains("確認できません"), "{}", error);
+        assert!(decide("save", Some(&fingerprint), &observed, true).is_ok());
+    }
+
+    #[test]
+    fn a_read_only_file_is_refused_even_with_force() {
+        let fingerprint = at(100, 1_000, 7);
+        let observed = Observed {
+            current: Ok(fingerprint.clone()),
+            emulators: Ok(Vec::new()),
+            read_only: true,
+        };
+        let error = decide("save", Some(&fingerprint), &observed, true).unwrap_err();
+        assert!(error.contains("読み取り専用"), "{}", error);
+    }
+
+    #[test]
+    fn a_missing_target_is_refused_even_with_force() {
+        let observed = Observed {
+            current: Err(String::from("書き込み先が見つかりません: gone.sav")),
+            emulators: Ok(Vec::new()),
+            read_only: false,
+        };
+        let error = decide("gone.sav", None, &observed, true).unwrap_err();
+        assert!(error.contains("見つかりません"), "{}", error);
+    }
+
+    #[test]
+    fn a_write_without_a_loaded_fingerprint_needs_force() {
+        let observed = clean(at(100, 1_000, 7));
+        let error = decide("save", None, &observed, false).unwrap_err();
+        assert!(error.contains("記録できていない"), "{}", error);
+        assert!(decide("save", None, &observed, true).is_ok());
+    }
+
+    #[test]
+    fn observe_names_a_file_that_is_not_there() {
+        let path = temp_path("missing");
+        let _ = std::fs::remove_file(&path);
+        let text = path.to_str().expect("the temp path is text");
+        let observed = observe(text);
+        match observed.current {
+            Err(message) => assert!(message.contains("見つかりません"), "{}", message),
+            Ok(_) => panic!("a file that is not there must not have a fingerprint"),
+        }
+        assert!(!observed.read_only);
+    }
+
+    #[test]
+    fn observe_sees_the_read_only_mark() {
+        let path = temp_path("readonly");
+        std::fs::write(&path, b"save").expect("the temp file is writable");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).expect("the mark can be set");
+
+        let observed = observe(path.to_str().expect("the temp path is text"));
+        assert!(observed.read_only, "the read-only mark must be seen");
+        assert!(observed.current.is_ok());
+
+        // Put the mark back so the file can be removed.
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).expect("the mark can be cleared");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_real_file_that_changed_after_the_read_is_refused() {
+        // The fingerprint is taken, the file is edited by "something else",
+        // and the check runs on the pair: this is the whole pre-write check on
+        // a real file, without a hand-built Observed.
+        let path = temp_path("stale_check");
+        std::fs::write(&path, b"aaaaa").expect("the temp file is writable");
+        let text = path
+            .to_str()
+            .expect("the temp path is text")
+            .to_string();
+        let loaded = loaded_fingerprint(&text).expect("the temp file fingerprints");
+        std::fs::write(&path, b"bbbbb").expect("the temp file is writable");
+        let error = check_write_allowed(&text, Some(&loaded), false).unwrap_err();
+        assert!(error.contains("変わっています"), "{}", error);
+        assert!(error.contains("--force"), "{}", error);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_real_read_only_file_is_refused_by_the_whole_check() {
+        let path = temp_path("readonly_check");
+        std::fs::write(&path, b"save").expect("the temp file is writable");
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions).expect("the mark can be set");
+        let text = path
+            .to_str()
+            .expect("the temp path is text")
+            .to_string();
+        let loaded = loaded_fingerprint(&text);
+        // --force does not clear a read-only file, so this holds on any machine.
+        let error = check_write_allowed(&text, loaded.as_ref(), true).unwrap_err();
+        assert!(error.contains("読み取り専用"), "{}", error);
+
+        let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&path, permissions).expect("the mark can be cleared");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_file_is_refused_by_the_whole_check() {
+        let path = temp_path("missing_check");
+        let _ = std::fs::remove_file(&path);
+        let text = path
+            .to_str()
+            .expect("the temp path is text")
+            .to_string();
+        for force in [false, true] {
+            let error = check_write_allowed(&text, None, force).unwrap_err();
+            assert!(error.contains("見つかりません"), "{}", error);
+        }
+    }
+
+    #[test]
+    fn force_gets_a_real_file_past_the_soft_checks() {
+        // This machine may have an emulator open, so what can be checked about
+        // the real path is that --force clears the soft reasons; the hard ones
+        // are covered above.
+        let path = temp_path("force");
+        std::fs::write(&path, b"save").expect("the temp file is writable");
+        let text = path
+            .to_str()
+            .expect("the temp path is text")
+            .to_string();
+        let loaded = loaded_fingerprint(&text).expect("the temp file fingerprints");
+        check_write_allowed(&text, Some(&loaded), true)
+            .expect("--force must get past the soft checks");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_write_itself_keeps_a_copy_and_verifies_the_bytes() {
+        let path = temp_path("replace");
+        std::fs::write(&path, b"old").expect("the temp file is writable");
+        let text = path
+            .to_str()
+            .expect("the temp path is text")
+            .to_string();
+        let loaded = loaded_fingerprint(&text);
+        write_in_place(&text, b"new bytes", loaded.as_ref(), true)
+            .expect("the write goes through");
+        assert_eq!(
+            std::fs::read(&path).expect("the file reads"),
+            b"new bytes"
+        );
+        let bak = format!("{}.bak", text);
+        assert_eq!(
+            std::fs::read(&bak).expect("the copy is kept"),
+            b"old"
+        );
+        let _ = std::fs::remove_file(&bak);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn only_the_commands_that_rewrite_a_save_take_force() {
+        for name in [
+            "install",
+            "slot-import",
+            "cat-add",
+            "cat-del",
+            "restore",
+            "import-items",
+            "import-equipment",
+        ] {
+            assert!(rewrites_in_place(name), "{} rewrites the save", name);
+        }
+        for name in [
+            "csv-items",
+            "csv-equipment",
+            "pouch",
+            "sets",
+            "info",
+            "verify",
+            "snapshot",
+            "add-quest",
+            "equip-set",
+        ] {
+            assert!(!rewrites_in_place(name), "{} must refuse --force", name);
         }
     }
 }

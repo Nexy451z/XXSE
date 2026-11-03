@@ -77,6 +77,7 @@ pub mod itembox;
 pub mod quest;
 pub mod questfields;
 pub mod save;
+#[cfg(feature = "std")] pub mod safety;
 /// Proving a write landed: compare what was written with what came back.
 pub mod verify;
 /// Snapshot naming and rotation rules, shared by every build.

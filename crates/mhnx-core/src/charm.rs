@@ -52,6 +52,7 @@
 
 use alloc::vec::Vec;
 
+use crate::save::Save;
 use crate::skills::skill_name;
 
 /// Number of records in the equipment box.
@@ -587,6 +588,11 @@ pub fn template_for_grade_or_pair(
 ///
 /// One short string per problem, empty when the record is ordinary for its
 /// grade. Nothing here changes the save: it is for the warning line.
+///
+/// This answers "is this legal for its grade"; the five shape rules that hold
+/// whatever the grade is - no skill, the same skill twice, points without a
+/// skill and so on - live in `structure_warnings`, so a caller that wants both
+/// asks both.
 pub fn grade_warnings(
     box_bytes: &[u8],
     index: usize,
@@ -634,6 +640,114 @@ pub fn grade_warnings(
         }
     }
     out
+}
+
+/// The name of a skill for a warning line, with the raw id as the fallback.
+///
+/// The table is 1-based and finite: a record can carry an id past its end,
+/// which is itself worth naming rather than silently printing nothing.
+fn skill_label(id: u8) -> alloc::string::String {
+    use alloc::format;
+    match skill_name(id) {
+        Some(n) => alloc::string::String::from(n),
+        None => format!("ID{}", id),
+    }
+}
+
+/// Structural warnings for one raw record (36 bytes).
+///
+/// These are the five shapes the game never writes, independent of grade and
+/// of the points tables, taken from the reference editor's own checks:
+///
+/// 1. no skill at all - both skill ids 0
+/// 2. the same skill in both slots
+/// 3. only the second slot filled (skill 1 empty, skill 2 not)
+/// 4. a skill whose points are 0, so it would contribute nothing
+/// 5. points left behind with no skill in that slot
+///
+/// Warning only: nothing here reads past the record or writes to it, and the
+/// caller decides what to do with the lines. An empty vector means the record
+/// has an ordinary shape.
+pub fn structure_warnings_record(rec: &[u8]) -> Vec<alloc::string::String> {
+    use alloc::format;
+    let mut out = Vec::new();
+    if rec.len() < CHARM_RECORD || !is_talisman(rec) {
+        return out;
+    }
+    let skill1 = rec[0x0C];
+    let skill2 = rec[0x0D];
+    let points1 = rec[0x0E] as i8;
+    let points2 = rec[0x0F] as i8;
+
+    // 1. A talisman with nothing on it is not a record the game writes: it
+    // would be an empty charm occupying a box slot.
+    if skill1 == 0 && skill2 == 0 {
+        out.push(alloc::string::String::from(
+            "スキルが1つも設定されていません（スキル1もスキル2も空です）",
+        ));
+    }
+    // 2. The two slots are meant to carry different skills.
+    if skill1 != 0 && skill1 == skill2 {
+        out.push(format!(
+            "スキル1とスキル2が同じです（{}）",
+            skill_label(skill1)
+        ));
+    }
+    // 3. The second slot filled while the first is empty.
+    if skill1 == 0 && skill2 != 0 {
+        out.push(format!(
+            "スキル1が空なのにスキル2だけ設定されています（{}）",
+            skill_label(skill2)
+        ));
+    }
+    for (label, skill, points) in [
+        ("スキル1", skill1, points1),
+        ("スキル2", skill2, points2),
+    ] {
+        // 4. A skill with no points does nothing: the game never stores one.
+        if skill != 0 && points == 0 {
+            out.push(format!(
+                "{}（{}）のポイントが0です",
+                label,
+                skill_label(skill)
+            ));
+        }
+        // 5. Points with no skill are the leftover of a skill that was
+        // cleared: the value is kept but means nothing.
+        if skill == 0 && points != 0 {
+            out.push(format!(
+                "{}が空なのにポイントだけ{}入っています",
+                label, points
+            ));
+        }
+    }
+    out
+}
+
+/// Structural warnings for the talisman at (slot, index) of a save.
+///
+/// The box accessor owns the bounds check, so a slot or index that does not
+/// exist (or a record that is not a talisman) answers with no warnings. See
+/// structure_warnings_record for the five rules. Nothing is written, and the
+/// save is only read.
+pub fn structure_warnings(
+    save: &Save,
+    slot: usize,
+    index: usize,
+) -> Vec<alloc::string::String> {
+    let Some(box_bytes) = save.equipment_box(slot) else {
+        return Vec::new();
+    };
+    let Some(o) = index.checked_mul(CHARM_RECORD) else {
+        return Vec::new();
+    };
+    let Some(end) = o.checked_add(CHARM_RECORD) else {
+        return Vec::new();
+    };
+    let Some(rec) = box_bytes.get(o..end) else {
+        return Vec::new();
+    };
+    structure_warnings_record(rec)
 }
 
 /// Clamp the decoration slots to what the grade allows.

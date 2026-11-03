@@ -7,6 +7,10 @@
 use std::path::Path;
 
 fn main() {
+    // The crate picks its bundle module with `#[cfg(official_bundle)]`, a cfg
+    // only this script knows about. Without this line rustc's check-cfg pass
+    // warns on every use of it.
+    println!("cargo:rustc-check-cfg=cfg(official_bundle)");
     println!("cargo:rerun-if-changed=src/dlc_bundle_gen.rs");
     println!("cargo:rerun-if-changed=src/official_dlc.bin");
 

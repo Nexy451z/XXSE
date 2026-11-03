@@ -8691,9 +8691,11 @@ mod tests {
             alloc::format!("{}/equipment-{}.csv", CSV_DIR, stamp)
         );
         let text = core::str::from_utf8(&files[0].1).expect("utf-8");
-        assert!(text.starts_with("slot,id,count\r\n"), "{}", ed.message);
-        assert!(text.contains("\r\n0,1,5\r\n"));
-        assert!(text.contains("\r\n1,2,3\r\n"));
+        // The name column was added after the first release of this export;
+        // reading it back still uses only the first three columns.
+        assert!(text.starts_with("slot,id,count,name\r\n"), "{}", ed.message);
+        assert!(text.contains("\r\n0,1,5,"));
+        assert!(text.contains("\r\n1,2,3,"));
 
         // The layer reports what it wrote, and the folder is listed again.
         ed.csv_exported(2, 2);

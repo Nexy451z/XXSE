@@ -19,7 +19,7 @@ use mhnx_core::questfields::FieldKind;
 use mhnx_core::questprogress::{self, Progress};
 use mhnx_core::requests;
 use mhnx_core::romfstables::{self, RequestRecord};
-use mhnx_core::save::{Character, Save, SaveKind, BODY_SIZE, SWITCH_SIZE};
+use mhnx_core::save::{Character, Save, SaveKind};
 use mhnx_core::snapshot;
 use mhnx_core::verify;
 
@@ -139,8 +139,6 @@ pub enum Confirm {
     DiscardForOpen(PathBuf),
     /// Empty the DLC section.
     ClearDlc,
-    /// Delete one charm.
-    Charm(usize),
     /// Clear one equipment record. The first ask, before the reference check
     /// has run: the dialog cannot say yet whether anything points at it.
     EquipClear(usize),
@@ -436,14 +434,13 @@ pub struct MhnxEditor {
     pub charm_skill2: u8,
     pub charm_points2: i8,
     pub charm_slots: u8,
+    /// Arena the ギルド tab edits, 0..16. The five rank fields beside the
+    /// selector write through [MhnxEditor::set_arena_time].
+    pub arena_sel: usize,
 
     // ---- snapshots ----
     /// Snapshots next to the open save, newest first.
     pub snapshots: Vec<SnapshotEntry>,
-
-    // ---- dlc ----
-    pub dlc_files: Vec<PathBuf>,
-    pub dlc_log: Vec<String>,
 
     // ---- progress (進行状況) ----
     /// romfs folder the user typed or picked. Nothing is read from it until
@@ -566,9 +563,8 @@ impl Default for MhnxEditor {
             charm_skill2: 0,
             charm_points2: 0,
             charm_slots: 0,
+            arena_sel: 0,
             snapshots: Vec::new(),
-            dlc_files: Vec::new(),
-            dlc_log: Vec::new(),
             romfs_path: String::new(),
             romfs_status: String::new(),
             romfs_dir: None,
@@ -1395,56 +1391,6 @@ impl MhnxEditor {
         }
     }
 
-    /// Collect every .arc in a folder.
-    pub fn scan_quest_dir(&mut self, dir: PathBuf) {
-        let mut v = Vec::new();
-        if let Ok(rd) = std::fs::read_dir(&dir) {
-            for e in rd.flatten() {
-                let p = e.path();
-                if p.extension().and_then(|s| s.to_str()) == Some("arc") {
-                    v.push(p);
-                }
-            }
-        }
-        v.sort();
-        self.message = format!("{} 件の .arc を検出しました", v.len());
-        self.dlc_files = v;
-    }
-
-    /// Install the selected .arc files into the open save.
-    pub fn install_dlc(&mut self) {
-        let files = self.dlc_files.clone();
-        let Some(save) = &mut self.save else {
-            self.message = "先にセーブを開いてください".to_owned();
-            return;
-        };
-        self.dlc_log.clear();
-        let mut ok = 0usize;
-        for f in &files {
-            let id = match f
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.strip_prefix('q'))
-                .and_then(|s| s.parse::<i32>().ok())
-            {
-                Some(v) => v,
-                None => continue,
-            };
-            match std::fs::read(f) {
-                Ok(bytes) => match dlc::install_quest(save, id, &bytes) {
-                    Ok(slot) => {
-                        self.dlc_log.push(format!("q{} -> スロット {}", id, slot));
-                        ok += 1;
-                    }
-                    Err(e) => self.dlc_log.push(format!("q{}: {}", id, e)),
-                },
-                Err(e) => self.dlc_log.push(format!("q{}: {}", id, e)),
-            }
-        }
-        self.dirty = true;
-        self.message = format!("{} 件をインストールしました", ok);
-    }
-
     /// Write quest arcs from the save back out as files.
     ///
     /// With an empty id list every quest is written. The payload is copied byte
@@ -1498,26 +1444,6 @@ impl MhnxEditor {
             )
         };
         written
-    }
-
-    /// Zero one quest slot.
-    ///
-    /// This is a one-way door: the record disappears but the installed flag
-    /// lives in a catalogue indexed set that a slot number cannot address, so
-    /// the flag stays set and the tool can never put the quest back. The UI
-    /// asks for confirmation and says so.
-    pub fn remove_dlc(&mut self, slot: usize) {
-        let Some(save) = &mut self.save else { return };
-        match dlc::uninstall_quest(save, slot) {
-            Ok(_) => {
-                self.dirty = true;
-                self.message = format!(
-                    "スロット {} を空にしました（元に戻せません。ゲーム側には空の項目が残る可能性があります）",
-                    slot
-                );
-            }
-            Err(e) => self.message = format!("削除失敗: {}", e),
-        }
     }
 }
 
@@ -1998,7 +1924,7 @@ impl MhnxEditor {
     /// that cannot be undone sat in the same row as the harmless ones.
     fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         let fill = egui::Color32::from_rgb(92, 52, 56);
-        let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 142, 142));
+        let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 142, 142));
         ui.add(
             egui::Button::new(egui::RichText::new(label).color(egui::Color32::from_rgb(240, 190, 190)))
                 .fill(fill)
@@ -2136,7 +2062,10 @@ impl MhnxEditor {
         }
     }
 
-    /// Delete one charm, after the dialog has said yes.
+    /// Delete one charm, after the button has been pressed twice.
+    ///
+    /// The charm tab arms its own button instead of opening a modal, so this is
+    /// reached from there rather than from [Confirm].
     pub fn delete_charm(&mut self, index: usize) {
         if let Some(s) = &mut self.save {
             if s.clear_charm(self.slot, index) {
@@ -2144,6 +2073,159 @@ impl MhnxEditor {
                 self.message = format!("お守り {} を削除しました", index);
             }
         }
+    }
+
+    /// Store the four global options and mark the save dirty.
+    ///
+    /// The console build shows brightness, rumble and the two 3DS-era switches
+    /// as one group, and all four live in `mhnx_core::save::Options`, so the
+    /// panel writes them together. Marking `dirty` is all the overwrite path
+    /// needs: 書き出し copies the body that was just updated.
+    pub fn apply_options(&mut self, o: &mhnx_core::save::Options) -> bool {
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        save.set_options(o);
+        self.dirty = true;
+        self.message = String::from("本体オプションを更新しました（まだファイルには書いていません）");
+        true
+    }
+
+    /// Write one arena time, in hundredths of a second.
+    ///
+    /// 0 empties the entry, which is how the game stores an unset record, so
+    /// the same field both records and erases a time. Only the two time bytes
+    /// are touched; the two that follow them are left as they were.
+    pub fn set_arena_time(&mut self, arena: usize, rank: usize, centis: u16) -> bool {
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        if !mhnx_core::guildcard::set_arena_time(save, self.slot, arena, rank, centis) {
+            self.message = format!("アリーナ {} の {} 位には書けません", arena, rank + 1);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "アリーナ {} の {} 位を {} にしました（まだファイルには書いていません）",
+            arena,
+            rank + 1,
+            Self::arena_clock(centis)
+        );
+        true
+    }
+
+    /// A stored arena time as the `m:ss.cc` the game shows.
+    fn arena_clock(centis: u16) -> String {
+        let total = centis as u32;
+        format!(
+            "{}:{:02}.{:02}",
+            total / 6000,
+            (total / 100) % 60,
+            total % 100
+        )
+    }
+
+    /// Read a time typed into the arena editor.
+    ///
+    /// `9:35.44` and `35.44` are seconds with hundredths, a bare number is the
+    /// raw count of hundredths the save itself holds, so a value copied out of
+    /// another tool round-trips unchanged. Anything that does not parse
+    /// returns None, which leaves the field as it was.
+    fn arena_clock_value(text: &str) -> Option<u16> {
+        let t = text.trim();
+        if t.is_empty() {
+            return None;
+        }
+        let (has_colon, minutes, rest) = match t.split_once(':') {
+            Some((m, r)) => (true, m.trim().parse::<u64>().ok()?, r.trim()),
+            None => (false, 0, t),
+        };
+        if !has_colon && !rest.contains('.') {
+            return rest.parse::<u64>().ok().map(|v| v.min(u16::MAX as u64) as u16);
+        }
+        let (secs, frac) = match rest.split_once('.') {
+            Some((s, f)) => (s.trim(), Some(f.trim())),
+            None => (rest, None),
+        };
+        let secs: u64 = secs.parse().ok()?;
+        let frac: u64 = match frac {
+            None => 0,
+            Some("") => return None,
+            Some(f) => {
+                // .4 is 40 hundredths and .456 is 45: the field has two digits.
+                let mut f = String::from(f);
+                f.truncate(2);
+                while f.len() < 2 {
+                    f.push('0');
+                }
+                f.parse().ok()?
+            }
+        };
+        let total = minutes * 6000 + secs * 100 + frac;
+        Some(total.min(u16::MAX as u64) as u16)
+    }
+
+    /// Drag or type one arena time; the field is drawn as `m:ss.cc`.
+    fn arena_time_drag(centis: &mut u16) -> egui::DragValue<'_> {
+        egui::DragValue::new(centis)
+            .range(0..=u16::MAX)
+            .custom_formatter(|n, _| Self::arena_clock(n as u16))
+            .custom_parser(|s| Self::arena_clock_value(s).map(|v| v as f64))
+    }
+
+    /// The stored times of one arena, `m:ss.cc` each, in rank order.
+    fn arena_rows_text(rows: &[&mhnx_core::guildcard::ArenaTime]) -> String {
+        rows.iter()
+            .map(|e| Self::arena_clock(e.centis))
+            .collect::<Vec<_>>()
+            .join("   ")
+    }
+
+    /// One fixed-phrase entry: UTF-8 text, zero padded to the record size.
+    fn shoutout_text(entry: &[u8]) -> String {
+        let end = entry.iter().position(|b| *b == 0).unwrap_or(entry.len());
+        String::from_utf8_lossy(&entry[..end]).into_owned()
+    }
+
+    /// Split a raw shoutout block into `count` entries of `entry` bytes.
+    fn shoutout_list(block: &[u8], entry: usize, count: usize) -> Vec<String> {
+        if entry == 0 {
+            return Vec::new();
+        }
+        (0..count)
+            .map(|i| {
+                block
+                    .get(i * entry..(i + 1) * entry)
+                    .map(Self::shoutout_text)
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The two shoutout blocks of the open character, decoded for the list.
+    ///
+    /// None when nothing is open or when the save is MHGU: that kind moves the
+    /// footer and enlarges each entry to 104 bytes, while the getter reads the
+    /// MHXX layout, so showing its result would show 60-byte windows of the
+    /// wrong text.
+    fn shoutout_entries(&self) -> Option<(Vec<String>, Vec<String>)> {
+        let save = self.save.as_ref()?;
+        if save.kind() == SaveKind::Mhgu {
+            return None;
+        }
+        let (manual, auto) = save.shoutouts(self.slot)?;
+        Some((
+            Self::shoutout_list(
+                manual,
+                mhnx_core::save::SHOUTOUT_ENTRY,
+                mhnx_core::save::TOTAL_MANUAL_SHOUTOUTS,
+            ),
+            Self::shoutout_list(
+                auto,
+                mhnx_core::save::SHOUTOUT_ENTRY,
+                mhnx_core::save::TOTAL_AUTO_SHOUTOUTS,
+            ),
+        ))
     }
 
     /// A modal that asks before something irreversible happens.
@@ -2173,11 +2255,6 @@ impl MhnxEditor {
                     ),
                     None => "クエストを削除します。元に戻せません。".to_string(),
                 },
-                "削除する",
-            ),
-            Confirm::Charm(n) => (
-                "お守りを削除します",
-                format!("枠 {} のお守りを削除します。元に戻せません。", n),
                 "削除する",
             ),
             Confirm::EquipClear(n) => (
@@ -2386,7 +2463,6 @@ impl MhnxEditor {
                     Confirm::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
                     Confirm::DiscardForOpen(p) => self.open_save(p),
                     Confirm::ClearDlc => self.clear_dlc(),
-                    Confirm::Charm(n) => self.delete_charm(n),
                     // The first "yes" only starts the check: a record that is
                     // still named by something comes back as a second dialog.
                     Confirm::EquipClear(n) => self.equip_delete_checked(n),
@@ -5978,33 +6054,87 @@ impl MhnxEditor {
         }
         ui.separator();
         ui.separator();
-        ui.label(egui::RichText::new("闘技大会の記録（タイムは 1/100 秒）").strong());
+        ui.label(egui::RichText::new("闘技大会の記録").strong());
+        // The summary is read-only; the editor below writes through
+        // set_arena_time. Both read the copy taken at the top of the tab, so
+        // the save is not borrowed while the fields are drawn.
+        let mut pick: Option<usize> = None;
         if log.iter().all(|e| e.is_empty()) {
             ui.label("記録はありません");
-            return;
+        } else {
+            egui::Grid::new("arenagrid")
+                .num_columns(3)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("アリーナ");
+                    ui.strong("ベストタイム");
+                    ui.end_row();
+                    for a in 0..mhnx_core::guildcard::ARENA_COUNT {
+                        let rows: Vec<_> =
+                            log.iter().filter(|e| e.arena == a && !e.is_empty()).collect();
+                        if rows.is_empty() {
+                            continue;
+                        }
+                        ui.label(format!("{}", a));
+                        ui.label(Self::arena_rows_text(&rows));
+                        if ui.small_button("編集").clicked() {
+                            pick = Some(a);
+                        }
+                        ui.end_row();
+                    }
+                });
         }
-        egui::Grid::new("arenagrid").num_columns(2).striped(true).show(ui, |ui| {
-            ui.strong("アリーナ");
-            ui.strong("ベストタイム");
-            ui.end_row();
-            for a in 0..mhnx_core::guildcard::ARENA_COUNT {
-                let rows: Vec<_> = log.iter().filter(|e| e.arena == a && !e.is_empty()).collect();
-                if rows.is_empty() {
-                    continue;
-                }
-                ui.label(format!("{}", a));
-                let text = rows
-                    .iter()
-                    .map(|e| {
-                        let (m, s, cs) = e.as_clock();
-                        format!("{}:{:02}.{:02}", m, s, cs)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("   ");
-                ui.label(text);
-                ui.end_row();
-            }
+        ui.separator();
+        let mut edit_sel = self.arena_sel.min(mhnx_core::guildcard::ARENA_COUNT - 1);
+        if let Some(a) = pick {
+            edit_sel = a;
+        }
+        ui.horizontal(|ui| {
+            ui.label("編集するアリーナ");
+            egui::ComboBox::from_id_salt("arena_sel")
+                .selected_text(format!("{}", edit_sel))
+                .show_ui(ui, |ui| {
+                    for a in 0..mhnx_core::guildcard::ARENA_COUNT {
+                        ui.selectable_value(&mut edit_sel, a, format!("{}", a));
+                    }
+                });
+            ui.label(
+                egui::RichText::new("タイムは 1/100 秒。m:ss.cc で入り、0:00.00 で消えます")
+                    .weak()
+                    .small(),
+            );
         });
+        let mut edits: Vec<(usize, usize, u16)> = Vec::new();
+        egui::Grid::new("arenaedit")
+            .num_columns(2)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                for rank in 0..mhnx_core::guildcard::ARENA_RANKS {
+                    let current = log
+                        .iter()
+                        .find(|e| e.arena == edit_sel && e.rank == rank)
+                        .map(|e| e.centis)
+                        .unwrap_or(0);
+                    ui.label(format!("{} 位", rank + 1));
+                    let mut c = current;
+                    if ui.add(Self::arena_time_drag(&mut c)).changed() && c != current {
+                        edits.push((edit_sel, rank, c));
+                    }
+                    ui.end_row();
+                }
+            });
+        ui.label(
+            egui::RichText::new(
+                "タイムの 2 バイトだけを書き換えます（各記録の後ろ 2 バイトはそのまま）。\
+                 0:00.00 にすると記録を消します。空の枠に入れた場合のゲーム側の表示は未確認です。",
+            )
+            .weak()
+            .small(),
+        );
+        self.arena_sel = edit_sel;
+        for (a, r, c) in edits {
+            self.set_arena_time(a, r, c);
+        }
     }
     /// The equipment box: the list on the left, the editor for the selected
     /// record on the right.
@@ -7409,12 +7539,9 @@ impl MhnxEditor {
             }
         }
         if let Some(i) = drop_idx {
-            if let Some(s) = &mut self.save {
-                if s.clear_charm(self.slot, i) {
-                    self.dirty = true;
-                    self.message = format!("お守り {} を削除しました", i);
-                }
-            }
+            // Same write the confirm dialog used to run: one place for the
+            // message, so the two cannot drift apart.
+            self.delete_charm(i);
         }
     }
 
@@ -7559,21 +7686,100 @@ impl MhnxEditor {
         let mut want_import = false;
 
         ui.heading("本体オプション");
+        // The console build edits four switches, and all four sit in the same
+        // Options struct. The desktop panel used to show brightness and rumble
+        // only, so the other two could not be reached from here at all.
         let o = self.save.as_ref().unwrap().options();
-        ui.horizontal(|ui| {
-            ui.label("明るさ");
-            let mut b = o.brightness as i32;
-            if ui.add(egui::Slider::new(&mut b, 0..=255)).changed() {
-                let mut n = o;
-                n.brightness = b as u8;
-                set_opts = Some(n);
+        let mut edit_o = o;
+        let mut opts_changed = false;
+        egui::Grid::new("optiongrid")
+            .num_columns(2)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                ui.label("明るさ");
+                let mut b = o.brightness as i32;
+                if ui.add(egui::Slider::new(&mut b, 0..=255)).changed() {
+                    edit_o.brightness = b as u8;
+                    opts_changed = true;
+                }
+                ui.end_row();
+                ui.label("振動");
+                let mut on = o.rumble != 0;
+                if ui.checkbox(&mut on, "オン").changed() {
+                    edit_o.rumble = if on { 1 } else { 0 };
+                    opts_changed = true;
+                }
+                ui.end_row();
+                ui.label("3D表示");
+                let mut off = o.disable_3d != 0;
+                if ui.checkbox(&mut off, "3D を止める").changed() {
+                    edit_o.disable_3d = if off { 1 } else { 0 };
+                    opts_changed = true;
+                }
+                ui.end_row();
+                ui.label("拡張スライドパッド");
+                let mut on = o.circle_pad_pro != 0;
+                if ui.checkbox(&mut on, "使用する").changed() {
+                    edit_o.circle_pad_pro = if on { 1 } else { 0 };
+                    opts_changed = true;
+                }
+                ui.end_row();
+            });
+        ui.label(
+            egui::RichText::new(
+                "Switch / 3DS の本体設定と同じ 4 項目です。値はセーブの同じ位置に入り、\
+                 書き出すまでファイルは変わりません。",
+            )
+            .weak()
+            .small(),
+        );
+        if opts_changed {
+            set_opts = Some(edit_o);
+        }
+
+        ui.separator();
+        // 定型文 is the per-character footer: 60 bytes of UTF-8 per entry,
+        // zero padded. The core crate only exposes the getter, so the list is
+        // read-only, but the entries are what the game will say, so they are
+        // shown rather than left out.
+        let shoutouts = self.shoutout_entries();
+        match &shoutouts {
+            Some((manual, auto)) => {
+                egui::CollapsingHeader::new(format!(
+                    "定型文（手動 {} 件 / 自動 {} 件）",
+                    manual.len(),
+                    auto.len()
+                ))
+                .id_salt("shoutouts")
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "読み取り専用。MHXX の 60 バイト固定配置を UTF-8 として読んでいます。",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("shoutoutlist")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.strong("手動");
+                            for (i, s) in manual.iter().enumerate() {
+                                ui.label(format!("{:>2}  {}", i + 1, s));
+                            }
+                            ui.separator();
+                            ui.strong("自動");
+                            for (i, s) in auto.iter().enumerate() {
+                                ui.label(format!("{:>2}  {}", i + 1, s));
+                            }
+                        });
+                });
             }
-        });
-        let mut rumble = o.rumble != 0;
-        if ui.checkbox(&mut rumble, "振動").changed() {
-            let mut n = o;
-            n.rumble = if rumble { 1 } else { 0 };
-            set_opts = Some(n);
+            None => {
+                ui.label(
+                    egui::RichText::new("定型文は MHGU の配置にはまだ対応していません").weak(),
+                );
+            }
         }
 
         ui.separator();
@@ -7726,11 +7932,7 @@ impl MhnxEditor {
 
         // ---- apply ----
         if let Some(o) = set_opts {
-            if let Some(s) = &mut self.save {
-                s.set_options(&o);
-                self.dirty = true;
-                self.message = String::from("オプションを更新しました");
-            }
+            self.apply_options(&o);
         }
         if let Some((lang, idx)) = add_cat {
             let ls = if lang == 0 {
@@ -8542,7 +8744,7 @@ impl MhnxEditor {
                             [170.0, 26.0],
                             egui::Button::new(text)
                                 .fill(award_fill(on))
-                                .stroke(egui::Stroke::new(1.0, award_stroke(on))),
+                                .stroke(egui::Stroke::new(1.0_f32, award_stroke(on))),
                         );
                         let tip = if full.is_empty() {
                             format!("勲章 {}（{}）", a + 1, if on { "取得済み" } else { "未取得" })
@@ -8915,6 +9117,9 @@ mod tests {
     //! filesystem helpers and the editor state, never at egui.
 
     use super::*;
+    // Only the save-size constants are used here, so they are imported here
+    // rather than in the module above, where nothing reads them.
+    use mhnx_core::save::{BODY_SIZE, SWITCH_SIZE};
 
     /// A scratch folder that removes itself.
     struct Scratch(PathBuf);
@@ -9955,13 +10160,16 @@ mod tests {
         assert!(!app.dirty, "an export must not dirty the save");
         let text = std::fs::read_to_string(&csv).expect("the file");
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "slot,id,count");
+        // The header is the one the writer declares; the three cells the
+        // importer reads are what this test pins down below.
+        assert_eq!(lines[0], csvout::ITEM_COLUMNS.join(","));
         // Every one of the 2300 records travels, blank ones included: the box
         // is written back by position, so the holes have to come along.
         assert_eq!(lines.len(), total + 1);
-        assert_eq!(lines[1], "0,5,7");
-        assert_eq!(lines[2], "1,0,0");
-        assert_eq!(lines[3], "2,12,3");
+        let cells = |n: usize| -> Vec<&str> { lines[n].split(',').take(3).collect() };
+        assert_eq!(cells(1), ["0", "5", "7"]);
+        assert_eq!(cells(2), ["1", "0", "0"]);
+        assert_eq!(cells(3), ["2", "12", "3"]);
 
         // Reading it back only arms the dialog: the rows are measured on a copy
         // of the save and the save itself is untouched.
@@ -10050,7 +10258,7 @@ mod tests {
         assert!(app.message.contains("読めません"), "{}", app.message);
     }
 
-    /// The equipment box goes out as the eight columns of csvout, and a hand
+    /// The equipment box goes out as the columns csvout declares, and a hand
     /// edited row goes back in through the same dialog as the item box.
     #[test]
     fn the_equipment_box_goes_out_as_csv_and_comes_back() {
@@ -10073,17 +10281,39 @@ mod tests {
         let csv = dir.path().join("equip.csv");
         assert!(app.csv_write(CsvKind::Equipment, &csv), "{}", app.message);
         let text = std::fs::read_to_string(&csv).expect("the file");
-        assert_eq!(
-            text.lines().next(),
-            Some("index,kind,id,level,transmog,deco1,deco2,deco3")
-        );
-        assert!(text.contains("5,1,10,3,0,0,0,0\r\n"), "{:?}", text);
+        let header = csvout::EQUIP_COLUMNS.join(",");
+        assert_eq!(text.lines().next(), Some(header.as_str()));
+        // The eight readable cells keep their positions; a row may carry more
+        // columns (the whole record as hex, and the name).
+        let row = text.lines().nth(1).expect("the record row");
+        let cells: Vec<&str> = row.split(',').collect();
+        assert_eq!(&cells[..8], ["5", "1", "10", "3", "0", "0", "0", "0"]);
         // Only the records that hold something are listed.
         assert_eq!(text.lines().count(), 2);
 
-        // Hand edit the row, the way a spreadsheet would.
-        let edited = text.replace("5,1,10,3,0,0,0,0", "5,1,11,5,0,0,0,0");
-        std::fs::write(&csv, edited).expect("the edited file");
+        // Hand edit the row, the way a spreadsheet would. The readable columns
+        // are what this test moves; the whole-record column, when the writer
+        // has one, is emptied so those columns are the ones that decide - a row
+        // that carries both writes that record and only reports the rest.
+        let edited: Vec<String> = text
+            .lines()
+            .enumerate()
+            .map(|(n, line)| {
+                if n != 1 {
+                    return line.to_owned();
+                }
+                let mut cells: Vec<String> = line.split(',').map(|c| c.to_owned()).collect();
+                if let Some(i) = csvout::EQUIP_COLUMNS.iter().position(|c| *c == "raw") {
+                    if i < cells.len() {
+                        cells[i].clear();
+                    }
+                }
+                cells[2] = String::from("11");
+                cells[3] = String::from("5");
+                cells.join(",")
+            })
+            .collect();
+        std::fs::write(&csv, edited.join("\r\n") + "\r\n").expect("the edited file");
         let before = app
             .save
             .as_ref()
@@ -10457,6 +10687,147 @@ mod tests {
         assert_eq!(app.save.as_ref().expect("save").body(), &before[..]);
         assert!(!app.quest_on(821, Progress::Cleared));
         assert!(!app.quest_on(821, Progress::Seen));
+    }
+
+    #[test]
+    fn all_four_options_reach_the_save_the_console_build_shows() {
+        let dir = Scratch::new("four-options");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        // Every field differs from the blank fixture, so a field dropped
+        // anywhere on the way to the file shows up as a mismatch.
+        let want = mhnx_core::save::Options {
+            brightness: 48,
+            rumble: 1,
+            disable_3d: 1,
+            circle_pad_pro: 1,
+        };
+        assert!(app.apply_options(&want));
+        assert!(app.dirty, "the overwrite path is driven by this flag");
+        {
+            let save = app.save.as_ref().expect("save");
+            assert_eq!(save.options(), want);
+            let body = save.body();
+            assert_eq!(body[mhnx_core::save::OFF_BRIGHTNESS], 48);
+            assert_eq!(body[mhnx_core::save::OFF_RUMBLE], 1);
+            // The other two sit just before the download-quest section, so
+            // their position comes from the save and not from a constant here.
+            let dlc = save.dlc_section_offset() as usize;
+            assert_eq!(body[dlc - 2], 1, "3D を止める");
+            assert_eq!(body[dlc - 1], 1, "拡張スライドパッド");
+        }
+        // Nothing is on disk yet: the file still holds the blank value.
+        let on_disk = std::fs::read(&path).expect("read");
+        assert_eq!(
+            on_disk[mhnx_core::save::SWITCH_HEADER_SIZE + mhnx_core::save::OFF_BRIGHTNESS],
+            0
+        );
+
+        // The usual overwrite carries them out and clears dirty.
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("out");
+        app.write_switch_pair(out.clone());
+        assert!(!app.dirty, "{}", app.message);
+        let bytes = std::fs::read(out.join("system")).expect("system");
+        let back = Save::from_bytes(&bytes).expect("parse the written save");
+        assert_eq!(back.options(), want);
+    }
+
+    #[test]
+    fn an_arena_time_is_written_and_cleared_through_the_save() {
+        let dir = Scratch::new("arena-time");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        // 57,544 hundredths is the 9:35.44 the sample save holds.
+        assert!(app.set_arena_time(3, 1, 57_544), "{}", app.message);
+        assert!(app.dirty);
+        let at = {
+            let save = app.save.as_ref().expect("save");
+            let at = save.slot_base(0).expect("base") as usize
+                + mhnx_core::guildcard::OFF_ARENA
+                + (3 * mhnx_core::guildcard::ARENA_RANKS + 1) * mhnx_core::guildcard::ARENA_ENTRY;
+            assert_eq!(&save.body()[at..at + 2], &57_544u16.to_le_bytes());
+            let log = mhnx_core::guildcard::arena(save, 0);
+            let e = log
+                .iter()
+                .find(|e| e.arena == 3 && e.rank == 1)
+                .expect("the entry");
+            assert_eq!(e.as_clock(), (9, 35, 44));
+            // Its neighbours in the same arena are untouched.
+            assert!(log
+                .iter()
+                .find(|e| e.arena == 3 && e.rank == 0)
+                .expect("the entry")
+                .is_empty());
+            at
+        };
+        // 0 empties the entry the way an unset record is stored, and only the
+        // two time bytes move: the two that follow them are left alone.
+        let before = app.save.as_ref().expect("save").body().to_vec();
+        assert!(app.set_arena_time(3, 1, 0));
+        let after = app.save.as_ref().expect("save").body().to_vec();
+        assert_eq!(&after[at..at + 2], &[0, 0]);
+        let changed: Vec<usize> = (0..before.len()).filter(|i| before[*i] != after[*i]).collect();
+        assert_eq!(changed, vec![at, at + 1]);
+        let log = mhnx_core::guildcard::arena(app.save.as_ref().expect("save"), 0);
+        assert!(log
+            .iter()
+            .find(|e| e.arena == 3 && e.rank == 1)
+            .expect("the entry")
+            .is_empty());
+    }
+
+    #[test]
+    fn an_arena_clock_round_trips_through_the_edit_field() {
+        assert_eq!(MhnxEditor::arena_clock(57_544), "9:35.44");
+        assert_eq!(MhnxEditor::arena_clock(0), "0:00.00");
+        assert_eq!(MhnxEditor::arena_clock(2_348), "0:23.48");
+        assert_eq!(MhnxEditor::arena_clock_value("9:35.44"), Some(57_544));
+        assert_eq!(MhnxEditor::arena_clock_value(" 0:23.48 "), Some(2_348));
+        // A shorter fraction is still hundredths: .4 is 40, not 4.
+        assert_eq!(MhnxEditor::arena_clock_value("35.4"), Some(3_540));
+        assert_eq!(MhnxEditor::arena_clock_value("9:35"), Some(57_500));
+        // A bare number is the unit the save holds, so a value copied out of
+        // the log round-trips without being multiplied by anything.
+        assert_eq!(MhnxEditor::arena_clock_value("57544"), Some(57_544));
+        assert_eq!(MhnxEditor::arena_clock_value(""), None);
+        assert_eq!(MhnxEditor::arena_clock_value("abc"), None);
+        assert_eq!(MhnxEditor::arena_clock_value("9:"), None);
+        // Past the field's range the value stops at the top instead of wrapping.
+        assert_eq!(MhnxEditor::arena_clock_value("999:00.00"), Some(u16::MAX));
+        for c in [0u16, 1, 99, 100, 6_000, 57_544, u16::MAX] {
+            assert_eq!(
+                MhnxEditor::arena_clock_value(&MhnxEditor::arena_clock(c)),
+                Some(c)
+            );
+        }
+    }
+
+    #[test]
+    fn the_shoutout_list_reads_utf8_entries_up_to_the_padding() {
+        let mut save = mhnx_core::save::empty_switch_save();
+        let base = save.slot_base(0).expect("slot") as usize;
+        let manual = base + mhnx_core::save::OFF_MANUAL_SHOUTOUTS;
+        let first = "よろしくお願いします".as_bytes();
+        save.body_mut()[manual..manual + first.len()].copy_from_slice(first);
+        let second = "ありがとう！".as_bytes();
+        let at = manual + mhnx_core::save::SHOUTOUT_ENTRY;
+        save.body_mut()[at..at + second.len()].copy_from_slice(second);
+
+        let mut app = MhnxEditor::default();
+        app.save = Some(save);
+        let (entries, auto) = app.shoutout_entries().expect("the MHXX layout");
+        assert_eq!(entries.len(), mhnx_core::save::TOTAL_MANUAL_SHOUTOUTS);
+        assert_eq!(auto.len(), mhnx_core::save::TOTAL_AUTO_SHOUTOUTS);
+        assert_eq!(entries[0], "よろしくお願いします");
+        assert_eq!(entries[1], "ありがとう！");
+        // The zero padding after one entry does not leak into it.
+        assert_eq!(entries[2], "");
+        assert!(auto.iter().all(|s| s.is_empty()));
     }
 }
 

@@ -10,7 +10,8 @@
 use std::path::PathBuf;
 
 use mhnx_core::charm::{self, TalismanGrade};
-use mhnx_core::save::Save;
+use mhnx_core::save::{empty_switch_save, Save};
+use mhnx_core::skills::skill_name;
 
 /// The dump the other tests read. Prefer the fixed copy: the Ryujinx save is
 /// live and the game writes to it, so a test pinned to it would rot.
@@ -394,3 +395,207 @@ fn every_talisman_in_the_real_save_is_clean_for_the_grade_it_carries() {
     let after = std::fs::read(&path).expect("the save is still readable");
     assert_eq!(after, raw, "checking a save must not modify the file");
 }
+
+// ---------------------------------------------------------------------------
+// The five structural rules: the shapes the game never writes, whatever the
+// grade and whatever the points tables say.
+// ---------------------------------------------------------------------------
+
+/// A whole save holding one talisman at slot 0, record 0, with the given bytes
+/// set on it. Built from the blank template, so the tests below never open the
+/// real save and always have a byte-for-byte baseline to compare against.
+fn save_with_talisman(bytes: &[(usize, u8)]) -> Save {
+    let mut save = empty_switch_save();
+    {
+        let b = save.equipment_box_mut(0).expect("the blank save has slot 1");
+        let rec = &mut b[..charm::CHARM_RECORD];
+        rec[0] = charm::CHARM_TYPE;
+        rec[0x02] = 0x0A;
+        rec[0x12] = TalismanGrade::Enduring.rarity();
+        for (at, v) in bytes {
+            rec[*at] = *v;
+        }
+    }
+    save
+}
+
+#[test]
+fn a_talisman_with_no_skill_at_all_is_reported() {
+    // Rule 1: both skill ids 0. Nothing else is wrong with the record, so this
+    // must be the only line.
+    let save = save_with_talisman(&[]);
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(w.len(), 1, "one line, got {:?}", w);
+    assert!(
+        w[0].contains("スキルが1つも設定されていません"),
+        "the line must say so plainly: {:?}",
+        w
+    );
+}
+
+#[test]
+fn the_same_skill_in_both_slots_is_reported() {
+    // Rule 2: one skill twice. Both slots carry points, so the point rules
+    // stay quiet and this test names exactly one defect.
+    let save = save_with_talisman(&[(0x0C, 18), (0x0E, 3), (0x0D, 18), (0x0F, 1)]);
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(w.len(), 1, "one line, got {:?}", w);
+    assert!(w[0].contains("スキル1とスキル2が同じです"), "{:?}", w);
+    assert!(
+        w[0].contains(skill_name(18).expect("skill 18 is in the table")),
+        "the line names the duplicated skill: {:?}",
+        w
+    );
+}
+
+#[test]
+fn a_second_skill_without_a_first_is_reported() {
+    // Rule 3: skill 1 empty, skill 2 set.
+    let save = save_with_talisman(&[(0x0D, 18), (0x0F, 2)]);
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(w.len(), 1, "one line, got {:?}", w);
+    assert!(
+        w[0].contains("スキル1が空なのにスキル2だけ設定されています"),
+        "{:?}",
+        w
+    );
+}
+
+#[test]
+fn a_skill_with_zero_points_is_reported() {
+    // Rule 4, first slot. Skill 2 carries points, so only slot 1 is empty of
+    // them and only rule 4 fires.
+    let save = save_with_talisman(&[(0x0C, 18), (0x0E, 0), (0x0D, 25), (0x0F, 2)]);
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(w.len(), 1, "one line, got {:?}", w);
+    assert!(w[0].contains("スキル1（") && w[0].contains("）のポイントが0です"), "{:?}", w);
+
+    // And the second slot, the same way round.
+    let save = save_with_talisman(&[(0x0C, 18), (0x0E, 2), (0x0D, 25), (0x0F, 0)]);
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(w.len(), 1, "one line, got {:?}", w);
+    assert!(w[0].contains("スキル2（") && w[0].contains("）のポイントが0です"), "{:?}", w);
+}
+
+#[test]
+fn points_without_a_skill_are_reported() {
+    // Rule 5, second slot: skill 1 is real, skill 2 is empty but still carries
+    // points. Nothing else is wrong, so this one is isolated.
+    let save = save_with_talisman(&[(0x0C, 18), (0x0E, 2), (0x0F, 0xFF)]);
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(w.len(), 1, "one line, got {:?}", w);
+    assert!(
+        w[0].contains("スキル2が空なのにポイントだけ-1入っています"),
+        "{:?}",
+        w
+    );
+
+    // The first slot cannot be isolated: an empty skill 1 with points on it is
+    // also "only the second skill" (rule 3) or "no skill at all" (rule 1). Both
+    // lines are true, so both are returned.
+    let save = save_with_talisman(&[(0x0D, 25), (0x0F, 2), (0x0E, 5)]);
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(w.len(), 2, "two true lines, got {:?}", w);
+    assert!(
+        w.iter().any(|l| l.contains("スキル1が空なのにポイントだけ5入っています")),
+        "{:?}",
+        w
+    );
+    assert!(
+        w.iter().any(|l| l.contains("スキル2だけ設定されています")),
+        "{:?}",
+        w
+    );
+}
+
+#[test]
+fn an_ordinary_talisman_has_no_structure_warnings() {
+    // Two different skills, both with points, one of them negative.
+    let save = save_with_talisman(&[(0x0C, 18), (0x0E, 3), (0x0D, 25), (0x0F, 0xFE)]);
+    assert!(charm::structure_warnings(&save, 0, 0).is_empty());
+
+    // An empty record, a record past the end of the box, and a slot that does
+    // not exist all answer with nothing rather than panicking.
+    let save = empty_switch_save();
+    assert!(charm::structure_warnings(&save, 0, 0).is_empty(), "blank record");
+    assert!(charm::structure_warnings(&save, 0, charm::CHARM_COUNT).is_empty());
+    assert!(charm::structure_warnings(&save, 0, usize::MAX).is_empty());
+    assert!(charm::structure_warnings(&save, 3, 0).is_empty(), "no fourth slot");
+}
+
+#[test]
+fn every_talisman_in_the_real_save_has_no_structure_warnings() {
+    let path = real_save_path();
+    let Some(raw) = std::fs::read(&path).ok() else {
+        return;
+    };
+    let Some(save) = Save::from_bytes(&raw).ok() else {
+        return;
+    };
+
+    let mut counted = 0usize;
+    for slot in 0..3 {
+        let Some(b) = save.equipment_box(slot) else {
+            continue;
+        };
+        for i in 0..charm::CHARM_COUNT {
+            let o = i * charm::CHARM_RECORD;
+            let rec = &b[o..o + charm::CHARM_RECORD];
+            if !charm::is_talisman(rec) {
+                continue;
+            }
+            counted += 1;
+            let w = charm::structure_warnings(&save, slot, i);
+            assert!(
+                w.is_empty(),
+                "slot {} #{}: {:?}",
+                slot + 1,
+                i,
+                w
+            );
+            // The record helper must agree with the save helper.
+            assert!(charm::structure_warnings_record(rec).is_empty());
+        }
+    }
+    assert_eq!(counted, 650, "the sample save carries 650 talismans");
+
+    // Asking for warnings must not write to the file.
+    let after = std::fs::read(&path).expect("the save is still readable");
+    assert_eq!(after, raw, "checking a save must not modify the file");
+}
+
+#[test]
+fn structure_warnings_change_no_byte() {
+    // A record that trips every rule at once.
+    let save = save_with_talisman(&[(0x0C, 18), (0x0E, 0), (0x0D, 18), (0x0F, 0)]);
+    let before = save.to_3ds_bytes();
+    let w = charm::structure_warnings(&save, 0, 0);
+    assert_eq!(
+        w.len(),
+        3,
+        "the same skill twice plus zero points on both slots, got {:?}",
+        w
+    );
+    assert_eq!(save.to_3ds_bytes(), before, "asking must not write");
+
+    // And the same over the real save, whole file included.
+    let Some(raw) = std::fs::read(real_save_path()).ok() else {
+        return;
+    };
+    let Ok(save) = Save::from_bytes(&raw) else {
+        return;
+    };
+    let before_body = save.to_3ds_bytes();
+    for slot in 0..3 {
+        for i in 0..charm::CHARM_COUNT {
+            let _ = charm::structure_warnings(&save, slot, i);
+        }
+    }
+    assert_eq!(save.to_3ds_bytes(), before_body, "the body must be untouched");
+    assert_eq!(
+        std::fs::read(real_save_path()).expect("still readable"),
+        raw,
+        "the file must be untouched"
+    );
+}
+

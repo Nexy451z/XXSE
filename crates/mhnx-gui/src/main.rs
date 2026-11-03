@@ -38,30 +38,30 @@ fn apply_theme(ctx: &egui::Context) {
 
     v.widgets.noninteractive.bg_fill = c(30, 30, 33);
     v.widgets.noninteractive.weak_bg_fill = c(30, 30, 33);
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, c(58, 58, 65));
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, c(228, 228, 231));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, c(58, 58, 65));
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, c(228, 228, 231));
 
     v.widgets.inactive.bg_fill = c(52, 52, 57);
     v.widgets.inactive.weak_bg_fill = c(44, 44, 49);
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, c(110, 110, 120));
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, c(228, 228, 231));
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, c(110, 110, 120));
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, c(228, 228, 231));
 
     v.widgets.hovered.bg_fill = c(66, 66, 72);
     v.widgets.hovered.weak_bg_fill = c(58, 58, 63);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, c(161, 161, 170));
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, c(240, 240, 243));
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, c(161, 161, 170));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, c(240, 240, 243));
 
     v.widgets.active.bg_fill = c(80, 80, 88);
     v.widgets.active.weak_bg_fill = c(74, 74, 80);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, c(228, 228, 231));
-    v.widgets.active.fg_stroke = Stroke::new(1.0, c(255, 255, 255));
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, c(228, 228, 231));
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, c(255, 255, 255));
 
     // egui does not draw a border around a selected row, so the fill alone has
     // to carry it: at 58,58,64 it measured 1.57 to 1 against the panel, which
     // is below the 3 to 1 that a UI state needs. This one is 3.3 to 1 and
     // white on it still reads at 5.35 to 1.
     v.selection.bg_fill = c(106, 106, 116);
-    v.selection.stroke = Stroke::new(1.0, c(255, 255, 255));
+    v.selection.stroke = Stroke::new(1.0_f32, c(255, 255, 255));
     v.hyperlink_color = c(161, 161, 170);
     v.warn_fg_color = c(161, 161, 170);
     v.error_fg_color = c(229, 72, 77);
