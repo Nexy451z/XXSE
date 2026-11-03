@@ -73,6 +73,7 @@ pub mod palicogear;
 pub mod equipnames;
 pub mod entries;
 pub mod hbedit;
+pub mod hunts;
 pub mod itembox;
 pub mod quest;
 pub mod questfields;
