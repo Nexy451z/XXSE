@@ -253,6 +253,74 @@ fn list_dir(path: &CStr) -> Vec<Entry> {
     out
 }
 
+/// The same scan, for a path the core names as a plain string.
+///
+/// list_dir takes a C string because libnx does; every folder this file knew
+/// before was a constant here, but the CSV folder is named by the core so that
+/// both builds agree on it and it is not written out twice.
+fn list_dir_at(path: &str) -> Vec<Entry> {
+    let p = to_cstring(path);
+    match CStr::from_bytes_with_nul(&p) {
+        Ok(c) => list_dir(c),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The CSV files on the SD card, in name order.
+///
+/// The extension is the whole contract of the folder, and the names carry a
+/// timestamp, so a plain sort is chronological.
+fn scan_csv() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for e in list_dir_at(mhnx_core::hbedit::CSV_DIR) {
+        if !e.is_file || !e.name.to_ascii_lowercase().ends_with(".csv") {
+            continue;
+        }
+        out.push(format!("{}/{}", mhnx_core::hbedit::CSV_DIR, e.name));
+    }
+    out.sort();
+    out
+}
+
+/// Write the two CSV files the core built for the open save.
+///
+/// The core names them (items / equipment plus the timestamp) and hands back
+/// the text; the card is the only thing this layer knows about. The folder is
+/// created first: fopen on a missing directory fails, and that failure would
+/// otherwise look like a full card.
+fn export_csv_to_sd(ed: &mut Editor) {
+    let files = ed.export_csv(crate::savedata::now_unix());
+    if files.is_empty() {
+        // The core already said why (no clock, or no save open).
+        return;
+    }
+    make_dirs(mhnx_core::hbedit::CSV_DIR);
+    let total = files.len();
+    let mut written = 0usize;
+    for (path, bytes) in files.iter() {
+        if write_file(path, bytes) {
+            written += 1;
+        }
+    }
+    ed.csv_exported(written, total);
+}
+
+/// Read the CSV the editor asked for and hand the text back.
+fn read_csv_into(ed: &mut Editor, path: &str) {
+    let Some(bytes) = read_file(path) else {
+        ed.message = format!("CSV を読み込めません: {}", path);
+        return;
+    };
+    match String::from_utf8(bytes) {
+        Ok(text) => {
+            ed.apply_csv_text(path, &text);
+        }
+        Err(_) => {
+            ed.message = format!("CSV が UTF-8 ではありません: {}", path);
+        }
+    }
+}
+
 /// Collect save candidates from every candidate folder.
 fn scan_saves() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -800,6 +868,7 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Sets => "マイセット",
         Palico => "配信オトモ",
         Options => "設定",
+        Csv => "CSV 入出力",
     }
 }
 
@@ -936,6 +1005,13 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("Y", "スナップショット"),
             ("B", "戻る"),
         ],
+        // Twice for the apply: it replaces a whole box.
+        Csv => &[
+            ("A", "適用(2回)"),
+            ("Y", "書き出し"),
+            ("-", "再読込"),
+            ("B", "戻る"),
+        ],
     }
 }
 
@@ -1048,6 +1124,21 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
     }
     if let Some(arc_idx) = gui.wants_install_arc_idx.take() {
         install_arc_file_into_save(ed, arc_idx);
+        force_redraw = true;
+    }
+    // The CSV folder: listing it, writing the two exports, and reading the one
+    // file an apply asked for. The core names every path; this layer is the
+    // only one that touches the card.
+    if ed.take_csv_rescan() {
+        ed.set_csv_files(scan_csv());
+        force_redraw = true;
+    }
+    if ed.take_csv_export() {
+        export_csv_to_sd(ed);
+        force_redraw = true;
+    }
+    if let Some(path) = ed.take_csv_read() {
+        read_csv_into(ed, &path);
         force_redraw = true;
     }
     if gui.wants_restore_snapshot {

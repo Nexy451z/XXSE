@@ -3295,7 +3295,7 @@ fn the_console_entry_is_labelled_in_the_list() {
 // ===========================================================================
 
 /// Every Screen variant, so the reachability test cannot miss a new one.
-const AUDIT_SCREENS: [Screen; 26] = [
+const AUDIT_SCREENS: [Screen; 27] = [
     Screen::SaveList,
     Screen::Slots,
     Screen::Char,
@@ -3322,6 +3322,7 @@ const AUDIT_SCREENS: [Screen; 26] = [
     Screen::Mib,
     Screen::Gmd,
     Screen::Check,
+    Screen::Csv,
 ];
 
 /// Keys that could plausibly start an edit on a record screen.
@@ -3363,6 +3364,9 @@ fn audit_screen_name(s: Screen) -> &'static str {
         Screen::Mib => "Mib",
         Screen::Gmd => "Gmd",
         Screen::Check => "Check",
+        // Added with the CSV screen: the audit walks every screen, so the new
+        // one has to have a name for its report.
+        Screen::Csv => "Csv",
     }
 }
 
@@ -3650,6 +3654,10 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::SaveList);
     press!(Key::X);
     assert_eq!(ed.screen, Screen::Options);
+    // R is the tab-forward key on the console, and the tab after the settings
+    // is the CSV screen, so one press lands on it either way.
+    press!(Key::R);
+    assert_eq!(ed.screen, Screen::Csv);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::SaveList);
     ed.input(Key::A);
@@ -4338,7 +4346,7 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
         .collect();
     assert_eq!(
         arms.len(),
-        26,
+        27,
         "arms: {:?}",
         arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     );

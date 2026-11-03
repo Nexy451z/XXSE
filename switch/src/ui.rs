@@ -27,10 +27,10 @@ use mhnx_core::check::Severity;
 use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
-    decoration_name_of, item_name_of, monster_name, palico_part_name, Editor, Key,
-    PalicoEquipRow, Screen, CHAR_FIELDS, CONSOLE_SAVE, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT,
-    ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, SET_EDIT_ROWS,
-    SET_ROW_NAME, STEPS,
+    decoration_name_of, item_name_of, monster_name, palico_part_name, Editor, ItemSetOp, Key,
+    PalicoEquipRow, Screen, CHAR_FIELDS, CONSOLE_SAVE, CSV_DIR, ITEM_OP_ADD, ITEM_OP_CLAMP,
+    ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS,
+    PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -197,7 +197,11 @@ const MAIN_SECTIONS: [(MainSection, &str); 6] = [
 
 pub fn section_of(screen: Screen) -> MainSection {
     match screen {
-        Screen::SaveList | Screen::Convert | Screen::Options => MainSection::File,
+        // The CSV screen is the fourth tab of the file section: it lists a
+        // folder of files, the same kind of thing the save list does.
+        Screen::SaveList | Screen::Convert | Screen::Options | Screen::Csv => {
+            MainSection::File
+        }
         Screen::Slots | Screen::Char => MainSection::Hunter,
         Screen::Items | Screen::ItemPick => MainSection::Items,
         Screen::Charms
@@ -508,6 +512,13 @@ impl GuiState {
             ed.set_clear_armed = None;
             ed.set_warnings.clear();
         }
+        // The item set form is the other mode of the same screen and is put
+        // away by the same jumps.
+        if ed.item_set_edit.is_some() {
+            ed.item_set_edit = None;
+            ed.item_set_armed = None;
+            ed.item_set_warnings.clear();
+        }
     }
 
     /// Put the palico equipment panel away when a jump leaves its screens.
@@ -602,11 +613,12 @@ impl GuiState {
         match section_of(ed.screen) {
             MainSection::File => {
                 let labels: &'static [&'static str] =
-                    &["セーブ一覧", "形式変換", "環境設定"];
+                    &["セーブ一覧", "形式変換", "環境設定", "CSV入出力"];
                 let active = match ed.screen {
                     Screen::SaveList => 0,
                     Screen::Convert => 1,
                     Screen::Options => 2,
+                    Screen::Csv => 3,
                     _ => 0,
                 };
                 (labels, active)
@@ -717,6 +729,8 @@ impl GuiState {
         // The マイセット tab means the list, so a tab press also closes the
         // set editor; leaving the screen any other way does too.
         self.close_set_form(ed);
+        // A pending CSV apply belongs to the screen it was armed on.
+        ed.csv_armed = None;
         // Same rule for the palico equipment panel.
         self.close_palico_panel(ed);
 
@@ -789,7 +803,7 @@ impl GuiState {
                         ed.screen = Screen::Convert;
                     }
                 }
-                _ => {
+                2 => {
                     if ed.save.is_none() {
                         ed.message = String::from("設定を開くには先にセーブデータを開いてください");
                     } else {
@@ -797,6 +811,9 @@ impl GuiState {
                         ed.option_cursor = 0;
                     }
                 }
+                // The CSV tab lists a folder, so it opens even with no save
+                // loaded: the user may want to see what is on the card first.
+                _ => ed.open_csv(),
             },
             MainSection::Hunter => match idx {
                 0 => {
@@ -928,9 +945,10 @@ impl GuiState {
             return;
         }
         if ed.screen == Screen::Sets {
-            // The set editor has eight rows on one panel; there is nothing to
-            // page there and scrolling must not move the list under it.
-            if ed.set_edit.is_some() {
+            // The equipment form has eight rows on one panel, so there is
+            // nothing to page there; the item form has thirty-two and pages
+            // itself through the cursor. Neither may move the list underneath.
+            if ed.set_editor_open() {
                 return;
             }
             let len = sets_len(ed, self.sets_tab);
@@ -1224,7 +1242,9 @@ impl GuiState {
             // shape the item bulk menu uses. The list's own cursor lives in
             // this struct, so A is what hands the selected record to the state
             // machine.
-            Screen::Sets if ed.set_edit.is_some() => match key {
+            // Either set form owns every key while it is open: the equipment
+            // one for its parts, the item one for its thirty-two entries.
+            Screen::Sets if ed.set_editor_open() => match key {
                 Key::Up | Key::Down | Key::Left | Key::Right | Key::A | Key::Y | Key::Minus
                 | Key::B => ed.input(key),
                 _ => {},
@@ -1240,12 +1260,14 @@ impl GuiState {
                     }
                 }
                 Key::A => {
-                    // Only the equipment sets have an editor. Saying so beats
-                    // a key that silently does nothing.
+                    // Both tabs have a form now, and each takes the record its
+                    // own list is showing: the two arrays are unrelated.
                     if self.sets_tab == 0 {
-                        ed.message = String::from(
-                            "アイテムセットはまだ編集できません（[◀/▶] で装備セットへ）",
-                        );
+                        if let Some(set) = item_set_at(ed, self.sets_cursor) {
+                            ed.open_item_set_editor(set);
+                        } else {
+                            ed.message = String::from("編集できるアイテムセットがありません");
+                        }
                     } else if let Some(set) = equip_set_at(ed, self.sets_cursor) {
                         ed.open_set_editor(set);
                     } else {
@@ -1260,6 +1282,15 @@ impl GuiState {
                     ed.open_charms();
                 }
                 _ => {},
+            },
+            // The CSV screen is a folder list: A applies a file (twice, since
+            // an apply replaces a box), Y writes both boxes out and Minus reads
+            // the folder again.
+            Screen::Csv => match key {
+                Key::Up | Key::Down | Key::A | Key::Y | Key::Minus | Key::B => {
+                    ed.input(key);
+                }
+                _ => {}
             },
             Screen::SaveQuests => match key {
                 Key::Up if self.quest_tab > 0 => {
@@ -2108,6 +2139,18 @@ fn equip_set_at(ed: &Editor, row: usize) -> Option<usize> {
         .map(|s| s.index)
 }
 
+/// The item set array index of one row of the my-sets item list.
+///
+/// The list skips the empty records, so its row number is not the record index
+/// the form needs.
+fn item_set_at(ed: &Editor, row: usize) -> Option<usize> {
+    ed.item_sets()
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .nth(row)
+        .map(|s| s.index)
+}
+
 fn sets_len(ed: &Editor, tab: usize) -> usize {
     let Some(save) = &ed.save else { return 0 };
     if tab == 0 {
@@ -2151,8 +2194,12 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         // the set editor is open: the editor is a mode of this screen.
         Screen::Sets => match ed.set_edit {
             Some(e) => e.field,
-            None => gui.sets_cursor,
+            None => match ed.item_set_edit {
+                Some(e) => e.field,
+                None => gui.sets_cursor,
+            },
         },
+        Screen::Csv => ed.csv_cursor,
         Screen::SaveQuests => {
             if gui.quest_tab > 0 {
                 gui.quest_cat_cursor[gui.quest_tab]
@@ -2211,10 +2258,13 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Sets => {
             if ed.set_edit.is_some() {
                 SET_EDIT_ROWS
+            } else if ed.item_set_edit.is_some() {
+                ITEM_SET_EDIT_ROWS
             } else {
                 sets_len(ed, gui.sets_tab)
             }
         }
+        Screen::Csv => ed.csv_files.len(),
         Screen::SaveQuests => {
             if gui.quest_tab > 0 {
                 bundled_quests_for_tab(gui.quest_tab, &ed.quest_filter).len()
@@ -2270,18 +2320,37 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         return;
     }
     if ed.screen == Screen::Sets {
-        // While the editor is open a tap moves its row cursor, not the list's.
+        // While a form is open a tap moves its row cursor, not the list's.
         // A tap on another row is a cursor move like any other, so a pending
-        // part clear (which belongs to the row it was armed on) is dropped.
+        // operation (which belongs to the row it was armed on) is dropped.
         if let Some(mut e) = ed.set_edit {
             e.field = idx.min(SET_EDIT_ROWS - 1);
             ed.set_edit = Some(e);
             ed.set_clear_armed = None;
             return;
         }
+        if let Some(mut e) = ed.item_set_edit {
+            e.field = idx.min(ITEM_SET_EDIT_ROWS - 1);
+            ed.item_set_edit = Some(e);
+            ed.item_set_armed = None;
+            return;
+        }
         let n = sets_len(ed, gui.sets_tab);
         if n > 0 {
             gui.sets_cursor = idx.min(n - 1);
+        }
+        return;
+    }
+    if ed.screen == Screen::Csv {
+        let n = ed.csv_files.len();
+        if n > 0 {
+            let target = idx.min(n - 1);
+            // A tap on another file drops the pending apply; a second tap on
+            // the same one keeps it, because that is the confirmation.
+            if target != ed.csv_cursor {
+                ed.csv_armed = None;
+            }
+            ed.csv_cursor = target;
         }
         return;
     }
@@ -3039,12 +3108,22 @@ impl GuiState {
             Screen::JewelPick => {
                 "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [▲/▼] 行  [B] 戻る"
             }
-            // The set editor is a mode of the my-sets screen, so the chips
-            // change with it: X stops saving and reads the set back instead.
+            // The set editors are modes of the my-sets screen, so the chips
+            // change with them.
             Screen::Sets if ed.set_edit.is_some() => {
                 "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-]×2 外す  [Y] 警告  [X] 保存  [B] 一覧"
             }
+            Screen::Sets if ed.item_set_edit.is_some() => {
+                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込×2  [-]×2 ポーチへ  [B] 一覧"
+            }
             Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
+            // The CSV screen: A applies twice, Y writes, Minus reads the folder.
+            Screen::Csv if ed.csv_armed.is_some() => {
+                "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [-] 再読込"
+            }
+            Screen::Csv => {
+                "[A] 適用(2回)  [Y] 書き出し  [-] 再読込  [▲/▼] 行  [L/R] タブ"
+            }
             Screen::Options => "[◀/▶] 値変更  [Y] 直近スナップショットへ戻す  [X] 保存  [B] 戻る",
             // The equipment panel is a mode of both palico screens: its chips
             // replace theirs while it is open.
@@ -3094,6 +3173,7 @@ impl GuiState {
             Screen::EquipEdit => self.draw_equip_edit(c, ed),
             Screen::JewelPick => self.draw_jewel_pick(c, ed),
             Screen::Sets => self.draw_sets(c, ed),
+            Screen::Csv => self.draw_csv(c, ed),
             // The palico equipment panel is a mode of the two palico screens,
             // so it is dispatched before the screens themselves.
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
@@ -3785,7 +3865,74 @@ impl GuiState {
             // goes through the same key path the pad uses, so a tap can never
             // clear a part the pad would ask twice about.
             Screen::Sets => {
-                if ed.set_edit.is_some() {
+                if let Some(e) = ed.item_set_edit {
+                    // The item form's own tools: the candidate stepper the
+                    // equipment form gets from the numeric stepper, and the
+                    // two operations the set exists for. Both go through the
+                    // same key path the pad uses, so a tap can never write the
+                    // pouch without the second press the pad asks for.
+                    let _ = e;
+                    c.text_sized(ix + 20, cur_y, "このセットの操作", t.text_muted, FontSize::Small);
+                    cur_y += 24;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        half_w,
+                        38,
+                        "◀ 前の候補",
+                        UiAction::AdjustRow(row_idx, Key::Left),
+                    );
+                    self.draw_tool_button(
+                        c,
+                        ix + 28 + half_w,
+                        cur_y,
+                        half_w,
+                        38,
+                        "▶ 次の候補",
+                        UiAction::AdjustRow(row_idx, Key::Right),
+                    );
+                    cur_y += 44;
+                    let from_lbl = if ed.item_set_armed == Some(ItemSetOp::FromPouch) {
+                        "もう一度タップで取り込む"
+                    } else {
+                        "[Y] ポーチから取り込む（2回）"
+                    };
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        from_lbl,
+                        UiAction::Key(Key::Y),
+                    );
+                    cur_y += 44;
+                    let to_lbl = if ed.item_set_armed == Some(ItemSetOp::ToPouch) {
+                        "もう一度タップで適用する"
+                    } else {
+                        "[-] ポーチへ適用（2回）"
+                    };
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        to_lbl,
+                        UiAction::Key(Key::Minus),
+                    );
+                    cur_y += 44;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[B] 一覧に戻る",
+                        UiAction::Key(Key::B),
+                    );
+                } else if ed.set_edit.is_some() {
                     c.text_sized(ix + 20, cur_y, "このセットの操作", t.text_muted, FontSize::Small);
                     cur_y += 24;
                     self.draw_tool_button(
@@ -4902,10 +5049,14 @@ impl GuiState {
     }
 
     fn draw_sets(&mut self, c: &mut Canvas, ed: &Editor) {
-        // The editor is a mode of this screen, so it owns the panel while it
-        // is open and the list comes back on B.
+        // A form is a mode of this screen, so it owns the panel while it is
+        // open and the list comes back on B.
         if ed.set_edit.is_some() {
             self.draw_set_edit(c, ed);
+            return;
+        }
+        if ed.item_set_edit.is_some() {
+            self.draw_item_set_edit(c, ed);
             return;
         }
         let Some(save) = &ed.save else {
@@ -4960,7 +5111,7 @@ impl GuiState {
             &rows,
             self.sets_cursor.min(rows.len().saturating_sub(1)),
             false,
-            if self.sets_tab == 1 { "編集" } else { "切替" },
+            "編集",
         );
     }
 
@@ -5022,6 +5173,122 @@ impl GuiState {
                 "名前入力"
             } else {
                 "決定"
+            },
+            &notice,
+        );
+    }
+
+    /// The item set form: one row per entry, thirty-two of them.
+    ///
+    /// The same list/inspector shape the equipment form uses, with the rows
+    /// paged by the list itself: a set holds more rows than the panel shows, so
+    /// the cursor is the scroll. The amber strip carries
+    /// `myset::item_set_warnings` for the record as it is stored.
+    fn draw_item_set_edit(&mut self, c: &mut Canvas, ed: &Editor) {
+        let Some(e) = ed.item_set_edit else {
+            return;
+        };
+        let set_name = ed
+            .editing_item_set()
+            .map(|r| r.name)
+            .unwrap_or_default();
+        let used = ed
+            .editing_item_set()
+            .map(|r| r.used_items().len())
+            .unwrap_or(0);
+        let mut rows = Vec::with_capacity(ITEM_SET_EDIT_ROWS);
+        for row in 0..ITEM_SET_EDIT_ROWS {
+            let item = e.pick[row];
+            let empty = item.id == 0;
+            let armed = ed.item_set_armed.is_some() && row == e.field;
+            let badge = if armed {
+                match ed.item_set_armed {
+                    Some(ItemSetOp::FromPouch) => String::from("取込?"),
+                    Some(ItemSetOp::ToPouch) => String::from("適用?"),
+                    None => format!("#{:02}", row + 1),
+                }
+            } else {
+                format!("#{:02}", row + 1)
+            };
+            rows.push((
+                row,
+                if empty {
+                    String::from("空き")
+                } else {
+                    item_name_of(item.id)
+                },
+                if empty {
+                    String::from("◀ ▶ でアイテムBOX の使用中を巡回")
+                } else {
+                    format!("ID {} / ◀ ▶ で巡回  [A] で決定", item.id)
+                },
+                if empty {
+                    String::new()
+                } else {
+                    format!("×{}", item.count)
+                },
+                badge,
+            ));
+        }
+        let notice: Vec<String> = ed.item_set_warnings.clone();
+        let hdr = format!(
+            "マイセット (アイテム) #{:02} を編集 — {} / {} 枠",
+            e.set + 1,
+            if set_name.is_empty() {
+                String::from("(無題)")
+            } else {
+                set_name
+            },
+            used
+        );
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            &hdr,
+            &rows,
+            e.field,
+            false,
+            "決定",
+            &notice,
+        );
+    }
+
+    /// The CSV screen: the folder's files, one row each.
+    ///
+    /// The rows say what each file holds (the name's stem, then the header when
+    /// it is applied) and the amber strip carries the last report - the counts
+    /// the apply or the export produced.
+    fn draw_csv(&mut self, c: &mut Canvas, ed: &Editor) {
+        let mut rows = Vec::with_capacity(ed.csv_files.len());
+        for (i, path) in ed.csv_files.iter().enumerate() {
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let kind = mhnx_core::hbedit::csv_kind_label(path);
+            let armed = ed.csv_armed == Some(i);
+            rows.push((
+                i,
+                String::from(name),
+                format!("{} / {}", kind, CSV_DIR),
+                if armed {
+                    String::from("もう一度 [A]")
+                } else {
+                    String::from(kind)
+                },
+                format!("#{:02}", i + 1),
+            ));
+        }
+        let notice: Vec<String> = ed.csv_report.clone();
+        let hdr = format!("CSV 入出力 — slot {} / {}", ed.slot + 1, CSV_DIR);
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            &hdr,
+            &rows,
+            ed.csv_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            if ed.csv_armed.is_some() {
+                "確定"
+            } else {
+                "選択"
             },
             &notice,
         );

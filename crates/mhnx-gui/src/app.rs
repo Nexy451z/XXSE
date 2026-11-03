@@ -7,6 +7,7 @@ use egui_extras::{Column, TableBuilder};
 
 use mhnx_core::arc::{extension_for, Arc};
 use mhnx_core::check::{self, Finding, Severity};
+use mhnx_core::csvout::{self, ApplyReport, EquipmentRow};
 use mhnx_core::dlc;
 use mhnx_core::equipops::{self, EquipError};
 use mhnx_core::equiprefs::EquipRef;
@@ -17,6 +18,90 @@ use mhnx_core::questfields::FieldKind;
 use mhnx_core::save::{Character, Save, SaveKind, BODY_SIZE, SWITCH_SIZE};
 use mhnx_core::snapshot;
 use mhnx_core::verify;
+
+/// Which of the two boxes a CSV file belongs to.
+///
+/// The two files are not interchangeable: the item file lists all 2300 records
+/// and the equipment file only the used ones, and the parsers read different
+/// columns. Keeping the kind in one place is what lets the dialog, the writer
+/// and the reader say which box they mean without repeating the name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsvKind {
+    /// The 2300 record item box.
+    Items,
+    /// The 2000 record equipment box.
+    Equipment,
+}
+
+impl CsvKind {
+    /// What the interface calls this file.
+    pub fn label(self) -> &'static str {
+        match self {
+            CsvKind::Items => "アイテムボックスの CSV",
+            CsvKind::Equipment => "装備ボックスの CSV",
+        }
+    }
+
+    /// The part of the file name the export dialog starts from.
+    pub fn stem(self) -> &'static str {
+        match self {
+            CsvKind::Items => "items",
+            CsvKind::Equipment => "equip",
+        }
+    }
+
+    /// Which box the file describes, for the confirmation line.
+    pub fn target(self, slot: usize) -> String {
+        match self {
+            CsvKind::Items => format!("枠 {} のアイテムボックス", slot + 1),
+            CsvKind::Equipment => format!("枠 {} の装備ボックス", slot + 1),
+        }
+    }
+}
+
+/// What a parsed CSV file holds, in file order.
+///
+/// The two shapes are kept apart rather than behind one boxed trait object: the
+/// apply functions take a slice of their own row type, and a file that was
+/// parsed as the wrong one would otherwise reach a writer that cannot read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CsvRows {
+    /// One (id, count) pair per record, from csvout::parse_items.
+    Items(Vec<(u16, u16)>),
+    /// One decoded record per row, from csvout::parse_equipment.
+    Equipment(Vec<EquipmentRow>),
+}
+
+impl CsvRows {
+    /// How many rows the file holds.
+    pub fn len(&self) -> usize {
+        match self {
+            CsvRows::Items(rows) => rows.len(),
+            CsvRows::Equipment(rows) => rows.len(),
+        }
+    }
+
+    /// Whether the file held no row at all.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// A CSV file that was read and is waiting for the user to agree to it.
+///
+/// The rows are applied to a copy of the save the moment the file is read, and
+/// the report of that dry run is what the dialog shows. Nothing of the file
+/// reaches the open save until the dialog is answered; see csv_commit.
+pub struct CsvPending {
+    /// Which box the file describes.
+    pub kind: CsvKind,
+    /// Where it was read from, for the dialog and the status line.
+    pub path: PathBuf,
+    /// The rows, in file order.
+    pub rows: CsvRows,
+    /// What applying them to a copy of the save reported.
+    pub report: ApplyReport,
+}
 
 /// Which page is visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +185,16 @@ pub enum Confirm {
     /// Empty one saved equipment set. The contents are gone after this, and
     /// nothing below asks a second time: this dialog is the ask.
     SetClear(usize),
+    /// Write a parsed CSV file into a box, after the dialog showed what the
+    /// file would do. The rows themselves wait in
+    /// [MhnxEditor::csv_pending]: a whole item box is 2300 of them and the
+    /// dialog only needs the numbers.
+    CsvApply,
+    /// Copy the pouch into this item set, replacing what the set holds.
+    SetFromPouch(usize),
+    /// Replace the pouch with this item set. Nothing of the pouch the
+    /// character carries now survives except the copy kept for 元に戻す.
+    SetToPouch(usize),
 }
 
 /// Two-step confirmation for the destructive charm delete.
@@ -211,6 +306,14 @@ pub struct MhnxEditor {
     pub equip_show_empty: bool,
     /// Index of the saved equipment set the panel on the right is editing.
     pub set_selected: Option<usize>,
+    /// Index of the item set the マイセット tab's editor is showing.
+    pub item_set_selected: Option<usize>,
+    /// The pouch as it was before ポーチへ適用, so the one action that
+    /// replaces all 32 entries can be taken back. Cleared once it is used,
+    /// and never written to disk.
+    pub pouch_undo: Option<Vec<mhnx_core::myset::SetItem>>,
+    /// A CSV file that was read and is waiting for the user to agree to it.
+    pub csv_pending: Option<CsvPending>,
     /// Search text of the seven equipment pickers in the set editor, one per
     /// part: each picker narrows the box on its own.
     pub set_part_search: [String; mhnx_core::myset::EQUIP_SET_PARTS],
@@ -319,6 +422,9 @@ impl Default for MhnxEditor {
             equip_selected: None,
             equip_show_empty: false,
             set_selected: None,
+            item_set_selected: None,
+            pouch_undo: None,
+            csv_pending: None,
             set_part_search: [
                 String::new(),
                 String::new(),
@@ -414,6 +520,13 @@ impl MhnxEditor {
         for s in self.set_part_search.iter_mut() {
             s.clear();
         }
+        // The item set editor and the pouch undo are the same: both name a
+        // record of this slot's own section.
+        self.item_set_selected = None;
+        self.pouch_undo = None;
+        // A staged CSV file is a list of rows for the box that was open, and
+        // applying it after a slot switch would write it into another box.
+        self.csv_pending = None;
         // The otomo panel names a roster record and a row of this slot's own
         // gear box, so neither number means anything in another slot.
         self.palico_selected = None;
@@ -2019,6 +2132,49 @@ impl MhnxEditor {
                 ),
                 "丸める",
             ),
+            Confirm::SetToPouch(n) => {
+                // The name is read now, so the dialog says which set it means.
+                let name = self
+                    .save
+                    .as_ref()
+                    .and_then(|s| {
+                        mhnx_core::myset::item_sets(s, self.slot)
+                            .into_iter()
+                            .find(|set| set.index == *n)
+                    })
+                    .map(|set| set.name)
+                    .unwrap_or_default();
+                (
+                    "ポーチを置き換えます",
+                    format!(
+                        "セット {}「{}」の 32 枠を、今のポーチに写します。\n\
+                         今のポーチは置き換わります。\n\
+                         ポーチはクエストに持ち込む 32 枠そのものです。\n\
+                         置き換える前のポーチは控えてあり、「元に戻す」で戻せます。",
+                        n, name
+                    ),
+                    "置き換える",
+                )
+            }
+            Confirm::SetFromPouch(n) => (
+                "セットにポーチを取り込みます",
+                format!(
+                    "今のポーチ 32 枠を、セット {} に写します。\n\
+                     セットの中身は置き換わります（名前と装備はそのままです）。\n\
+                     この操作は元に戻せません。",
+                    n
+                ),
+                "取り込む",
+            ),
+            Confirm::CsvApply => {
+                // Anything the file could not place is drawn in the warning
+                // colour: the row count alone would hide it.
+                let report = self.csv_pending.as_ref().map(|p| &p.report);
+                warn = report
+                    .map(|r| r.skipped > 0 || r.clamped > 0)
+                    .unwrap_or(false);
+                ("CSV を読み込みます", self.csv_confirm_text(), "適用する")
+            }
             Confirm::SetClear(n) => {
                 // The name is read now, so the dialog says which set it means
                 // rather than only a number.
@@ -2108,10 +2264,26 @@ impl MhnxEditor {
                     Confirm::SetClear(n) => {
                         self.set_clear(n);
                     }
+                    Confirm::SetFromPouch(n) => {
+                        self.item_set_from_pouch(n);
+                    }
+                    Confirm::SetToPouch(n) => {
+                        self.item_set_to_pouch(n);
+                    }
+                    Confirm::CsvApply => {
+                        self.csv_commit();
+                    }
                     Confirm::None => {}
                 }
             }
-            Some(false) => self.confirm = Confirm::None,
+            Some(false) => {
+                // A file that was turned down is dropped, so nothing is left
+                // waiting to be applied by a later answer.
+                if matches!(self.confirm, Confirm::CsvApply) {
+                    self.csv_pending = None;
+                }
+                self.confirm = Confirm::None;
+            }
             None => {}
         }
     }
@@ -2188,6 +2360,47 @@ impl MhnxEditor {
             {
                 self.add_item_to_box(9);
             }
+        });
+        // CSV: the box as a table, and a table back into the box. Both go
+        // through the same rfd file dialogs the rest of the window uses, so
+        // there is no new dependency and no second way to pick a file.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("CSV").strong()).on_hover_text(
+                "アイテムボックスを表として持ち出し、その表から書き戻せます（ID と個数だけの 3 列）",
+            );
+            if ui
+                .button("CSV 書き出し")
+                .on_hover_text("このキャラのアイテムボックス 2300 枠を CSV にします（空き枠も 1 行ずつ）")
+                .clicked()
+            {
+                let name = self.csv_suggested_name(CsvKind::Items);
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_file_name(name)
+                    .add_filter("CSV", &["csv"])
+                    .set_title("アイテムボックスの CSV 書き出し")
+                    .save_file()
+                {
+                    self.csv_write(CsvKind::Items, &p);
+                }
+            }
+            if ui
+                .button("CSV 読み込み")
+                .on_hover_text("CSV の内容をこのキャラのボックスに書き戻します（内容を確認してから適用・確認あり）")
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .set_title("アイテムボックスの CSV 読み込み")
+                    .pick_file()
+                {
+                    self.csv_stage(CsvKind::Items, p);
+                }
+            }
+            ui.label(
+                egui::RichText::new("UTF-8 の CSV を読みます。適用の前に、何行が入るかを確認できます")
+                    .weak()
+                    .small(),
+            );
         });
         if self.item_bulk_open {
             self.item_bulk_panel(ui);
@@ -3494,55 +3707,389 @@ impl MhnxEditor {
             width = 900.0;
         }
         ui.label(egui::RichText::new("アイテムセット").strong());
-        // Bounded: twenty-four sets pushed the equipment sets below the fold,
-        // where nothing down there could be reached.
-        egui::ScrollArea::vertical()
-            .id_salt("itemsetlist")
-            .max_height(150.0)
-            .show(ui, |ui| self.item_set_grid(ui, width));
+        self.item_set_tab(ui, width);
+        ui.separator();
+        ui.label(egui::RichText::new("ポーチ").strong());
+        self.pouch_panel(ui, width);
         ui.separator();
         ui.label(egui::RichText::new("装備セット").strong());
         self.equip_set_tab(ui, width);
     }
 
-    /// The item sets: the name with its box index, the contents under it.
+    /// The twenty-four item sets: a list on the left, one editor on the
+    /// right.
     ///
-    /// A plain list rather than a Grid: a Grid sizes its columns to the widest
-    /// cell and does not wrap, so one long line of items stretched the whole
-    /// tab sideways and took the editor with it.
-    fn item_set_grid(&mut self, ui: &mut egui::Ui, width: f32) {
+    /// The list used to be a column of names with a line of item names under
+    /// each; it now edits as well, because a set is only useful if its
+    /// thirty-two entries can be changed. The height is fixed for the same
+    /// reason the equipment sets use one: this tab already sits in the outer
+    /// scroll area.
+    fn item_set_tab(&mut self, ui: &mut egui::Ui, width: f32) {
         let slot = self.slot;
-        ui.set_max_width(width);
-        let Some(save) = &mut self.save else {
+        let Some(sets) = self
+            .save
+            .as_ref()
+            .map(|s| mhnx_core::myset::item_sets(s, slot))
+        else {
             return;
         };
-        let items = mhnx_core::myset::item_sets(save, slot);
-        let mut changed = false;
-        for set in items.iter().filter(|s| !s.is_empty()) {
-            ui.horizontal(|ui| {
-                ui.label(format!("[{}]", set.index));
-                let mut name = set.name.clone();
-                if ui
-                    .add(egui::TextEdit::singleline(&mut name).desired_width(180.0))
-                    .changed()
-                {
-                    mhnx_core::myset::set_item_set_name(save, slot, set.index, &name);
-                    changed = true;
-                }
-            });
-            let body = set
-                .used_items()
+        // One pass over the twenty-four records, so the list itself says which
+        // ones have something to report.
+        let warn_counts: Vec<usize> = self
+            .save
+            .as_ref()
+            .map(|s| {
+                sets.iter()
+                    .map(|set| mhnx_core::myset::item_set_warnings(s, slot, set.index).len())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The same yellow the equipment set editor uses, so the two read as one
+        // signal.
+        let warn_colour = egui::Color32::from_rgb(240, 199, 94);
+        // Land on something editable the first time the tab is opened: an empty
+        // panel on the right looks like the tab has no editor at all.
+        if !self.item_set_selected.is_some_and(|i| i < sets.len()) {
+            self.item_set_selected = sets
                 .iter()
-                .map(|i| format!("{} x{}", mhnx_core::hbedit::item_name_of(i.id), i.count))
-                .collect::<Vec<_>>()
-                .join(", ");
-            if !body.is_empty() {
-                ui.add(egui::Label::new(egui::RichText::new(body).weak().small()).truncate());
-            }
-            ui.add_space(2.0);
+                .find(|s| !s.is_empty())
+                .map(|s| s.index)
+                .or(Some(0));
         }
-        if changed {
-            self.dirty = true;
+        const PANEL_W: f32 = 460.0;
+        const BLOCK_H: f32 = 300.0;
+        let mut pick: Option<usize> = None;
+        let selected = self.item_set_selected;
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, BLOCK_H),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.horizontal_top(|ui| {
+                    let table_w = (width - PANEL_W - 16.0).max(250.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(table_w);
+                        ui.set_height(ui.available_height());
+                        TableBuilder::new(ui)
+                            .id_salt("itemsets")
+                            .striped(true)
+                            .sense(egui::Sense::click())
+                            .column(Column::exact(36.0))
+                            .column(Column::remainder())
+                            .column(Column::exact(52.0))
+                            .column(Column::exact(44.0))
+                            .header(22.0, |mut h| {
+                                for t in ["枠", "名前", "中身", "注意"] {
+                                    h.col(|ui| {
+                                        ui.strong(t);
+                                    });
+                                }
+                            })
+                            .body(|body| {
+                                body.rows(20.0, sets.len(), |mut row| {
+                                    let set = &sets[row.index()];
+                                    row.set_selected(selected == Some(set.index));
+                                    row.col(|ui| {
+                                        ui.label(format!("{}", set.index));
+                                    });
+                                    row.col(|ui| {
+                                        if set.name.trim().is_empty()
+                                            || set.name == mhnx_core::myset::EMPTY_NAME
+                                        {
+                                            ui.label(egui::RichText::new("（名前なし）").weak());
+                                        } else {
+                                            ui.label(set.name.clone());
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        let n = set.items.iter().filter(|i| i.id != 0).count();
+                                        if n == 0 {
+                                            ui.label(egui::RichText::new("0").weak());
+                                        } else {
+                                            ui.label(format!("{}", n));
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        let n = warn_counts.get(set.index).copied().unwrap_or(0);
+                                        if n == 0 {
+                                            ui.label(egui::RichText::new("—").weak());
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(format!("{}", n))
+                                                    .color(warn_colour),
+                                            );
+                                        }
+                                    });
+                                    if row.response().clicked() {
+                                        pick = Some(set.index);
+                                    }
+                                });
+                            });
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_min_width(PANEL_W);
+                        ui.set_max_width(PANEL_W + 60.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("itemsetedit")
+                            .max_height(BLOCK_H - 8.0)
+                            .show(ui, |ui| match pick.or(selected) {
+                                Some(index) => self.item_set_edit_panel(ui, index, &sets),
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "行をクリックすると、ここで編集できます",
+                                        )
+                                        .weak(),
+                                    );
+                                }
+                            });
+                    });
+                });
+            },
+        );
+        if let Some(p) = pick {
+            self.item_set_selected = Some(p);
+        }
+    }
+
+    /// The editor for one item set: the name, the pouch buttons, the warnings
+    /// and the thirty-two entries.
+    ///
+    /// Every write goes through myset: set_item for one entry, clear_item for
+    /// emptying one, copy_from_pouch and apply_to_pouch for the two whole-pouch
+    /// moves. Nothing here touches the 170 byte record by hand.
+    fn item_set_edit_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        sets: &[mhnx_core::myset::ItemSet],
+    ) {
+        let Some(set) = sets.iter().find(|s| s.index == index).cloned() else {
+            ui.label("そのセットは読めません");
+            return;
+        };
+        let slot = self.slot;
+        // Reported, not repaired: a save that came from the game can hold each
+        // of these. See myset::item_set_warnings.
+        let warns = self
+            .save
+            .as_ref()
+            .map(|s| mhnx_core::myset::item_set_warnings(s, slot, index))
+            .unwrap_or_default();
+        let warn_colour = egui::Color32::from_rgb(240, 199, 94);
+        ui.label(egui::RichText::new(format!("セット {} の編集", index)).strong());
+        ui.horizontal(|ui| {
+            ui.label("名前");
+            let mut name = set.name.clone();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut name)
+                        .desired_width(230.0)
+                        .hint_text("セット名"),
+                )
+                .changed()
+            {
+                self.item_set_name_write(index, &name);
+            }
+        });
+        ui.add_space(4.0);
+        if warns.is_empty() {
+            ui.label(egui::RichText::new("警告はありません").weak().small());
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "警告 {} 件（保存はできます。直すかどうかは任せます）",
+                    warns.len()
+                ))
+                .color(warn_colour)
+                .strong(),
+            );
+            for w in &warns {
+                ui.label(egui::RichText::new(format!("・{}", w)).color(warn_colour));
+            }
+        }
+        ui.add_space(2.0);
+        // Both of these write over something - the set one way and the pouch
+        // the other - so both only arm the confirmation dialog.
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("ポーチから取り込む")
+                .on_hover_text(
+                    "今のポーチ 32 枠をこのセットに写します（セットの中身は置き換わります・確認あり）",
+                )
+                .clicked()
+            {
+                self.confirm = Confirm::SetFromPouch(index);
+            }
+            if ui
+                .button("ポーチへ適用")
+                .on_hover_text(
+                    "このセットの 32 枠をポーチに写します（今のポーチは置き換わります・確認あり）",
+                )
+                .clicked()
+            {
+                self.confirm = Confirm::SetToPouch(index);
+            }
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("中身（32 枠）").strong())
+            .on_hover_text("ID 0 は空きです。個数は 99 まで。ID を 0 にすると空きに戻ります。");
+        let mut action: Option<(usize, u16, u16)> = None;
+        egui::ScrollArea::vertical()
+            .id_salt(("itemsetitems", index))
+            .max_height(180.0)
+            .show(ui, |ui| {
+                egui::Grid::new(("itemsetgrid", index))
+                    .num_columns(5)
+                    .spacing([6.0, 2.0])
+                    .show(ui, |ui| {
+                        for t in ["#", "ID", "名前", "個数", ""] {
+                            ui.label(egui::RichText::new(t).weak().small());
+                        }
+                        ui.end_row();
+                        for entry in 0..set.items.len() {
+                            let item = set.items[entry];
+                            ui.label(format!("{}", entry));
+                            let mut id = item.id;
+                            let mut count = item.count;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut id)
+                                        .range(0..=LAST_ITEM_ID as u16)
+                                        .speed(1.0),
+                                )
+                                .changed()
+                            {
+                                action = Some((entry, id, if id == 0 { 0 } else { count }));
+                            }
+                            if id == 0 {
+                                ui.label(egui::RichText::new("（空き）").weak());
+                            } else {
+                                ui.label(item_name(id));
+                            }
+                            if ui
+                                .add(egui::DragValue::new(&mut count).range(0..=MAX_COUNT))
+                                .changed()
+                                && id != 0
+                            {
+                                action = Some((entry, id, count));
+                            }
+                            if ui
+                                .add_enabled(id != 0, egui::Button::new("解除"))
+                                .on_hover_text("この枠を空きに戻します（ID と個数が 0 になります）")
+                                .clicked()
+                            {
+                                action = Some((entry, 0, 0));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some((entry, id, count)) = action {
+            self.item_set_entry_write(index, entry, id, count);
+        }
+    }
+
+    /// The pouch: the same thirty-two entries an item set holds, as the
+    /// character carries them into a quest.
+    ///
+    /// Editing here writes the pouch; the set side can write it too (ポーチへ
+    /// 適用), which is why the confirmation there keeps a copy. Both roads end
+    /// in the same 76 bytes at OFF_POUCH.
+    fn pouch_panel(&mut self, ui: &mut egui::Ui, width: f32) {
+        let slot = self.slot;
+        let Some(entries) = self
+            .save
+            .as_ref()
+            .map(|s| mhnx_core::myset::pouch(s, slot))
+        else {
+            return;
+        };
+        if entries.len() != mhnx_core::myset::POUCH_SLOTS {
+            ui.label(
+                egui::RichText::new(format!(
+                    "枠 {} のポーチは読めません（32 枠ぶんの領域がありません）",
+                    slot + 1
+                ))
+                .color(egui::Color32::from_rgb(229, 72, 77)),
+            );
+            return;
+        }
+        let used = entries.iter().filter(|i| i.id != 0).count();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "{} / {} 枠を使用中",
+                used,
+                mhnx_core::myset::POUCH_SLOTS
+            ));
+            if ui
+                .add_enabled(self.pouch_undo.is_some(), egui::Button::new("元に戻す"))
+                .on_hover_text("ポーチへ適用 の直前に控えたポーチへ戻します")
+                .clicked()
+            {
+                self.pouch_restore();
+            }
+            ui.label(
+                egui::RichText::new(
+                    "ここはクエストに持ち込む 32 枠そのものです。「ポーチへ適用」はこの欄を丸ごと置き換えます",
+                )
+                .weak()
+                .small(),
+            );
+        });
+        let mut action: Option<(usize, u16, u16)> = None;
+        ui.set_max_width(width);
+        egui::ScrollArea::vertical()
+            .id_salt("pouchedit")
+            .max_height(165.0)
+            .show(ui, |ui| {
+                egui::Grid::new("pouchgrid")
+                    .num_columns(5)
+                    .spacing([6.0, 2.0])
+                    .show(ui, |ui| {
+                        for t in ["#", "ID", "名前", "個数", ""] {
+                            ui.label(egui::RichText::new(t).weak().small());
+                        }
+                        ui.end_row();
+                        for (entry, item) in entries.iter().enumerate() {
+                            ui.label(format!("{}", entry));
+                            let mut id = item.id;
+                            let mut count = item.count;
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut id)
+                                        .range(0..=LAST_ITEM_ID as u16)
+                                        .speed(1.0),
+                                )
+                                .changed()
+                            {
+                                action = Some((entry, id, if id == 0 { 0 } else { count }));
+                            }
+                            if id == 0 {
+                                ui.label(egui::RichText::new("（空き）").weak());
+                            } else {
+                                ui.label(item_name(id));
+                            }
+                            if ui
+                                .add(egui::DragValue::new(&mut count).range(0..=MAX_COUNT))
+                                .changed()
+                                && id != 0
+                            {
+                                action = Some((entry, id, count));
+                            }
+                            if ui
+                                .add_enabled(id != 0, egui::Button::new("解除"))
+                                .on_hover_text("この枠を空きに戻します")
+                                .clicked()
+                            {
+                                action = Some((entry, 0, 0));
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some((entry, id, count)) = action {
+            self.pouch_entry_write(entry, id, count);
         }
     }
 
@@ -4053,6 +4600,431 @@ impl MhnxEditor {
             self.message = format!("セット {} は空にできませんでした", index);
             false
         }
+    }
+
+    // ------------------------------------------------------------------ CSV
+
+    /// The file name the export dialog starts from: box, slot number.
+    pub fn csv_suggested_name(&self, kind: CsvKind) -> String {
+        format!("{}-slot{}.csv", kind.stem(), self.slot + 1)
+    }
+
+    /// The item box of the open slot as CSV, taken from what the screen shows.
+    ///
+    /// The working copy is written into a *copy* of the save first. An export
+    /// must not mark the save dirty, and it must not write the box on screen
+    /// into the real save just to get at its text either.
+    pub fn csv_items_text(&self) -> Option<String> {
+        let save = self.save.as_ref()?;
+        let slot = self.slot;
+        let mut copy = save.clone();
+        if !self.items.is_empty() {
+            let _ = copy.write_item_box(slot, &self.items);
+        }
+        Some(csvout::items_to_csv(&copy, slot))
+    }
+
+    /// The equipment box of the open slot as CSV.
+    ///
+    /// The equipment tab writes into the save as it goes, so there is no
+    /// working copy to fold in first.
+    pub fn csv_equipment_text(&self) -> Option<String> {
+        let save = self.save.as_ref()?;
+        Some(csvout::equipment_to_csv(save, self.slot))
+    }
+
+    /// Write one of the two boxes to `path`.
+    ///
+    /// Returns whether the file was written; the status line says where it
+    /// went, or why it could not be written.
+    pub fn csv_write(&mut self, kind: CsvKind, path: &std::path::Path) -> bool {
+        let text = match kind {
+            CsvKind::Items => self.csv_items_text(),
+            CsvKind::Equipment => self.csv_equipment_text(),
+        };
+        let Some(text) = text else {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        };
+        match std::fs::write(path, text.as_bytes()) {
+            Ok(()) => {
+                // lines() counts what a spreadsheet of the box would show,
+                // header included; the header is not a record.
+                let rows = text.lines().count().saturating_sub(1);
+                self.message = format!(
+                    "{} を書き出しました: {}（{} 行）",
+                    kind.label(),
+                    path.display(),
+                    rows
+                );
+                true
+            }
+            Err(e) => {
+                self.message = format!("CSV を書き出せません: {}（{}）", path.display(), e);
+                false
+            }
+        }
+    }
+
+    /// Read a CSV file and put what it would do in front of the user.
+    ///
+    /// Nothing is written here: the rows are applied to a copy of the save and
+    /// the report of that dry run is what the confirmation dialog shows. The
+    /// rows wait in csv_pending until csv_commit.
+    pub fn csv_stage(&mut self, kind: CsvKind, path: PathBuf) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = format!("CSV を読めません: {}（{}）", path.display(), e);
+                return false;
+            }
+        };
+        // Excel writes UTF-8 or the system code page. The parser wants UTF-8,
+        // and a file in another code page would be read as mojibake, so it is
+        // refused rather than half applied.
+        let text = match String::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => {
+                self.message =
+                    String::from("CSV は UTF-8 で保存してください（文字コードを判別できません）");
+                return false;
+            }
+        };
+        let rows = match kind {
+            CsvKind::Items => match csvout::parse_items(&text) {
+                Ok(rows) => CsvRows::Items(rows),
+                Err(e) => {
+                    // The message of CsvError already carries the line and
+                    // the column, so it is shown as it is.
+                    self.message = format!("CSV を読めません: {}", e);
+                    return false;
+                }
+            },
+            CsvKind::Equipment => match csvout::parse_equipment(&text) {
+                Ok(rows) => CsvRows::Equipment(rows),
+                Err(e) => {
+                    self.message = format!("CSV を読めません: {}", e);
+                    return false;
+                }
+            },
+        };
+        if rows.is_empty() {
+            self.message = format!("{} には適用できる行がありません", path.display());
+            return false;
+        }
+        let slot = self.slot;
+        let Some(save) = self.save.as_ref() else {
+            return false;
+        };
+        // A dry run: the report the dialog shows is what the file would do,
+        // measured without touching the save that is open.
+        let mut trial = save.clone();
+        let report = match &rows {
+            CsvRows::Items(rows) => csvout::apply_items(&mut trial, slot, rows),
+            CsvRows::Equipment(rows) => csvout::apply_equipment(&mut trial, slot, rows),
+        };
+        self.message = format!(
+            "{} を読みました（{} 行）。内容を確認して、適用するか決めてください",
+            path.display(),
+            rows.len()
+        );
+        self.csv_pending = Some(CsvPending {
+            kind,
+            path,
+            rows,
+            report,
+        });
+        self.confirm = Confirm::CsvApply;
+        true
+    }
+
+    /// The numbers one apply report has to show.
+    fn report_line(report: &ApplyReport) -> String {
+        format!(
+            "書き込み {} 行 / 対象外 {} 行 / 丸め {} 行",
+            report.applied, report.skipped, report.clamped
+        )
+    }
+
+    /// The body of the CSV confirmation dialog.
+    ///
+    /// Every number and every message of the ApplyReport is listed: a row the
+    /// file has but the box will not take must not disappear without a word.
+    pub fn csv_confirm_text(&self) -> String {
+        let Some(pending) = &self.csv_pending else {
+            return String::from("読み込んだ CSV がありません");
+        };
+        let mut body = format!(
+            "{} を {} に書き込みます。\n{}（{} 行）\n\n",
+            pending.path.display(),
+            pending.kind.target(self.slot),
+            Self::report_line(&pending.report),
+            pending.rows.len()
+        );
+        // Bounded: a file that trips every row would otherwise make a window
+        // taller than the screen.
+        const SHOWN: usize = 8;
+        for m in pending.report.messages.iter().take(SHOWN) {
+            body += &format!("・{}\n", m);
+        }
+        if pending.report.messages.len() > SHOWN {
+            body += &format!("・ほか {} 件\n", pending.report.messages.len() - SHOWN);
+        }
+        body += "\n「適用する」でセーブデータに反映します（ファイルへは「上書き保存」で書き込みます）。";
+        body
+    }
+
+    /// Apply the staged CSV file, after the dialog said yes.
+    ///
+    /// The report that comes back is the one the real save produced, not the
+    /// preview: both are computed the same way, and this one is what happened.
+    pub fn csv_commit(&mut self) -> Option<ApplyReport> {
+        let pending = self.csv_pending.take()?;
+        let slot = self.slot;
+        let items_file = matches!(pending.kind, CsvKind::Items);
+        if items_file {
+            // The item tab's 元に戻す has to be able to take the file back.
+            self.push_item_undo();
+        }
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("先にセーブを開いてください");
+            return None;
+        };
+        let report = match &pending.rows {
+            CsvRows::Items(rows) => csvout::apply_items(save, slot, rows),
+            CsvRows::Equipment(rows) => csvout::apply_equipment(save, slot, rows),
+        };
+        if items_file {
+            if let Some(items) = save.read_item_box(slot) {
+                self.items = items;
+            }
+        }
+        if report.applied == 0 {
+            self.message = format!(
+                "CSV を適用できませんでした: {}",
+                Self::report_line(&report)
+            );
+        } else {
+            self.dirty = true;
+            self.message = format!(
+                "{} を適用しました: {}",
+                pending.kind.label(),
+                Self::report_line(&report)
+            );
+        }
+        Some(report)
+    }
+
+    // -------------------------------------------------- item sets / pouch
+
+    /// Rename one of the twenty-four item sets.
+    pub fn item_set_name_write(&mut self, index: usize, name: &str) -> bool {
+        let slot = self.slot;
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        let ok = mhnx_core::myset::set_item_set_name(save, slot, index, name);
+        if ok {
+            self.dirty = true;
+        } else {
+            self.message = format!("セット {} の名前を書き換えられませんでした", index);
+        }
+        ok
+    }
+
+    /// Write one of the thirty-two entries of an item set.
+    ///
+    /// An id of 0 means "empty", and the core refuses an empty entry that still
+    /// carries a count, so clearing goes through clear_item and drops both.
+    pub fn item_set_entry_write(
+        &mut self,
+        set: usize,
+        entry: usize,
+        id: u16,
+        count: u16,
+    ) -> bool {
+        let slot = self.slot;
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        let ok = if id == 0 {
+            mhnx_core::myset::clear_item(save, slot, set, entry)
+        } else {
+            mhnx_core::myset::set_item(save, slot, set, entry, id, count)
+        };
+        if ok {
+            self.dirty = true;
+            self.message = if id == 0 {
+                format!("セット {} の {} 番目を空にしました", set, entry)
+            } else {
+                format!(
+                    "セット {} の {} 番目を {} x{} にしました",
+                    set,
+                    entry,
+                    item_name(id),
+                    count
+                )
+            };
+        } else {
+            self.message = format!(
+                "セット {} の {} 番目を書き換えられませんでした（ID {} / 個数 {}）",
+                set, entry, id, count
+            );
+        }
+        ok
+    }
+
+    /// Copy the pouch into an item set. Destructive: the caller asks first.
+    ///
+    /// Returns how many entries hold something; 0 means nothing was written,
+    /// which is either an empty pouch or a pouch that cannot be read, and the
+    /// status line says which.
+    pub fn item_set_from_pouch(&mut self, set: usize) -> usize {
+        let slot = self.slot;
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return 0;
+        };
+        let carried = mhnx_core::myset::pouch(save, slot);
+        if carried.len() != mhnx_core::myset::POUCH_SLOTS {
+            self.message = format!("枠 {} のポーチが読めません", slot + 1);
+            return 0;
+        }
+        let used = mhnx_core::myset::copy_from_pouch(save, slot, set);
+        self.dirty = true;
+        self.message = if used == 0 {
+            // All thirty-two entries are written either way, so an empty
+            // pouch really does empty the set.
+            format!(
+                "ポーチが空だったので、セット {} を空にしました（名前はそのままです）",
+                set
+            )
+        } else {
+            format!(
+                "ポーチの {} 個をセット {} に取り込みました（空き {} 枠）",
+                used,
+                set,
+                mhnx_core::myset::POUCH_SLOTS - used
+            )
+        };
+        used
+    }
+
+    /// Replace the pouch with an item set.
+    ///
+    /// Destructive and confirmed by the caller. What is about to be replaced
+    /// is kept, because nothing else in the save can reconstruct it; the one
+    /// press of 元に戻す puts it back.
+    pub fn item_set_to_pouch(&mut self, set: usize) -> usize {
+        let slot = self.slot;
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return 0;
+        };
+        let before = mhnx_core::myset::pouch(save, slot);
+        if before.len() != mhnx_core::myset::POUCH_SLOTS {
+            self.message = format!("枠 {} のポーチが読めません", slot + 1);
+            return 0;
+        }
+        // A set that holds nothing must not reach the pouch: applying it would
+        // empty the 32 slots the character carries into a quest, and the core
+        // only refuses the narrower case of a record still named '－－－'.
+        let holds = mhnx_core::myset::item_sets(save, slot)
+            .into_iter()
+            .find(|s| s.index == set)
+            .map(|s| s.items.iter().any(|i| i.id != 0))
+            .unwrap_or(false);
+        if !holds {
+            self.message = format!(
+                "セット {} は中身が空なので、ポーチへは適用しませんでした（ポーチはそのままです）",
+                set
+            );
+            return 0;
+        }
+        let used = mhnx_core::myset::apply_to_pouch(save, slot, set);
+        if used == 0 {
+            // Refused by the core, or the 76 bytes could not be written.
+            self.message = format!(
+                "セット {} をポーチへ適用できませんでした（ポーチはそのままです）",
+                set
+            );
+            return 0;
+        }
+        self.pouch_undo = Some(before);
+        self.dirty = true;
+        self.message = format!(
+            "ポーチをセット {} の内容 {} 個に置き換えました（「元に戻す」で戻せます）",
+            set, used
+        );
+        used
+    }
+
+    /// Put the pouch back the way it was before ポーチへ適用.
+    pub fn pouch_restore(&mut self) -> bool {
+        let Some(before) = self.pouch_undo.clone() else {
+            self.message = String::from("戻せるポーチの控えがありません");
+            return false;
+        };
+        let slot = self.slot;
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        let mut bad = 0usize;
+        for (index, item) in before.iter().enumerate() {
+            if !mhnx_core::myset::set_pouch_item(save, slot, index, item.id, item.count) {
+                bad += 1;
+            }
+        }
+        if bad > 0 {
+            self.message = format!("ポーチを戻せませんでした（{} 枠）", bad);
+            return false;
+        }
+        self.pouch_undo = None;
+        self.dirty = true;
+        self.message = String::from("ポーチを ポーチへ適用 の前に戻しました");
+        true
+    }
+
+    /// Write one pouch entry.
+    ///
+    /// The pouch is the same thirty-two (id, count) pairs an item set holds,
+    /// coded into 76 bytes; the core owns the bit layout.
+    pub fn pouch_entry_write(&mut self, entry: usize, id: u16, count: u16) -> bool {
+        let slot = self.slot;
+        // The core refuses an empty entry that carries a count; dropping the
+        // count here is what makes "set the id to 0" mean "clear this one".
+        let (id, count) = if id == 0 { (0, 0) } else { (id, count) };
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        let ok = mhnx_core::myset::set_pouch_item(save, slot, entry, id, count);
+        if ok {
+            self.dirty = true;
+            self.message = if id == 0 {
+                format!("ポーチの {} 番目を空にしました", entry)
+            } else {
+                format!(
+                    "ポーチの {} 番目を {} x{} にしました",
+                    entry,
+                    item_name(id),
+                    count
+                )
+            };
+        } else {
+            self.message = format!(
+                "ポーチの {} 番目を書き換えられませんでした（ID {} / 個数 {}）",
+                entry, id, count
+            );
+        }
+        ok
     }
 
     fn tab_palico_detail(&mut self, ui: &mut egui::Ui) {
@@ -4952,6 +5924,42 @@ impl MhnxEditor {
         if create {
             self.equip_create(self.equip_new_kind, self.equip_new_id, self.equip_new_level);
         }
+        // The same two CSV actions the item tab has, for the equipment box.
+        // The export writes the records that hold something; the import is
+        // shown before it is applied, like the item one.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("CSV").strong()).on_hover_text(
+                "装備ボックスを表として持ち出し、その表から書き戻せます（使用中の枠だけを 8 列で）",
+            );
+            if ui
+                .button("CSV 書き出し")
+                .on_hover_text("このキャラの装備ボックスの使用中の枠を CSV にします")
+                .clicked()
+            {
+                let name = self.csv_suggested_name(CsvKind::Equipment);
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_file_name(name)
+                    .add_filter("CSV", &["csv"])
+                    .set_title("装備ボックスの CSV 書き出し")
+                    .save_file()
+                {
+                    self.csv_write(CsvKind::Equipment, &p);
+                }
+            }
+            if ui
+                .button("CSV 読み込み")
+                .on_hover_text("CSV の内容を装備ボックスに書き戻します（内容を確認してから適用・確認あり）")
+                .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .set_title("装備ボックスの CSV 読み込み")
+                    .pick_file()
+                {
+                    self.csv_stage(CsvKind::Equipment, p);
+                }
+            }
+        });
         let needle = self.equip_filter.trim().to_lowercase();
         let show_empty = self.equip_show_empty;
         let rows: Vec<_> = all
@@ -7678,6 +8686,323 @@ mod tests {
             mhnx_core::palicogear::PALICO_EQUIP_COUNT as u16
         ));
         assert!(!app.dirty);
+    }
+
+    // ------------------------------------------------------------ csv tests
+
+    /// One item set, read back out of the open save.
+    fn item_set_of(app: &MhnxEditor, index: usize) -> mhnx_core::myset::ItemSet {
+        app.save
+            .as_ref()
+            .and_then(|s| {
+                mhnx_core::myset::item_sets(s, 0)
+                    .into_iter()
+                    .find(|set| set.index == index)
+            })
+            .expect("the set")
+    }
+
+    /// The pouch of slot 0, read back out of the open save.
+    fn pouch_of(app: &MhnxEditor) -> Vec<mhnx_core::myset::SetItem> {
+        app.save
+            .as_ref()
+            .map(|s| mhnx_core::myset::pouch(s, 0))
+            .unwrap_or_default()
+    }
+
+    /// The item box makes the trip out as a table and back in through the same
+    /// three columns; the import only lands when the dialog is answered.
+    #[test]
+    fn the_item_box_goes_out_as_csv_and_comes_back() {
+        let dir = Scratch::new("csvitems");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let total = mhnx_core::itembox::TOTAL_ITEM_SLOTS;
+        let mut items = vec![ItemSlot::default(); total];
+        items[0] = ItemSlot { id: 5, count: 7 };
+        items[2] = ItemSlot { id: 12, count: 3 };
+        app.items = items;
+        app.dirty = false;
+
+        let csv = dir.path().join("items.csv");
+        assert!(app.csv_write(CsvKind::Items, &csv), "{}", app.message);
+        assert!(app.message.contains("書き出しました"), "{}", app.message);
+        assert!(!app.dirty, "an export must not dirty the save");
+        let text = std::fs::read_to_string(&csv).expect("the file");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "slot,id,count");
+        // Every one of the 2300 records travels, blank ones included: the box
+        // is written back by position, so the holes have to come along.
+        assert_eq!(lines.len(), total + 1);
+        assert_eq!(lines[1], "0,5,7");
+        assert_eq!(lines[2], "1,0,0");
+        assert_eq!(lines[3], "2,12,3");
+
+        // Reading it back only arms the dialog: the rows are measured on a copy
+        // of the save and the save itself is untouched.
+        assert!(app.csv_stage(CsvKind::Items, csv.clone()), "{}", app.message);
+        assert!(matches!(app.confirm, Confirm::CsvApply));
+        {
+            let pending = app.csv_pending.as_ref().expect("the staged file");
+            assert_eq!(pending.rows.len(), total);
+            assert_eq!(pending.report.applied, total);
+            assert_eq!(pending.report.skipped, 0);
+            assert_eq!(pending.report.clamped, 0);
+        }
+        let body = app.csv_confirm_text();
+        assert!(body.contains("書き込み 2300 行"), "{}", body);
+        assert!(body.contains("アイテムボックス"), "{}", body);
+        let stored = app
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(0))
+            .expect("box");
+        assert!(stored[0].is_blank(), "the dry run wrote nothing");
+
+        // Something else on screen, so 元に戻す has something to put back.
+        let mut other = vec![ItemSlot::default(); total];
+        other[1] = ItemSlot { id: 9, count: 1 };
+        app.items = other;
+
+        let report = app.csv_commit().expect("the report");
+        assert_eq!(report.applied, total);
+        assert!(app.dirty, "an import is a change");
+        assert!(app.message.contains("適用しました"), "{}", app.message);
+        let stored = app
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(0))
+            .expect("box");
+        assert_eq!(stored[0], ItemSlot { id: 5, count: 7 });
+        assert_eq!(stored[2], ItemSlot { id: 12, count: 3 });
+        // The working copy the item tab reads was rebuilt from the save.
+        assert_eq!(app.items[0], ItemSlot { id: 5, count: 7 });
+        assert!(app.items[1].is_blank());
+        // One undo puts the box that was on screen before the import back.
+        app.undo_item();
+        assert_eq!(app.items[1], ItemSlot { id: 9, count: 1 });
+        // Nothing is staged after the import, so a second commit does nothing.
+        assert!(app.csv_commit().is_none());
+    }
+
+    /// A file the parser cannot read is reported with the line and the column
+    /// it names, and nothing is staged or written.
+    #[test]
+    fn a_broken_csv_file_names_the_line_and_changes_nothing() {
+        let dir = Scratch::new("csvbad");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let before = app
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(0))
+            .expect("box");
+        let csv = dir.path().join("broken.csv");
+        std::fs::write(&csv, "slot,id,count\r\n0,5,7\r\n1,abc,3\r\n").expect("the file");
+        app.dirty = false;
+
+        assert!(!app.csv_stage(CsvKind::Items, csv));
+        // The wording of CsvError is shown as it is: it names the line and the
+        // column a spreadsheet would point at.
+        assert!(app.message.contains("3 行目"), "{}", app.message);
+        assert!(app.message.contains("2 列目"), "{}", app.message);
+        assert!(app.message.contains("abc"), "{}", app.message);
+        assert!(app.csv_pending.is_none(), "a broken file is not staged");
+        assert!(matches!(app.confirm, Confirm::None));
+        assert!(!app.dirty);
+        let after = app
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(0))
+            .expect("box");
+        assert_eq!(before, after);
+        assert!(app.csv_commit().is_none());
+
+        // A file that is not there at all says so, too.
+        assert!(!app.csv_stage(CsvKind::Items, dir.path().join("missing.csv")));
+        assert!(app.message.contains("読めません"), "{}", app.message);
+    }
+
+    /// The equipment box goes out as the eight columns of csvout, and a hand
+    /// edited row goes back in through the same dialog as the item box.
+    #[test]
+    fn the_equipment_box_goes_out_as_csv_and_comes_back() {
+        let dir = Scratch::new("csvequip");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        let mut rec = [0u8; mhnx_core::equip::EQUIP_RECORD];
+        rec[0] = 1; // a weapon type the equipment box knows
+        assert!(mhnx_core::equip::set_level(&mut rec, 3));
+        rec[2..4].copy_from_slice(&10u16.to_le_bytes());
+        app.save
+            .as_mut()
+            .and_then(|s| s.equipment_record_mut(0, 5))
+            .expect("record 5")
+            .copy_from_slice(&rec);
+
+        let csv = dir.path().join("equip.csv");
+        assert!(app.csv_write(CsvKind::Equipment, &csv), "{}", app.message);
+        let text = std::fs::read_to_string(&csv).expect("the file");
+        assert_eq!(
+            text.lines().next(),
+            Some("index,kind,id,level,transmog,deco1,deco2,deco3")
+        );
+        assert!(text.contains("5,1,10,3,0,0,0,0\r\n"), "{:?}", text);
+        // Only the records that hold something are listed.
+        assert_eq!(text.lines().count(), 2);
+
+        // Hand edit the row, the way a spreadsheet would.
+        let edited = text.replace("5,1,10,3,0,0,0,0", "5,1,11,5,0,0,0,0");
+        std::fs::write(&csv, edited).expect("the edited file");
+        let before = app
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_at(0, 5))
+            .expect("record");
+        assert_eq!((before.kind, before.id, before.level), (1, 10, 3));
+
+        assert!(app.csv_stage(CsvKind::Equipment, csv), "{}", app.message);
+        assert!(matches!(app.confirm, Confirm::CsvApply));
+        assert_eq!(app.csv_pending.as_ref().expect("staged").rows.len(), 1);
+        let after = app
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_at(0, 5))
+            .expect("record");
+        assert_eq!(
+            (after.kind, after.id, after.level),
+            (1, 10, 3),
+            "nothing is written before the dialog is answered"
+        );
+
+        let report = app.csv_commit().expect("the report");
+        assert_eq!(report.applied, 1);
+        let got = app
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_at(0, 5))
+            .expect("record");
+        assert_eq!((got.kind, got.id, got.level), (1, 11, 5));
+        assert!(app.dirty);
+    }
+
+    /// The item set editor writes one entry at a time, and the id 0 it uses
+    /// for "empty" drops the count rather than leaving a stray one behind.
+    #[test]
+    fn an_item_set_entry_is_written_and_cleared() {
+        let dir = Scratch::new("itemsetentry");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.dirty = false;
+
+        assert!(app.item_set_entry_write(3, 0, 5, 7), "{}", app.message);
+        assert!(app.dirty);
+        let set = item_set_of(&app, 3);
+        assert_eq!(set.items[0], mhnx_core::myset::SetItem { id: 5, count: 7 });
+
+        // id 0 means empty: the count goes with it.
+        assert!(app.item_set_entry_write(3, 0, 0, 7), "{}", app.message);
+        let set = item_set_of(&app, 3);
+        assert_eq!(set.items[0], mhnx_core::myset::SetItem { id: 0, count: 0 });
+
+        // A name is written the way the equipment set editor writes one.
+        assert!(app.item_set_name_write(3, "旅支度"), "{}", app.message);
+        assert_eq!(item_set_of(&app, 3).name, "旅支度");
+
+        // Out of range, a record the core refuses: nothing moves.
+        app.dirty = false;
+        assert!(!app.item_set_entry_write(3, 0, 4000, 1));
+        assert!(!app.item_set_entry_write(
+            3,
+            0,
+            5,
+            mhnx_core::itembox::MAX_COUNT + 1
+        ));
+        assert!(!app.item_set_entry_write(mhnx_core::myset::ITEM_SETS, 0, 5, 1));
+        assert!(!app.dirty);
+
+        // The yellow line the editor draws is this list of reports.
+        assert!(app.item_set_entry_write(3, 0, 5, 7), "{}", app.message);
+        let clean =
+            mhnx_core::myset::item_set_warnings(app.save.as_ref().expect("save"), 0, 3);
+        assert!(clean.is_empty(), "{:?}", clean);
+        // The same item in a second entry is what the warning list reports.
+        assert!(app.item_set_entry_write(3, 1, 5, 1), "{}", app.message);
+        let warns =
+            mhnx_core::myset::item_set_warnings(app.save.as_ref().expect("save"), 0, 3);
+        assert_eq!(warns.len(), 1, "{:?}", warns);
+        assert!(warns[0].contains("重複"), "{:?}", warns);
+    }
+
+    /// The pouch is written, read back, copied into a set and replaced by it;
+    /// what ポーチへ適用 replaces is kept so 元に戻す can put it back.
+    #[test]
+    fn the_pouch_can_be_written_read_back_and_restored() {
+        let dir = Scratch::new("pouchedit");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        assert_eq!(pouch_of(&app).len(), mhnx_core::myset::POUCH_SLOTS);
+
+        assert!(app.pouch_entry_write(0, 5, 7), "{}", app.message);
+        assert!(app.pouch_entry_write(1, 9, 2), "{}", app.message);
+        let pouch = pouch_of(&app);
+        assert_eq!(pouch[0], mhnx_core::myset::SetItem { id: 5, count: 7 });
+        assert_eq!(pouch[1], mhnx_core::myset::SetItem { id: 9, count: 2 });
+
+        // id 0 clears the entry instead of writing a stray count.
+        assert!(app.pouch_entry_write(1, 0, 50), "{}", app.message);
+        assert_eq!(
+            pouch_of(&app)[1],
+            mhnx_core::myset::SetItem { id: 0, count: 0 }
+        );
+        // A count past the cap and an entry past the end are refused.
+        app.dirty = false;
+        assert!(!app.pouch_entry_write(2, 5, mhnx_core::itembox::MAX_COUNT + 1));
+        assert!(!app.pouch_entry_write(mhnx_core::myset::POUCH_SLOTS, 5, 1));
+        assert!(!app.dirty);
+
+        // ポーチから取り込む copies all 32 entries, the empty ones included.
+        assert_eq!(app.item_set_from_pouch(3), 1);
+        let set = item_set_of(&app, 3);
+        assert_eq!(set.items[0], mhnx_core::myset::SetItem { id: 5, count: 7 });
+        assert_eq!(
+            set.items[31],
+            mhnx_core::myset::SetItem { id: 0, count: 0 }
+        );
+
+        // Something the set does not hold, so replacing it is visible.
+        assert!(app.pouch_entry_write(5, 77, 1), "{}", app.message);
+        assert_eq!(app.item_set_to_pouch(3), 1);
+        let pouch = pouch_of(&app);
+        assert_eq!(pouch[0], mhnx_core::myset::SetItem { id: 5, count: 7 });
+        assert_eq!(pouch[5], mhnx_core::myset::SetItem { id: 0, count: 0 });
+        assert!(app.pouch_undo.is_some(), "the replaced pouch is kept");
+
+        // 元に戻す puts the pouch that was there before back.
+        assert!(app.pouch_restore(), "{}", app.message);
+        assert_eq!(
+            pouch_of(&app)[5],
+            mhnx_core::myset::SetItem { id: 77, count: 1 }
+        );
+        assert!(app.pouch_undo.is_none());
+        assert!(!app.pouch_restore(), "a second undo has nothing to put back");
+
+        // A set that holds nothing must not empty the pouch.
+        let before = pouch_of(&app);
+        assert_eq!(app.item_set_to_pouch(20), 0);
+        assert!(app.message.contains("空"), "{}", app.message);
+        assert_eq!(pouch_of(&app), before);
     }
 }
 

@@ -88,6 +88,12 @@ pub enum Screen {
     Palico,
     /// Global options.
     Options,
+    /// CSV export and import of the item box and the equipment box.
+    ///
+    /// A screen of its own rather than a mode: the folder it lists has nothing
+    /// to do with the record that is open, and the two keys that matter (write
+    /// the boxes out, apply a file) are the whole screen.
+    Csv,
 }
 
 /// A button press.
@@ -141,6 +147,11 @@ fn split_dir(path: &str) -> String {
         Some(i) => path[..=i].to_string(),
         None => String::new(),
     }
+}
+
+/// The last component of a path: what the user calls the file.
+fn file_name_of(path: &str) -> String {
+    path.rsplit(['/', '\\']).next().unwrap_or(path).to_string()
 }
 
 /// Data the I/O layer must write.
@@ -415,6 +426,48 @@ impl Default for SetEdit {
     }
 }
 
+/// Rows on the item set form: one per entry the set holds.
+pub const ITEM_SET_EDIT_ROWS: usize = crate::myset::ITEM_SET_ITEMS;
+
+/// The item set being edited on the my-sets screen.
+///
+/// The twin of [SetEdit] for the other array the screen lists: the record
+/// index, the row the cursor is on and the pending entry of each of the
+/// thirty-two rows. Like SetEdit it is a **mode of the my-sets screen**, not a
+/// screen of its own, and the pending entries are kept apart from the record so
+/// that walking the rows writes nothing: only [A] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemSetEdit {
+    /// Index into the twenty-four record array (0..ITEM_SETS).
+    pub set: usize,
+    /// Which entry row the cursor is on (0..ITEM_SET_EDIT_ROWS).
+    pub field: usize,
+    /// The entry [A] would write, per row. Id 0 is an empty entry.
+    pub pick: [crate::myset::SetItem; ITEM_SET_EDIT_ROWS],
+}
+
+impl Default for ItemSetEdit {
+    fn default() -> Self {
+        ItemSetEdit {
+            set: 0,
+            field: 0,
+            pick: [crate::myset::SetItem { id: 0, count: 0 }; ITEM_SET_EDIT_ROWS],
+        }
+    }
+}
+
+/// A two-press operation on the item set form.
+///
+/// Both of them replace thirty-two entries at once - the set, or the pouch -
+/// so neither is one press: the first press only says what would be lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemSetOp {
+    /// myset::copy_from_pouch: the pouch replaces the set.
+    FromPouch,
+    /// myset::apply_to_pouch: the set replaces the pouch.
+    ToPouch,
+}
+
 /// A text edit request (software keyboard).
 ///
 /// index == usize::MAX means the character name of the current slot.
@@ -621,6 +674,80 @@ pub fn quest_id_of_arc(bytes: &[u8]) -> Option<i32> {
 /// Pseudo path that stands for the console's own save, not a file on the SD card.
 pub const CONSOLE_SAVE: &str = "nand:/system";
 
+/// Where the CSV files live on the SD card.
+///
+/// One folder for everything the tool trades with a spreadsheet, beside the
+/// saves and the quest arcs. The I/O layer creates it and lists it; a CSV is
+/// never read from anywhere else, so a user can always find what was written.
+pub const CSV_DIR: &str = "/switch/XXSE/csv";
+/// File name stem of the item box export: items-<stamp>.csv.
+pub const CSV_ITEMS_STEM: &str = "items";
+/// File name stem of the equipment box export: equipment-<stamp>.csv.
+pub const CSV_EQUIP_STEM: &str = "equipment";
+/// The byte order mark a spreadsheet may put in front of the header.
+const BYTE_ORDER_MARK: char = '\u{feff}';
+
+/// What a file in the CSV folder holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsvKind {
+    /// The item box: what crate::csvout::items_to_csv writes.
+    Items,
+    /// The equipment box: what crate::csvout::equipment_to_csv writes.
+    Equipment,
+}
+
+impl CsvKind {
+    /// The word the interface uses for it.
+    pub fn label(self) -> &'static str {
+        match self {
+            CsvKind::Items => "アイテム",
+            CsvKind::Equipment => "装備",
+        }
+    }
+}
+
+/// The kind a file name claims, or None when the name says nothing.
+///
+/// The exports are named from a stem, so the list can say what a file holds
+/// before anything is read. A user who renamed one is not lost: the first line
+/// of the file decides when it is applied, and this is only the fallback.
+fn csv_kind_of_name(path: &str) -> Option<CsvKind> {
+    let name = file_name_of(path).to_ascii_lowercase();
+    if name.starts_with(CSV_ITEMS_STEM) {
+        Some(CsvKind::Items)
+    } else if name.starts_with(CSV_EQUIP_STEM) {
+        Some(CsvKind::Equipment)
+    } else {
+        None
+    }
+}
+
+/// The kind the first line of a file claims, or None.
+///
+/// The header is the only thing in a file that says which table it is, and
+/// crate::csvout writes "slot,..." for the item box and "index,..." for the
+/// equipment box. A byte order mark is skipped: a spreadsheet on Windows adds
+/// one, and it would otherwise hide the first cell.
+fn csv_kind_of_text(text: &str) -> Option<CsvKind> {
+    let first = text.trim_start_matches(BYTE_ORDER_MARK).lines().next()?;
+    let cell = first.split(',').next()?.trim().trim_matches('"');
+    if cell.eq_ignore_ascii_case(crate::csvout::EQUIP_COLUMNS[0]) {
+        Some(CsvKind::Equipment)
+    } else if cell.eq_ignore_ascii_case(crate::csvout::ITEM_COLUMNS[0]) {
+        Some(CsvKind::Items)
+    } else {
+        None
+    }
+}
+
+/// "アイテム" / "装備" / "?" for a file in the folder.
+pub fn csv_kind_label(path: &str) -> &'static str {
+    match csv_kind_of_name(path) {
+        Some(k) => k.label(),
+        None => "?",
+    }
+}
+
 /// The editable character fields, in menu order.
 pub const CHAR_FIELDS: &[(&str, &str)] = &[
     ("name", "名前"),
@@ -732,6 +859,24 @@ impl ItemMenuStats {
 }
 
 /// How many items the box holds in total.
+/// An ApplyReport as the lines the panel shows.
+///
+/// The counts come first because they are the answer to "did it work"; the
+/// per-row messages follow, five at most, each clipped to the panel's width.
+fn csv_report_lines(report: &crate::csvout::ApplyReport) -> Vec<String> {
+    let mut out = Vec::with_capacity(6);
+    out.push(alloc::format!(
+        "適用 {} 行 / スキップ {} 行 / 丸め {} 行",
+        report.applied,
+        report.skipped,
+        report.clamped
+    ));
+    for m in report.messages.iter().take(5) {
+        out.push(clip_text(m, 60));
+    }
+    out
+}
+
 fn box_total(items: &[ItemSlot]) -> u32 {
     items
         .iter()
@@ -864,6 +1009,18 @@ pub struct Editor {
     /// while drawing: `warnings` decodes the whole record and looks seven
     /// parts up in the equipment box, which is more than a redraw should do.
     pub set_warnings: Vec<String>,
+    /// The item set form, when it is open.
+    ///
+    /// The second mode of the my-sets screen. At most one of the two forms is
+    /// open, so opening either closes the other.
+    pub item_set_edit: Option<ItemSetEdit>,
+    /// The two-press item set operation waiting for its second press.
+    pub item_set_armed: Option<ItemSetOp>,
+    /// What `myset::item_set_warnings` last said about the set on screen.
+    ///
+    /// Collected when the form opens and after every write, never while
+    /// drawing: the check decodes the whole record.
+    pub item_set_warnings: Vec<String>,
     /// Cursor inside the save's own quest list.
     pub save_quest_cursor: usize,
     /// Cursor inside the download Palico catalogue.
@@ -877,6 +1034,25 @@ pub struct Editor {
     pub palico_equip: Option<PalicoEquip>,
     /// Cursor inside the options list.
     pub option_cursor: usize,
+    /// CSV files offered by the I/O layer, in the folder's own order.
+    ///
+    /// Paths, not contents: a file is read only when the user applies it, and
+    /// the console layer does the reading.
+    pub csv_files: Vec<String>,
+    /// Cursor inside that list.
+    pub csv_cursor: usize,
+    /// Row whose apply is waiting for its second [A].
+    ///
+    /// An apply cannot be undone - it replaces a whole box - so the first press
+    /// only says what would happen. Any cursor move drops it, the same rule the
+    /// equipment delete and the part clear follow.
+    pub csv_armed: Option<usize>,
+    /// What the last apply did, one line per fact, for the panel.
+    pub csv_report: Vec<String>,
+    /// The folder was asked for again and the I/O layer has not answered yet.
+    pub wants_csv_rescan: bool,
+    /// The user asked for an export; the I/O layer owns the clock.
+    pub wants_csv_export: bool,
     /// Save files offered by the I/O layer.
     pub save_files: Vec<String>,
     /// Archive files offered by the I/O layer.
@@ -899,6 +1075,8 @@ pub struct Editor {
     pending_request: Option<Request>,
     pending_write: Option<Write>,
     pending_text: Option<TextRequest>,
+    /// The CSV file the I/O layer should read and hand back.
+    pending_csv_read: Option<String>,
     /// Working copy of the .mib bytes.
     pub mib_bytes: Vec<u8>,
     /// Working copy of the .gmd strings.
@@ -970,11 +1148,20 @@ impl Editor {
             set_edit: None,
             set_clear_armed: None,
             set_warnings: Vec::new(),
+            item_set_edit: None,
+            item_set_armed: None,
+            item_set_warnings: Vec::new(),
             save_quest_cursor: 0,
             palico_cursor: 0,
             palico_lang: 0,
             palico_equip: None,
             option_cursor: 0,
+            csv_files: Vec::new(),
+            csv_cursor: 0,
+            csv_armed: None,
+            csv_report: Vec::new(),
+            wants_csv_rescan: false,
+            wants_csv_export: false,
             save_files: Vec::new(),
             arc_files: Vec::new(),
             save: None,
@@ -987,6 +1174,7 @@ impl Editor {
             pending_request: None,
             pending_write: None,
             pending_text: None,
+            pending_csv_read: None,
             mib_bytes: Vec::new(),
             gmd: None,
         }
@@ -1074,9 +1262,12 @@ impl Editor {
     pub fn uses_minus(&self) -> bool {
         match self.screen {
             Screen::ArcEntries | Screen::SaveQuests | Screen::Equip | Screen::Items => true,
-            // The set editor uses Minus for the two-press part clear. On the
-            // list above it Minus still means "rescan".
-            Screen::Sets => self.set_edit.is_some(),
+            // The equipment set editor uses Minus for the two-press part
+            // clear and the item set editor for the two-press pouch write. On
+            // the list above them Minus still means "rescan".
+            Screen::Sets => self.set_editor_open(),
+            // The CSV screen lists a folder, so Minus reads it again.
+            Screen::Csv => true,
             // On the two palico screens Minus opens the equipment panel, so it
             // cannot also rescan there: one press would do both at once.
             Screen::Roster | Screen::Palico => true,
@@ -1308,6 +1499,7 @@ impl Editor {
             Screen::CharmEdit => self.input_charm_edit(key),
             Screen::Palico => self.input_palico(key),
             Screen::Options => self.input_options(key),
+            Screen::Csv => self.input_csv(key),
         }
     }
 
@@ -1677,6 +1869,11 @@ impl Editor {
                 self.dirty = true;
             }
             Key::A => self.request_write_save(),
+            // R is the console's tab-forward key, and the tab after the
+            // settings is the CSV screen, so one press lands on the same screen
+            // either way (the pad takes L / R for the tab bar before the screen
+            // sees them, exactly as L on the save list means the format tab).
+            Key::R => self.open_csv(),
             Key::B => {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
@@ -1684,6 +1881,272 @@ impl Editor {
             Key::Plus => self.quit = true,
             _ => {}
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CSV export / import
+    // -----------------------------------------------------------------------
+    //
+    // The two boxes a player shares with a spreadsheet: the item box and the
+    // equipment box. The files live in CSV_DIR and are named after a timestamp,
+    // so an export never overwrites an earlier one, and an apply asks twice
+    // because it replaces a whole box.
+    //
+    // Nothing here touches a file. The I/O layer lists the folder
+    // (set_csv_files), owns the clock (export_csv takes it), writes what
+    // export_csv returns and reads the file an apply asks for (take_csv_read,
+    // answered with apply_csv_text). That is what keeps every rule above
+    // testable on the host.
+
+    /// Replace the CSV file list.
+    ///
+    /// Clamps the cursor and drops a pending apply that the new list no longer
+    /// covers: an armed row belongs to the file it was armed on.
+    pub fn set_csv_files(&mut self, files: Vec<String>) {
+        self.csv_files = files;
+        if self.csv_cursor >= self.csv_files.len() {
+            self.csv_cursor = 0;
+        }
+        if self
+            .csv_armed
+            .map(|a| a >= self.csv_files.len())
+            .unwrap_or(false)
+        {
+            self.csv_armed = None;
+        }
+    }
+
+    /// Open the CSV screen and ask the I/O layer for the folder.
+    pub fn open_csv(&mut self) {
+        self.screen = Screen::Csv;
+        self.cursor = 0;
+        self.csv_cursor = 0;
+        self.csv_armed = None;
+        self.wants_csv_rescan = true;
+        self.message = alloc::format!(
+            "CSV 入出力: {}（[Y] で書き出し / [A] を 2 回で適用）",
+            CSV_DIR
+        );
+    }
+
+    /// Take the "read the folder again" request.
+    pub fn take_csv_rescan(&mut self) -> bool {
+        let w = self.wants_csv_rescan;
+        self.wants_csv_rescan = false;
+        w
+    }
+
+    /// Take the "write the two CSV files now" request.
+    ///
+    /// The clock belongs to the I/O layer, so it is the layer that collects the
+    /// request and hands the timestamp back to Self::export_csv.
+    pub fn take_csv_export(&mut self) -> bool {
+        let w = self.wants_csv_export;
+        self.wants_csv_export = false;
+        w
+    }
+
+    /// The file an apply asked for, or None.
+    ///
+    /// The I/O layer reads it and answers with Self::apply_csv_text.
+    pub fn take_csv_read(&mut self) -> Option<String> {
+        self.pending_csv_read.take()
+    }
+
+    /// The CSV file under the cursor, if the folder has one.
+    pub fn csv_selected(&self) -> Option<&str> {
+        self.csv_files.get(self.csv_cursor).map(|s| s.as_str())
+    }
+
+    /// The CSV screen's keys.
+    fn input_csv(&mut self, key: Key) {
+        match key {
+            Key::Up => {
+                self.csv_cursor = self.csv_cursor.saturating_sub(1);
+                self.csv_armed = None;
+            }
+            Key::Down => {
+                if self.csv_cursor + 1 < self.csv_files.len() {
+                    self.csv_cursor += 1;
+                }
+                self.csv_armed = None;
+            }
+            Key::A => self.csv_apply_press(),
+            // Y writes both boxes out. The I/O layer supplies the clock, so the
+            // request is left for it rather than stamped here.
+            Key::Y => {
+                self.csv_armed = None;
+                self.wants_csv_export = true;
+                self.message = String::from("CSV を書き出しています…");
+            }
+            Key::Minus => {
+                self.csv_armed = None;
+                self.wants_csv_rescan = true;
+                self.message = String::from("CSV フォルダを読み直しています…");
+            }
+            Key::B => {
+                self.csv_armed = None;
+                self.screen = Screen::SaveList;
+                self.cursor = 0;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    /// [A] on the CSV screen: the first press says what would happen, the
+    /// second one asks the I/O layer for the file.
+    fn csv_apply_press(&mut self) {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        }
+        let Some(path) = self.csv_selected().map(String::from) else {
+            self.csv_armed = None;
+            self.message =
+                String::from("CSV がありません（[Y] でこのキャラの BOX を書き出せます）");
+            return;
+        };
+        if self.csv_armed != Some(self.csv_cursor) {
+            self.csv_armed = Some(self.csv_cursor);
+            self.message = alloc::format!(
+                "「{}」（{}）をキャラ {} に適用します。BOX の内容は置き換わります — もう一度 [A] で確定 / [B] で中止",
+                file_name_of(&path),
+                csv_kind_label(&path),
+                self.slot + 1
+            );
+            return;
+        }
+        self.csv_armed = None;
+        self.pending_csv_read = Some(path);
+        self.message = String::from("CSV を読み込んでいます…");
+    }
+
+    /// Build both CSV files for the current character.
+    ///
+    /// Returns the (path, bytes) pairs the I/O layer has to write, in the order
+    /// they are reported. Nothing is written here: only the layer knows where
+    /// the SD card is. An empty result means nothing was built, and the message
+    /// already says why - no clock, or no save open.
+    ///
+    /// The timestamp comes from the caller because this module has no clock.
+    /// It names the files, so an export never overwrites an earlier one.
+    pub fn export_csv(&mut self, unix: Option<u64>) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let Some(unix) = unix else {
+            self.message = String::from("本体の時計から時刻を取得できないため書き出せません");
+            return out;
+        };
+        let Some(save) = &self.save else {
+            self.message = String::from("先にセーブを開いてください");
+            return out;
+        };
+        let stamp = crate::snapshot::stamp(unix);
+        let items_path = alloc::format!("{}/{}-{}.csv", CSV_DIR, CSV_ITEMS_STEM, stamp);
+        let equip_path = alloc::format!("{}/{}-{}.csv", CSV_DIR, CSV_EQUIP_STEM, stamp);
+        out.push((
+            items_path.clone(),
+            crate::csvout::items_to_csv(save, self.slot).into_bytes(),
+        ));
+        out.push((
+            equip_path.clone(),
+            crate::csvout::equipment_to_csv(save, self.slot).into_bytes(),
+        ));
+        out
+    }
+
+    /// The I/O layer wrote some of the files Self::export_csv handed it.
+    ///
+    /// Some of them, not all: a card that is full or write protected is
+    /// reported as such instead of as a successful export.
+    pub fn csv_exported(&mut self, written: usize, total: usize) {
+        let line = if written == total {
+            alloc::format!("{} ファイルを書き出しました（{}）", written, CSV_DIR)
+        } else {
+            alloc::format!(
+                "{} / {} ファイルしか書き出せませんでした（SD カードの空き容量・保護を確認してください）",
+                written,
+                total
+            )
+        };
+        self.csv_report = alloc::vec![line.clone()];
+        // A file that landed changes the folder, so list it again.
+        if written > 0 {
+            self.wants_csv_rescan = true;
+        }
+        self.message = line;
+    }
+
+    /// The I/O layer hands back the text of a file an apply asked for.
+    ///
+    /// The header decides which table the file is, so a renamed export still
+    /// applies; the file name is only the fallback for a file without one. The
+    /// report is kept in csv_report for the panel and the save is marked dirty
+    /// only when a row was really written.
+    pub fn apply_csv_text(&mut self, path: &str, text: &str) -> bool {
+        let name = file_name_of(path);
+        // A spreadsheet on Windows puts a byte order mark in front of the
+        // header. It is invisible on screen but it is not part of the first
+        // cell, so the reader would take the header for a record and refuse
+        // the whole file. Drop it once, here, for both the sniff and the parse.
+        let text = text.trim_start_matches(BYTE_ORDER_MARK);
+        let Some(kind) = csv_kind_of_text(text).or_else(|| csv_kind_of_name(path)) else {
+            self.csv_report = alloc::vec![String::from(
+                "先頭の行が items / equipment のどちらでもありません",
+            )];
+            self.message = alloc::format!("{} はアイテム/装備の CSV ではありません", name);
+            return false;
+        };
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let slot = self.slot;
+        let mut report = None;
+        if kind == CsvKind::Items {
+            match crate::csvout::parse_items(text) {
+                Ok(rows) => {
+                    if let Some(s) = &mut self.save {
+                        report = Some(crate::csvout::apply_items(s, slot, &rows));
+                    }
+                }
+                Err(e) => {
+                    self.csv_report = alloc::vec![alloc::format!("{}", e)];
+                    self.message = alloc::format!("{} を読めません: {}", name, e);
+                    return false;
+                }
+            }
+        } else {
+            match crate::csvout::parse_equipment(text) {
+                Ok(rows) => {
+                    if let Some(s) = &mut self.save {
+                        report = Some(crate::csvout::apply_equipment(s, slot, &rows));
+                    }
+                }
+                Err(e) => {
+                    self.csv_report = alloc::vec![alloc::format!("{}", e)];
+                    self.message = alloc::format!("{} を読めません: {}", name, e);
+                    return false;
+                }
+            }
+        }
+        let Some(report) = report else {
+            return false;
+        };
+        if report.applied > 0 {
+            self.dirty = true;
+        }
+        let head = alloc::format!(
+            "{}（{}）: {} 行適用 / {} 行スキップ / {} 行丸め",
+            name,
+            kind.label(),
+            report.applied,
+            report.skipped,
+            report.clamped
+        );
+        self.csv_report = csv_report_lines(&report);
+        self.message = head;
+        true
     }
 
     /// Run the quest checker on the open archive.
@@ -3243,9 +3706,13 @@ impl Editor {
         }
     }
 
-    /// Is the set editor open? (A mode of the my-sets screen, not a screen.)
+    /// Is one of the two set forms open? (A mode of the my-sets screen, not a
+    /// screen.)
+    ///
+    /// Either form answers true: the console layer holds every key while one of
+    /// them owns the panel, whichever tab of the list it was opened from.
     pub fn set_editor_open(&self) -> bool {
-        self.set_edit.is_some()
+        self.set_edit.is_some() || self.item_set_edit.is_some()
     }
 
     /// The equipment set the editor is looking at, re-read from the save.
@@ -3330,6 +3797,10 @@ impl Editor {
         } else {
             rec.name.clone()
         };
+        // One form at a time, for the same reason the item form says so.
+        self.item_set_edit = None;
+        self.item_set_armed = None;
+        self.item_set_warnings.clear();
         self.set_edit = Some(SetEdit {
             set,
             field: SET_ROW_NAME,
@@ -3399,6 +3870,10 @@ impl Editor {
     fn input_sets(&mut self, key: Key) {
         if self.set_edit.is_some() {
             self.input_set_edit(key);
+            return;
+        }
+        if self.item_set_edit.is_some() {
+            self.input_item_set_edit(key);
             return;
         }
         match key {
@@ -3672,6 +4147,412 @@ impl Editor {
         } else {
             self.message = String::from("セット名を書き込めませんでした");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Item sets: the other half of the my-sets screen
+    // -----------------------------------------------------------------------
+    //
+    // The item sets used to be list-only. This is their editor: the same shape
+    // the equipment set form has - one row per entry, Left/Right walking the
+    // candidates, [A] writing the row - plus the two operations a set exists
+    // for: take the pouch in, put the set back out there.
+    //
+    // The pouch is not edited here (a screen of its own is the next step).
+    // These two keys are the only place this form touches it, and both ask
+    // twice, because both replace thirty-two entries at once.
+
+    /// Is the item set form open?
+    pub fn item_set_editor_open(&self) -> bool {
+        self.item_set_edit.is_some()
+    }
+
+    /// The item set the form is looking at, re-read from the save.
+    ///
+    /// Re-read rather than cached, so the rows on screen are the bytes that are
+    /// really stored. Only the pending entries of the form run ahead of the
+    /// record, and only until [A] writes them.
+    pub fn editing_item_set(&self) -> Option<crate::myset::ItemSet> {
+        let e = self.item_set_edit?;
+        self.item_sets().into_iter().nth(e.set)
+    }
+
+    /// The pending entry of one row of the item set form.
+    pub fn item_set_pick(&self, row: usize) -> crate::myset::SetItem {
+        self.item_set_edit
+            .as_ref()
+            .and_then(|e| e.pick.get(row).copied())
+            .unwrap_or(crate::myset::SetItem { id: 0, count: 0 })
+    }
+
+    /// "回復薬 ×10" for a row of the item set form, "空き" for an empty one.
+    pub fn item_set_row_label(&self, row: usize) -> String {
+        let item = self.item_set_pick(row);
+        if item.id == 0 {
+            String::from("空き")
+        } else {
+            alloc::format!("{} ×{}", item_name_of(item.id), item.count)
+        }
+    }
+
+    /// Open the item set form on one record of the item set array.
+    ///
+    /// The argument is an index into the twenty-four record array, not a row of
+    /// the list the console draws: that list skips the empty records, so the
+    /// caller maps its row back to this index.
+    pub fn open_item_set_editor(&mut self, set: usize) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        if set >= crate::myset::ITEM_SETS {
+            self.message = alloc::format!("アイテムセット {} は範囲外です", set + 1);
+            return false;
+        }
+        let Some(rec) = self.item_sets().into_iter().nth(set) else {
+            self.message = String::from("このアイテムセットは読み取れません");
+            return false;
+        };
+        let mut pick = [crate::myset::SetItem { id: 0, count: 0 }; ITEM_SET_EDIT_ROWS];
+        for (i, p) in pick.iter_mut().enumerate() {
+            *p = rec.items.get(i).copied().unwrap_or(crate::myset::SetItem { id: 0, count: 0 });
+        }
+        let name = if rec.name.trim().is_empty() {
+            String::from("(無題)")
+        } else {
+            rec.name.clone()
+        };
+        let used = rec.used_items().len();
+        // One form at a time: the two editors belong to the same screen and both
+        // hold a record, so opening one puts the other away.
+        self.set_edit = None;
+        self.set_clear_armed = None;
+        self.set_warnings.clear();
+        self.item_set_armed = None;
+        self.item_set_edit = Some(ItemSetEdit {
+            set,
+            field: 0,
+            pick,
+        });
+        let warned = self.refresh_item_set_warnings();
+        self.message = alloc::format!(
+            "アイテムセット #{:02} 「{}」を編集中 — {} 枠 / 警告 {} 件",
+            set + 1,
+            name,
+            used,
+            warned
+        );
+        true
+    }
+
+    /// Leave the item set form and go back to the list.
+    ///
+    /// Only [A] ever writes an entry, so leaving cannot lose an edit that was
+    /// already made: the bytes are in the open save and reach the file with the
+    /// save key pressed on the list.
+    pub fn close_item_set_editor(&mut self) {
+        self.item_set_edit = None;
+        self.item_set_armed = None;
+        self.item_set_warnings.clear();
+        self.message = String::from("マイセット一覧に戻りました（[X] でセーブ保存）");
+    }
+
+    /// Re-read myset::item_set_warnings for the set on screen.
+    ///
+    /// Returns how many there are. Called when the form opens and after every
+    /// write, never from the renderer.
+    pub fn refresh_item_set_warnings(&mut self) -> usize {
+        let Some(e) = self.item_set_edit else {
+            self.item_set_warnings.clear();
+            return 0;
+        };
+        let slot = self.slot;
+        self.item_set_warnings = match &self.save {
+            Some(s) => crate::myset::item_set_warnings(s, slot, e.set),
+            None => Vec::new(),
+        };
+        self.item_set_warnings.len()
+    }
+
+    /// How many entries of the pouch hold something.
+    fn pouch_used(&self) -> usize {
+        match &self.save {
+            Some(s) => crate::myset::pouch(s, self.slot)
+                .iter()
+                .filter(|i| i.id != 0)
+                .count(),
+            None => 0,
+        }
+    }
+
+    /// The entries the item form's Left / Right walks.
+    ///
+    /// An empty entry comes first - a set the game wrote can hold holes and
+    /// there is otherwise no way back to one - then every item the item box
+    /// holds, in box order and without repeating an id. The box is where the
+    /// character's items are; a set naming something the box does not hold
+    /// could not be registered again.
+    fn item_set_candidates(&self) -> Vec<crate::myset::SetItem> {
+        let mut out = Vec::new();
+        out.push(crate::myset::SetItem { id: 0, count: 0 });
+        let Some(items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return out;
+        };
+        for it in items.iter() {
+            if it.id == 0 || it.count == 0 {
+                continue;
+            }
+            if out.iter().any(|c| c.id == it.id) {
+                continue;
+            }
+            out.push(crate::myset::SetItem {
+                id: it.id,
+                count: it.count as u16,
+            });
+        }
+        out
+    }
+
+    /// Walk the candidates for one row of the item set form.
+    fn move_item_set_pick(&mut self, row: usize, d: i64) {
+        if row >= ITEM_SET_EDIT_ROWS {
+            return;
+        }
+        let cands = self.item_set_candidates();
+        if cands.len() <= 1 {
+            self.message = String::from("アイテムBOXが空です（先にアイテムBOXへ入れてください）");
+            return;
+        }
+        let Some(mut e) = self.item_set_edit else {
+            return;
+        };
+        let n = cands.len() as i64;
+        let cur = e.pick[row];
+        let next = match cands.iter().position(|c| *c == cur) {
+            Some(p) => ((p as i64 + d).rem_euclid(n)) as usize,
+            // What the record holds is not in the box any more: start from an
+            // end rather than pretending it is the first candidate.
+            None => {
+                if d > 0 {
+                    0
+                } else {
+                    (n - 1) as usize
+                }
+            }
+        };
+        e.pick[row] = cands[next];
+        self.item_set_edit = Some(e);
+        let label = self.item_set_row_label(row);
+        self.message = alloc::format!(
+            "[枠 {:02}] {} — [A] で決定（候補 {} / {} 番目）",
+            row + 1,
+            label,
+            cands.len(),
+            next + 1
+        );
+    }
+
+    /// Write the row's pending entry into the set.
+    fn commit_item_set_row(&mut self) {
+        let Some(e) = self.item_set_edit else {
+            return;
+        };
+        if e.field >= ITEM_SET_EDIT_ROWS {
+            return;
+        }
+        let row = e.field;
+        let item = e.pick[row];
+        let slot = self.slot;
+        let set = e.set;
+        let wrote = match &mut self.save {
+            Some(s) => {
+                if item.id == 0 {
+                    crate::myset::clear_item(s, slot, set, row)
+                } else {
+                    crate::myset::set_item(s, slot, set, row, item.id, item.count)
+                }
+            }
+            None => false,
+        };
+        if wrote {
+            self.dirty = true;
+            let label = self.item_set_row_label(row);
+            let n = self.refresh_item_set_warnings();
+            self.message = if item.id == 0 {
+                alloc::format!("枠 {:02} を空けました（警告 {} 件）", row + 1, n)
+            } else {
+                alloc::format!(
+                    "枠 {:02} に「{}」を入れました（警告 {} 件）",
+                    row + 1,
+                    label,
+                    n
+                )
+            };
+        } else {
+            self.message = alloc::format!(
+                "枠 {:02} には書き込めません（値が範囲外か、セーブが開かれていません）",
+                row + 1
+            );
+        }
+    }
+
+    /// First or second press of [Y]: copy the pouch into the set.
+    ///
+    /// myset::copy_from_pouch rewrites all thirty-two entries, so the first
+    /// press only says what would be replaced; the second one writes.
+    fn item_set_from_pouch(&mut self) {
+        let Some(e) = self.item_set_edit else {
+            return;
+        };
+        if self.item_set_armed != Some(ItemSetOp::FromPouch) {
+            self.item_set_armed = Some(ItemSetOp::FromPouch);
+            let held = self
+                .editing_item_set()
+                .map(|r| r.used_items().len())
+                .unwrap_or(0);
+            self.message = alloc::format!(
+                "ポーチの内容でセット #{:02} の 32 枠を置き換えます（いま {} 枠 → ポーチ {} 枠）。もう一度 [Y] で実行",
+                e.set + 1,
+                held,
+                self.pouch_used()
+            );
+            return;
+        }
+        self.item_set_armed = None;
+        let slot = self.slot;
+        let set = e.set;
+        let readable = match &self.save {
+            Some(s) => !crate::myset::pouch(s, slot).is_empty(),
+            None => false,
+        };
+        if !readable {
+            self.message = String::from("ポーチを読めないため取り込めませんでした");
+            return;
+        }
+        let n = match &mut self.save {
+            Some(s) => crate::myset::copy_from_pouch(s, slot, set),
+            None => 0,
+        };
+        self.dirty = true;
+        self.reload_item_set_picks(set);
+        let w = self.refresh_item_set_warnings();
+        self.message = alloc::format!("ポーチから {} 枠を取り込みました（警告 {} 件）", n, w);
+    }
+
+    /// First or second press of [-]: copy the set into the pouch.
+    ///
+    /// myset::apply_to_pouch replaces the pouch, so the first press names what
+    /// would be lost; the second one writes. A record the game left unused is
+    /// refused by the API itself, which is why a zero result is reported as a
+    /// refusal rather than as success.
+    fn item_set_to_pouch(&mut self) {
+        let Some(e) = self.item_set_edit else {
+            return;
+        };
+        if self.item_set_armed != Some(ItemSetOp::ToPouch) {
+            self.item_set_armed = Some(ItemSetOp::ToPouch);
+            let held = self
+                .editing_item_set()
+                .map(|r| r.used_items().len())
+                .unwrap_or(0);
+            self.message = alloc::format!(
+                "ポーチをセット #{:02} の内容で置き換えます（ポーチ {} 枠 → {} 枠）。もう一度 [-] で実行",
+                e.set + 1,
+                self.pouch_used(),
+                held
+            );
+            return;
+        }
+        self.item_set_armed = None;
+        let slot = self.slot;
+        let set = e.set;
+        let n = match &mut self.save {
+            Some(s) => crate::myset::apply_to_pouch(s, slot, set),
+            None => 0,
+        };
+        if n == 0 {
+            self.message = String::from(
+                "適用できませんでした（セットが空か、セーブが開かれていません）",
+            );
+            return;
+        }
+        self.dirty = true;
+        self.message =
+            alloc::format!("ポーチをセットの {} 枠で置き換えました（[X] でセーブ保存）", n);
+    }
+
+    /// Re-seed the pending entries from the record, after a write that changed
+    /// more than one row.
+    fn reload_item_set_picks(&mut self, set: usize) {
+        let Some(rec) = self.item_sets().into_iter().nth(set) else {
+            return;
+        };
+        let Some(mut e) = self.item_set_edit else {
+            return;
+        };
+        for (i, p) in e.pick.iter_mut().enumerate() {
+            *p = rec.items.get(i).copied().unwrap_or(crate::myset::SetItem { id: 0, count: 0 });
+        }
+        if e.field >= ITEM_SET_EDIT_ROWS {
+            e.field = ITEM_SET_EDIT_ROWS - 1;
+        }
+        self.item_set_edit = Some(e);
+    }
+
+    /// One line for the footer on the item set form.
+    pub fn item_set_row_hint(&self) -> String {
+        let Some(e) = self.item_set_edit else {
+            return String::from("アイテムセットを選んで [A]");
+        };
+        alloc::format!(
+            "枠 {:02} {} — [◀/▶] アイテムBOX を巡回 / [A] 決定 / [Y] ポーチから取込 / [-] 2回でポーチへ適用",
+            e.field + 1,
+            self.item_set_row_label(e.field)
+        )
+    }
+
+    /// The item set form's keys.
+    fn input_item_set_edit(&mut self, key: Key) {
+        let Some(mut e) = self.item_set_edit else {
+            return;
+        };
+        // Both two-press operations belong to the row the user is looking at,
+        // so any other key drops the pending one before it does its own work.
+        if !matches!(key, Key::Y | Key::Minus) {
+            self.item_set_armed = None;
+        }
+        match key {
+            Key::Up => e.field = (e.field + ITEM_SET_EDIT_ROWS - 1) % ITEM_SET_EDIT_ROWS,
+            Key::Down => e.field = (e.field + 1) % ITEM_SET_EDIT_ROWS,
+            Key::Left | Key::Right => {
+                self.item_set_edit = Some(e);
+                self.move_item_set_pick(e.field, if key == Key::Right { 1 } else { -1 });
+                return;
+            }
+            Key::A => {
+                self.item_set_edit = Some(e);
+                self.commit_item_set_row();
+                return;
+            }
+            Key::Y => {
+                self.item_set_edit = Some(e);
+                self.item_set_from_pouch();
+                return;
+            }
+            Key::Minus => {
+                self.item_set_edit = Some(e);
+                self.item_set_to_pouch();
+                return;
+            }
+            Key::B => {
+                self.item_set_edit = Some(e);
+                self.close_item_set_editor();
+                return;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+        self.item_set_edit = Some(e);
     }
 
     fn input_equip(&mut self, key: Key) {
@@ -5928,6 +6809,76 @@ impl Editor {
                     );
                     return out;
                 }
+                // The item set form, the twin of the equipment one above.
+                if let Some(e) = self.item_set_edit {
+                    push(
+                        &mut out,
+                        alloc::format!("MY SETS   slot {}   ITEM EDIT", self.slot + 1),
+                        false,
+                        false,
+                    );
+                    let name = self
+                        .editing_item_set()
+                        .map(|r| r.name)
+                        .unwrap_or_default();
+                    push(
+                        &mut out,
+                        alloc::format!("  SET #{:02}  {}", e.set + 1, clip_text(&name, 24)),
+                        false,
+                        false,
+                    );
+                    for row in 0..ITEM_SET_EDIT_ROWS {
+                        let item = e.pick[row];
+                        let label = if item.id == 0 {
+                            String::from("(空き)")
+                        } else {
+                            alloc::format!("{} x{}", item_name_of(item.id), item.count)
+                        };
+                        // Kept short: this renderer is the 80 column
+                        // console, and the row already holds a name and a
+                        // count.
+                        let armed = if self.item_set_armed == Some(ItemSetOp::FromPouch) {
+                            "  << [Y] で取込確定"
+                        } else if self.item_set_armed == Some(ItemSetOp::ToPouch) {
+                            "  << [-] で適用確定"
+                        } else {
+                            ""
+                        };
+                        push(
+                            &mut out,
+                            alloc::format!("  {:>2} {}{}", row + 1, pad_cells(&label, 30), armed),
+                            true,
+                            row == e.field,
+                        );
+                    }
+                    push(
+                        &mut out,
+                        alloc::format!("  警告 {} 件", self.item_set_warnings.len()),
+                        false,
+                        false,
+                    );
+                    if self.item_set_warnings.is_empty() {
+                        push(&mut out, String::from("    (なし)"), false, false);
+                    } else {
+                        for line in self.item_set_warnings.iter().take(4) {
+                            push(
+                                &mut out,
+                                alloc::format!("    {}", clip_text(line, 60)),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    push(
+                        &mut out,
+                        String::from(
+                            "  Up/Down 枠  Left/Right アイテム  A 決定  Y ポーチから取込×2  - ポーチへ適用×2  B 一覧",
+                        ),
+                        false,
+                        false,
+                    );
+                    return out;
+                }
                 push(
                     &mut out,
                     alloc::format!("MY SETS   slot {}", self.slot + 1),
@@ -5964,7 +6915,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A 編集(装備セット)   B back"),
+                    String::from("  A 編集(アイテム/装備セット)   B back"),
                     false,
                     false,
                 );
@@ -6528,6 +7479,58 @@ impl Editor {
                     false,
                 );
             }
+            Screen::Csv => {
+                push(
+                    &mut out,
+                    alloc::format!("CSV   slot {}   {}", self.slot + 1, CSV_DIR),
+                    false,
+                    false,
+                );
+                if self.csv_files.is_empty() {
+                    push(
+                        &mut out,
+                        String::from("  (CSV ファイルがありません - Y で書き出します)"),
+                        false,
+                        false,
+                    );
+                }
+                for (i, path) in self.csv_files.iter().enumerate() {
+                    let armed = if self.csv_armed == Some(i) {
+                        "  << [A] で適用確定"
+                    } else {
+                        ""
+                    };
+                    push(
+                        &mut out,
+                        alloc::format!(
+                            "  [{:>2}] {}  {}  {}",
+                            i,
+                            pad_cells(csv_kind_label(path), 8),
+                            pad_cells(&file_name_of(path), 34),
+                            armed
+                        ),
+                        true,
+                        i == self.csv_cursor,
+                    );
+                }
+                if !self.csv_report.is_empty() {
+                    push(&mut out, String::from(" 前回の結果"), false, false);
+                    for line in self.csv_report.iter().take(3) {
+                        push(
+                            &mut out,
+                            alloc::format!("    {}", clip_text(line, 64)),
+                            false,
+                            false,
+                        );
+                    }
+                }
+                push(
+                    &mut out,
+                    String::from("  Up/Down 行  A 適用(2回)  Y 書き出し  - 再読込  B back"),
+                    false,
+                    false,
+                );
+            }
             Screen::Options => {
                 push(&mut out, String::from("設定"), false, false);
                 let o = self
@@ -6828,5 +7831,284 @@ mod tests {
         // The panel's row count is the worn list's own number, not a new one.
         assert_eq!(PALICO_PART_NAMES.len(), palico::EQUIP_SLOTS);
         assert_eq!(palicogear::KINDS.len(), PALICO_EQUIP_ROWS);
+    }
+
+    /// A blank Switch save whose item box holds these (id, count) pairs, with
+    /// an editor that has it open on slot 0.
+    ///
+    /// Nothing comes from a real save: the box is written through the same
+    /// writer the editor uses, and the rest of the body stays zero, so the test
+    /// runs anywhere.
+    fn editor_with_item_box(items: &[(u16, u8)]) -> Editor {
+        let mut save = crate::save::empty_switch_save();
+        let mut slots = alloc::vec![ItemSlot::default(); TOTAL_ITEM_SLOTS];
+        for (i, &(id, count)) in items.iter().enumerate() {
+            slots[i] = ItemSlot { id, count };
+        }
+        save.write_item_box(0, &slots).expect("item box");
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        assert_eq!(ed.slot, 0);
+        ed
+    }
+
+    #[test]
+    fn an_item_set_is_edited_one_entry_at_a_time() {
+        // Two items in the box: the form walks them, and every row it is not
+        // asked to write keeps what the record has.
+        let mut ed = editor_with_item_box(&[(1, 5), (2, 3)]);
+        ed.screen = Screen::Sets;
+        assert!(ed.open_item_set_editor(0), "{}", ed.message);
+        assert!(ed.item_set_editor_open());
+        // A mode of the my-sets screen, not a screen of its own.
+        assert_eq!(ed.screen, Screen::Sets);
+        assert_eq!(ed.item_set_edit.map(|e| e.field), Some(0));
+        assert!(ed.set_editor_open(), "either form answers the same question");
+        // The console renderer draws the form instead of the list.
+        let shown = ed
+            .lines()
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains("ITEM EDIT"), "{}", shown);
+        // Thirty-two entry rows, one of them the cursor.
+        assert_eq!(
+            ed.lines().iter().filter(|l| l.selectable).count(),
+            ITEM_SET_EDIT_ROWS
+        );
+        assert_eq!(ed.lines().iter().filter(|l| l.cursor).count(), 1);
+
+        // Walking the rows is not a write.
+        ed.input(Key::Down);
+        ed.input(Key::Up);
+        assert!(!ed.dirty);
+        assert_eq!(ed.item_set_row_label(0), "空き");
+
+        // The candidates are the empty entry and the box's items in box order,
+        // so the first Right lands on the first item.
+        ed.input(Key::Right);
+        assert_eq!(ed.item_set_pick(0), crate::myset::SetItem { id: 1, count: 5 });
+        assert!(!ed.dirty, "walking the candidates writes nothing");
+        let stored = crate::myset::item_sets(ed.save.as_ref().expect("save"), 0)[0].clone();
+        assert_eq!(stored.items[0].id, 0);
+
+        // [A] writes that one entry.
+        ed.input(Key::A);
+        assert!(ed.dirty);
+        let stored = crate::myset::item_sets(ed.save.as_ref().expect("save"), 0)[0].clone();
+        assert_eq!(stored.items[0], crate::myset::SetItem { id: 1, count: 5 });
+        assert!(stored.items[1..].iter().all(|i| i.id == 0), "nothing else moved");
+
+        // The second row takes the second item: the pending entry starts on the
+        // empty one, so two steps reach it.
+        ed.input(Key::Down);
+        ed.input(Key::Right);
+        ed.input(Key::Right);
+        assert_eq!(ed.item_set_pick(1), crate::myset::SetItem { id: 2, count: 3 });
+        ed.input(Key::A);
+        let stored = crate::myset::item_sets(ed.save.as_ref().expect("save"), 0)[0].clone();
+        assert_eq!(stored.items[1], crate::myset::SetItem { id: 2, count: 3 });
+
+        // Cycling past the last candidate comes back round to the empty one,
+        // and [A] on it empties the row again.
+        ed.input(Key::Up);
+        ed.input(Key::Right);
+        ed.input(Key::Right);
+        assert_eq!(ed.item_set_pick(0), crate::myset::SetItem { id: 0, count: 0 });
+        ed.input(Key::A);
+        let stored = crate::myset::item_sets(ed.save.as_ref().expect("save"), 0)[0].clone();
+        assert_eq!(stored.items[0].id, 0);
+        assert_eq!(stored.items[1].id, 2, "the other row is untouched");
+
+        // B gives the list back and drops the form.
+        ed.input(Key::B);
+        assert!(!ed.item_set_editor_open());
+        assert_eq!(ed.screen, Screen::Sets);
+        // The other form is not left open behind it.
+        assert!(!ed.set_editor_open());
+    }
+
+    #[test]
+    fn the_pouch_and_an_item_set_trade_places_two_presses_at_a_time() {
+        let mut ed = editor_with_item_box(&[(1, 5)]);
+        // A pouch of its own, so the two directions cannot look alike.
+        {
+            let save = ed.save.as_mut().expect("save");
+            assert!(crate::myset::set_pouch_item(save, 0, 0, 11, 7));
+            assert!(crate::myset::set_pouch_item(save, 0, 1, 12, 2));
+        }
+        ed.screen = Screen::Sets;
+        assert!(ed.open_item_set_editor(0), "{}", ed.message);
+        ed.dirty = false;
+        let before = ed.save.as_ref().expect("save").body().to_vec();
+
+        // One press only says what would be replaced.
+        ed.input(Key::Y);
+        assert_eq!(ed.item_set_armed, Some(ItemSetOp::FromPouch));
+        assert!(!ed.dirty);
+        assert_eq!(
+            ed.save.as_ref().expect("save").body(),
+            &before[..],
+            "the first press must write nothing"
+        );
+        assert!(ed.message.contains("もう一度"), "{}", ed.message);
+
+        // The second press takes the pouch in.
+        ed.input(Key::Y);
+        assert_eq!(ed.item_set_armed, None);
+        assert!(ed.dirty);
+        let stored = crate::myset::item_sets(ed.save.as_ref().expect("save"), 0)[0].clone();
+        assert_eq!(stored.items[0], crate::myset::SetItem { id: 11, count: 7 });
+        assert_eq!(stored.items[1], crate::myset::SetItem { id: 12, count: 2 });
+        assert_eq!(stored.used_items().len(), 2);
+        // The pending rows follow the record that was just written.
+        assert_eq!(ed.item_set_pick(0), crate::myset::SetItem { id: 11, count: 7 });
+
+        // Now the other direction. The pouch is emptied first so that a write
+        // is visible, and one [-] press is not enough to replace it.
+        {
+            let save = ed.save.as_mut().expect("save");
+            assert!(crate::myset::set_pouch_item(save, 0, 0, 0, 0));
+            assert!(crate::myset::set_pouch_item(save, 0, 1, 0, 0));
+        }
+        ed.dirty = false;
+        ed.input(Key::Minus);
+        assert_eq!(ed.item_set_armed, Some(ItemSetOp::ToPouch));
+        assert!(!ed.dirty);
+        assert_eq!(crate::myset::pouch(ed.save.as_ref().expect("save"), 0)[0].id, 0);
+
+        ed.input(Key::Minus);
+        assert!(ed.dirty);
+        let pouch = crate::myset::pouch(ed.save.as_ref().expect("save"), 0);
+        assert_eq!(pouch[0], crate::myset::SetItem { id: 11, count: 7 });
+        assert_eq!(pouch[1], crate::myset::SetItem { id: 12, count: 2 });
+        // Applying a set is not a move: the record keeps what it had.
+        let stored = crate::myset::item_sets(ed.save.as_ref().expect("save"), 0)[0].clone();
+        assert_eq!(stored.items[0], crate::myset::SetItem { id: 11, count: 7 });
+
+        // Any other key drops the pending operation, so the next [Y] starts the
+        // question over instead of writing on a press the user did not see.
+        ed.input(Key::Y);
+        ed.input(Key::Down);
+        assert_eq!(ed.item_set_armed, None);
+    }
+
+    #[test]
+    fn csv_export_names_the_files_after_the_clock_and_applies_back() {
+        let mut ed = editor_with_item_box(&[(1, 5), (2, 3)]);
+        ed.open_csv();
+        assert_eq!(ed.screen, Screen::Csv);
+        assert!(ed.take_csv_rescan(), "opening the screen lists the folder");
+        let shown = ed
+            .lines()
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(shown.contains(CSV_DIR), "{}", shown);
+
+        // No clock: nothing is built, and the message says why.
+        assert!(ed.export_csv(None).is_empty());
+        assert!(ed.message.contains("時計"), "{}", ed.message);
+
+        let unix = 1_700_000_000u64;
+        let files = ed.export_csv(Some(unix));
+        assert_eq!(files.len(), 2, "one file per box");
+        let stamp = crate::snapshot::stamp(unix);
+        assert_eq!(
+            files[0].0,
+            alloc::format!("{}/items-{}.csv", CSV_DIR, stamp)
+        );
+        assert_eq!(
+            files[1].0,
+            alloc::format!("{}/equipment-{}.csv", CSV_DIR, stamp)
+        );
+        let text = core::str::from_utf8(&files[0].1).expect("utf-8");
+        assert!(text.starts_with("slot,id,count\r\n"), "{}", ed.message);
+        assert!(text.contains("\r\n0,1,5\r\n"));
+        assert!(text.contains("\r\n1,2,3\r\n"));
+
+        // The layer reports what it wrote, and the folder is listed again.
+        ed.csv_exported(2, 2);
+        assert!(ed.message.contains("2 ファイル"), "{}", ed.message);
+        assert!(ed.take_csv_rescan());
+
+        // Applying the file back to a second editor restores the box.
+        let mut other = editor_with_item_box(&[]);
+        other.open_csv();
+        assert!(other.take_csv_rescan());
+        other.set_csv_files(alloc::vec![files[0].0.clone()]);
+        // The first press only arms the apply; nothing is read yet.
+        other.input(Key::A);
+        assert_eq!(other.csv_armed, Some(0));
+        assert_eq!(other.take_csv_read(), None);
+        assert!(other.message.contains("もう一度"), "{}", other.message);
+        // The second press asks the I/O layer for the file.
+        other.input(Key::A);
+        assert_eq!(other.take_csv_read(), Some(files[0].0.clone()));
+        assert_eq!(other.csv_armed, None);
+
+        assert!(other.apply_csv_text(&files[0].0, text));
+        assert!(other.dirty);
+        let boxed = other.save.as_ref().expect("save").read_item_box(0).expect("box");
+        assert_eq!((boxed[0].id, boxed[0].count), (1, 5));
+        assert_eq!((boxed[1].id, boxed[1].count), (2, 3));
+        assert_eq!((boxed[2].id, boxed[2].count), (0, 0));
+        // The report the panel draws says how much was written.
+        assert!(
+            other.csv_report[0].contains("適用 2300 行"),
+            "{:?}",
+            other.csv_report
+        );
+        assert!(other.message.contains("適用"), "{}", other.message);
+    }
+
+    #[test]
+    fn a_csv_that_is_not_one_is_refused_without_touching_the_box() {
+        let mut ed = editor_with_item_box(&[(1, 5)]);
+        ed.open_csv();
+        ed.take_csv_rescan();
+        ed.set_csv_files(alloc::vec![alloc::format!("{}/notes.csv", CSV_DIR)]);
+        ed.input(Key::A);
+        ed.input(Key::A);
+        let path = ed.take_csv_read().expect("the second press asks for the file");
+
+        // A file whose first line names neither table is refused whole.
+        assert!(!ed.apply_csv_text(&path, "hello,world\r\n"));
+        assert!(!ed.dirty);
+        assert!(ed.message.contains("CSV ではありません"), "{}", ed.message);
+        assert_eq!(
+            ed.save.as_ref().expect("save").read_item_box(0).expect("box")[0].id,
+            1
+        );
+
+        // A broken row names the line it is on and writes nothing either.
+        let bad = "slot,id,count\r\n1,x,3\r\n";
+        assert!(!ed.apply_csv_text(&alloc::format!("{}/items-1.csv", CSV_DIR), bad));
+        assert!(!ed.dirty);
+        assert!(ed.message.contains("2 行目"), "{}", ed.message);
+        assert_eq!(
+            ed.save.as_ref().expect("save").read_item_box(0).expect("box")[0].id,
+            1
+        );
+
+        // A renamed export still applies: the header decides, not the name.
+        let good = "slot,id,count\r\n0,4,9\r\n";
+        assert!(ed.apply_csv_text(&alloc::format!("{}/renamed.csv", CSV_DIR), good));
+        assert!(ed.dirty);
+        assert_eq!(
+            ed.save.as_ref().expect("save").read_item_box(0).expect("box")[0].id,
+            4
+        );
+
+        // A byte order mark in front of the header is what a spreadsheet on
+        // Windows writes; it is skipped rather than taken for a broken row.
+        let bom = "\u{feff}slot,id,count\r\n0,7,1\r\n";
+        assert!(ed.apply_csv_text(&alloc::format!("{}/excel.csv", CSV_DIR), bom));
+        assert_eq!(
+            ed.save.as_ref().expect("save").read_item_box(0).expect("box")[0].id,
+            7
+        );
     }
 }

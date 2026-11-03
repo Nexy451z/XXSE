@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mhnx_core::arc::Arc;
+use mhnx_core::csvout::{self, ApplyReport};
 use mhnx_core::dlc;
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::save::{self, Save, SaveKind};
@@ -57,10 +58,25 @@ USAGE:
   mhnx snapshot <system>               keep a copy of the save in snapshots/, newest 10 kept
   mhnx snapshots <system>              list the kept snapshots, newest first
   mhnx restore <system> <name>         put a snapshot back, snapshotting the current save first
+  mhnx csv-items <save> <out.csv> [--slot N]        write the item box as CSV
+  mhnx csv-equipment <save> <out.csv> [--slot N]    write the equipment box as CSV
+  mhnx import-items <save> <in.csv> [--slot N] [--force]   read a CSV back into the item box
+  mhnx import-equipment <save> <in.csv> [--slot N]  read a CSV back into the equipment box
+  mhnx pouch <save> [--slot N]         show the 32 pouch slots
+  mhnx sets <save> [--slot N]          item sets and equipment sets, summarised
 
 Commands that rewrite a save in place keep a copy next to it as <file>.bak.
 Snapshots live in <save's directory>/snapshots/ and are named
 <stem>-YYYYMMDD-HHMMSS.sav.
+
+The CSV commands and the set commands take --slot N to choose the character:
+0, 1 or 2, defaulting to 0, and a slot the save has no character in is an
+error rather than an empty report. import-items replaces the whole item box
+with the file - row n is record n - so a file that stops early empties the
+records after it; when that would drop an item the save holds now the command
+stops, lists what would go, and waits for --force. Both imports go through the
+same keep-a-copy-and-compare write as every other command here, so <file>.bak
+is still left behind and a write that does not read back is undone.
 
 verify never writes the save: it parses the bytes, writes them back in memory
 and compares. It exits 0 when the bytes are identical, 1 when they differ.
@@ -1336,6 +1352,381 @@ fn cmd_restore(save: &str, name: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// CSV, pouch and set commands
+// ---------------------------------------------------------------------------
+
+/// The options the CSV and set commands share.
+struct Flags {
+    /// Character slot to work on, 0..=2. The core counts slots from zero, and
+    /// so does --slot; the messages name the slot one higher, like the rest of
+    /// this tool, so the two never look the same by accident.
+    slot: usize,
+    /// Allow an import that would empty records holding something now.
+    force: bool,
+    /// The arguments that are not options, in the order they were given.
+    positional: Vec<String>,
+}
+
+/// Split `--slot N` and `--force` out of the argument list.
+///
+/// An unknown option is refused instead of skipped: these commands rewrite a
+/// save, so a mistyped `--slto 2` must not quietly work on slot 0.
+fn parse_flags(args: &[String]) -> Result<Flags, String> {
+    let mut flags = Flags {
+        slot: 0,
+        force: false,
+        positional: Vec::new(),
+    };
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--slot" {
+            let value = args
+                .get(i + 1)
+                .ok_or_else(|| String::from("--slot needs a number (0, 1 or 2)"))?;
+            flags.slot = num(value, "--slot")?;
+            i += 2;
+        } else if let Some(value) = arg.strip_prefix("--slot=") {
+            flags.slot = num(value, "--slot")?;
+            i += 1;
+        } else if arg == "--force" {
+            flags.force = true;
+            i += 1;
+        } else if arg.starts_with("--") {
+            return Err(format!(
+                "unknown option {} (these commands take --slot N and --force)",
+                arg
+            ));
+        } else {
+            flags.positional.push(String::from(arg));
+            i += 1;
+        }
+    }
+    if flags.slot >= save::MAX_SLOTS {
+        return Err(format!("--slot must be 0, 1 or 2, got {}", flags.slot));
+    }
+    Ok(flags)
+}
+
+/// The usage line of one of the commands below, for a wrong argument count.
+fn command_usage(name: &str) -> &'static str {
+    match name {
+        "csv-items" => "mhnx csv-items <save> <out.csv> [--slot N]",
+        "csv-equipment" => "mhnx csv-equipment <save> <out.csv> [--slot N]",
+        "import-items" => "mhnx import-items <save> <in.csv> [--slot N] [--force]",
+        "import-equipment" => "mhnx import-equipment <save> <in.csv> [--slot N]",
+        "pouch" => "mhnx pouch <save> [--slot N]",
+        "sets" => "mhnx sets <save> [--slot N]",
+        _ => "mhnx",
+    }
+}
+
+/// Refuse a slot the save has no character in, and hand it back.
+///
+/// Reading a slot that does not exist would produce an empty table, which
+/// reads like "this character has nothing" instead of "there is no character
+/// here". Every command below goes through this first.
+fn checked_slot(s: &Save, slot: usize) -> Result<usize, String> {
+    if slot >= save::MAX_SLOTS {
+        return Err(format!("--slot must be 0, 1 or 2, got {}", slot));
+    }
+    if s.slot_base(slot).is_none() {
+        return Err(format!(
+            "slot {} is not in use: the save has no character there",
+            slot + 1
+        ));
+    }
+    Ok(slot)
+}
+
+/// `slot 2 (name)`, the way these commands name a character.
+fn slot_label(s: &Save, slot: usize) -> String {
+    let name = s.read_character(slot).map(|c| c.name).unwrap_or_default();
+    if name.is_empty() {
+        format!("slot {}", slot + 1)
+    } else {
+        format!("slot {} ({})", slot + 1, name)
+    }
+}
+
+/// Read a UTF-8 text file, naming the path when it is not text.
+///
+/// A spreadsheet on a Japanese Windows may still save in Shift_JIS; saying so
+/// is more use than the byte offset the parser would report.
+fn read_text(path: &str) -> Result<String, String> {
+    let bytes = read(path)?;
+    String::from_utf8(bytes).map_err(|_| format!("{}: not a UTF-8 text file", path))
+}
+
+/// Refuse to write a CSV over the save it was read from.
+fn csv_out_checked(save: &str, out: &str) -> Result<(), String> {
+    if same_file(save, out) {
+        return Err(format!(
+            "out must be a different file from the save ({}); a CSV is not a save",
+            save
+        ));
+    }
+    Ok(())
+}
+
+/// Say what an import did, one line per thing worth mentioning.
+fn print_report(report: &ApplyReport) {
+    println!(
+        "  applied {}, skipped {}, clamped {}",
+        report.applied, report.skipped, report.clamped
+    );
+    for line in &report.messages {
+        println!("  {}", line);
+    }
+}
+
+/// Write one character's item box out as CSV.
+fn cmd_csv_items(save: &str, out: &str, slot: usize) -> Result<(), String> {
+    csv_out_checked(save, out)?;
+    let s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
+    let slot = checked_slot(&s, slot)?;
+    let items = s
+        .read_item_box(slot)
+        .ok_or_else(|| format!("slot {} has no item box", slot + 1))?;
+    let csv = csvout::items_to_csv(&s, slot);
+    std::fs::write(out, csv.as_bytes()).map_err(|e| format!("{}: {}", out, e))?;
+    let used = items.iter().filter(|i| i.id != 0).count();
+    println!("wrote {} for {}", out, slot_label(&s, slot));
+    println!(
+        "  {} data rows (header included: {} lines), {} of the {} records used",
+        items.len(),
+        items.len() + 1,
+        used,
+        mhnx_core::itembox::TOTAL_ITEM_SLOTS
+    );
+    Ok(())
+}
+
+/// Write one character's equipment box out as CSV.
+fn cmd_csv_equipment(save: &str, out: &str, slot: usize) -> Result<(), String> {
+    csv_out_checked(save, out)?;
+    let s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
+    let slot = checked_slot(&s, slot)?;
+    if s.equipment_box(slot).is_none() {
+        return Err(format!("slot {} has no equipment box", slot + 1));
+    }
+    let csv = csvout::equipment_to_csv(&s, slot);
+    std::fs::write(out, csv.as_bytes()).map_err(|e| format!("{}: {}", out, e))?;
+    let rows = csv.lines().count().saturating_sub(1);
+    println!("wrote {} for {}", out, slot_label(&s, slot));
+    println!(
+        "  {} data rows (records that hold something) out of {}",
+        rows,
+        mhnx_core::equip::EQUIP_COUNT
+    );
+    Ok(())
+}
+
+/// Apply an item CSV to one character's box.
+///
+/// The box becomes the file - row n is record n - so a file that stops early
+/// empties the records after it. When that would drop something the save holds
+/// now, the command lists what would go and stops; `--force` is the only way
+/// past it. Nothing is written before that decision either way.
+fn cmd_import_items(save: &str, inp: &str, slot: usize, force: bool) -> Result<(), String> {
+    let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
+    let slot = checked_slot(&s, slot)?;
+    let current = s
+        .read_item_box(slot)
+        .ok_or_else(|| format!("slot {} has no item box", slot + 1))?;
+    let text = read_text(inp)?;
+    let rows = csvout::parse_items(&text).map_err(|e| format!("{}: {}", inp, e))?;
+    if rows.is_empty() {
+        return Err(format!(
+            "{} holds no item rows; the save was not written",
+            inp
+        ));
+    }
+    if !force {
+        let lost: Vec<usize> = current
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| item.id != 0 && rows.get(*i).map(|r| r.0).unwrap_or(0) == 0)
+            .map(|(i, _)| i)
+            .collect();
+        if !lost.is_empty() {
+            println!(
+                "this import would empty {} record(s) that hold something now:",
+                lost.len()
+            );
+            for i in lost.iter().take(10) {
+                println!(
+                    "  record {}: id {} x{} {}",
+                    i,
+                    current[*i].id,
+                    current[*i].count,
+                    item_name(current[*i].id)
+                );
+            }
+            if lost.len() > 10 {
+                println!("  ... and {} more", lost.len() - 10);
+            }
+            return Err(format!(
+                "refusing to drop {} record(s); run again with --force to replace the box anyway (the save was not written)",
+                lost.len()
+            ));
+        }
+    }
+    let report = csvout::apply_items(&mut s, slot, &rows);
+    print_report(&report);
+    if report.applied == 0 {
+        return Err(String::from(
+            "no row was applied, so the save was not written",
+        ));
+    }
+    let out = s.to_bytes();
+    let label = slot_label(&s, slot);
+    write_in_place(save, &out)?;
+    println!("{} applied to {} in {}", inp, label, save);
+    println!("NOTE: write system_backup too - the game keeps the pair in sync");
+    Ok(())
+}
+
+/// Apply an equipment CSV to one character's box.
+///
+/// A row names the record it belongs to, so a record the file does not mention
+/// keeps what it had; nothing is emptied here. A row that would move a record
+/// other sets point at is refused by the core and reported, not forced.
+fn cmd_import_equipment(save: &str, inp: &str, slot: usize) -> Result<(), String> {
+    let mut s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
+    let slot = checked_slot(&s, slot)?;
+    if s.equipment_box(slot).is_none() {
+        return Err(format!("slot {} has no equipment box", slot + 1));
+    }
+    let text = read_text(inp)?;
+    let rows = csvout::parse_equipment(&text).map_err(|e| format!("{}: {}", inp, e))?;
+    if rows.is_empty() {
+        return Err(format!(
+            "{} holds no equipment rows; the save was not written",
+            inp
+        ));
+    }
+    let report = csvout::apply_equipment(&mut s, slot, &rows);
+    print_report(&report);
+    if report.applied == 0 {
+        return Err(String::from(
+            "no row was applied, so the save was not written",
+        ));
+    }
+    let out = s.to_bytes();
+    let label = slot_label(&s, slot);
+    write_in_place(save, &out)?;
+    println!("{} applied to {} in {}", inp, label, save);
+    println!("NOTE: write system_backup too - the game keeps the pair in sync");
+    Ok(())
+}
+
+/// Show the thirty-two pouch slots of one character.
+fn cmd_pouch(save: &str, slot: usize) -> Result<(), String> {
+    let s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
+    let slot = checked_slot(&s, slot)?;
+    let items = mhnx_core::myset::pouch(&s, slot);
+    if items.is_empty() {
+        return Err(format!("slot {} has no readable pouch", slot + 1));
+    }
+    let used = items.iter().filter(|i| i.id != 0).count();
+    println!(
+        "{} pouch: {} of {} slots used",
+        slot_label(&s, slot),
+        used,
+        items.len()
+    );
+    for (index, item) in items.iter().enumerate() {
+        if item.id == 0 {
+            println!("  #{:<3} empty", index);
+            continue;
+        }
+        println!(
+            "  #{:<3} id {:<5} x{:<3} {}",
+            index,
+            item.id,
+            item.count,
+            mhnx_core::hbedit::item_name_of(item.id)
+        );
+    }
+    Ok(())
+}
+
+/// Summarise the item sets and the equipment sets of one character.
+///
+/// The full contents are what `mysets` is for; this is the count and the
+/// names, plus a warning count so a broken record is visible without dumping
+/// every entry.
+fn cmd_sets(save: &str, slot: usize) -> Result<(), String> {
+    let s = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
+    let slot = checked_slot(&s, slot)?;
+    println!("{}", slot_label(&s, slot));
+
+    let item_sets = mhnx_core::myset::item_sets(&s, slot);
+    if item_sets.is_empty() {
+        return Err(format!("slot {} has no readable item sets", slot + 1));
+    }
+    let used = item_sets.iter().filter(|set| !set.is_empty()).count();
+    println!(
+        "  item sets: {} of {} in use",
+        used,
+        mhnx_core::myset::ITEM_SETS
+    );
+    for set in item_sets.iter().filter(|set| !set.is_empty()) {
+        let warnings = mhnx_core::myset::item_set_warnings(&s, slot, set.index);
+        println!(
+            "    [{:>2}] {:<16} {:>2}/{} entries{}",
+            set.index,
+            set.name,
+            set.used_items().len(),
+            mhnx_core::myset::ITEM_SET_ITEMS,
+            warning_tag(warnings.len())
+        );
+    }
+
+    let equip_sets = mhnx_core::myset::equip_sets(&s, slot);
+    let used = equip_sets.iter().filter(|set| !set.is_empty()).count();
+    println!(
+        "  equipment sets: {} of {} in use",
+        used,
+        mhnx_core::myset::EQUIP_SETS
+    );
+    for set in equip_sets.iter().filter(|set| !set.is_empty()) {
+        let parts: Vec<String> = set
+            .parts
+            .iter()
+            .enumerate()
+            .map(|(part, index)| {
+                let name = mhnx_core::myset::PART_NAMES[part];
+                if *index == mhnx_core::myset::NONE {
+                    format!("{}-", name)
+                } else {
+                    format!("{}#{}", name, index)
+                }
+            })
+            .collect();
+        let warnings = mhnx_core::myset::warnings(&s, slot, set.index);
+        println!(
+            "    [{:>2}] {:<16} {}{}",
+            set.index,
+            set.name,
+            parts.join(" "),
+            warning_tag(warnings.len())
+        );
+    }
+    Ok(())
+}
+
+/// `  (3 warning(s))`, or nothing when there are none.
+fn warning_tag(count: usize) -> String {
+    if count == 0 {
+        String::new()
+    } else {
+        format!("  ({} warning(s))", count)
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -1419,6 +1810,58 @@ fn main() -> ExitCode {
         "snapshot" if args.len() == 2 => cmd_snapshot(&args[1]),
         "snapshots" if args.len() == 2 => cmd_snapshots(&args[1]),
         "restore" if args.len() == 3 => cmd_restore(&args[1], &args[2]),
+        "csv-items" | "csv-equipment" | "import-items" | "import-equipment" | "pouch"
+        | "sets" => {
+            let name = args[0].as_str();
+            (|| {
+                let flags = parse_flags(&args[1..])?;
+                if flags.force && name != "import-items" {
+                    return Err(format!(
+                        "--force is only for import-items\nusage: {}",
+                        command_usage(name)
+                    ));
+                }
+                let count = flags.positional.len();
+                let expected = match name {
+                    "csv-items" | "csv-equipment" | "import-items" | "import-equipment" => 2,
+                    _ => 1,
+                };
+                let wrong = || {
+                    Err(format!(
+                        "usage: {}\n({} argument(s) given, {} expected)",
+                        command_usage(name),
+                        count,
+                        expected
+                    ))
+                };
+                match name {
+                    "csv-items" if count == 2 => cmd_csv_items(
+                        &flags.positional[0],
+                        &flags.positional[1],
+                        flags.slot,
+                    ),
+                    "csv-equipment" if count == 2 => cmd_csv_equipment(
+                        &flags.positional[0],
+                        &flags.positional[1],
+                        flags.slot,
+                    ),
+                    "import-items" if count == 2 => cmd_import_items(
+                        &flags.positional[0],
+                        &flags.positional[1],
+                        flags.slot,
+                        flags.force,
+                    ),
+                    "import-equipment" if count == 2 => cmd_import_equipment(
+                        &flags.positional[0],
+                        &flags.positional[1],
+                        flags.slot,
+                    ),
+                    "pouch" if count == 1 => cmd_pouch(&flags.positional[0], flags.slot),
+                    "sets" if count == 1 => cmd_sets(&flags.positional[0], flags.slot),
+                    _ => wrong(),
+                }
+            })()
+        }
         other => {
             eprintln!("unknown or incomplete command: {}\n", other);
             usage();
