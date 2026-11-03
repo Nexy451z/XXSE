@@ -606,6 +606,54 @@ impl Save {
         };
         charm::create_charm(b, c.index, &template, c)
     }
+    /// Write a talisman at a chosen grade.
+    ///
+    /// Same as set_charm, except that a new record is seeded from a talisman
+    /// of that grade rather than from the most common one in the box, and the
+    /// grade's slot ceiling and points ranges are enforced afterwards.
+    /// Returns false only when there is no talisman in the box to copy at all.
+    pub fn set_charm_with_grade(
+        &mut self,
+        slot: usize,
+        c: &charm::Charm,
+        grade: charm::TalismanGrade,
+    ) -> bool {
+        let Some(b) = self.equipment_box(slot) else {
+            return false;
+        };
+        let o = c.index * charm::CHARM_RECORD;
+        if o + charm::CHARM_RECORD > b.len() {
+            return false;
+        }
+        if charm::is_talisman(&b[o..o + charm::CHARM_RECORD]) {
+            let Some(b) = self.equipment_box_mut(slot) else {
+                return false;
+            };
+            let current = charm::rarity_of_record(&b[o..o + charm::CHARM_RECORD]);
+            if !charm::update_charm(b, c) {
+                return false;
+            }
+            // Only re-grade when the caller asked for a different one, and only
+            // then clamp: moving a talisman down a grade makes values illegal,
+            // but writing the skills someone typed must not silently rewrite
+            // them. The desktop build has always warned instead of clamping,
+            // and both builds behave the same way now.
+            if current != Some(grade) {
+                charm::set_grade(b, c.index, grade);
+                charm::clamp_points(b, c.index, grade);
+                charm::clamp_slots(b, c.index, grade);
+            }
+            return true;
+        }
+        let Some((template, _synth)) = charm::template_for_grade_or_pair(b, grade) else {
+            return false;
+        };
+        let Some(b) = self.equipment_box_mut(slot) else {
+            return false;
+        };
+        charm::create_charm(b, c.index, &template, c)
+    }
+
     /// Delete one talisman from the slot's equipment box.
     pub fn clear_charm(&mut self, slot: usize, index: usize) -> bool {
         match self.equipment_box_mut(slot) {

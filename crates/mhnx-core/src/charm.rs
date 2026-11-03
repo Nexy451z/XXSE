@@ -35,10 +35,17 @@
 //! +0x0F and +0x10. Everything else is preserved byte for byte.
 //!
 //! An earlier version of this module zeroed the record and wrote fixed
-//! constants for +0x02 (0x0A) and +0x12 (100). Both are wrong - they are a
-//! linked pair that varies - so merely opening and saving a save rewrote 70
-//! talismans and turned rarity 99 records into rarity 100 ones. Never
-//! synthesise those bytes: copy them from a record the game wrote.
+//! constants for +0x02 (0x0A) and +0x12 (100). Both are wrong: they are a
+//! linked pair, so merely opening and saving a save rewrote 70 talismans and
+//! turned rarity 99 records into rarity 100 ones.
+//!
+//! The pair is not arbitrary, though. +0x02 is the equipment id 1..10 and
+//! +0x12 is the talisman id 97..100, and TALISMAN_RARITY links them
+//! (1-2 -> 97, 3-4 -> 98, 5-7 -> 99, 8-10 -> 100). What is impossible is a
+//! record whose two bytes disagree. So a new talisman is built from a real
+//! record of the same grade when the box holds one, and otherwise from a real
+//! talisman with the pair set from that table - never a fixed pair regardless
+//! of grade, which is what broke the old version.
 //!
 //! A brand new talisman therefore needs a template (see create_charm), and
 //! writing one over a weapon or a piece of armour is refused outright.
@@ -369,6 +376,343 @@ pub fn template_from_box(box_bytes: &[u8]) -> Option<[u8; CHARM_RECORD]> {
         }
     }
     fallback
+}
+
+
+/// The four talisman grades the game ships.
+///
+/// The rarity byte at +0x12 is 97, 98, 99 or 100 and each one has its own
+/// table of legal skill ranges. The byte at +0x02 is paired with it through
+/// `TALISMAN_RARITY`, and several type bytes map to the same rarity, so the
+/// grade is chosen by rarity and the type byte is copied from a record the
+/// game itself wrote rather than invented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum TalismanGrade {
+    /// Rarity 97. The lowest grade the tables cover.
+    Mystery,
+    /// Rarity 98.
+    Shining,
+    /// Rarity 99.
+    Timeworn,
+    /// Rarity 100, the skyward talisman most editors stop at.
+    #[default]
+    Enduring,
+}
+
+impl TalismanGrade {
+    /// Every grade, in the order the game ranks them.
+    pub const ALL: [TalismanGrade; 4] = [
+        TalismanGrade::Mystery,
+        TalismanGrade::Shining,
+        TalismanGrade::Timeworn,
+        TalismanGrade::Enduring,
+    ];
+
+    /// The rarity byte this grade is stored as.
+    pub fn rarity(self) -> u8 {
+        match self {
+            TalismanGrade::Mystery => 97,
+            TalismanGrade::Shining => 98,
+            TalismanGrade::Timeworn => 99,
+            TalismanGrade::Enduring => 100,
+        }
+    }
+
+    /// Short label, with the rarity attached.
+    ///
+    /// Only the top grade's name is confirmed against the game (天の護石,
+    /// rarity 100, the one the save's first character is full of). The other
+    /// three labels are the conventional translations of the reference
+    /// editor's table, so the rarity is carried alongside them: the number is
+    /// the fact, the name is a convenience.
+    pub fn name(self) -> &'static str {
+        match self {
+            TalismanGrade::Mystery => "護石 R97",
+            TalismanGrade::Shining => "護石 R98",
+            TalismanGrade::Timeworn => "古びた護石 R99",
+            TalismanGrade::Enduring => "天の護石 R100",
+        }
+    }
+
+    /// Grade for a rarity byte.
+    pub fn from_rarity(rarity: u8) -> Option<Self> {
+        TalismanGrade::ALL.into_iter().find(|g| g.rarity() == rarity)
+    }
+
+    /// Most decoration slots this grade is allowed.
+    ///
+    /// 1 / 2 / 3 / 3. The reference editor (MHGU, same layout) states this
+    /// directly, and the sample MHXX save agrees: rarity 98 records stop at
+    /// two slots, 99 and 100 reach three.
+    pub fn max_slots(self) -> u8 {
+        match self {
+            TalismanGrade::Mystery => 1,
+            TalismanGrade::Shining => 2,
+            TalismanGrade::Timeworn => 3,
+            TalismanGrade::Enduring => 3,
+        }
+    }
+
+    /// The first type byte the rarity table maps to this grade.
+    ///
+    /// Used only when the box has no real record of the grade to copy: the
+    /// pair still has to agree, and this is the pairing the table states.
+    #[cfg(feature = "gamedata")]
+    pub fn type_byte(self) -> u8 {
+        crate::gamedata::TALISMAN_RARITY
+            .iter()
+            .position(|r| *r == self.rarity() as i32)
+            .unwrap_or(0) as u8
+    }
+
+    /// The first type byte the rarity table maps to this grade.
+    #[cfg(not(feature = "gamedata"))]
+    pub fn type_byte(self) -> u8 {
+        0
+    }
+}
+
+/// Grade of a raw record, from the rarity byte at +0x12.
+pub fn rarity_of_record(rec: &[u8]) -> Option<TalismanGrade> {
+    if rec.len() < CHARM_RECORD || !is_talisman(rec) {
+        return None;
+    }
+    TalismanGrade::from_rarity(rec[0x12])
+}
+
+/// Legal points range for a skill at a rarity, without going through the
+/// type byte.
+#[cfg(feature = "gamedata")]
+pub fn allowed_points_rarity(rarity: u8, skill: u8, second: bool) -> Option<AllowedPoints> {
+    use crate::gamedata::{
+        TALISMAN_ENDURING_SKILL, TALISMAN_MYSTERY_SKILL, TALISMAN_SHINING_SKILL,
+        TALISMAN_TIMEWORN_SKILL,
+    };
+    if skill == 0 {
+        return None;
+    }
+    let table: &[&str] = match rarity {
+        97 => TALISMAN_MYSTERY_SKILL,
+        98 => TALISMAN_SHINING_SKILL,
+        99 => TALISMAN_TIMEWORN_SKILL,
+        100 => TALISMAN_ENDURING_SKILL,
+        _ => return None,
+    };
+    let cell = table.get(skill as usize)?;
+    let mut halves = cell.split(':');
+    let pair = if second { halves.nth(1)? } else { halves.next()? };
+    let mut bits = pair.split('~');
+    let min: i8 = bits.next()?.trim().parse().ok()?;
+    let max: i8 = bits.next()?.trim().parse().ok()?;
+    Some(AllowedPoints { min, max })
+}
+
+/// Legal points range for a skill at a rarity.
+#[cfg(not(feature = "gamedata"))]
+pub fn allowed_points_rarity(_rarity: u8, _skill: u8, _second: bool) -> Option<AllowedPoints> {
+    None
+}
+
+/// A real record of the requested grade to copy, preferring a clean one.
+///
+/// Returns None when the box holds no talisman of that grade, which is the
+/// normal case for the lowest grades in a long-played save.
+pub fn template_for_grade(
+    box_bytes: &[u8],
+    grade: TalismanGrade,
+) -> Option<[u8; CHARM_RECORD]> {
+    if box_bytes.len() < CHARM_BOX_SIZE {
+        return None;
+    }
+    let want = grade.rarity();
+    let mut fallback: Option<[u8; CHARM_RECORD]> = None;
+    for i in 0..CHARM_COUNT {
+        let rec = &box_bytes[i * CHARM_RECORD..(i + 1) * CHARM_RECORD];
+        if !is_talisman(rec) || rec[0x12] != want {
+            continue;
+        }
+        let mut out = [0u8; CHARM_RECORD];
+        out.copy_from_slice(rec);
+        if is_clean(rec) {
+            return Some(out);
+        }
+        if fallback.is_none() {
+            fallback = Some(out);
+        }
+    }
+    fallback
+}
+
+/// The type byte real records of this grade use in this box, if any.
+///
+/// The table says several type bytes map to the same rarity, and the ones the
+/// game actually writes are not the first of each run (rarity 98 records use
+/// 0x04, not the 0x03 the table starts on). Writing a table-derived byte would
+/// produce a pair no game ever wrote, so a real record of the grade has to be
+/// present before the grade can be created or switched to.
+pub fn type_byte_for_grade(box_bytes: &[u8], grade: TalismanGrade) -> Option<u8> {
+    template_for_grade(box_bytes, grade).map(|t| t[0x02])
+}
+
+/// A template for the requested grade: a real record when the box has one,
+/// otherwise a clean talisman with the grade's two paired bytes set.
+///
+/// The second value is true when the pair had to be written. That is allowed:
+/// the byte at +0x02 is the equipment id 1..10 and the byte at +0x12 is the
+/// talisman id 97..100, and the two are linked by a table both this crate and
+/// the reference editor carry (1-2 -> 97, 3-4 -> 98, 5-7 -> 99, 8-10 -> 100).
+/// A record whose pair agrees is what the game writes; only disagreements are
+/// impossible. Copying a real record is still preferred, because it also
+/// carries whatever else the grade needs.
+pub fn template_for_grade_or_pair(
+    box_bytes: &[u8],
+    grade: TalismanGrade,
+) -> Option<([u8; CHARM_RECORD], bool)> {
+    if let Some(t) = template_for_grade(box_bytes, grade) {
+        return Some((t, false));
+    }
+    let mut t = template_from_box(box_bytes)?;
+    t[0x02] = grade.type_byte();
+    t[0x12] = grade.rarity();
+    Some((t, true))
+}
+
+/// What about this talisman would the game not have written?
+///
+/// One short string per problem, empty when the record is ordinary for its
+/// grade. Nothing here changes the save: it is for the warning line.
+pub fn grade_warnings(
+    box_bytes: &[u8],
+    index: usize,
+    grade: TalismanGrade,
+) -> Vec<alloc::string::String> {
+    use alloc::format;
+    let mut out = Vec::new();
+    if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
+        return out;
+    }
+    let o = index * CHARM_RECORD;
+    if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
+        return out;
+    }
+    if box_bytes[o + 0x10] > grade.max_slots() {
+        out.push(format!(
+            "スロット{}個は{}の上限{}を超えています",
+            box_bytes[o + 0x10],
+            grade.name(),
+            grade.max_slots()
+        ));
+    }
+    for (skill_at, pts_at, second, label) in [
+        (0x0Cusize, 0x0Eusize, false, "スキル1"),
+        (0x0D, 0x0F, true, "スキル2"),
+    ] {
+        let skill = box_bytes[o + skill_at];
+        if skill == 0 {
+            continue;
+        }
+        match allowed_points_rarity(grade.rarity(), skill, second) {
+            Some(r) if r.min == 0 && r.max == 0 => {
+                out.push(format!("{} は{}では付けられません", label, grade.name()));
+            }
+            Some(r) => {
+                let pts = box_bytes[o + pts_at] as i8;
+                if pts < r.min || pts > r.max {
+                    out.push(format!(
+                        "{} {} は {}〜{} の範囲外です",
+                        label, pts, r.min, r.max
+                    ));
+                }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// Clamp the decoration slots to what the grade allows.
+pub fn clamp_slots(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> bool {
+    if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
+        return false;
+    }
+    let o = index * CHARM_RECORD;
+    if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
+        return false;
+    }
+    let max = grade.max_slots();
+    if box_bytes[o + 0x10] > max {
+        box_bytes[o + 0x10] = max;
+        return true;
+    }
+    false
+}
+
+/// Change the grade of a talisman already in the box.
+///
+/// Only the two linked bytes move; the skills are left alone, so the caller
+/// should clamp the points afterwards with `clamp_points`.
+/// The type byte is copied from a real record of the grade when one exists,
+/// and otherwise taken from the rarity table, which keeps the pair consistent.
+pub fn set_grade(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> bool {
+    if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
+        return false;
+    }
+    let o = index * CHARM_RECORD;
+    if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
+        return false;
+    }
+    // Prefer the byte a real record of this grade uses; fall back to the
+    // table's first id for the grade, which the pairing still makes legal.
+    let type_byte = type_byte_for_grade(box_bytes, grade).unwrap_or_else(|| grade.type_byte());
+    box_bytes[o + 0x02] = type_byte;
+    box_bytes[o + 0x12] = grade.rarity();
+    true
+}
+
+/// Clamp both skill point values to what the grade allows.
+///
+/// Returns true when a value had to move. A skill the grade forbids outright
+/// is cleared rather than silently left illegal.
+pub fn clamp_points(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> bool {
+    if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
+        return false;
+    }
+    let o = index * CHARM_RECORD;
+    if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
+        return false;
+    }
+    let mut moved = false;
+    for (skill_at, pts_at, second) in [(0x0Cusize, 0x0Eusize, false), (0x0D, 0x0F, true)] {
+        let skill = box_bytes[o + skill_at];
+        if skill == 0 {
+            continue;
+        }
+        match allowed_points_rarity(grade.rarity(), skill, second) {
+            // "0~0" means the grade does not carry this skill at all. The
+            // record is left alone rather than quietly cleared: the reference
+            // editor warns about this and still writes, and silently deleting
+            // a skill the user chose is worse than writing it. grade_warnings
+            // is how the caller tells them.
+            Some(r) if r.min == 0 && r.max == 0 => {}
+            Some(r) => {
+                let pts = box_bytes[o + pts_at] as i8;
+                if pts < r.min {
+                    box_bytes[o + pts_at] = r.min as u8;
+                    moved = true;
+                } else if pts > r.max {
+                    box_bytes[o + pts_at] = r.max as u8;
+                    moved = true;
+                }
+            }
+            None => {
+                // The grade does not allow this skill at all.
+                box_bytes[o + skill_at] = 0;
+                box_bytes[o + pts_at] = 0;
+                moved = true;
+            }
+        }
+    }
+    moved
 }
 
 /// Remove a talisman.

@@ -160,6 +160,8 @@ pub struct Line {
 pub struct CharmEdit {
     /// Charm slot index (0..1999).
     pub index: usize,
+    /// Talisman grade (rarity 97..100).
+    pub grade: crate::charm::TalismanGrade,
     /// Decoration slots.
     pub slots: u8,
     /// First skill id.
@@ -844,14 +846,29 @@ impl Editor {
         } else {
             base
         };
+        // New talismans start on the grade of the record they were seeded
+        // from, so the console stops defaulting every one to rarity 100.
+        let grade = self
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_box(self.slot))
+            .and_then(|b| {
+                let o = seed.index * crate::charm::CHARM_RECORD;
+                b.get(o..o + crate::charm::CHARM_RECORD)
+                    .and_then(crate::charm::rarity_of_record)
+            })
+            .unwrap_or_default();
         self.charm_edit = Some(CharmEdit {
             index: seed.index,
+            grade,
             slots: seed.slots,
             skill1: seed.skill1,
             points1: seed.points1,
             skill2: seed.skill2,
             points2: seed.points2,
-            field: 2,
+            // Land on the first skill: the grade and slot rows are quicker to
+            // reach than to pass through on every visit.
+            field: 3,
         });
         self.screen = Screen::CharmEdit;
         self.cursor = 0;
@@ -904,25 +921,57 @@ impl Editor {
             return;
         };
         match key {
-            Key::Up => e.field = (e.field + 5) % 6,
-            Key::Down => e.field = (e.field + 1) % 6,
+            Key::Up => e.field = (e.field + 6) % 7,
+            Key::Down => e.field = (e.field + 1) % 7,
             Key::Left | Key::Right => {
                 let d: i64 = if key == Key::Right { 1 } else { -1 } * STEPS[self.step].min(10).max(1);
                 match e.field {
                     0 => e.index = ((e.index as i64 + d).rem_euclid(CHARM_COUNT as i64)) as usize,
-                    1 => e.slots = ((e.slots as i64 + d).rem_euclid(4)) as u8,
-                    2 => e.skill1 = ((e.skill1 as i64 + d).rem_euclid(256)) as u8,
-                    3 => e.points1 = (e.points1 as i64 + d).clamp(-127, 127) as i8,
-                    4 => e.skill2 = ((e.skill2 as i64 + d).rem_euclid(256)) as u8,
-                    5 => e.points2 = (e.points2 as i64 + d).clamp(-127, 127) as i8,
+                    // The grade decides the slot ceiling and the points
+                    // ranges, so moving it re-clamps both straight away
+                    // instead of writing a record the game would refuse.
+                    1 => {
+                        let all = crate::charm::TalismanGrade::ALL;
+                        let at = all.iter().position(|g| *g == e.grade).unwrap_or(3);
+                        let next = if d > 0 {
+                            (at + 1) % all.len()
+                        } else {
+                            (at + all.len() - 1) % all.len()
+                        };
+                        e.grade = all[next];
+                        e.slots = e.slots.min(e.grade.max_slots());
+                        for (skill, pts, second) in [
+                            (e.skill1, &mut e.points1, false),
+                            (e.skill2, &mut e.points2, true),
+                        ] {
+                            if skill == 0 {
+                                continue;
+                            }
+                            match crate::charm::allowed_points_rarity(e.grade.rarity(), skill, second) {
+                                Some(r) if r.min == 0 && r.max == 0 => {
+                                    *pts = 0;
+                                }
+                                Some(r) => *pts = (*pts).clamp(r.min, r.max),
+                                None => {}
+                            }
+                        }
+                    }
+                    2 => {
+                        let max = e.grade.max_slots() as i64;
+                        e.slots = ((e.slots as i64 + d).rem_euclid(max + 1)) as u8;
+                    }
+                    3 => e.skill1 = ((e.skill1 as i64 + d).rem_euclid(256)) as u8,
+                    4 => e.points1 = (e.points1 as i64 + d).clamp(-127, 127) as i8,
+                    5 => e.skill2 = ((e.skill2 as i64 + d).rem_euclid(256)) as u8,
+                    6 => e.points2 = (e.points2 as i64 + d).clamp(-127, 127) as i8,
                     _ => {}
                 }
             }
             // Y on a skill row opens the name picker: typing a number is
             // hopeless when there are 306 skills.
             Key::Y => {
-                if e.field == 2 || e.field == 4 {
-                    self.skill_pick_field = if e.field == 2 { 1 } else { 2 };
+                if e.field == 3 || e.field == 5 {
+                    self.skill_pick_field = if e.field == 3 { 1 } else { 2 };
                     self.skill_pick_filter.clear();
                     self.skill_pick_cursor = 0;
                     self.charm_edit = Some(e);
@@ -943,11 +992,12 @@ impl Editor {
                     points2: e.points2,
                 };
                 if let Some(s) = &mut self.save {
-                    if s.set_charm(self.slot, &c) {
+                    if s.set_charm_with_grade(self.slot, &c, e.grade) {
                         self.dirty = true;
                         self.message = format!(
-                            "wrote charm {} - it copies a real talisman's rarity and unknown bytes",
-                            e.index
+                            "お守り {} を書き込みました（{}）",
+                            e.index,
+                            e.grade.name()
                         );
                     } else {
                         self.message = String::from(
@@ -3726,8 +3776,16 @@ impl Editor {
             Screen::CharmEdit => {
                 push(&mut out, String::from("お守りの編集"), false, false);
                 let e = self.charm_edit.unwrap_or_default();
-                let rows: [(alloc::string::String, alloc::string::String); 6] = [
+                // Seven rows, matching the state machine and the console's
+                // drawn form. This text view was left at six when the grade
+                // row was added, so the highlight sat one row above the value
+                // it was editing.
+                let rows: [(alloc::string::String, alloc::string::String); 7] = [
                     (String::from("枠"), format!("{}", e.index)),
+                    (
+                        String::from("レア度"),
+                        format!("{}（最大 S{}）", e.grade.name(), e.grade.max_slots()),
+                    ),
                     (String::from("装飾スロット"), format!("{}", e.slots)),
                     (
                         String::from("スキル1 ID"),
@@ -3778,6 +3836,18 @@ impl Editor {
                             false,
                         );
                     }
+                    // The form's own grade, not the stored record's: a skill
+                    // picked with Y is not in the box until A is pressed.
+                    push(
+                        &mut out,
+                        format!(
+                            "  編集中のレア度 {} / スロット上限 {}",
+                            e.grade.name(),
+                            e.grade.max_slots()
+                        ),
+                        false,
+                        false,
+                    );
                     for (label, sid, pts, second) in [
                         ("skill 1", e.skill1, e.points1, false),
                         ("skill 2", e.skill2, e.points2, true),
@@ -3785,7 +3855,11 @@ impl Editor {
                         if sid == 0 {
                             continue;
                         }
-                        let Some(r) = crate::charm::allowed_points(ty, sid, second) else {
+                        // From the form's grade, so the range shown matches
+                        // what the console form is about to write.
+                        let Some(r) =
+                            crate::charm::allowed_points_rarity(e.grade.rarity(), sid, second)
+                        else {
                             continue;
                         };
                         let name = crate::skills::skill_name(sid).unwrap_or("?");

@@ -548,8 +548,14 @@ fn charm_screen_creates_and_deletes() {
     assert_eq!(ed.screen, Screen::CharmEdit);
     let lines = ed.lines();
     assert!(lines[0].text.contains("お守りの編集"));
-    // The defaults are a usable charm.
-    assert!(lines[3].text.contains("スキル1 ID"));
+    // The form shows each field on its own row. Find the skill row by label
+    // rather than by a fixed line number, so the grade row that sits above it
+    // does not shift the assertion.
+    assert!(
+        lines.iter().any(|l| l.text.contains("スキル1 ID")),
+        "the skill row must be drawn: {:?}",
+        lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+    );
 
     // A new charm starts as a copy of a real one, so the seed values come from
     // the box rather than from invented defaults. Read them, then bump.
@@ -1218,6 +1224,49 @@ fn undo_restores_the_whole_box_not_just_the_item() {
 // ---------------------------------------------------------------------------
 // The console talisman editor shows the published range, not just the numbers.
 // ---------------------------------------------------------------------------
+
+#[test]
+fn the_console_charm_editor_can_change_the_grade() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.screen = Screen::Charms;
+    ed.cursor = 0;
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    let before = ed.charm_edit.expect("editor state");
+    assert_eq!(before.field, 3, "the cursor lands on the first skill");
+    ed.input(Key::Up);
+    ed.input(Key::Up);
+    assert_eq!(ed.charm_edit.unwrap().field, 1, "row 1 is the grade");
+    let grade_before = ed.charm_edit.unwrap().grade;
+    ed.input(Key::Right);
+    let after = ed.charm_edit.unwrap();
+    assert_ne!(after.grade, grade_before, "right must move the grade");
+    assert!(
+        after.slots <= after.grade.max_slots(),
+        "slots {} exceed the ceiling {} for {}",
+        after.slots,
+        after.grade.max_slots(),
+        after.grade.name()
+    );
+    ed.input(Key::A);
+    assert!(ed.dirty, "writing marks the save dirty");
+    let rec = {
+        let s = ed.save.as_ref().unwrap();
+        let b = s.equipment_box(ed.slot).unwrap();
+        let o = after.index * mhnx_core::charm::CHARM_RECORD;
+        b[o..o + mhnx_core::charm::CHARM_RECORD].to_vec()
+    };
+    assert_eq!(rec[0x12], after.grade.rarity());
+    assert_eq!(
+        mhnx_core::charm::rarity_of(rec[0x02]),
+        Some(after.grade.rarity() as i32),
+        "the equipment id must agree with the rarity"
+    );
+}
 
 #[test]
 fn the_console_charm_editor_shows_the_allowed_range() {
@@ -3691,10 +3740,24 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
     );
     let seed = ed.charm_edit.expect("the form is open");
     let points0 = seed.points1;
+    let grade = seed.grade;
 
-    // The form navigates with Up/Down and edits with Left/Right.
+    // The form has seven rows and opens on the first skill: 0 index, 1 grade,
+    // 2 slots, 3 skill1, 4 points1, 5 skill2, 6 points2. Down walks all of
+    // them and wraps, which is what "seven rows" means here.
+    assert_eq!(seed.field, 3, "the form lands on the first skill");
+    for want in [4usize, 5, 6, 0, 1, 2, 3] {
+        ed.input(Key::Down);
+        assert_eq!(
+            ed.charm_edit.expect("open").field,
+            want,
+            "the form must have seven rows"
+        );
+    }
+
+    // Left/Right edits the row under the cursor.
     ed.input(Key::Down);
-    assert_eq!(ed.charm_edit.expect("open").field, 3);
+    assert_eq!(ed.charm_edit.expect("open").field, 4);
     ed.input(Key::Right);
     assert_eq!(
         ed.charm_edit.expect("open").points1,
@@ -3702,24 +3765,134 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
         "the points row must move"
     );
     ed.input(Key::Up);
-    assert_eq!(ed.charm_edit.expect("open").field, 2);
+    assert_eq!(ed.charm_edit.expect("open").field, 3);
 
     // Y on a skill row opens the name picker.
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::SkillPick);
     assert!(ed.skill_pick_matches().len() > 3);
-    ed.input(Key::Down);
-    ed.input(Key::Down);
+    ed.apply_skill_filter(String::from("攻撃"));
+    assert!(!ed.skill_pick_matches().is_empty(), "the filter must find 攻撃");
     let chosen = ed.skill_pick_matches()[ed.skill_pick_cursor];
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit);
     assert_eq!(ed.charm_edit.expect("open").skill1, chosen);
+    assert_eq!(
+        ed.charm_edit.expect("open").skill2,
+        seed.skill2,
+        "picking skill 1 must leave skill 2 alone"
+    );
+    assert_eq!(
+        ed.charm_edit.expect("open").grade,
+        grade,
+        "the picker must not touch the grade"
+    );
 
+    // Row 1 is the grade; Right steps it on and Left brings it back.
+    ed.input(Key::Up); // 2: slots
+    ed.input(Key::Up); // 1: grade
+    assert_eq!(ed.charm_edit.expect("open").field, 1, "row 1 is the grade");
+    ed.input(Key::Right);
+    assert_ne!(
+        ed.charm_edit.expect("open").grade,
+        grade,
+        "right must move the grade"
+    );
+    ed.input(Key::Left);
+    assert_eq!(ed.charm_edit.expect("open").grade, grade, "left steps back");
+
+    // Writing applies the grade the form holds. The points are clamped to what
+    // that grade allows, but the chosen skill is kept.
+    let edit = ed.charm_edit.expect("open");
+    let (want_skill, want_points) = match mhnx_core::charm::allowed_points_rarity(
+        edit.grade.rarity(),
+        edit.skill1,
+        false,
+    ) {
+        // A skill the grade forbids outright: warned about, never deleted.
+        Some(r) if r.min == 0 && r.max == 0 => (edit.skill1, edit.points1),
+        Some(r) => (edit.skill1, edit.points1.clamp(r.min, r.max)),
+        None => (0, 0),
+    };
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Charms);
     assert!(ed.dirty);
     let idx = ed.charm_edit.expect("kept").index;
+    let rec = {
+        let s = ed.save.as_ref().expect("a save");
+        let b = s.equipment_box(ed.slot).expect("a box");
+        let o = idx * mhnx_core::charm::CHARM_RECORD;
+        b[o..o + mhnx_core::charm::CHARM_RECORD].to_vec()
+    };
+    assert_eq!(
+        rec[0x12],
+        edit.grade.rarity(),
+        "the grade in the form must be written"
+    );
+    assert_eq!(
+        mhnx_core::charm::rarity_of(rec[0x02]),
+        Some(edit.grade.rarity() as i32),
+        "the equipment id must agree with the rarity"
+    );
+    assert_eq!(
+        rec[0x0C], want_skill,
+        "the chosen skill must survive the write"
+    );
+    assert_eq!(
+        rec[0x0E] as i8,
+        want_points,
+        "the points must land inside the grade's range"
+    );
 
+    // A skill the grade cannot carry is still written: the console warns and
+    // leaves the choice alone instead of quietly deleting it. Use a second
+    // talisman so both writes can be checked in the written file.
+    assert!(
+        ed.charms().len() > 1,
+        "the sample box holds more than one talisman"
+    );
+    ed.cursor = 1;
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    let second = ed.charm_edit.expect("open");
+    assert_ne!(second.index, idx, "the second edit must touch another charm");
+    let forbidden = (1..=255u8)
+        .find(|s| {
+            matches!(
+                mhnx_core::charm::allowed_points_rarity(second.grade.rarity(), *s, false),
+                Some(r) if r.min == 0 && r.max == 0
+            )
+        })
+        .expect("the grade forbids some skills");
+    if let Some(e) = &mut ed.charm_edit {
+        e.skill1 = forbidden;
+        e.points1 = 0;
+    }
+    let target = ed.charm_edit.expect("open");
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Charms);
+    let rec2 = {
+        let s = ed.save.as_ref().expect("a save");
+        let b = s.equipment_box(ed.slot).expect("a box");
+        let o = target.index * mhnx_core::charm::CHARM_RECORD;
+        b[o..o + mhnx_core::charm::CHARM_RECORD].to_vec()
+    };
+    assert_eq!(
+        rec2[0x0C], forbidden,
+        "a skill the grade forbids must not be deleted"
+    );
+    let warnings = {
+        let s = ed.save.as_ref().expect("a save");
+        let b = s.equipment_box(ed.slot).expect("a box");
+        let grade = mhnx_core::charm::rarity_of_record(&rec2).expect("still a talisman");
+        mhnx_core::charm::grade_warnings(b, target.index, grade)
+    };
+    assert!(
+        !warnings.is_empty(),
+        "the record must be warned about, not repaired"
+    );
+
+    // Both writes survive the save round trip.
     ed.input(Key::X);
     match ed.take_write() {
         Some(Write::File { bytes, .. }) => {
@@ -3729,8 +3902,16 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
                 .iter()
                 .find(|c| c.index == idx)
                 .expect("the edited charm must be in the box");
-            assert_eq!(c.skill1, chosen, "the skill must survive the write");
-            assert_eq!(c.points1, points0 + 1, "the points must survive the write");
+            assert_eq!(c.skill1, want_skill, "the skill must survive the write");
+            assert_eq!(c.points1, want_points, "the points must survive the write");
+            let c2 = list
+                .iter()
+                .find(|c| c.index == target.index)
+                .expect("the warned charm must be in the box");
+            assert_eq!(
+                c2.skill1, forbidden,
+                "the forbidden skill is written as chosen"
+            );
         }
         other => panic!("expected a save write, got {:?}", other),
     }

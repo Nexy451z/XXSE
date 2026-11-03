@@ -1502,33 +1502,31 @@ impl GuiState {
             }
             UiAction::CharmLegalMax => {
                 if let Some(mut ce) = ed.charm_edit {
-                    let ty = ed
-                        .save
-                        .as_ref()
-                        .and_then(|s| s.equipment_box(ed.slot))
-                        .and_then(|b| b.get(ce.index * charm::CHARM_RECORD + 2).copied())
-                        .unwrap_or(4);
-                    ce.slots = 3;
-                    if ce.skill1 != 0 {
-                        if let Some(r) = charm::allowed_points(ty, ce.skill1, false) {
-                            if r.max > 0 {
-                                ce.points1 = r.max;
-                            }
-                        } else {
-                            ce.points1 = 10;
+                    // The ceiling now comes from the grade the form shows, not
+                    // from the type byte still stored in the box: those two
+                    // disagree the moment the rarity row is moved.
+                    let grade = ce.grade;
+                    ce.slots = grade.max_slots();
+                    for (skill, pts, second) in [
+                        (ce.skill1, &mut ce.points1, false),
+                        (ce.skill2, &mut ce.points2, true),
+                    ] {
+                        if skill == 0 {
+                            continue;
                         }
-                    }
-                    if ce.skill2 != 0 {
-                        if let Some(r) = charm::allowed_points(ty, ce.skill2, true) {
+                        if let Some(r) = charm::allowed_points_rarity(grade.rarity(), skill, second)
+                        {
                             if r.max > 0 {
-                                ce.points2 = r.max;
+                                *pts = r.max;
                             }
-                        } else {
-                            ce.points2 = 10;
                         }
                     }
                     ed.charm_edit = Some(ce);
-                    ed.message = String::from("護石を合法最大値・スロ3に設定しました");
+                    ed.message = format!(
+                        "護石を合法最大値・スロ{}に設定しました（{}）",
+                        ce.slots,
+                        grade.name()
+                    );
                 }
             }
             UiAction::CharmPreset(preset_id) => {
@@ -1547,13 +1545,25 @@ impl GuiState {
                         3 => ("通常弾強化", 6, "達人", 10),
                         _ => ("貫通弾強化", 6, "達人", 10),
                     };
+                    let grade = ce.grade;
                     ce.skill1 = find_skill(s1_name);
-                    ce.points1 = p1;
                     ce.skill2 = find_skill(s2_name);
-                    ce.points2 = p2;
-                    ce.slots = 3;
+                    // A preset asks for the strongest version of a build; the
+                    // grade still decides how many slots it may carry and how
+                    // high each of its two skills may go.
+                    ce.slots = grade.max_slots();
+                    ce.points1 = preset_points(grade, ce.skill1, p1, false);
+                    ce.points2 = preset_points(grade, ce.skill2, p2, true);
                     ed.charm_edit = Some(ce);
-                    ed.message = format!("プリセット ({}+{} / {}+{} / S3) を適用しました", s1_name, p1, s2_name, p2);
+                    ed.message = format!(
+                        "プリセット ({} {:+} / {} {:+} / S{}) を適用しました（{}）",
+                        s1_name,
+                        ce.points1,
+                        s2_name,
+                        ce.points2,
+                        ce.slots,
+                        grade.name()
+                    );
                 }
             }
             UiAction::NewCharm => {
@@ -2034,7 +2044,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Items => ed.visible_items().len(),
         Screen::ItemPick => ed.item_pick_matches().len(),
         Screen::Charms => ed.charms().len(),
-        Screen::CharmEdit => 6,
+        Screen::CharmEdit => 7,
         Screen::SkillPick => ed.skill_pick_matches().len(),
         Screen::Equip => ed.equipment().len(),
         Screen::Hunts => ed.hunt_rows().len(),
@@ -2380,6 +2390,91 @@ fn btn_text(
     }
 }
 
+fn push_unique(out: &mut Vec<String>, s: String) {
+    if !out.iter().any(|e| *e == s) {
+        out.push(s);
+    }
+}
+
+/// Everything about the talisman under the cursor that the game would refuse.
+///
+/// `charm::grade_warnings` answers for the record that is in the box right
+/// now, and the same questions are asked again about the values the form would
+/// write: picking a skill in the form does not touch the box until `[A]`, so
+/// the stored record alone would never flag a skill the grade cannot carry.
+#[allow(clippy::too_many_arguments)]
+fn charm_warnings(
+    box_bytes: Option<&[u8]>,
+    index: usize,
+    grade: charm::TalismanGrade,
+    slots: u8,
+    skill1: u8,
+    points1: i8,
+    skill2: u8,
+    points2: i8,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(b) = box_bytes {
+        for w in charm::grade_warnings(b, index, grade) {
+            push_unique(&mut out, w);
+        }
+    }
+    let max_slots = grade.max_slots();
+    if slots > max_slots {
+        push_unique(
+            &mut out,
+            format!(
+                "スロット{}個は{}の上限{}を超えています",
+                slots,
+                grade.name(),
+                max_slots
+            ),
+        );
+    }
+    for (skill, pts, second, label) in [
+        (skill1, points1, false, "スキル1"),
+        (skill2, points2, true, "スキル2"),
+    ] {
+        if skill == 0 {
+            continue;
+        }
+        match charm::allowed_points_rarity(grade.rarity(), skill, second) {
+            Some(r) if r.min == 0 && r.max == 0 => {
+                push_unique(
+                    &mut out,
+                    format!("{} は{}では付けられません", label, grade.name()),
+                );
+            }
+            Some(r) => {
+                if pts < r.min || pts > r.max {
+                    push_unique(
+                        &mut out,
+                        format!("{} {} は {}〜{} の範囲外です", label, pts, r.min, r.max),
+                    );
+                }
+            }
+            None => {}
+        }
+    }
+    out
+}
+
+/// A preset's requested points, clamped to what the grade actually allows.
+///
+/// The four presets used to force `slots = 3` and their nominal `+6/+10`
+/// whatever the grade was, which is exactly the record the game would reject.
+fn preset_points(grade: charm::TalismanGrade, skill: u8, want: i8, second: bool) -> i8 {
+    if skill == 0 {
+        return 0;
+    }
+    match charm::allowed_points_rarity(grade.rarity(), skill, second) {
+        Some(r) if r.max > 0 => want.clamp(r.min, r.max),
+        // "0~0": the grade cannot carry this skill, so do not write points for it.
+        Some(_) => 0,
+        None => want,
+    }
+}
+
 impl GuiState {
     pub fn draw(&mut self, c: &mut Canvas, ed: &Editor) {
         self.hits.clear();
@@ -2558,6 +2653,8 @@ impl GuiState {
                 self.add_hit(1108, sy, 158, sh, UiAction::NewCharm);
             }
             Screen::CharmEdit => {
+                // Slot ceiling follows the grade on screen, never a fixed S3.
+                let max_s = ed.charm_edit.map(|c| c.grade.max_slots()).unwrap_or(3);
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, "[Y] 合法最大値", t.accent_secondary, FontSize::Small);
@@ -2565,7 +2662,8 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "痛撃6 達人10 S3", t.text_primary, FontSize::Small);
+                let preset_lbl = format!("痛撃6 達人10 S{}", max_s);
+                btn_text(c, 1108, sy, 158, sh, &preset_lbl, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::CharmPreset(0));
             }
             Screen::Roster => {
@@ -2620,7 +2718,9 @@ impl GuiState {
             Screen::Items => "[A] 変更  [◀/▶] 個数  [Y] 刻み  [L/R] ページ  [X] 保存",
             Screen::ItemPick | Screen::SkillPick => "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る",
             Screen::Charms => "[A] 編集  [Y×2] 削除  [-] 新規  [L/R] サブタブ  [X] 保存",
-            Screen::CharmEdit => "[A] 選択/反映  [◀/▶] 増減  [Y] 合法最大  [X] 保存  [B] 戻る",
+            Screen::CharmEdit => {
+                "[A] BOXへ反映  [▲/▼] 行  [◀/▶] 値  [Y] スキル選択  [X] 刻み  [B] 戻る"
+            }
             Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [L/R] サブタブ  [X] 保存",
             Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [L/R] サブタブ  [X] 保存",
             Screen::Hunts => "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [L/R] サブタブ  [X] 保存",
@@ -2697,6 +2797,31 @@ impl GuiState {
         has_stepper: bool,
         primary_a_label: &str,
     ) {
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            header_title,
+            rows,
+            active_row_idx,
+            has_stepper,
+            primary_a_label,
+            &[],
+        );
+    }
+
+    /// Same list/inspector layout, plus 1〜2 amber warning lines under the list.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_adaptive_rows_warn(
+        &mut self,
+        c: &mut Canvas,
+        ed: &Editor,
+        header_title: &str,
+        rows: &[(usize, String, String, String, String)],
+        active_row_idx: usize,
+        has_stepper: bool,
+        primary_a_label: &str,
+        warnings: &[String],
+    ) {
         let t = theme();
         let total = rows.len();
 
@@ -2748,9 +2873,19 @@ impl GuiState {
         c.round_rect(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, t.bg_panel);
         c.round_rect_border(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, 1, t.border_subtle);
 
-        let vis = 9usize;
-        let start = window_start(cur_pos, total, vis);
+        // A warning strip needs one or two lines under the list, so the list
+        // gives up a row rather than drawing text over the last entry.
+        let warn_lh = c.line_height_sized(FontSize::Small).max(16);
+        let warn_reserve = if warnings.is_empty() {
+            0
+        } else {
+            warnings.len().min(2) as i32 * warn_lh + 16
+        };
         let row_h = 56i32;
+        let rows_that_fit = ((body_h - 10 - warn_reserve).max(row_h)) / row_h;
+        let vis = (rows_that_fit.max(1) as usize).min(9);
+        let vis = if warnings.is_empty() { vis } else { vis.min(8) };
+        let start = window_start(cur_pos, total, vis);
 
         for i in 0..vis {
             let Some((r_idx, title, _meta, val, badge)) = rows.get(start + i) else {
@@ -2818,6 +2953,42 @@ impl GuiState {
                 if is_sel { t.text_primary } else { t.text_secondary },
                 FontSize::Medium,
             );
+        }
+
+        // Amber warning strip, pinned to the bottom of the list panel.
+        if !warnings.is_empty() {
+            let mut lines: Vec<String> = Vec::new();
+            lines.push(warnings[0].clone());
+            if warnings.len() == 2 {
+                lines.push(warnings[1].clone());
+            } else if warnings.len() > 2 {
+                lines.push(format!("ほか {} 件 — 上の行を直してください", warnings.len() - 1));
+            }
+            let drawn = total.min(vis);
+            let rows_bottom = body_y + 10 + drawn as i32 * row_h;
+            let limit = body_y + body_h - 4;
+            let mut strip_h = lines.len() as i32 * warn_lh;
+            let mut top = (limit - strip_h).max(rows_bottom + 12);
+            // If the strip would run past the panel (a tall font metric), drop
+            // the second line instead of drawing over the footer.
+            if top + strip_h > limit && lines.len() > 1 {
+                lines.truncate(1);
+                strip_h = warn_lh;
+                top = (limit - strip_h).max(rows_bottom + 12);
+            }
+            if top - 8 > rows_bottom + 2 {
+                c.hline(MAIN_X + 16, top - 8, V1_LIST_W - 32, t.border_subtle);
+            }
+            for (i, line) in lines.iter().enumerate() {
+                c.text_clipped(
+                    MAIN_X + 20,
+                    top + i as i32 * warn_lh,
+                    V1_LIST_W - 40,
+                    line,
+                    t.accent_warn,
+                    FontSize::Small,
+                );
+            }
         }
 
         // Right Inspector Panel (x = 832, y = 132, w = 428, h = 526)
@@ -3094,23 +3265,24 @@ impl GuiState {
                 );
             }
             Screen::Charms | Screen::CharmEdit => {
+                // The slot count on these labels is whatever the current grade
+                // allows, so a preset can no longer promise an S3 the game
+                // refuses at rarity 97/98.
+                let max_s = ed.charm_edit.map(|c| c.grade.max_slots()).unwrap_or(3);
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
                 cur_y += 24;
-                self.draw_tool_button(
-                    c,
-                    ix + 20,
-                    cur_y,
-                    full_w,
-                    36,
-                    "合法最大値 + スロ3をセット",
-                    UiAction::CharmLegalMax,
-                );
+                let legal_lbl = format!("合法最大値 + スロ{}をセット", max_s);
+                self.draw_tool_button(c, ix + 20, cur_y, full_w, 36, &legal_lbl, UiAction::CharmLegalMax);
                 cur_y += 42;
-                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, "痛撃6 達人10 S3", UiAction::CharmPreset(0));
-                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, "斬れ味6 達人10 S3", UiAction::CharmPreset(1));
+                let p0 = format!("痛撃6 達人10 S{}", max_s);
+                let p1 = format!("斬れ味6 達人10 S{}", max_s);
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, &p0, UiAction::CharmPreset(0));
+                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, &p1, UiAction::CharmPreset(1));
                 cur_y += 42;
-                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, "溜め6 達人10 S3", UiAction::CharmPreset(2));
-                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, "通常6 達人10 S3", UiAction::CharmPreset(3));
+                let p2 = format!("溜め6 達人10 S{}", max_s);
+                let p3 = format!("通常6 達人10 S{}", max_s);
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, &p2, UiAction::CharmPreset(2));
+                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, &p3, UiAction::CharmPreset(3));
             }
             Screen::Roster => {
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
@@ -3744,6 +3916,18 @@ impl GuiState {
         };
         let s1 = mhnx_core::skills::skill_name(ce.skill1).unwrap_or("なし");
         let s2 = mhnx_core::skills::skill_name(ce.skill2).unwrap_or("なし");
+        // The allowed range follows the grade now, so it is read from the
+        // table instead of being printed as a fixed -10..+14 on every row.
+        let range_of = |skill: u8, second: bool| -> alloc::string::String {
+            if skill == 0 {
+                return String::from("なし");
+            }
+            match mhnx_core::charm::allowed_points_rarity(ce.grade.rarity(), skill, second) {
+                Some(r) if r.min == 0 && r.max == 0 => String::from("このレア度では不可"),
+                Some(r) => format!("{} 〜 {}", r.min, r.max),
+                None => String::from("—"),
+            }
+        };
         let rows = alloc::vec![
             (
                 0,
@@ -3754,58 +3938,79 @@ impl GuiState {
             ),
             (
                 1,
-                String::from("スロット数"),
-                String::from("0 〜 3"),
-                format!("S{} ({})", ce.slots, "◯".repeat(ce.slots.min(3) as usize)),
+                String::from("レア度"),
+                // The ceiling lives in the meta column so the value column
+                // stays inside its 230px budget (the grade name alone already
+                // reads 古びた護石 R99).
+                format!("◀ ▶ で切替 / 最大 S{}", ce.grade.max_slots()),
+                String::from(ce.grade.name()),
                 String::from("#02"),
             ),
             (
                 2,
-                String::from("第1スキル"),
-                format!("Skill ID: {}", ce.skill1),
-                s1.to_string(),
+                String::from("スロット数"),
+                format!("0 〜 {}", ce.grade.max_slots()),
+                format!("S{} ({})", ce.slots, "◯".repeat(ce.slots.min(3) as usize)),
                 String::from("#03"),
             ),
             (
                 3,
-                String::from("第1スキル値"),
-                String::from("-10 〜 +14"),
-                format!("{:+}", ce.points1),
+                String::from("第1スキル"),
+                format!("Skill ID: {}", ce.skill1),
+                s1.to_string(),
                 String::from("#04"),
             ),
             (
                 4,
-                String::from("第2スキル"),
-                format!("Skill ID: {}", ce.skill2),
-                s2.to_string(),
+                String::from("第1スキル値"),
+                range_of(ce.skill1, false),
+                format!("{:+}", ce.points1),
                 String::from("#05"),
             ),
             (
                 5,
-                String::from("第2スキル値"),
-                String::from("-10 〜 +14"),
-                format!("{:+}", ce.points2),
+                String::from("第2スキル"),
+                format!("Skill ID: {}", ce.skill2),
+                s2.to_string(),
                 String::from("#06"),
+            ),
+            (
+                6,
+                String::from("第2スキル値"),
+                range_of(ce.skill2, true),
+                format!("{:+}", ce.points2),
+                String::from("#07"),
             ),
         ];
 
-        let a_lbl = if ce.field == 2 || ce.field == 4 {
-            "スキル選択"
-        } else if ce.field == 1 {
-            "スロ数変更"
-        } else {
-            "BOXへ反映"
-        };
+        // Warnings for the record in the box and for what the form would write.
+        let box_bytes = ed.save.as_ref().and_then(|s| s.equipment_box(ed.slot));
+        let warnings = charm_warnings(
+            box_bytes,
+            ce.index,
+            ce.grade,
+            ce.slots,
+            ce.skill1,
+            ce.points1,
+            ce.skill2,
+            ce.points2,
+        );
 
-        self.draw_adaptive_rows(
+        // [A] always writes the form into the box (core: Key::A on any row),
+        // so every row carries the same label; [Y] is the skill picker.
+        let a_lbl = "BOXへ反映";
+
+        self.draw_adaptive_rows_warn(
             c,
             ed,
             "護石編集",
-            "",
             &rows,
-            ce.field.min(5),
+            // The form has seven rows (0..=6); clamping to 5 left the last row
+            // unhighlighted whenever the second skill's value was being edited.
+            ce.field.min(6),
             true,
             a_lbl,
+            &warnings,
         );
     }
 

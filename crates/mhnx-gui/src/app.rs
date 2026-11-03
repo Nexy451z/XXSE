@@ -73,6 +73,8 @@ pub struct MhnxEditor {
     pub charm_confirm: CharmConfirm,
     /// Row of the item table to scroll into view once.
     pub scroll_to_item: Option<usize>,
+    /// Grade a new talisman is created at, and the one the selector last hit.
+    pub charm_new_grade: mhnx_core::charm::TalismanGrade,
     /// Quest-equipment slot whose supply and ammo lists are on screen.
     pub qe_slot: Option<usize>,
     /// Supply or ammo entry the item picker is choosing for:
@@ -170,6 +172,7 @@ impl Default for MhnxEditor {
             item_selected: None,
         charm_confirm: CharmConfirm::default(),
         scroll_to_item: None,
+        charm_new_grade: mhnx_core::charm::TalismanGrade::Enduring,
         qe_slot: None,
         qe_pick: None,
         confirm: Confirm::default(),
@@ -3333,7 +3336,9 @@ impl MhnxEditor {
         };
         let charms = save.charms(self.slot).unwrap_or_default();
         // Copied out of the save so the editor closures can hold &mut self.
-        let charm_box: Vec<u8> = save
+        // Mutable because a grade switch rewrites the record and the warning
+        // line below has to see that write in the same frame.
+        let mut charm_box: Vec<u8> = save
             .equipment_box(self.slot)
             .map(|b| b.to_vec())
             .unwrap_or_default();
@@ -3406,17 +3411,48 @@ impl MhnxEditor {
             ui.vertical(|ui| {
                 ui.set_min_width(360.0);
                 ui.label(egui::RichText::new("選択中のお守り").strong());
+                // Everything this editor offers is bounded by the grade of the
+                // record on screen: how many decoration slots may be picked and
+                // how far each skill's points may go. A talisman has a grade of
+                // its own; an empty slot borrows the one a new talisman would be
+                // made at, so the fields already say what is going to be legal;
+                // anything else (a weapon or a piece of armour, which cannot be
+                // written from this tab) keeps the wide open fields, because its
+                // bytes are not skills at all. The box is copied once per frame,
+                // so a grade click lands on the next frame's copy.
+                let rec_at = self.charm_index * mhnx_core::charm::CHARM_RECORD;
+                let cur_rec = charm_box.get(rec_at..rec_at + mhnx_core::charm::CHARM_RECORD);
+                let mut cur_grade = cur_rec.and_then(mhnx_core::charm::rarity_of_record);
+                let bound = match cur_grade {
+                    Some(g) => Some(g),
+                    None if cur_rec.map_or(false, mhnx_core::charm::is_empty_record) => {
+                        Some(self.charm_new_grade)
+                    }
+                    None => None,
+                };
+                let max_slots = bound.map(|g| g.max_slots()).unwrap_or(3);
                 ui.horizontal(|ui| {
                     ui.label("枠");
                     ui.add(egui::DragValue::new(&mut self.charm_index).range(0..=1999));
                     ui.label(egui::RichText::new("装飾スロット").weak());
-                    for n in 0..=3u8 {
+                    // Only the grades' own maximum is offered: 1 / 2 / 3 / 3.
+                    // A record can still hold more than its grade allows (the
+                    // game forbids writing it, not reading it), which is what
+                    // grade_warnings below reports.
+                    for n in 0..=max_slots {
                         if ui
-                            .selectable_label(self.charm_slots == n, format!("{}", "●".repeat(n as usize)))
+                            .selectable_label(self.charm_slots == n, "●".repeat(n as usize))
                             .clicked()
                         {
                             self.charm_slots = n;
                         }
+                    }
+                    if max_slots < 3 {
+                        ui.label(
+                            egui::RichText::new(format!("最大 {} 個", max_slots))
+                                .weak()
+                                .small(),
+                        );
                     }
                 });
                 ui.add_space(4.0);
@@ -3426,33 +3462,103 @@ impl MhnxEditor {
                     ui.label("スキル1");
                     Self::skill_combo(ui, "sk1", &mut self.charm_skill1, &mut self.skill_search1);
                     ui.label("ポイント");
-                    let mut p = self.charm_points1 as i32;
-                    if ui
-                        .add(egui::DragValue::new(&mut p).range(-128..=127).prefix("+"))
-                        .changed()
-                    {
-                        self.charm_points1 = p as i8;
-                    }
+                    let allowed = Self::charm_allowed(bound, self.charm_skill1, false);
+                    Self::charm_points_field(ui, allowed, &mut self.charm_points1);
                 });
+                // Read after the row, so switching the skill in the combo above
+                // is explained on the same frame.
+                Self::charm_points_note(
+                    ui,
+                    Self::charm_allowed(bound, self.charm_skill1, false),
+                    self.charm_skill1,
+                    "スキル1",
+                );
                 ui.horizontal_wrapped(|ui| {
                     ui.label("スキル2");
                     Self::skill_combo(ui, "sk2", &mut self.charm_skill2, &mut self.skill_search2);
                     ui.label("ポイント");
-                    let mut p = self.charm_points2 as i32;
-                    if ui
-                        .add(egui::DragValue::new(&mut p).range(-128..=127).prefix("+"))
-                        .changed()
-                    {
-                        self.charm_points2 = p as i8;
-                    }
+                    let allowed = Self::charm_allowed(bound, self.charm_skill2, true);
+                    Self::charm_points_field(ui, allowed, &mut self.charm_points2);
                 });
+                Self::charm_points_note(
+                    ui,
+                    Self::charm_allowed(bound, self.charm_skill2, true),
+                    self.charm_skill2,
+                    "スキル2",
+                );
                 // The published per-rarity range. The indexing was resolved
                 // from the reference editor: the byte at +0x02 is the talisman
                 // type, TALISMAN_RARITY[type] the rarity, and the table is
                 // indexed by skill id - 1. Verified against all 650 talismans
                 // in the sample save.
                 if !charm_box.is_empty() {
-                    let rec_at = self.charm_index * mhnx_core::charm::CHARM_RECORD;
+                    // The editor used to build every talisman from the most
+                    // common record in the box, which is always rarity 100, so
+                    // the lower grades could not be made at all. The grade is
+                    // now something you choose.
+                    let mut apply_grade: Option<mhnx_core::charm::TalismanGrade> = None;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("レア度");
+                        for g in mhnx_core::charm::TalismanGrade::ALL {
+                            let is_cur = cur_grade == Some(g);
+                            let resp = ui
+                                .add(egui::Button::new(g.name()).selected(is_cur))
+                                .on_hover_text(format!(
+                                    "装飾スロットは最大 {} 個",
+                                    g.max_slots()
+                                ));
+                            if resp.clicked() && !is_cur {
+                                apply_grade = Some(g);
+                            }
+                        }
+                    });
+                    if let Some(g) = apply_grade {
+                        let mut ok = false;
+                        if let Some(s) = &mut self.save {
+                            if let Some(b) = s.equipment_box_mut(self.slot) {
+                                ok = mhnx_core::charm::set_grade(b, self.charm_index, g);
+                                if ok {
+                                    mhnx_core::charm::clamp_points(b, self.charm_index, g);
+                                    mhnx_core::charm::clamp_slots(b, self.charm_index, g);
+                                }
+                            }
+                        }
+                        if ok {
+                            self.dirty = true;
+                            self.charm_new_grade = g;
+                            // The switch is already written, so the bounds and
+                            // the warning line below must describe the record as
+                            // it is now rather than as it was at frame start.
+                            cur_grade = Some(g);
+                            // Reflect what the clamps did to the record.
+                            self.charm_sync_from_record();
+                            charm_box = self
+                                .save
+                                .as_ref()
+                                .and_then(|s| s.equipment_box(self.slot))
+                                .map(|b| b.to_vec())
+                                .unwrap_or_default();
+                            self.message = format!(
+                                "レア度を {} に変更しました（許容範囲とスロットを調整）",
+                                g.name()
+                            );
+                        } else {
+                            self.message = format!("{} に変更できませんでした", g.name());
+                        }
+                    }
+                    // Everything about this record the game would not have
+                    // written for its grade: slots above the maximum, points
+                    // outside the grade's table, a skill the grade cannot
+                    // carry. The core owns that knowledge, so the UI only
+                    // prints what it returns, one line each, in the same
+                    // yellow the other out-of-range notes use.
+                    for warning in mhnx_core::charm::grade_warnings(
+                        &charm_box,
+                        self.charm_index,
+                        cur_grade.unwrap_or(self.charm_new_grade),
+                    ) {
+                        ui.colored_label(egui::Color32::from_rgb(235, 190, 90), warning);
+                    }
                     let ty = charm_box.get(rec_at + 2).copied().unwrap_or(0);
                     let rarity = mhnx_core::charm::rarity_of(ty);
                     ui.label(
@@ -3511,15 +3617,28 @@ impl MhnxEditor {
                             skill2: self.charm_skill2,
                             points2: self.charm_points2,
                         };
-                        if let Some(s) = &mut self.save {
-                            if s.set_charm(self.slot, &c) {
-                                self.dirty = true;
-                                self.message = format!("お守り {} を更新しました", c.index);
-                            } else {
-                                self.message = String::from(
-                                    "書き込めません（武器・防具の枠は保護されています）",
-                                );
-                            }
+                        // The grade is part of what this button writes: on an
+                        // empty slot it picks the real record the talisman is
+                        // seeded from, and on an existing one it is applied with
+                        // the five edited fields, so what is on screen is what
+                        // lands in the box.
+                        let grade = cur_grade.unwrap_or(self.charm_new_grade);
+                        let written = match &mut self.save {
+                            Some(s) => s.set_charm_with_grade(self.slot, &c, grade),
+                            None => false,
+                        };
+                        if written {
+                            self.dirty = true;
+                            self.charm_new_grade = grade;
+                            // The call clamps the points to the grade, so read
+                            // the record back instead of still showing a value
+                            // it no longer holds.
+                            self.charm_sync_from_record();
+                            self.message =
+                                format!("お守り {} を更新しました（{}）", c.index, grade.name());
+                        } else {
+                            self.message =
+                                String::from("書き込めません（武器・防具の枠は保護されています）");
                         }
                     }
                     // Find the first free box slot instead of making the user
@@ -3548,14 +3667,23 @@ impl MhnxEditor {
                             skill2: 0,
                             points2: 0,
                         };
+                        let grade = self.charm_new_grade;
                         if let Some(s) = &mut self.save {
-                            if s.set_charm(self.slot, &new) {
+                            if s.set_charm_with_grade(self.slot, &new, grade) {
                                 self.dirty = true;
-                                self.message =
-                                    format!("空き枠 {} にお守りを作りました", self.charm_index);
+                                self.message = format!(
+                                    "空き枠 {} に {} を作りました",
+                                    self.charm_index,
+                                    grade.name()
+                                );
                             } else {
-                                self.message = String::from(
-                                    "その枠は空きではないか、保護されています",
+                                // set_charm_with_grade seeds a new record from
+                                // a real one of the requested grade, so this is
+                                // about the grade, not about the slot: the slot
+                                // just came back from first_free.
+                                self.message = format!(
+                                    "このレア度では作成できません（{} のレコードが装備ボックスにありません）",
+                                    grade.name()
                                 );
                             }
                         }
@@ -3564,7 +3692,7 @@ impl MhnxEditor {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "装飾スロットは ● の数、ポイントは符号付きです。レア度ごとの許容範囲は未検証なので、実在するお守りに近い値にしてください。",
+                        "装飾スロットは ● の数、ポイントは符号付きです。レア度を変えると、その範囲外のポイントとスロットは自動で調整されます。新規作成は最後に選んだレア度で作られます。",
                     )
                     .weak()
                     .small(),
@@ -3592,6 +3720,128 @@ impl MhnxEditor {
         }
     }
 
+    /// Pull the five fields this editor owns back out of the record in the box.
+    ///
+    /// The core clamps what it writes, so after an apply or a grade switch the
+    /// record is the truth and the fields have to follow it, not the reverse.
+    fn charm_sync_from_record(&mut self) {
+        let Some(b) = self.save.as_ref().and_then(|s| s.equipment_box(self.slot)) else {
+            return;
+        };
+        let o = self.charm_index * mhnx_core::charm::CHARM_RECORD;
+        if o + mhnx_core::charm::CHARM_RECORD > b.len() {
+            return;
+        }
+        self.charm_slots = b[o + 0x10];
+        self.charm_skill1 = b[o + 0x0C];
+        self.charm_points1 = b[o + 0x0E] as i8;
+        self.charm_skill2 = b[o + 0x0D];
+        self.charm_points2 = b[o + 0x0F] as i8;
+    }
+
+    /// Legal points for one skill at the grade in effect, if there is one.
+    ///
+    /// The range comes from the grade's own table rather than from the type
+    /// byte, because the grade is what this editor lets the user switch. None
+    /// means "no bound to apply": no grade, no skill picked, or a skill the
+    /// tables say nothing about.
+    fn charm_allowed(
+        grade: Option<mhnx_core::charm::TalismanGrade>,
+        skill: u8,
+        second: bool,
+    ) -> Option<mhnx_core::charm::AllowedPoints> {
+        match grade {
+            Some(g) if skill != 0 => {
+                mhnx_core::charm::allowed_points_rarity(g.rarity(), skill, second)
+            }
+            _ => None,
+        }
+    }
+
+    /// One talisman points field, limited to what the grade allows.
+    ///
+    /// A 0〜0 range means the grade carries no such skill at all: the field is
+    /// disabled and the note below the row explains it. The value is not
+    /// cleared, so a value typed for another grade survives (the core leaves
+    /// the record alone for the same reason and warns instead).
+    fn charm_points_field(
+        ui: &mut egui::Ui,
+        allowed: Option<mhnx_core::charm::AllowedPoints>,
+        points: &mut i8,
+    ) {
+        match allowed {
+            Some(r) if r.min == 0 && r.max == 0 => {
+                ui.add_enabled(false, Self::charm_points_drag(points, None));
+            }
+            _ => {
+                ui.add(Self::charm_points_drag(points, allowed));
+            }
+        }
+    }
+
+    /// The "cannot be placed at this grade" note, on a line of its own.
+    ///
+    /// Inline it was squeezed beside the field and clipped by the panel edge;
+    /// a full width row keeps the whole sentence readable.
+    fn charm_points_note(
+        ui: &mut egui::Ui,
+        allowed: Option<mhnx_core::charm::AllowedPoints>,
+        skill: u8,
+        row: &str,
+    ) {
+        let Some(r) = allowed else {
+            return;
+        };
+        if r.min != 0 || r.max != 0 {
+            return;
+        }
+        let name = mhnx_core::skills::skill_name(skill).unwrap_or("?");
+        ui.colored_label(
+            egui::Color32::from_rgb(235, 190, 90),
+            format!("{} {} はこのレア度では付けられません", row, name),
+        );
+    }
+
+    /// A points widget that prints the sign itself.
+    ///
+    /// prefix("+") alone reads "+-7" as soon as the range reaches below zero,
+    /// which the grade tables do, so the sign is formatted here. The value is
+    /// not clamped merely by being displayed: a record can hold something its
+    /// grade would not allow, and that has to stay visible until the user edits
+    /// it or presses 適用.
+    fn charm_points_drag(
+        points: &mut i8,
+        allowed: Option<mhnx_core::charm::AllowedPoints>,
+    ) -> egui::DragValue<'_> {
+        let (low, high) = match allowed {
+            Some(r) if r.min <= r.max => (r.min, r.max),
+            Some(r) => (r.max, r.min),
+            None => (-128, 127),
+        };
+        egui::DragValue::new(points)
+            .range(low..=high)
+            .clamp_existing_to_range(false)
+            .custom_formatter(|n, _| {
+                let v = n as i8;
+                if v > 0 {
+                    format!("+{}", v)
+                } else {
+                    format!("{}", v)
+                }
+            })
+            .custom_parser(|s| {
+                let t = s.trim();
+                let negative = t.starts_with('-');
+                let digits = t.trim_start_matches(|c: char| c == '+' || c == '-');
+                if digits.is_empty() {
+                    return None;
+                }
+                digits
+                    .parse::<f64>()
+                    .ok()
+                    .map(|v| if negative { -v } else { v })
+            })
+    }
 
     fn tab_extras(&mut self, ui: &mut egui::Ui) {
         if self.save.is_none() {
