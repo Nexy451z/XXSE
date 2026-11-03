@@ -433,6 +433,160 @@ fn write_palico_equip(save: &mut Save, slot: usize, palico: usize, part: usize, 
     true
 }
 
+/// Rows on the palico skill panel's skill tab: the twelve learned skills a
+/// record carries (palico::LEARNED_SKILL_SLOTS).
+pub const PALICO_SKILL_ROWS: usize = crate::palico::LEARNED_SKILL_SLOTS;
+
+/// Rows on its support move tab: the sixteen learned moves.
+pub const PALICO_MOVE_ROWS: usize = crate::palico::LEARNED_MOVE_SLOTS;
+
+/// The skill tab of the palico skill panel.
+pub const PALICO_TAB_SKILLS: usize = 0;
+
+/// The support move tab of the palico skill panel.
+pub const PALICO_TAB_MOVES: usize = 1;
+
+/// The id [A] starts a row on when its slot holds nothing.
+///
+/// Zero is "no skill" and the 57 / 96 fill is "not in the list", so neither can
+/// be written back: id 1 is the first entry both name tables have.
+pub const PALICO_PICK_FIRST: u8 = 1;
+
+/// Name of one of the panel's two lists.
+pub fn palico_skill_tab_name(tab: usize) -> &'static str {
+    if tab == PALICO_TAB_MOVES {
+        "サポート行動"
+    } else {
+        "スキル"
+    }
+}
+
+/// Rows one tab shows: twelve skills, sixteen support moves.
+pub fn palico_skill_tab_rows(tab: usize) -> usize {
+    if tab == PALICO_TAB_MOVES {
+        PALICO_MOVE_ROWS
+    } else {
+        PALICO_SKILL_ROWS
+    }
+}
+
+/// Name of one id in one of the two learned lists.
+pub fn palico_skill_id_name(tab: usize, id: u8) -> String {
+    if tab == PALICO_TAB_MOVES {
+        crate::palico::move_name(id)
+    } else {
+        crate::palico::skill_name(id)
+    }
+}
+
+/// Highest id one of the two learned lists takes.
+pub fn palico_skill_max_id(tab: usize) -> u8 {
+    if tab == PALICO_TAB_MOVES {
+        crate::palico::MAX_MOVE
+    } else {
+        crate::palico::MAX_SKILL
+    }
+}
+
+/// The palico skill / support move panel, open as a mode of the roster screen.
+///
+/// The same shape [PalicoEquip] has: a **mode**, not a variant of `Screen`, so
+/// the roster underneath keeps its own row and cursor, and nothing has to be
+/// taught about a new screen. The tab picks which of the two learned lists is
+/// on screen, the field the slot in it, and [PalicoSkill::picks] the id [A]
+/// would write into each slot with palico::set_skill / palico::set_move.
+/// Walking the rows and moving a candidate never writes: only [A] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PalicoSkill {
+    /// Roster record index (0..palico::SLOTS) being edited.
+    pub palico: usize,
+    /// 0 = learned skills, 1 = learned support moves.
+    pub tab: usize,
+    /// Slot under the cursor within that list.
+    pub field: usize,
+    /// Id [A] would write, per slot. Both tabs share the buffer because only
+    /// one of them is on screen at a time and switching tabs re-seeds it.
+    pub picks: [u8; PALICO_MOVE_ROWS],
+}
+
+impl PalicoSkill {
+    /// The id [A] would write into the slot under the cursor.
+    pub fn pick(&self) -> u8 {
+        self.picks
+            .get(self.field)
+            .copied()
+            .unwrap_or(PALICO_PICK_FIRST)
+    }
+}
+
+/// One slot of a learned list, decoded for the panel.
+///
+/// The counted flag is the record's own length byte: the game holds
+/// [ids in use][taught but empty][57 / 96 fill] and only writes inside the
+/// first two, which is the range palico::set_skill / palico::set_move accept.
+/// The fill is listed rather than hidden so the panel shows the list the
+/// record really carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PalicoSkillRow {
+    /// Slot index, 0-based.
+    pub index: usize,
+    /// Id stored in the slot; 0, 57 or 96 when it holds nothing.
+    pub current: u8,
+    /// Id [A] would write here.
+    pub pick: u8,
+    /// Does the record's length byte count this slot?
+    pub counted: bool,
+    /// Name of the stored id, "-" when the slot holds nothing.
+    pub current_name: String,
+    /// Name of the candidate, "-" when it holds nothing.
+    pub pick_name: String,
+}
+
+impl PalicoSkillRow {
+    /// Does the slot hold nothing the panel can name?
+    pub fn is_empty(&self) -> bool {
+        self.current_name == "-"
+    }
+
+    /// "ID 5 / Health Up (S)" for the slot, or "空き" for nothing.
+    pub fn current_text(&self) -> String {
+        if self.is_empty() {
+            String::from("空き")
+        } else {
+            format!("ID {} / {}", self.current, self.current_name)
+        }
+    }
+
+    /// The same shape for the candidate.
+    pub fn pick_text(&self) -> String {
+        if self.pick_name == "-" {
+            String::from("空き")
+        } else {
+            format!("ID {} / {}", self.pick, self.pick_name)
+        }
+    }
+}
+
+/// The candidate every row of a learned list starts on.
+///
+/// A row starts on the id it already holds, so [A] on an untouched row writes
+/// that same id back and changes nothing; an empty or fill slot starts on the
+/// first id, which is where a short walk with [◀/▶] begins.
+fn palico_skill_picks(p: &crate::palico::Palico, tab: usize) -> [u8; PALICO_MOVE_ROWS] {
+    let (list, empty) = if tab == PALICO_TAB_MOVES {
+        (&p.learned_moves, crate::palico::MOVE_EMPTY)
+    } else {
+        (&p.learned_skills, crate::palico::SKILL_EMPTY)
+    };
+    let mut picks = [PALICO_PICK_FIRST; PALICO_MOVE_ROWS];
+    for (k, v) in list.iter().take(PALICO_MOVE_ROWS).enumerate() {
+        if *v != 0 && *v != empty {
+            picks[k] = *v;
+        }
+    }
+    picks
+}
+
 /// Rows on the equipment set editor: 0 is the name, 1..=7 the seven parts.
 pub const SET_EDIT_ROWS: usize = 1 + crate::myset::EQUIP_SET_PARTS;
 
@@ -1108,6 +1262,12 @@ pub struct Editor {
     /// A mode of the roster / download-palico screen, the same shape `set_edit`
     /// has on the my-sets screen: `None` means the screen shows its own list.
     pub palico_equip: Option<PalicoEquip>,
+    /// The palico skill / support move panel, when it is open.
+    ///
+    /// The other mode of the roster screen, kept apart from the equipment one
+    /// because the two edit different bytes of the same record: opening either
+    /// closes the other, and both leave the list underneath alone.
+    pub palico_skill: Option<PalicoSkill>,
     /// Cursor inside the options list.
     pub option_cursor: usize,
     /// CSV files offered by the I/O layer, in the folder's own order.
@@ -1238,6 +1398,7 @@ impl Editor {
             palico_cursor: 0,
             palico_lang: 0,
             palico_equip: None,
+            palico_skill: None,
             option_cursor: 0,
             csv_files: Vec::new(),
             csv_cursor: 0,
@@ -3603,8 +3764,12 @@ impl Editor {
     }
 
     fn input_roster(&mut self, key: Key) {
-        // The equipment panel is a mode of this screen: while it is open every
+        // The two panels are modes of this screen: while either is open every
         // key belongs to it and the list underneath cannot move.
+        if self.palico_skill.is_some() {
+            self.input_palico_skill(key);
+            return;
+        }
         if self.palico_equip.is_some() {
             self.input_palico_equip(key);
             return;
@@ -3678,11 +3843,21 @@ impl Editor {
                     self.open_palico_equip(index);
                 }
             }
+            // Plus opens the skill / support move panel for the highlighted
+            // palico. The pad has no other free button on this screen and
+            // Plus is already the screen-specific tool key on the equipment
+            // list; quitting stays on the slot list one B away, and comes
+            // back here while the panel itself is open.
+            Key::Plus => {
+                if let Some(p) = list.get(self.roster_cursor) {
+                    let index = p.index;
+                    self.open_palico_skill(index);
+                }
+            }
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
             }
-            Key::Plus => self.quit = true,
             _ => {}
         }
     }
@@ -3773,6 +3948,9 @@ impl Editor {
             self.message = format!("枠 {} にオトモがいません", palico);
             return false;
         };
+        // The skill panel is the other mode of this screen: one form at a
+        // time, so opening this one puts that one away.
+        self.palico_skill = None;
         let mut pick = [PALICO_EQUIP_NONE; PALICO_EQUIP_ROWS];
         for part in 0..PALICO_EQUIP_ROWS {
             // Start on what the palico wears, so [A] on an untouched row writes
@@ -4068,6 +4246,378 @@ impl Editor {
             _ => 0,
         }
     }
+
+    // ---------------------------------------------------------- palico skills
+
+    /// Is the palico skill / support move panel open?
+    pub fn palico_skill_open(&self) -> bool {
+        self.palico_skill.is_some()
+    }
+
+    /// The roster record the panel edits, as the save holds it now.
+    pub fn palico_skill_target(&self) -> Option<crate::palico::Palico> {
+        let state = self.palico_skill?;
+        self.palicos().into_iter().find(|p| p.index == state.palico)
+    }
+
+    /// The tab the panel is on: PALICO_TAB_SKILLS or PALICO_TAB_MOVES.
+    pub fn palico_skill_tab(&self) -> usize {
+        match self.palico_skill {
+            Some(state) if state.tab == PALICO_TAB_MOVES => PALICO_TAB_MOVES,
+            _ => PALICO_TAB_SKILLS,
+        }
+    }
+
+    /// Rows the tab on screen lists: twelve skills or sixteen support moves.
+    pub fn palico_skill_list_len(&self) -> usize {
+        match self.palico_skill {
+            Some(_) => palico_skill_tab_rows(self.palico_skill_tab()),
+            None => 0,
+        }
+    }
+
+    /// Slots the list on screen uses, out of the rows it shows.
+    ///
+    /// The first number is the record's own length byte: only those slots can be
+    /// written, because the game never writes past it. The rest is the 57 / 96
+    /// fill, listed rather than hidden so the panel shows the list the record
+    /// really carries.
+    pub fn palico_skill_slots(&self) -> (usize, usize) {
+        if self.palico_skill.is_none() {
+            return (0, 0);
+        }
+        let tab = self.palico_skill_tab();
+        let rows = palico_skill_tab_rows(tab);
+        let used = match self.palico_skill_target() {
+            Some(p) if tab == PALICO_TAB_MOVES => p.learned_move_slots(),
+            Some(p) => p.learned_skill_slots(),
+            None => 0,
+        };
+        (used, rows)
+    }
+
+    /// "系統: ヒーリング   攻撃傾向: 3" for the palico on the panel.
+    ///
+    /// The support tendency has eight documented values. The attack tendency has
+    /// no table in this project, so it is shown as the number the byte stores and
+    /// a byte outside the range the game offers is called out rather than dressed
+    /// up as a name.
+    pub fn palico_skill_tendencies(&self) -> String {
+        let Some(p) = self.palico_skill_target() else {
+            return String::new();
+        };
+        let system = if crate::palico::type_of(&p).is_some() {
+            String::from(p.system_name())
+        } else {
+            format!("?（{} は範囲外）", p.system)
+        };
+        let attack = match crate::palico::attack_of(&p) {
+            Some(v) => format!("{}", v),
+            None => format!("?（{} は範囲外）", p.attack),
+        };
+        format!("系統: {}   攻撃傾向: {}", system, attack)
+    }
+
+    /// Every slot of the list on screen, decoded.
+    pub fn palico_skill_rows(&self) -> Vec<PalicoSkillRow> {
+        let mut out = Vec::new();
+        let Some(state) = self.palico_skill else {
+            return out;
+        };
+        let Some(target) = self.palico_skill_target() else {
+            return out;
+        };
+        let tab = if state.tab == PALICO_TAB_MOVES {
+            PALICO_TAB_MOVES
+        } else {
+            PALICO_TAB_SKILLS
+        };
+        let moves = tab == PALICO_TAB_MOVES;
+        let empty = if moves {
+            crate::palico::MOVE_EMPTY
+        } else {
+            crate::palico::SKILL_EMPTY
+        };
+        let (list, used, rows) = if moves {
+            (
+                &target.learned_moves,
+                target.learned_move_slots(),
+                PALICO_MOVE_ROWS,
+            )
+        } else {
+            (
+                &target.learned_skills,
+                target.learned_skill_slots(),
+                PALICO_SKILL_ROWS,
+            )
+        };
+        for index in 0..rows {
+            let current = list.get(index).copied().unwrap_or(empty);
+            let pick = state.picks.get(index).copied().unwrap_or(PALICO_PICK_FIRST);
+            let named = current != 0 && current != empty;
+            out.push(PalicoSkillRow {
+                index,
+                current,
+                pick,
+                counted: index < used,
+                current_name: if named {
+                    palico_skill_id_name(tab, current)
+                } else {
+                    String::from("-")
+                },
+                pick_name: if pick != 0 {
+                    palico_skill_id_name(tab, pick)
+                } else {
+                    String::from("-")
+                },
+            });
+        }
+        out
+    }
+
+    /// The panel's warnings: the learned and equipped lists of this palico.
+    ///
+    /// Both lists are checked by the core, because the equipped lists hang off
+    /// the learned ones: showing half of what is inconsistent about a record
+    /// would be lying by omission.
+    pub fn palico_skill_warnings(&self) -> Vec<String> {
+        let Some(state) = self.palico_skill else {
+            return Vec::new();
+        };
+        let Some(save) = self.save.as_ref() else {
+            return Vec::new();
+        };
+        let mut out = crate::palico::skill_warnings(save, self.slot, state.palico);
+        out.extend(crate::palico::move_warnings(
+            save,
+            self.slot,
+            state.palico,
+        ));
+        out
+    }
+
+    /// Open the skill / support move panel for one roster record.
+    ///
+    /// The equipment panel is closed on the way in: the two are modes of the
+    /// same screen and edit the same record, so leaving one open under the other
+    /// would give the user two forms whose keys fight.
+    pub fn open_palico_skill(&mut self, palico: usize) -> bool {
+        if palico >= crate::palico::SLOTS {
+            return false;
+        }
+        let Some(record) = self.palicos().into_iter().find(|p| p.index == palico) else {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        };
+        self.palico_equip = None;
+        self.palico_skill = Some(PalicoSkill {
+            palico,
+            tab: PALICO_TAB_SKILLS,
+            field: 0,
+            picks: palico_skill_picks(&record, PALICO_TAB_SKILLS),
+        });
+        self.message = format!(
+            "{} のスキルとサポート行動（スキル {} 枠中 {}）",
+            record.name,
+            PALICO_SKILL_ROWS,
+            record.learned_skill_slots()
+        );
+        true
+    }
+
+    /// Put the panel away. The roster keeps its own row and cursor.
+    pub fn close_palico_skill(&mut self) {
+        if self.palico_skill.take().is_some() {
+            self.message = String::from("スキル編集を閉じました");
+        }
+    }
+
+    /// Write one slot of the learned list on screen.
+    ///
+    /// This is crate::palico::set_skill / set_move and nothing else: the length
+    /// byte stays where it is, a slot past it is refused, and a skill that was
+    /// equipped is unequipped by the core when it leaves the list. Writing the id
+    /// a slot already holds changes nothing and says so instead of marking the
+    /// save dirty.
+    pub fn palico_skill_assign(&mut self, palico: usize, index: usize, id: u8) -> bool {
+        let slot = self.slot;
+        let tab = self.palico_skill_tab();
+        let list_name = palico_skill_tab_name(tab);
+        let moves = tab == PALICO_TAB_MOVES;
+        if index >= palico_skill_tab_rows(tab) {
+            self.message = format!("{} の {} 番目は一覧の外です", list_name, index);
+            return false;
+        }
+        let max = palico_skill_max_id(tab);
+        if id == 0 || id > max {
+            self.message = format!("{} の ID は 1..={} です", list_name, max);
+            return false;
+        }
+        let Some(save) = self.save.as_mut() else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        let Some(record) = crate::palico::roster(save, slot)
+            .into_iter()
+            .find(|p| p.index == palico)
+        else {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        };
+        if record.is_empty() {
+            self.message = format!("枠 {} にオトモがいません", palico);
+            return false;
+        }
+        let empty = if moves {
+            crate::palico::MOVE_EMPTY
+        } else {
+            crate::palico::SKILL_EMPTY
+        };
+        let used = if moves {
+            record.learned_move_slots()
+        } else {
+            record.learned_skill_slots()
+        };
+        let current = if moves {
+            record.learned_moves.get(index).copied().unwrap_or(empty)
+        } else {
+            record.learned_skills.get(index).copied().unwrap_or(empty)
+        };
+        if current == id {
+            self.message = format!(
+                "{} の {} 番目はすでに {}（{}）です",
+                list_name,
+                index,
+                id,
+                palico_skill_id_name(tab, id)
+            );
+            return true;
+        }
+        let ok = if moves {
+            crate::palico::set_move(save, slot, palico, index, id)
+        } else {
+            crate::palico::set_skill(save, slot, palico, index, id)
+        };
+        if !ok {
+            self.message = format!(
+                "{} の {} 番目には書けません（記録の長さ {}、ID は 1..={}）",
+                list_name, index, used, max
+            );
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "{} の {} 番目を {}（{}）にしました",
+            list_name,
+            index,
+            id,
+            palico_skill_id_name(tab, id)
+        );
+        true
+    }
+
+    /// Keys of the skill / support move panel.
+    ///
+    /// [A] is the only key that writes a slot. [Y] swaps the two lists, [◀/▶]
+    /// move the candidate by one and [L/R] by ten - the tables run to 93 and 56
+    /// entries, so a key that steps ten is the difference between usable and not.
+    /// Every other key is a cursor move or is swallowed while the panel owns the
+    /// screen, so a press can never reach the roster underneath it.
+    fn input_palico_skill(&mut self, key: Key) {
+        let Some(mut state) = self.palico_skill else {
+            return;
+        };
+        let tab = if state.tab == PALICO_TAB_MOVES {
+            PALICO_TAB_MOVES
+        } else {
+            PALICO_TAB_SKILLS
+        };
+        let count = palico_skill_tab_rows(tab);
+        let field = state.field.min(count - 1);
+        state.tab = tab;
+        state.field = field;
+        match key {
+            Key::Up => {
+                state.field = (field + count - 1) % count;
+                self.palico_skill = Some(state);
+            }
+            Key::Down => {
+                state.field = (field + 1) % count;
+                self.palico_skill = Some(state);
+            }
+            Key::Left | Key::Right => {
+                self.palico_skill = Some(state);
+                self.cycle_palico_skill_pick(if key == Key::Right { 1 } else { -1 });
+            }
+            Key::L | Key::R => {
+                self.palico_skill = Some(state);
+                self.cycle_palico_skill_pick(if key == Key::R { 10 } else { -10 });
+            }
+            Key::Y => {
+                let next = if tab == PALICO_TAB_MOVES {
+                    PALICO_TAB_SKILLS
+                } else {
+                    PALICO_TAB_MOVES
+                };
+                state.tab = next;
+                state.field = 0;
+                if let Some(p) = self.palico_skill_target() {
+                    state.picks = palico_skill_picks(&p, next);
+                }
+                self.palico_skill = Some(state);
+                self.message = format!("{} の一覧に切り替えました", palico_skill_tab_name(next));
+            }
+            Key::A => {
+                let palico = state.palico;
+                let pick = state.picks[field];
+                self.palico_skill = Some(state);
+                self.palico_skill_assign(palico, field, pick);
+            }
+            Key::B => self.close_palico_skill(),
+            Key::X => {
+                self.palico_skill = Some(state);
+                self.request_write_save();
+            }
+            // Plus is the quit key again while the panel is open: on the list it
+            // is what opens the panel, here it has no other job.
+            Key::Plus => self.quit = true,
+            // [-] is the equipment panel's key on the list under this one, so it
+            // must not reach it while the skill panel is open; Z is ZR, which the
+            // pad spends on the section bar and the PC build on the arc list.
+            Key::Minus | Key::Z => {
+                self.palico_skill = Some(state);
+            }
+        }
+    }
+
+    /// Move the cursor row's candidate by delta, wrapping inside the table.
+    fn cycle_palico_skill_pick(&mut self, delta: i64) {
+        let Some(mut state) = self.palico_skill else {
+            return;
+        };
+        let tab = if state.tab == PALICO_TAB_MOVES {
+            PALICO_TAB_MOVES
+        } else {
+            PALICO_TAB_SKILLS
+        };
+        let count = palico_skill_tab_rows(tab);
+        let field = state.field.min(count - 1);
+        let max = palico_skill_max_id(tab) as i64;
+        let cur = (state.picks[field] as i64).clamp(1, max);
+        let next = (cur - 1 + delta).rem_euclid(max) + 1;
+        state.tab = tab;
+        state.field = field;
+        state.picks[field] = next as u8;
+        self.palico_skill = Some(state);
+        self.message = format!(
+            "{} の {} 番目: 差し替え先 {}（{}）",
+            palico_skill_tab_name(tab),
+            field,
+            next,
+            palico_skill_id_name(tab, next as u8)
+        );
+    }
+
     fn input_quest_equip(&mut self, key: Key) {
         let n = self.quest_equipment().len();
         // Two levels: the slot list, and the items inside the chosen slot.
@@ -6470,6 +7020,78 @@ impl Editor {
             return out;
         }
 
+        // The skill / support move panel is the other mode of the roster
+        // screen and owns the output while it is open, the same way.
+        if let Some(state) = self.palico_skill {
+            let tab = self.palico_skill_tab();
+            let (used, rows) = self.palico_skill_slots();
+            let (who, roster_no) = match self.palico_skill_target() {
+                Some(p) => (p.name, p.index + 1),
+                None => (String::from("?"), state.palico + 1),
+            };
+            push(
+                &mut out,
+                format!(
+                    "オトモ{} — {}（ロスター #{}）",
+                    palico_skill_tab_name(tab),
+                    who,
+                    roster_no
+                ),
+                false,
+                false,
+            );
+            push(
+                &mut out,
+                format!("  {}", self.palico_skill_tendencies()),
+                false,
+                false,
+            );
+            push(
+                &mut out,
+                format!(
+                    "  {} の修得枠 {} 使用 / {} 枠{}",
+                    palico_skill_tab_name(tab),
+                    used,
+                    rows,
+                    if used < rows { "" } else { "（いっぱい）" }
+                ),
+                false,
+                false,
+            );
+            for row in self.palico_skill_rows() {
+                // A slot past the length byte is the fill the game leaves there:
+                // it is listed, and marked so nobody walks down to it to write.
+                let mark = if row.counted { " " } else { "x" };
+                let arrow = if row.index == state.field {
+                    format!("  → {}", row.pick_text())
+                } else {
+                    String::new()
+                };
+                push(
+                    &mut out,
+                    format!("  {} {:>2}  {}{}", mark, row.index, row.current_text(), arrow),
+                    true,
+                    row.index == state.field,
+                );
+            }
+            for warning in self.palico_skill_warnings().iter().take(2) {
+                push(&mut out, format!("  !! {}", warning), false, false);
+            }
+            push(
+                &mut out,
+                String::from("  Up/Down 枠  Left/Right 候補  L/R ±10  Y タブ  A 差し替え"),
+                false,
+                false,
+            );
+            push(
+                &mut out,
+                String::from("  X save   B back   (x = 修得枠の外)"),
+                false,
+                false,
+            );
+            return out;
+        }
+
         match self.screen {
             Screen::SaveList => {
                 push(&mut out, format!("SAVE FILES  ({} found)", self.save_files.len()), false, false);
@@ -8497,6 +9119,230 @@ mod tests {
         // The panel's row count is the worn list's own number, not a new one.
         assert_eq!(PALICO_PART_NAMES.len(), palico::EQUIP_SLOTS);
         assert_eq!(palicogear::KINDS.len(), PALICO_EQUIP_ROWS);
+    }
+
+    /// A blank Switch save with one palico whose two learned lists are written
+    /// the way the game writes them: [ids in use][taught but empty][57 / 96
+    /// fill], with the length byte counting the first two.
+    fn editor_with_learned_lists() -> Editor {
+        let mut save = crate::save::empty_switch_save();
+        assert!(palico::set_name(&mut save, 0, 0, "テスト"));
+        let base = save.slot_base(0).expect("slot base") as usize;
+        let rec = base + palico::OFF_ROSTER;
+        let skills: [u8; 3] = [5, 46, 80];
+        for i in 0..palico::LEARNED_SKILL_SLOTS {
+            save.body_mut()[rec + palico::LEARNED_SKILLS + i] = if i < 3 {
+                skills[i]
+            } else if i < 5 {
+                0
+            } else {
+                palico::SKILL_EMPTY
+            };
+        }
+        save.body_mut()[rec + palico::SKILL_LEN] = 5;
+        let moves: [u8; 3] = [3, 5, 9];
+        for i in 0..palico::LEARNED_MOVE_SLOTS {
+            save.body_mut()[rec + palico::LEARNED_MOVES + i] = if i < 3 {
+                moves[i]
+            } else if i < 6 {
+                0
+            } else {
+                palico::MOVE_EMPTY
+            };
+        }
+        save.body_mut()[rec + palico::MOVE_LEN] = 6;
+        save.body_mut()[rec + palico::SYSTEM] = 4;
+        save.body_mut()[rec + palico::ATTACK] = 3;
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        assert!(ed.save.is_some(), "{}", ed.message);
+        ed.screen = Screen::Roster;
+        ed
+    }
+
+    #[test]
+    fn the_skill_panel_lists_the_two_lists_and_writes_one_slot() {
+        let mut ed = editor_with_learned_lists();
+        ed.roster_cursor = 0;
+        // Plus is the panel key on the roster screen.
+        ed.input(Key::Plus);
+        assert!(ed.palico_skill_open(), "{}", ed.message);
+        // A mode, not a screen: the roster is still the screen underneath.
+        assert_eq!(ed.screen, Screen::Roster);
+        assert_eq!(ed.palico_skill_target().map(|p| p.index), Some(0));
+        assert_eq!(ed.palico_skill_tab(), PALICO_TAB_SKILLS);
+
+        let rows = ed.palico_skill_rows();
+        assert_eq!(rows.len(), PALICO_SKILL_ROWS);
+        assert_eq!(PALICO_SKILL_ROWS, palico::LEARNED_SKILL_SLOTS);
+        assert_eq!(ed.palico_skill_slots(), (5, PALICO_SKILL_ROWS));
+        assert_eq!(rows[0].current, 5);
+        assert_eq!(rows[0].current_name, palico::skill_name(5));
+        // Two slots the list counts but has not taught yet, then the fill.
+        assert!(rows[3].counted && rows[3].is_empty(), "slot 3 is a taught-empty slot");
+        assert!(!rows[5].counted, "slot 5 is past the stored length");
+        assert_eq!(rows[5].current, palico::SKILL_EMPTY);
+        // The candidate starts on the id the slot already holds, so [A] on an
+        // untouched row writes the same id back.
+        assert_eq!(rows[0].pick, 5);
+        // Walking the rows is not a write.
+        ed.dirty = false;
+        ed.input(Key::Down);
+        assert_eq!(ed.palico_skill.map(|s| s.field), Some(1));
+        ed.input(Key::Up);
+        assert!(!ed.dirty);
+
+        // Right moves the candidate, and still nothing is written.
+        ed.input(Key::Right);
+        assert_eq!(ed.palico_skill.map(|s| s.pick()), Some(6));
+        assert!(!ed.dirty, "moving the candidate writes nothing");
+
+        // A writes the candidate, and only the one byte of that slot moves.
+        let before = ed.save.as_ref().expect("save").body().to_vec();
+        ed.input(Key::A);
+        assert!(ed.dirty, "{}", ed.message);
+        let base = ed
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        let at = base + palico::OFF_ROSTER + palico::LEARNED_SKILLS;
+        let after = ed.save.as_ref().expect("save").body().to_vec();
+        let moved: Vec<usize> = (0..before.len()).filter(|i| before[*i] != after[*i]).collect();
+        assert_eq!(moved, alloc::vec![at]);
+        assert_eq!(
+            palico::learned_skills(&palico::roster(ed.save.as_ref().expect("save"), 0)[0]),
+            alloc::vec![6, 46, 80]
+        );
+
+        // Y swaps to the sixteen slot support move list, and [A] writes there
+        // through set_move.
+        ed.input(Key::Y);
+        assert_eq!(ed.palico_skill_tab(), PALICO_TAB_MOVES);
+        let rows = ed.palico_skill_rows();
+        assert_eq!(rows.len(), PALICO_MOVE_ROWS);
+        assert_eq!(PALICO_MOVE_ROWS, palico::LEARNED_MOVE_SLOTS);
+        assert_eq!(ed.palico_skill_slots(), (6, PALICO_MOVE_ROWS));
+        assert_eq!(rows[0].current, 3);
+        assert_eq!(rows[0].pick, 3);
+        ed.input(Key::Right);
+        ed.input(Key::A);
+        assert_eq!(
+            palico::support_moves(&palico::roster(ed.save.as_ref().expect("save"), 0)[0]),
+            alloc::vec![4, 5, 9]
+        );
+
+        // The core owns the refusal: a slot past the stored length, an id the
+        // table does not have, a slot past the array and a record that is not
+        // a palico all leave the save alone.
+        ed.dirty = false;
+        let before = ed.save.as_ref().expect("save").body().to_vec();
+        assert!(!ed.palico_skill_assign(0, 9, 6), "{}", ed.message);
+        assert!(ed.message.contains("書けません"), "{}", ed.message);
+        assert!(!ed.palico_skill_assign(0, 0, 0));
+        assert!(!ed.palico_skill_assign(0, 0, palico::MAX_MOVE + 1));
+        assert!(!ed.palico_skill_assign(0, PALICO_MOVE_ROWS, 1));
+        assert!(!ed.palico_skill_assign(palico::SLOTS, 0, 1));
+        assert!(!ed.dirty);
+        assert_eq!(ed.save.as_ref().expect("save").body().to_vec(), before);
+
+        // Writing the id a slot already holds is not a change, and says so.
+        assert!(ed.palico_skill_assign(0, 1, 5));
+        assert!(!ed.dirty);
+        assert!(ed.message.contains("すでに"), "{}", ed.message);
+    }
+
+    #[test]
+    fn the_skill_panel_says_the_tendencies_and_carries_the_warnings() {
+        let mut ed = editor_with_learned_lists();
+        ed.roster_cursor = 0;
+        ed.input(Key::Plus);
+        assert!(ed.palico_skill_open(), "{}", ed.message);
+        // System 4 is ヒーリング and the attack byte is 3: both are on the panel.
+        let tendencies = ed.palico_skill_tendencies();
+        assert!(tendencies.contains("ヒーリング"), "{}", tendencies);
+        assert!(tendencies.contains("攻撃傾向: 3"), "{}", tendencies);
+
+        // Nothing is inconsistent yet, and the console output carries the line.
+        assert!(ed.palico_skill_warnings().is_empty());
+        let lines = ed.lines();
+        assert!(
+            lines.iter().any(|l| l.text.contains("ヒーリング")),
+            "the tendency line is missing"
+        );
+        assert!(!lines.iter().any(|l| l.text.contains("!!")));
+        // One row per slot of the list, one of them the cursor, and the header
+        // names the record.
+        assert_eq!(lines.iter().filter(|l| l.selectable).count(), PALICO_SKILL_ROWS);
+        assert_eq!(lines.iter().filter(|l| l.cursor).count(), 1);
+        assert!(lines[0].text.contains("ロスター #1"), "{}", lines[0].text);
+
+        // Equipping a skill the record never learned is a state the sample save
+        // itself holds: the panel shows the warning line instead of hiding it.
+        {
+            let base = ed
+                .save
+                .as_ref()
+                .and_then(|s| s.slot_base(0))
+                .expect("slot base") as usize;
+            let at = base + palico::OFF_ROSTER + palico::SKILLS;
+            ed.save.as_mut().expect("save").body_mut()[at] = 90;
+        }
+        let warnings = ed.palico_skill_warnings();
+        assert_eq!(warnings.len(), 1, "{:?}", warnings);
+        assert!(warnings[0].contains("装備スキル"), "{:?}", warnings);
+        let lines = ed.lines();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.text.contains("!!") && l.text.contains("装備スキル")),
+            "the warning line is missing"
+        );
+        assert_eq!(lines.iter().filter(|l| l.selectable).count(), PALICO_SKILL_ROWS);
+
+        // A tendency byte the game does not offer is called out, not named.
+        let base = ed
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        ed.save.as_mut().expect("save").body_mut()[base + palico::OFF_ROSTER + palico::ATTACK] = 9;
+        assert!(ed.palico_skill_tendencies().contains("範囲外"));
+    }
+
+    #[test]
+    fn closing_the_skill_panel_leaves_the_roster_where_it_was() {
+        let mut ed = editor_with_learned_lists();
+        ed.roster_cursor = 0;
+        ed.input(Key::Plus);
+        assert!(ed.palico_skill_open(), "{}", ed.message);
+        ed.input(Key::Down);
+        ed.input(Key::Down);
+        assert_eq!(ed.palico_skill.map(|s| s.field), Some(2));
+
+        // B closes the panel; the roster keeps its own row.
+        ed.input(Key::B);
+        assert!(!ed.palico_skill_open());
+        assert_eq!(ed.screen, Screen::Roster);
+        assert_eq!(ed.roster_cursor, 0);
+        assert!(ed.message.contains("閉じました"), "{}", ed.message);
+
+        // The two panels are modes of one screen: opening either closes the
+        // other, so one form is never left under the second.
+        ed.input(Key::Plus);
+        assert!(ed.palico_skill_open());
+        assert!(ed.open_palico_equip(0), "{}", ed.message);
+        assert!(ed.palico_equip_open());
+        assert!(!ed.palico_skill_open());
+        assert!(ed.open_palico_skill(0), "{}", ed.message);
+        assert!(ed.palico_skill_open());
+        assert!(!ed.palico_equip_open());
+
+        // An empty roster record and a record number past the roster are not a
+        // palico, so there is nothing to list.
+        assert!(!ed.open_palico_skill(palico::SLOTS));
+        assert!(!ed.open_palico_skill(7));
+        assert!(ed.message.contains("オトモがいません"), "{}", ed.message);
     }
 
     /// A blank Switch save whose item box holds these (id, count) pairs, with

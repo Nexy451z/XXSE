@@ -266,7 +266,7 @@ pub struct ProgressUndo {
     pub regions: Vec<(usize, Vec<u8>)>,
 }
 
-/// The three tables of a romfs folder, as found on disk.
+/// The five tables of a romfs folder, as found on disk.
 ///
 /// The paths are kept before they are read so the report can name the folder
 /// that answered: a user with two dumps needs to know which one is in use.
@@ -279,6 +279,10 @@ struct RomfsTables {
     names: Option<PathBuf>,
     /// `activityData.atd`, the request records with their two flags.
     atd: Option<PathBuf>,
+    /// `GC_Title_1*.gmd`, the 1309 title words (and their descriptions).
+    title1: Option<PathBuf>,
+    /// `GC_Title_2*.gmd`, the 121 linking words.
+    title2: Option<PathBuf>,
 }
 
 /// What one 読み込む found, before it is copied into the editor.
@@ -293,6 +297,9 @@ struct RomfsLoad {
     request_names: Vec<String>,
     /// 184 records, empty when the `.atd` could not be read.
     request_records: Vec<RequestRecord>,
+    /// The title words and linking words, empty when the two `.gmd` files
+    /// could not be read.
+    titles: mhnx_core::guildcard::TitleTable,
 }
 
 pub struct MhnxEditor {
@@ -437,6 +444,19 @@ pub struct MhnxEditor {
     /// Arena the ギルド tab edits, 0..16. The five rank fields beside the
     /// selector write through [MhnxEditor::set_arena_time].
     pub arena_sel: usize,
+    /// The title text tables (GC_Title_1 / GC_Title_2), read out of the same
+    /// romfs folder the award and request names come from. Empty until one is
+    /// loaded, and only the ギルド tab reads it.
+    pub title_table: mhnx_core::guildcard::TitleTable,
+    /// 小金 (mini crown) threshold as typed in the 狩猟記録 tab, in percent.
+    /// Empty means "do not judge that crown", so a fresh editor marks none.
+    pub crown_mini: String,
+    /// 金冠 (gold crown) threshold as typed, empty for no judgement.
+    pub crown_gold: String,
+    /// Skill id the オトモ tab's add row will teach when 修得させる is pressed.
+    pub palico_skill_add: u8,
+    /// Support move id the add row will teach.
+    pub palico_move_add: u8,
 
     // ---- snapshots ----
     /// Snapshots next to the open save, newest first.
@@ -564,6 +584,11 @@ impl Default for MhnxEditor {
             charm_points2: 0,
             charm_slots: 0,
             arena_sel: 0,
+            title_table: mhnx_core::guildcard::TitleTable::default(),
+            crown_mini: String::new(),
+            crown_gold: String::new(),
+            palico_skill_add: 1,
+            palico_move_add: 1,
             snapshots: Vec::new(),
             romfs_path: String::new(),
             romfs_status: String::new(),
@@ -5303,7 +5328,10 @@ impl MhnxEditor {
         // Bounded so the two panels below stay on screen. A share of what is
         // left rather than a fixed number: the window can be as short as 600
         // points, and a fixed 172 would push the gear editor off the bottom.
-        let roster_h = (ui.available_height() * 0.34).clamp(120.0, 180.0);
+        // The learned-skill panel below takes a share of the height too, so
+        // the roster gives some back: at 0.34 the gear table and the new panel
+        // were both squeezed to their body height and neither could scroll.
+        let roster_h = (ui.available_height() * 0.24).clamp(96.0, 140.0);
         egui::ScrollArea::vertical()
             .id_salt("palicolist")
             .max_height(roster_h)
@@ -5395,6 +5423,10 @@ impl MhnxEditor {
         }
         ui.separator();
         let palico = self.palico_selected.unwrap_or(list[0].index);
+        if let Some(stored) = list.iter().find(|p| p.index == palico) {
+            self.palico_learned_panel(ui, palico, stored);
+        }
+        ui.separator();
         // Gear assignment on the left, the box it points into on the right.
         // The box list takes the rest of the height.
         ui.horizontal_top(|ui| {
@@ -5407,6 +5439,348 @@ impl MhnxEditor {
                 self.palico_gear_panel(ui, &gear, &gear_bytes);
             });
         });
+    }
+
+    /// The learned skills and support moves of the selected palico.
+    ///
+    /// Two columns, each the taught list as the record holds it plus an add
+    /// row. Everything here writes through the core (set_skill / add_skill and
+    /// set_move / add_move) and nothing is refused that the core allows: the
+    /// warnings under the lists describe what the save already holds, which is
+    /// how the sample save's own out-of-list equipment can be seen at all.
+    fn palico_learned_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        palico: usize,
+        p: &mhnx_core::palico::Palico,
+    ) {
+        let (skill_warnings, move_warnings) = match &self.save {
+            Some(save) => (
+                mhnx_core::palico::skill_warnings(save, self.slot, palico),
+                mhnx_core::palico::move_warnings(save, self.slot, palico),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        ui.label(
+            egui::RichText::new(format!("枠 {} の修得スキルとサポート行動", palico)).strong(),
+        );
+        let mut new_system: Option<u8> = None;
+        let mut new_attack: Option<u8> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("系統");
+            let mut system = p.system;
+            egui::ComboBox::from_id_salt(("palicosystem", palico))
+                .selected_text(mhnx_core::palico::system_name(system))
+                .show_ui(ui, |ui| {
+                    for (i, name) in mhnx_core::palico::SYSTEMS.iter().enumerate() {
+                        ui.selectable_value(&mut system, i as u8, *name);
+                    }
+                });
+            if system != p.system {
+                new_system = Some(system);
+            }
+            ui.label("攻撃傾向");
+            let mut attack = p.attack;
+            let shown = if attack <= mhnx_core::palico::MAX_ATTACK {
+                format!("{}", attack)
+            } else {
+                format!("{}（範囲外）", attack)
+            };
+            egui::ComboBox::from_id_salt(("palicoattack", palico))
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    for v in 0..=mhnx_core::palico::MAX_ATTACK {
+                        ui.selectable_value(&mut attack, v, format!("{}", v));
+                    }
+                });
+            if attack != p.attack {
+                new_attack = Some(attack);
+            }
+            let mut line = String::new();
+            let equipped = p.skill_names().join(", ");
+            if !equipped.is_empty() {
+                line.push_str(&format!("装備スキル: {}", equipped));
+            }
+            let moves = p
+                .moves()
+                .iter()
+                .map(|id| mhnx_core::palico::move_name(*id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !moves.is_empty() {
+                if !line.is_empty() {
+                    line.push_str(" / ");
+                }
+                line.push_str(&format!("装備サポート行動: {}", moves));
+            }
+            if !line.is_empty() {
+                ui.label(egui::RichText::new(line).weak().small());
+            }
+        });
+        if let Some(system) = new_system {
+            self.set_palico_type(palico, system);
+        }
+        if let Some(attack) = new_attack {
+            self.set_palico_attack(palico, attack);
+        }
+        let half = (ui.available_width() * 0.5 - 16.0).max(220.0);
+        // Bounded: the tab is not one of the outer-scrolling ones, and 28
+        // slots of two columns would otherwise push the gear panel off the
+        // bottom where it cannot be reached at all.
+        egui::ScrollArea::vertical()
+            .id_salt(("palicolearnedpanel", palico))
+            .max_height(150.0)
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(half);
+                        self.palico_list_editor(
+                            ui,
+                            palico,
+                            false,
+                            &p.learned_skills,
+                            p.learned_skill_slots(),
+                        );
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_width(half);
+                        self.palico_list_editor(
+                            ui,
+                            palico,
+                            true,
+                            &p.learned_moves,
+                            p.learned_move_slots(),
+                        );
+                    });
+                });
+            });
+        if !skill_warnings.is_empty() || !move_warnings.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "データの警告 {} 件（書き換えは止めません）",
+                    skill_warnings.len() + move_warnings.len()
+                ))
+                .strong()
+                .color(warning_color()),
+            );
+            for w in skill_warnings.iter().chain(move_warnings.iter()) {
+                ui.label(egui::RichText::new(format!("・{}", w)).color(warning_color()));
+            }
+        }
+    }
+
+    /// One learned list of the selected palico, with an add row.
+    ///
+    /// `stored` is the list as the record holds it, empty taught slots
+    /// included. The slot number shown is the index the core writes, so an
+    /// empty slot has to stay visible: hiding it would make the numbers lie.
+    fn palico_list_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        palico: usize,
+        moves: bool,
+        stored: &[u8],
+        slots: usize,
+    ) {
+        let max = if moves {
+            mhnx_core::palico::MAX_MOVE
+        } else {
+            mhnx_core::palico::MAX_SKILL
+        };
+        let empty = if moves {
+            mhnx_core::palico::MOVE_EMPTY
+        } else {
+            mhnx_core::palico::SKILL_EMPTY
+        };
+        let title = if moves {
+            "修得サポート行動"
+        } else {
+            "修得スキル"
+        };
+        let name = |id: u8| {
+            if moves {
+                mhnx_core::palico::move_name(id)
+            } else {
+                mhnx_core::palico::skill_name(id)
+            }
+        };
+        ui.label(egui::RichText::new(format!("{}（{} 枠）", title, slots)).strong());
+        if slots == 0 {
+            // add_skill / add_move only fill a slot the length byte already
+            // counts, so a record whose list is empty cannot be taught here.
+            ui.label(
+                egui::RichText::new(
+                    "この記録の修得リストは長さ 0 です。ゲームが使っていない記録なので、\
+                     ここからは追加できません。",
+                )
+                .weak()
+                .small(),
+            );
+            return;
+        }
+        let mut edit: Option<(usize, u8)> = None;
+        egui::Grid::new(("palicolearned", palico, moves))
+            .num_columns(2)
+            .striped(true)
+            .show(ui, |ui| {
+                for k in 0..slots {
+                    ui.label(format!("{}", k));
+                    let current = stored.get(k).copied().unwrap_or(0);
+                    // An id the table does not name is still shown by number:
+                    // the save can hold one and a blank would read as "none".
+                    let shown = if current == 0 || current == empty {
+                        String::from("なし")
+                    } else {
+                        format!("{}: {}", current, name(current))
+                    };
+                    let mut pick = current;
+                    egui::ComboBox::from_id_salt(("palicoslot", palico, moves, k))
+                        .selected_text(shown)
+                        .width(200.0)
+                        .show_ui(ui, |ui| {
+                            for id in 1..=max {
+                                if ui
+                                    .selectable_label(
+                                        current == id,
+                                        format!("{}: {}", id, name(id)),
+                                    )
+                                    .clicked()
+                                {
+                                    pick = id;
+                                }
+                            }
+                        });
+                    if pick != current {
+                        edit = Some((k, pick));
+                    }
+                    ui.end_row();
+                }
+            });
+        let mut add: Option<u8> = None;
+        ui.horizontal(|ui| {
+            let mut pick = if moves {
+                self.palico_move_add
+            } else {
+                self.palico_skill_add
+            };
+            if pick == 0 || pick > max {
+                pick = 1;
+            }
+            egui::ComboBox::from_id_salt(("palicoadd", palico, moves))
+                .selected_text(format!("{}: {}", pick, name(pick)))
+                .width(200.0)
+                .show_ui(ui, |ui| {
+                    for id in 1..=max {
+                        ui.selectable_value(&mut pick, id, format!("{}: {}", id, name(id)));
+                    }
+                });
+            if moves {
+                self.palico_move_add = pick;
+            } else {
+                self.palico_skill_add = pick;
+            }
+            if ui.button("修得させる").clicked() {
+                add = Some(pick);
+            }
+        });
+        if let Some((k, id)) = edit {
+            self.palico_list_write(palico, moves, Some(k), id);
+        }
+        if let Some(id) = add {
+            self.palico_list_write(palico, moves, None, id);
+        }
+    }
+
+    /// Teach or replace one skill (moves = false) or support move of a palico.
+    ///
+    /// `index = None` fills the first empty taught slot (add_skill / add_move);
+    /// `Some(k)` replaces slot k (set_skill / set_move). The core decides what
+    /// is allowed and this only reports it: a full list, an id past the end of
+    /// the table and an already learned skill all come back false.
+    pub fn palico_list_write(
+        &mut self,
+        palico: usize,
+        moves: bool,
+        index: Option<usize>,
+        id: u8,
+    ) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        let ok = if moves {
+            match index {
+                Some(k) => mhnx_core::palico::set_move(save, slot, palico, k, id),
+                None => mhnx_core::palico::add_move(save, slot, palico, id).is_some(),
+            }
+        } else {
+            match index {
+                Some(k) => mhnx_core::palico::set_skill(save, slot, palico, k, id),
+                None => mhnx_core::palico::add_skill(save, slot, palico, id).is_some(),
+            }
+        };
+        let name = if moves {
+            mhnx_core::palico::move_name(id)
+        } else {
+            mhnx_core::palico::skill_name(id)
+        };
+        let what = if moves { "サポート行動" } else { "スキル" };
+        if ok {
+            self.dirty = true;
+            self.message = format!(
+                "{} {} を{}しました（まだファイルには書いていません）",
+                what,
+                name,
+                if index.is_some() { "書き換え" } else { "修得" }
+            );
+        } else {
+            self.message = format!(
+                "{} {} を書き換えられませんでした（空きがないか、すでに修得しています）",
+                what, name
+            );
+        }
+        ok
+    }
+
+    /// Set the support tendency of one palico.
+    pub fn set_palico_type(&mut self, palico: usize, system: u8) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if !mhnx_core::palico::set_type(save, slot, palico, system) {
+            self.message = format!("系統 {} を書き込めませんでした", system);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "枠 {} の系統を {} にしました（まだファイルには書いていません）",
+            palico,
+            mhnx_core::palico::system_name(system)
+        );
+        true
+    }
+
+    /// Set the attack tendency of one palico.
+    pub fn set_palico_attack(&mut self, palico: usize, attack: u8) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if !mhnx_core::palico::set_attack(save, slot, palico, attack) {
+            self.message = format!("攻撃傾向 {} を書き込めませんでした", attack);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "枠 {} の攻撃傾向を {} にしました（まだファイルには書いていません）",
+            palico, attack
+        );
+        true
     }
 
     /// Name of one of the three slots a palico wears things in.
@@ -5872,6 +6246,48 @@ impl MhnxEditor {
         }
     }
 
+    /// The crown window the 狩猟記録 tab judges with, or None while both
+    /// threshold fields are empty.
+    ///
+    /// An empty side is fed a value the game's comparison can never meet (0 for
+    /// 小金, the whole u16 range for 金冠). That is what keeps one filled field
+    /// from turning the other crown on: crown(size, (0, x)) would mark every
+    /// size gold, and crown(size, (x, u16::MAX)) would mark none.
+    pub fn crown_window(&self) -> Option<(u16, u16)> {
+        let mini = Self::parse_threshold(&self.crown_mini);
+        let gold = Self::parse_threshold(&self.crown_gold);
+        if mini.is_none() && gold.is_none() {
+            return None;
+        }
+        Some((mini.unwrap_or(0), gold.unwrap_or(u16::MAX)))
+    }
+
+    /// A threshold as typed: empty, unparsable or 0 all mean "not set".
+    fn parse_threshold(text: &str) -> Option<u16> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed.parse::<u16>().ok().filter(|v| *v > 0)
+    }
+
+    /// The two crowns of one monster's recorded sizes, or None when no
+    /// threshold is set or the monster has no record.
+    ///
+    /// The smallest end earns 小金 and the largest 金冠, one crown(size, range)
+    /// call each, which is the pair the game draws.
+    pub fn monster_crown(
+        &self,
+        monster: usize,
+    ) -> Option<(mhnx_core::hunts::Crown, mhnx_core::hunts::Crown)> {
+        let range = self.crown_window()?;
+        let (lo, hi) = *self.hunt_size.get(monster)?;
+        Some((
+            mhnx_core::hunts::crown(lo, range),
+            mhnx_core::hunts::crown(hi, range),
+        ))
+    }
+
     fn tab_hunts(&mut self, ui: &mut egui::Ui) {
         ui.heading("狩猟記録");
         if self.save.is_none() {
@@ -5899,15 +6315,52 @@ impl MhnxEditor {
                 self.apply_hunts();
             }
         });
+        ui.separator();
+        // The crown thresholds are editor state, not save data: nothing here
+        // is written, and both fields start empty so a fresh editor marks no
+        // crown rather than guessing a per-monster window.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("冠の閾値");
+            ui.label("小金");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.crown_mini)
+                    .hint_text("空")
+                    .desired_width(56.0),
+            );
+            ui.label("以下 / 金冠");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.crown_gold)
+                    .hint_text("空")
+                    .desired_width(56.0),
+            );
+            ui.label("以上");
+            if ui.small_button("クリア").clicked() {
+                self.crown_mini.clear();
+                self.crown_gold.clear();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "空欄のままなら冠は判定しません。片方だけ入れるとその冠だけを見ます。\
+                 サイズはセーブに入っている % の値です。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.separator();
+        let crowns: Vec<Option<(mhnx_core::hunts::Crown, mhnx_core::hunts::Crown)>> =
+            (0..self.hunt_size.len())
+                .map(|i| self.monster_crown(i))
+                .collect();
         let needle = self.hunt_filter.trim().to_lowercase();
         egui::ScrollArea::vertical()
             .id_salt("huntlist")
             .show(ui, |ui| {
                 egui::Grid::new("huntgrid")
-                    .num_columns(5)
+                    .num_columns(6)
                     .striped(true)
                     .show(ui, |ui| {
-                        for h in ["id", "モンスター", "討伐", "捕獲", "サイズ"] {
+                        for h in ["id", "モンスター", "討伐", "捕獲", "サイズ", "冠"] {
                             ui.strong(h);
                         }
                         ui.end_row();
@@ -5957,6 +6410,32 @@ impl MhnxEditor {
                                 });
                             } else {
                                 ui.label("-");
+                            }
+                            // crown() judges one stored size against the
+                            // window; the smallest end earns 小金, the largest
+                            // 金冠, which is the pair the game draws.
+                            match crowns.get(i).copied().flatten() {
+                                Some((mini, gold)) => {
+                                    ui.horizontal(|ui| {
+                                        if mini.mini {
+                                            ui.label(
+                                                egui::RichText::new("小金")
+                                                    .color(mini_crown_color()),
+                                            );
+                                        }
+                                        if gold.gold {
+                                            ui.label(
+                                                egui::RichText::new("金冠").color(crown_color()),
+                                            );
+                                        }
+                                        if !mini.mini && !gold.gold {
+                                            ui.label(egui::RichText::new("—").weak());
+                                        }
+                                    });
+                                }
+                                None => {
+                                    ui.label(egui::RichText::new("—").weak());
+                                }
                             }
                             ui.end_row();
                         }
@@ -6053,6 +6532,11 @@ impl MhnxEditor {
             self.message = "ギルドカードを更新しました（まだファイルには書いていません）".to_owned();
         }
         ui.separator();
+        self.guild_weapon_usage(ui);
+        ui.separator();
+        self.guild_title(ui);
+        ui.separator();
+        self.guild_history(ui);
         ui.separator();
         ui.label(egui::RichText::new("闘技大会の記録").strong());
         // The summary is read-only; the editor below writes through
@@ -6144,6 +6628,348 @@ impl MhnxEditor {
     /// reference checker first: deleting a named record comes back with the
     /// list of what still points at it, and the dialog shows that list before
     /// it offers the forced delete.
+    /// The 武器使用数 grid: 15 weapon types by the three venues, plus the
+    /// total the card draws.
+    ///
+    /// The save holds three independent u16 arrays and no total; the card adds
+    /// them up when it draws the graph, so each cell is edited on its own and
+    /// the total column stays read-only. That is also the reason
+    /// set_weapon_usage takes a venue: writing a "total" would mean inventing a
+    /// split between the three.
+    fn guild_weapon_usage(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("武器使用数").strong());
+        let Some(save) = &self.save else { return };
+        let slot = self.slot;
+        let venues = mhnx_core::guildcard::Venue::ALL;
+        let mut usage: Vec<Vec<u32>> = venues
+            .iter()
+            .map(|v| mhnx_core::guildcard::venue_usage(save, slot, *v))
+            .collect();
+        if usage.iter().all(|v| v.is_empty()) {
+            ui.label("このスロットにはギルドカードがありません");
+            return;
+        }
+        let mut edits: Vec<(mhnx_core::guildcard::Venue, usize, u16)> = Vec::new();
+        egui::Grid::new("weapongrid")
+            .num_columns(5)
+            .striped(true)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                for h in ["武器", "村", "集会所", "闘技場", "合計"] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for w in 0..mhnx_core::guildcard::WEAPON_TYPES {
+                    ui.label(
+                        mhnx_core::gamedata::HUNT_WEAPONS
+                            .get(w)
+                            .copied()
+                            .unwrap_or("?"),
+                    );
+                    let mut total = 0u32;
+                    for (vi, venue) in venues.iter().enumerate() {
+                        let mut value = usage
+                            .get(vi)
+                            .and_then(|v| v.get(w))
+                            .copied()
+                            .unwrap_or(0);
+                        let mut edited = value as i32;
+                        if ui
+                            .add(egui::DragValue::new(&mut edited).range(0..=u16::MAX as i32))
+                            .changed()
+                        {
+                            value = edited as u16 as u32;
+                            if let Some(cell) = usage.get_mut(vi).and_then(|v| v.get_mut(w)) {
+                                *cell = value;
+                            }
+                            edits.push((*venue, w, value as u16));
+                        }
+                        total = total.saturating_add(value);
+                    }
+                    ui.label(format!("{}", total));
+                    ui.end_row();
+                }
+            });
+        ui.label(
+            egui::RichText::new(
+                "村・集会所・闘技場は別々に保存されています。合計はカードが表示のために\
+                 足した値で、セーブには入りません。",
+            )
+            .weak()
+            .small(),
+        );
+        for (venue, weapon, count) in edits {
+            self.set_weapon_count(venue, weapon, count);
+        }
+    }
+
+    /// The 称号 picker: the three ids the card stores, named from the romfs
+    /// title tables.
+    fn guild_title(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("称号").strong());
+        let Some(save) = &self.save else { return };
+        let slot = self.slot;
+        let stored = mhnx_core::guildcard::title(save, slot).unwrap_or_default();
+        // Only what the card has unlocked is offered, plus whatever it shows
+        // now: a save can hold an id that is not in the unlock map, and the
+        // picker must not silently drop what is on screen.
+        let mut word_ids: Vec<u16> = mhnx_core::guildcard::unlocked_title_words(save, slot);
+        word_ids.retain(|id| (*id as usize) < mhnx_core::guildcard::TITLE_WORDS);
+        for id in [stored.first, stored.last] {
+            if !word_ids.contains(&id) {
+                word_ids.push(id);
+            }
+        }
+        word_ids.sort_unstable();
+        word_ids.dedup();
+        if word_ids.is_empty() {
+            word_ids.push(0);
+        }
+        // The names come from the romfs folder read on the 進行状況 tab; the
+        // same row is repeated here so a user who only wants a title does not
+        // have to find that tab.
+        egui::CollapsingHeader::new(if self.title_table.is_empty() {
+            "称号名を romfs から読む（未読込）"
+        } else {
+            "称号名の元になった romfs"
+        })
+        .id_salt("guildromfs")
+        .show(ui, |ui| self.progress_romfs_bar(ui));
+        let table = &self.title_table;
+        let text = table.text(stored);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("現在");
+            if text.is_empty() {
+                ui.label(egui::RichText::new("(なし)").weak());
+            } else {
+                ui.label(egui::RichText::new(text).strong());
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "番号 {} / {} / {}",
+                    stored.first, stored.link, stored.last
+                ))
+                .weak()
+                .small(),
+            );
+        });
+        let mut title = stored;
+        let words = &word_ids[..];
+        egui::Grid::new("titlegrid")
+            .num_columns(6)
+            .spacing([6.0, 3.0])
+            .show(ui, |ui| {
+                ui.label("前の語");
+                Self::title_word_picker(ui, "titlefirst", &mut title.first, words, table);
+                ui.label("連結");
+                Self::title_link_picker(ui, "titlelink", &mut title.link, table);
+                ui.label("後の語");
+                Self::title_word_picker(ui, "titlelast", &mut title.last, words, table);
+                ui.end_row();
+            });
+        ui.label(
+            egui::RichText::new(
+                "解放済みの語だけを並べています。名前は romfs の GC_Title_1 / GC_Title_2 から\
+                 読み、セーブにもファイルにも書きません。",
+            )
+            .weak()
+            .small(),
+        );
+        if title != stored {
+            self.set_title_ids(title);
+        }
+    }
+
+    /// One of the two word pickers of the 称号 row.
+    fn title_word_picker(
+        ui: &mut egui::Ui,
+        salt: &str,
+        id: &mut u16,
+        ids: &[u16],
+        table: &mhnx_core::guildcard::TitleTable,
+    ) {
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(Self::title_word_label(table, *id))
+            .width(240.0)
+            .show_ui(ui, |ui| {
+                for pick in ids {
+                    let label = Self::title_word_label(table, *pick);
+                    ui.selectable_value(id, *pick, label);
+                }
+            });
+    }
+
+    /// "number: name" for a word of GC_Title_1, or "number: (名前未読込)" when
+    /// the romfs table was not loaded: the id is still what gets written.
+    fn title_word_label(table: &mhnx_core::guildcard::TitleTable, id: u16) -> String {
+        if id == 0 {
+            return String::from("0: (なし)");
+        }
+        match table.word(id as usize) {
+            Some(name) => format!("{}: {}", id, name),
+            None => format!("{}: (名前未読込)", id),
+        }
+    }
+
+    /// The linking-word picker. All 121 entries are offered: the link table is
+    /// small enough to show whole, and an id the card has not unlocked is a
+    /// value the game itself can hold.
+    fn title_link_picker(
+        ui: &mut egui::Ui,
+        salt: &str,
+        id: &mut u16,
+        table: &mhnx_core::guildcard::TitleTable,
+    ) {
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(Self::title_link_label(table, *id))
+            .width(200.0)
+            .show_ui(ui, |ui| {
+                for pick in 0..(mhnx_core::guildcard::TITLE_LINKS as u16) {
+                    let label = Self::title_link_label(table, pick);
+                    ui.selectable_value(id, pick, label);
+                }
+            });
+    }
+
+    /// "number: name" for a word of GC_Title_2.
+    fn title_link_label(table: &mhnx_core::guildcard::TitleTable, id: u16) -> String {
+        if id == 0 {
+            return String::from("0: (なし)");
+        }
+        match table.link(id as usize) {
+            Some(name) => format!("{}: {}", id, name),
+            None => format!("{}: (名前未読込)", id),
+        }
+    }
+
+    /// The ten quest-history records and the seven quest counters.
+    fn guild_history(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("クエスト履歴（10 件）").strong());
+        let Some(save) = &self.save else { return };
+        let slot = self.slot;
+        let history = mhnx_core::guildcard::history(save, slot);
+        let counts = mhnx_core::guildcard::quest_counts(save, slot);
+        // The card shows the sum capped at 99,999; both numbers are worth
+        // seeing, because the counters themselves are not capped.
+        let shown_total = mhnx_core::guildcard::quest_total(save, slot);
+        let raw_total: u32 = counts.iter().sum();
+        if history.is_empty() {
+            ui.label("記録はありません");
+        } else {
+            egui::Grid::new("historygrid")
+                .num_columns(4)
+                .striped(true)
+                .spacing([8.0, 3.0])
+                .show(ui, |ui| {
+                    for h in ["日付", "クエストID", "クエスト名", "種別"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for r in &history {
+                        ui.label(format!("{:04}/{:02}/{:02}", r.year, r.month, r.day));
+                        ui.label(format!("{}", r.quest_id));
+                        ui.label(if r.name.is_empty() {
+                            "(名前なし)"
+                        } else {
+                            r.name.as_str()
+                        });
+                        ui.label(Self::history_kind(r.kind));
+                        ui.end_row();
+                    }
+                });
+        }
+        ui.separator();
+        ui.label(egui::RichText::new("クエスト回数").strong());
+        let labels = [
+            "村（下位）",
+            "村（上位）",
+            "集会所（下位）",
+            "集会所（上位）",
+            "集会所（G）",
+            "特別許可",
+            "闘技大会",
+        ];
+        egui::Grid::new("questcountgrid")
+            .num_columns(2)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                for (i, label) in labels.iter().enumerate() {
+                    ui.label(*label);
+                    ui.label(format!("{}", counts.get(i).copied().unwrap_or(0)));
+                    ui.end_row();
+                }
+                ui.label(egui::RichText::new("合計").strong());
+                ui.label(egui::RichText::new(format!("{}", raw_total)).strong());
+                ui.end_row();
+                ui.label("カードの表示");
+                ui.label(format!("{}（99,999 で頭打ち）", shown_total));
+            });
+    }
+
+    /// What one history record is about; the numbers are documented on
+    /// HistoryRecord.
+    fn history_kind(kind: u16) -> String {
+        match kind {
+            0 => "HR アップ".to_owned(),
+            1 => "MHX からの引き継ぎ".to_owned(),
+            2 => "ウェルカム".to_owned(),
+            3 => "作成".to_owned(),
+            4 | 5 => "強化・作成回数".to_owned(),
+            6 => "勲章コンプリート".to_owned(),
+            7 => "クエスト達成".to_owned(),
+            8 => "クエスト失敗".to_owned(),
+            9 => "クエスト破棄".to_owned(),
+            10 => "雇用".to_owned(),
+            other => format!("不明 ({})", other),
+        }
+    }
+
+    /// Rewrite one cell of the 武器使用数 grid.
+    pub fn set_weapon_count(
+        &mut self,
+        venue: mhnx_core::guildcard::Venue,
+        weapon: usize,
+        count: u16,
+    ) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if !mhnx_core::guildcard::set_weapon_usage(save, slot, venue, weapon, count) {
+            self.message = format!("武器使用数 {} 番を書き換えられませんでした", weapon);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "武器使用数を {} にしました（まだファイルには書いていません）",
+            count
+        );
+        true
+    }
+
+    /// Rewrite the three title ids.
+    ///
+    /// The ids are written as chosen; which of them the card has unlocked is
+    /// the picker's business, and a title the game itself wrote is not refused.
+    pub fn set_title_ids(&mut self, title: mhnx_core::guildcard::Title) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if !mhnx_core::guildcard::set_title(save, slot, title) {
+            self.message = String::from("称号を書き換えられませんでした");
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "称号を {} / {} / {} にしました（まだファイルには書いていません）",
+            title.first, title.link, title.last
+        );
+        true
+    }
+
     fn tab_equip(&mut self, ui: &mut egui::Ui) {
         ui.heading("装備ボックス");
         if self.save.is_none() {
@@ -8083,12 +8909,15 @@ impl MhnxEditor {
         }
     }
 
-    /// Find the three game tables under the folder the user named.
+    /// Find the game tables under the folder the user named.
     ///
     /// The retail layout puts them in nativeNX/table; the other spellings cover
     /// a folder that was picked one level too high (the romfs root) or too low
     /// (the table folder itself). A folder that holds only some of them is used
     /// for what it does hold: the medal table alone is still worth reading.
+    /// The two title tables ride along: the ギルド tab names a title with them,
+    /// and a second romfs field just for that would be one more thing to get
+    /// wrong.
     fn find_romfs_tables(root: &std::path::Path) -> Option<RomfsTables> {
         // A file that was picked instead of a folder still names the folder its
         // neighbours live in.
@@ -8112,6 +8941,8 @@ impl MhnxEditor {
             let mut awards: Vec<PathBuf> = Vec::new();
             let mut names: Vec<PathBuf> = Vec::new();
             let mut atd: Vec<PathBuf> = Vec::new();
+            let mut titles1: Vec<PathBuf> = Vec::new();
+            let mut titles2: Vec<PathBuf> = Vec::new();
             for entry in rd.flatten() {
                 let path = entry.path();
                 let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
@@ -8120,6 +8951,10 @@ impl MhnxEditor {
                 let lower = file.to_ascii_lowercase();
                 if lower.starts_with("gc_medal") && lower.ends_with(".gmd") {
                     awards.push(path);
+                } else if lower.starts_with("gc_title_1") && lower.ends_with(".gmd") {
+                    titles1.push(path);
+                } else if lower.starts_with("gc_title_2") && lower.ends_with(".gmd") {
+                    titles2.push(path);
                 } else if lower.starts_with("activitydata") && lower.ends_with(".gmd") {
                     names.push(path);
                 } else if lower.starts_with("activitydata") && lower.ends_with(".atd") {
@@ -8128,7 +8963,9 @@ impl MhnxEditor {
             }
             let score = (!awards.is_empty()) as usize
                 + (!names.is_empty()) as usize
-                + (!atd.is_empty()) as usize;
+                + (!atd.is_empty()) as usize
+                + (!titles1.is_empty()) as usize
+                + (!titles2.is_empty()) as usize;
             if score > best_score {
                 best_score = score;
                 best = Some(RomfsTables {
@@ -8136,6 +8973,8 @@ impl MhnxEditor {
                     award: Self::prefer_japanese(awards),
                     names: Self::prefer_japanese(names),
                     atd: Self::prefer_japanese(atd),
+                    title1: Self::prefer_japanese(titles1),
+                    title2: Self::prefer_japanese(titles2),
                 });
             }
         }
@@ -8178,7 +9017,25 @@ impl MhnxEditor {
             .and_then(|p| std::fs::read(p).ok())
             .map(|b| romfstables::request_records(&b))
             .unwrap_or_default();
-        if award_names.is_empty() && request_names.is_empty() && request_records.is_empty() {
+        // The two title tables are one table as far as the ギルド tab is
+        // concerned: a dump with only one of them still names the half it
+        // holds, and the other half reads as no name rather than a wrong one.
+        let title_words = tables
+            .title1
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        let title_links = tables
+            .title2
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .unwrap_or_default();
+        let titles = mhnx_core::guildcard::TitleTable::from_gmd(&title_words, &title_links);
+        if award_names.is_empty()
+            && request_names.is_empty()
+            && request_records.is_empty()
+            && titles.is_empty()
+        {
             return None;
         }
         let mut parts: Vec<String> = Vec::new();
@@ -8197,6 +9054,14 @@ impl MhnxEditor {
         } else {
             format!("依頼レコード {}", request_records.len())
         });
+        // TitleTable has no length accessor on purpose (the tables are only
+        // ever addressed by id), so the report says whether it can name a
+        // title rather than how many words it holds.
+        parts.push(if titles.is_empty() {
+            String::from("称号名 0（GC_Title_*.gmd が読めません）")
+        } else {
+            String::from("称号名 読込済み")
+        });
         Some(RomfsLoad {
             report: format!(
                 "{} から読み込みました: {}",
@@ -8207,6 +9072,7 @@ impl MhnxEditor {
             award_names,
             request_names,
             request_records,
+            titles,
         })
     }
 
@@ -8228,6 +9094,7 @@ impl MhnxEditor {
                 self.award_names = load.award_names;
                 self.request_names = load.request_names;
                 self.request_records = load.request_records;
+                self.title_table = load.titles;
                 self.message = load.report;
             }
             None => {
@@ -8238,6 +9105,7 @@ impl MhnxEditor {
                 self.award_names.clear();
                 self.request_names.clear();
                 self.request_records.clear();
+                self.title_table = mhnx_core::guildcard::TitleTable::default();
                 self.romfs_status = format!(
                     "{} に romfs の table が見つかりません（nativeNX/table を探しました）",
                     raw
@@ -8252,6 +9120,7 @@ impl MhnxEditor {
         self.award_names.clear();
         self.request_names.clear();
         self.request_records.clear();
+        self.title_table = mhnx_core::guildcard::TitleTable::default();
         self.romfs_dir = None;
         self.romfs_status = String::from("romfs を読み込んでいません");
         self.message = "romfs の読み込みを解除しました".to_owned();
@@ -8635,7 +9504,9 @@ impl MhnxEditor {
             if ui.button("読み込む").clicked() {
                 self.load_romfs();
             }
-            let loaded = !self.award_names.is_empty() || !self.request_records.is_empty();
+            let loaded = !self.award_names.is_empty()
+                || !self.request_records.is_empty()
+                || !self.title_table.is_empty();
             if loaded
                 && ui
                     .small_button("解除")
@@ -10829,9 +11700,289 @@ mod tests {
         assert_eq!(entries[2], "");
         assert!(auto.iter().all(|s| s.is_empty()));
     }
+
+    /// Teaching a skill or a move fills the first empty taught slot through
+    /// add_skill / add_move, replacing one goes through set_skill / set_move,
+    /// and the duplicate the core allows is reported by skill_warnings instead
+    /// of being refused.
+    #[test]
+    fn a_palico_is_taught_skills_and_moves_through_the_learned_lists() {
+        let dir = Scratch::new("palicolearned");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // A record the game uses: a name, and learned lists three and two
+        // slots long (the length byte is what the writers respect).
+        let base = app
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        {
+            let save = app.save.as_mut().expect("save");
+            assert!(mhnx_core::palico::set_name(save, 0, 0, "テスト"));
+            let at = base + mhnx_core::palico::OFF_ROSTER + mhnx_core::palico::SKILL_LEN;
+            save.body_mut()[at] = 3;
+            let at = base + mhnx_core::palico::OFF_ROSTER + mhnx_core::palico::MOVE_LEN;
+            save.body_mut()[at] = 2;
+        }
+        app.dirty = false;
+
+        // 8 is a real otomon skill; the first empty taught slot takes it.
+        assert!(app.palico_list_write(0, false, None, 8), "{}", app.message);
+        assert!(app.dirty, "a write has to mark the save dirty");
+        app.dirty = false;
+
+        // Slot 1 to the same id: the core does not deduplicate, so the tab has
+        // to show the duplicate rather than silently refuse it.
+        assert!(
+            app.palico_list_write(0, false, Some(1), 8),
+            "{}",
+            app.message
+        );
+        let warnings = app
+            .save
+            .as_ref()
+            .map(|s| mhnx_core::palico::skill_warnings(s, 0, 0))
+            .unwrap_or_default();
+        assert!(
+            warnings.iter().any(|w| w.contains("重複")),
+            "{:?}",
+            warnings
+        );
+
+        // A move in the other list, and the two tendency setters.
+        assert!(app.palico_list_write(0, true, None, 3), "{}", app.message);
+        assert!(app.set_palico_type(0, 5), "{}", app.message);
+        assert!(app.set_palico_attack(0, 2), "{}", app.message);
+
+        let p = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::palico::roster(s, 0).into_iter().next())
+            .expect("a palico");
+        assert!(p.learned_skills().contains(&8));
+        assert!(p.learned_moves().contains(&3));
+        assert_eq!(p.system, 5);
+        assert_eq!(p.attack, 2);
+        assert_eq!(mhnx_core::palico::type_of(&p), Some(5));
+        assert_eq!(mhnx_core::palico::attack_of(&p), Some(2));
+
+        // Refusals: past the list, a learnt skill again, and an id outside the
+        // tables. None of them may touch the save.
+        app.dirty = false;
+        assert!(!app.palico_list_write(0, false, Some(9), 8));
+        assert!(!app.dirty);
+        assert!(!app.palico_list_write(0, false, None, 8));
+        assert!(!app.palico_list_write(0, true, None, 3));
+        assert!(!app.palico_list_write(
+            0,
+            false,
+            None,
+            mhnx_core::palico::MAX_SKILL + 1
+        ));
+        assert!(!app.dirty);
+    }
+
+    /// One cell of the 武器使用数 grid moves only the venue it names, and the
+    /// total the card shows is the three venues added up.
+    #[test]
+    fn a_weapon_usage_cell_lands_in_the_venue_it_names() {
+        let dir = Scratch::new("weaponusage");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.dirty = false;
+
+        assert!(
+            app.set_weapon_count(mhnx_core::guildcard::Venue::Hub, 4, 321),
+            "{}",
+            app.message
+        );
+        assert!(app.dirty);
+        app.dirty = false;
+
+        let (village, hub, arena, total) = {
+            let save = app.save.as_ref().expect("save");
+            (
+                mhnx_core::guildcard::venue_usage(save, 0, mhnx_core::guildcard::Venue::Village),
+                mhnx_core::guildcard::venue_usage(save, 0, mhnx_core::guildcard::Venue::Hub),
+                mhnx_core::guildcard::venue_usage(save, 0, mhnx_core::guildcard::Venue::Arena),
+                mhnx_core::guildcard::weapon_usage(save, 0),
+            )
+        };
+        assert_eq!(hub[4], 321);
+        assert_eq!(village[4], 0, "the village array must not move");
+        assert_eq!(arena[4], 0, "the arena array must not move");
+        assert_eq!(total[4], 321, "the total is the three venues added up");
+
+        // A weapon past the fifteen is refused and writes nothing.
+        assert!(!app.set_weapon_count(
+            mhnx_core::guildcard::Venue::Arena,
+            mhnx_core::guildcard::WEAPON_TYPES,
+            1
+        ));
+        assert!(!app.dirty);
+    }
+
+    /// The title is written as three ids, and the romfs tables turn them into
+    /// the text the card shows.
+    #[test]
+    fn a_title_is_written_and_named_from_the_romfs_tables() {
+        let dir = Scratch::new("title");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        // The tables the way read_romfs builds them: 1309 words followed by
+        // their descriptions, and 121 linking words.
+        let mut words: Vec<String> = (0..1309).map(|i| format!("語{}", i)).collect();
+        words.extend((0..1309).map(|i| format!("説明{}", i)));
+        let links: Vec<String> = (0..121).map(|i| format!("接続{}", i)).collect();
+        app.title_table = mhnx_core::guildcard::TitleTable::from_gmd(
+            &gmd_bytes(&words),
+            &gmd_bytes(&links),
+        );
+        let title = mhnx_core::guildcard::Title {
+            first: 4,
+            link: 1,
+            last: 6,
+        };
+        app.dirty = false;
+        assert!(app.set_title_ids(title), "{}", app.message);
+        assert!(app.dirty);
+        assert_eq!(
+            app.save
+                .as_ref()
+                .and_then(|s| mhnx_core::guildcard::title(s, 0)),
+            Some(title)
+        );
+        assert_eq!(app.title_table.text(title), "語4接続1語6");
+    }
+
+    /// The title tables are read out of the same romfs folder the award names
+    /// come from, and 解除 drops them with the rest.
+    #[test]
+    fn the_title_tables_come_in_with_the_romfs_folder() {
+        let dir = Scratch::new("romfstitle");
+        let table = dir.path().join("nativeNX").join("table");
+        std::fs::create_dir_all(&table).expect("table folder");
+        let mut words: Vec<String> = (0..1309).map(|i| format!("語{}", i)).collect();
+        words.extend((0..1309).map(|i| format!("説明{}", i)));
+        std::fs::write(table.join("GC_Title_1_jpn.gmd"), gmd_bytes(&words)).expect("words");
+        let links: Vec<String> = (0..121).map(|i| format!("接続{}", i)).collect();
+        std::fs::write(table.join("GC_Title_2_jpn.gmd"), gmd_bytes(&links)).expect("links");
+
+        let mut app = MhnxEditor::default();
+        app.romfs_path = dir.path().display().to_string();
+        app.load_romfs();
+        assert!(app.romfs_dir.is_some(), "{}", app.romfs_status);
+        assert_eq!(
+            app.title_table.word(4).map(|s| s.to_owned()),
+            Some("語4".to_owned())
+        );
+        assert_eq!(
+            app.title_table.link(1).map(|s| s.to_owned()),
+            Some("接続1".to_owned())
+        );
+        assert!(app.message.contains("称号名"), "{}", app.message);
+
+        app.clear_romfs();
+        assert!(app.title_table.is_empty());
+    }
+
+    /// The three sections have to survive a frame without a window: egui
+    /// panics on a duplicate table id or a grid whose rows and columns do not
+    /// agree, and neither shows up in a write-path test.
+    #[test]
+    fn the_new_sections_draw_a_frame_without_a_window() {
+        let dir = Scratch::new("draw");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let base = app
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        {
+            let save = app.save.as_mut().expect("save");
+            assert!(mhnx_core::palico::set_name(save, 0, 0, "テスト"));
+            let at = base + mhnx_core::palico::OFF_ROSTER + mhnx_core::palico::SKILL_LEN;
+            save.body_mut()[at] = 3;
+            let at = base + mhnx_core::palico::OFF_ROSTER + mhnx_core::palico::MOVE_LEN;
+            save.body_mut()[at] = 2;
+        }
+        app.hunt_size = vec![(90, 130); mhnx_core::hunts::MONSTERS];
+        app.crown_mini = String::from("95");
+        app.crown_gold = String::from("120");
+        app.hunt_filter = String::from("rath");
+
+        for tab in [Tab::Palico, Tab::Guild, Tab::Hunts] {
+            app.tab = tab;
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| app.draw_tab(ui));
+                });
+            });
+            assert!(!output.shapes.is_empty(), "{:?} drew nothing", tab);
+        }
+    }
+    /// The crown thresholds start empty (no judgement) and each filled field
+    /// judges only its own crown.
+    #[test]
+    fn the_crown_window_starts_empty_and_judges_only_what_is_filled_in() {
+        let dir = Scratch::new("crown");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.hunt_size = vec![(90, 130), (0, 0)];
+
+        // Both fields empty: no threshold, so no crown is marked at all.
+        assert!(app.crown_window().is_none());
+        assert!(app.monster_crown(0).is_none());
+
+        // One field filled judges its own crown only: an empty 金冠 field must
+        // not turn every size gold, which a range of (mini, 0) would.
+        app.crown_mini = String::from("100");
+        let (mini, gold) = app.monster_crown(0).expect("a window");
+        assert!(mini.mini, "90 <= 100 is a mini crown");
+        assert!(!gold.gold, "no gold threshold was given");
+
+        app.crown_gold = String::from("120");
+        let (mini, gold) = app.monster_crown(0).expect("a window");
+        assert!(mini.mini);
+        assert!(gold.gold, "130 >= 120 is a gold crown");
+
+        // A record with no specimen stays crownless, and a field that is not
+        // a number is the same as an empty one.
+        let (mini, gold) = app.monster_crown(1).expect("a record");
+        assert!(!mini.mini && !gold.gold);
+        app.crown_mini = String::from("abc");
+        app.crown_gold = String::from("0");
+        assert!(app.crown_window().is_none());
+        assert!(app.monster_crown(0).is_none());
+    }
 }
 
 
+
+/// The colour a 金冠 (gold crown) mark is drawn in.
+fn crown_color() -> egui::Color32 {
+    egui::Color32::from_rgb(228, 196, 96)
+}
+
+/// The colour a 小金 (miniature crown) mark is drawn in. Pale steel, so the
+/// two marks stay apart without either reading as a warning.
+fn mini_crown_color() -> egui::Color32 {
+    egui::Color32::from_rgb(196, 202, 212)
+}
 
 /// The colour a warning about the data itself is drawn in.
 ///

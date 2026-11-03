@@ -988,11 +988,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         ],
         // Minus opens the palico equipment panel on both palico screens, and
         // inside it Minus is the two-press release, so the chip says both.
+        // Plus opens the skill / support move panel on the roster alone; it is
+        // not the quit key there, the slot list one B away still is.
         Roster => &[
             ("</>", "値"),
             ("Y", "項目切替"),
             ("A", "名前"),
             ("-", "装備/解除(2回)"),
+            ("+", "スキル/サポ"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1422,10 +1425,13 @@ pub fn run() -> i32 {
                     }
                 }
             } else {
-                // Plus quits everywhere except the equipment list, where the
-                // state machine uses it to open the new-record form. The key
-                // still reaches the screen below.
-                if down & BTN_PLUS != 0 && ed.screen != mhnx_core::hbedit::Screen::Equip {
+                // Plus quits everywhere except the two screens that give it a
+                // tool: the equipment list opens its new-record form with it, and
+                // the roster opens the skill panel. While that panel is open Plus
+                // is the quit key again, like the equipment panel above it.
+                let plus_is_a_tool = ed.screen == mhnx_core::hbedit::Screen::Equip
+                    || (ed.screen == mhnx_core::hbedit::Screen::Roster && !ed.palico_skill_open());
+                if down & BTN_PLUS != 0 && !plus_is_a_tool {
                     break;
                 }
 

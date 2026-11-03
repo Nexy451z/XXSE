@@ -27,11 +27,11 @@ use mhnx_core::check::Severity;
 use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
-    decoration_name_of, item_name_of, monster_name, palico_part_name, Editor, ItemSetOp, Key,
-    PalicoEquipRow, Screen, CHAR_FIELDS, CONSOLE_SAVE, CSV_DIR, ITEM_OP_ADD, ITEM_OP_CLAMP,
-    ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS,
-    PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_QUESTS,
-    PROGRESS_REQUESTS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
+    decoration_name_of, item_name_of, monster_name, palico_part_name, palico_skill_tab_name,
+    Editor, ItemSetOp, Key, PalicoEquipRow, PalicoSkillRow, Screen, CHAR_FIELDS, CONSOLE_SAVE,
+    CSV_DIR, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO,
+    ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, PROGRESS_AWARDS,
+    PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -533,6 +533,10 @@ impl GuiState {
     /// the jump already sets a message of its own.
     fn close_palico_panel(&mut self, ed: &mut Editor) {
         ed.palico_equip = None;
+        // The skill panel is the second mode of the same screen and is put
+        // away by the same jumps: a form left open on a screen that no longer
+        // draws it is the trap this exists for.
+        ed.palico_skill = None;
     }
 
     fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
@@ -1074,6 +1078,13 @@ impl GuiState {
             if ed.palico_equip_open() {
                 return;
             }
+            // The skill panel spends L / R on its candidate (the tables run to
+            // 93 and 56 entries, so one key has to step ten), and it owns the
+            // key for the same reason the equipment panel does.
+            if ed.palico_skill_open() {
+                ed.input(key);
+                return;
+            }
             // The second stage of the bulk add is one number: L/R step it
             // instead of paging the list underneath.
             if ed.screen == Screen::ItemPick
@@ -1234,6 +1245,10 @@ impl GuiState {
             // it is open every key belongs to it, the same shape the item menu
             // has on the item box.
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => ed.input(key),
+            // The skill panel is the second mode of the roster screen and owns
+            // every key while it is open, the same shape the equipment panel has
+            // (Y is its tab key there, not the roster's field key).
+            Screen::Roster if ed.palico_skill_open() => ed.input(key),
             Screen::Roster => match key {
                 Key::Y => {
                     ed.roster_field = (ed.roster_field + 1) % 3;
@@ -2215,10 +2230,13 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Guild => ed.guild_field,
         // One cursor per view: the screen swaps the list under it.
         Screen::Progress => ed.progress_cursor(),
-        // The panel's row while it is open, the list's row otherwise.
-        Screen::Roster => match ed.palico_equip {
+        // A mode's row while one is open, the list's row otherwise.
+        Screen::Roster => match ed.palico_skill {
             Some(state) => state.field,
-            None => ed.roster_cursor,
+            None => match ed.palico_equip {
+                Some(state) => state.field,
+                None => ed.roster_cursor,
+            },
         },
         // The list's row while the list is showing, and the form's row while
         // the set editor is open: the editor is a mode of this screen.
@@ -2282,9 +2300,12 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => 3,
         Screen::Progress => ed.progress_len(),
-        Screen::Roster => match ed.palico_equip {
-            Some(_) => PALICO_EQUIP_ROWS,
-            None => ed.palicos().len(),
+        Screen::Roster => match ed.palico_skill {
+            Some(_) => ed.palico_skill_list_len(),
+            None => match ed.palico_equip {
+                Some(_) => PALICO_EQUIP_ROWS,
+                None => ed.palicos().len(),
+            },
         },
         Screen::Sets => {
             if ed.set_edit.is_some() {
@@ -2434,7 +2455,10 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         Screen::Guild => ed.guild_field = clamped,
         Screen::Progress => ed.set_progress_cursor(clamped),
         Screen::Roster => {
-            if let Some(mut state) = ed.palico_equip {
+            if let Some(mut state) = ed.palico_skill {
+                state.field = clamped;
+                ed.palico_skill = Some(state);
+            } else if let Some(mut state) = ed.palico_equip {
                 // A tap on another row is a cursor move, so the pending release
                 // (which belongs to the row it was armed on) is dropped.
                 state.field = clamped;
@@ -3047,6 +3071,19 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, &preset_lbl, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::CharmPreset(0));
             }
+            // The skill panel is the other mode of the roster screen, so its
+            // two keys are the chips while it is open.
+            Screen::Roster if ed.palico_skill_open() => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[Y] タブ切替", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Y));
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "[A] 差し替え", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
+            }
             // The equipment panel is a mode of both palico screens, so its two
             // keys are the only chips while it is open.
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
@@ -3068,8 +3105,8 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "全オトモ Lv99", t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::RosterMaxAll);
+                btn_text(c, 1108, sy, 158, sh, "[+] スキル", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Plus));
             }
             Screen::Palico => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
@@ -3162,7 +3199,12 @@ impl GuiState {
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
                 "[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-×2] 解除  [B] 一覧  [X] 保存"
             }
-            Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [L/R] サブタブ  [X] 保存",
+            Screen::Roster if ed.palico_skill_open() => {
+                "[▲/▼] 枠  [◀/▶] 候補  [L/R] ±10  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
+            }
+            Screen::Roster => {
+                "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [+] スキル  [L/R] タブ  [X] 保存"
+            }
             Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
             Screen::Hunts => "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [L/R] サブタブ  [X] 保存",
             // The three views of the progress screen, one line each: Y is the
@@ -3216,6 +3258,7 @@ impl GuiState {
             Screen::Csv => self.draw_csv(c, ed),
             // The palico equipment panel is a mode of the two palico screens,
             // so it is dispatched before the screens themselves.
+            Screen::Roster if ed.palico_skill_open() => self.draw_palico_skill(c, ed),
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
                 self.draw_palico_equip(c, ed)
             }
@@ -3621,6 +3664,60 @@ impl GuiState {
         self.add_hit(ix + 20, btn_y, iw - 40, 42, UiAction::ActivateRow(row_idx));
 
         let mut cur_y = btn_y + 52; // iy + 220
+
+        // The skill panel is the other mode of the roster screen. A row is one
+        // slot of a learned list, so the deck gives the candidate stepper (the
+        // tables run to 93 and 56 entries, so the pad steps ten with L / R), the
+        // tab switch and the way back; the [A] button above writes the candidate
+        // into the row the list shows, so that is not repeated here.
+        if ed.palico_skill_open() {
+            let slot = row_idx;
+            c.hline(ix + 16, cur_y, iw - 32, t.border_subtle);
+            cur_y += 8;
+            let full_w = iw - 40;
+            let half_w = (iw - 48) / 2;
+            c.text_sized(ix + 20, cur_y, "候補をめくる・一覧を切り替える", t.text_muted, FontSize::Small);
+            cur_y += 24;
+            self.draw_tool_button(
+                c,
+                ix + 20,
+                cur_y,
+                half_w,
+                38,
+                "◀ 前の候補",
+                UiAction::AdjustRow(slot, Key::Left),
+            );
+            self.draw_tool_button(
+                c,
+                ix + 28 + half_w,
+                cur_y,
+                half_w,
+                38,
+                "▶ 次の候補",
+                UiAction::AdjustRow(slot, Key::Right),
+            );
+            cur_y += 44;
+            self.draw_tool_button(
+                c,
+                ix + 20,
+                cur_y,
+                full_w,
+                38,
+                "[Y] スキル / サポート行動",
+                UiAction::Key(Key::Y),
+            );
+            cur_y += 44;
+            self.draw_tool_button(
+                c,
+                ix + 20,
+                cur_y,
+                full_w,
+                38,
+                "[B] 一覧に戻る",
+                UiAction::Key(Key::B),
+            );
+            return;
+        }
 
         // The palico equipment panel is a mode of the two palico screens and
         // has the two tools those screens do not: the candidate stepper and the
@@ -4035,6 +4132,18 @@ impl GuiState {
                     38,
                     "全オトモ Lv99・なつき100・EXP最大",
                     UiAction::RosterMaxAll,
+                );
+                cur_y += 44;
+                // The panel the [A] button on the row above cannot open: this is
+                // the skill / support move editor for the palico on the list.
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[+] スキル / サポート行動",
+                    UiAction::Key(Key::Plus),
                 );
             }
             Screen::Palico => {
@@ -5413,6 +5522,63 @@ impl GuiState {
             "装着",
             &notice,
         );
+    }
+
+    /// The palico skill / support move panel: the twelve learned skills or the
+    /// sixteen learned support moves, one row each.
+    ///
+    /// The other mode of the roster screen, so it uses the same list/inspector
+    /// layout those screens use: a row is the id the slot holds and the candidate
+    /// [A] would write, the inspector meta line carries the two tendencies the
+    /// record stores, and the warnings the core reports are the amber strip under
+    /// the list instead of a line drawn over the last row.
+    fn draw_palico_skill(&mut self, c: &mut Canvas, ed: &Editor) {
+        let panel: Vec<PalicoSkillRow> = ed.palico_skill_rows();
+        let field = ed.palico_skill.map(|s| s.field).unwrap_or(0);
+        let tab = ed.palico_skill_tab();
+        let (used, rows_total) = ed.palico_skill_slots();
+        let (who, roster_no) = match ed.palico_skill_target() {
+            Some(p) => (p.name, p.index + 1),
+            None => (
+                String::from("?"),
+                ed.palico_skill.map(|s| s.palico + 1).unwrap_or(0),
+            ),
+        };
+        // The tendencies belong to the record, not to the row, so every row
+        // carries the same line: the inspector shows whichever row is open.
+        let tendencies = ed.palico_skill_tendencies();
+        let mut rows = Vec::with_capacity(panel.len());
+        for row in panel.iter() {
+            // A slot past the length byte is the fill the game leaves there: it
+            // is listed, and it says which value it holds, because [A] on it is
+            // refused and the user has to be able to see why.
+            let title = if !row.counted {
+                format!("未使用（{}）", row.current)
+            } else if row.is_empty() {
+                format!("空き {}/{}", row.index + 1, rows_total)
+            } else {
+                row.current_text()
+            };
+            rows.push((
+                row.index,
+                title,
+                tendencies.clone(),
+                row.pick_text(),
+                format!("#{:02}", row.index),
+            ));
+        }
+        // Name and tab first: the list column is clipped at 620px, so the
+        // part that identifies the record has to survive the clip.
+        let hdr = format!(
+            "オトモ{} — {}（#{}）  {}/{} 枠",
+            palico_skill_tab_name(tab),
+            who,
+            roster_no,
+            used,
+            rows_total
+        );
+        let warnings = ed.palico_skill_warnings();
+        self.draw_adaptive_rows_warn(c, ed, &hdr, &rows, field, false, "差し替え", &warnings);
     }
 
     fn draw_roster(&mut self, c: &mut Canvas, ed: &Editor) {
