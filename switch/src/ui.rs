@@ -260,6 +260,12 @@ pub enum UiAction {
     PageScroll(i32),
     Rescan,
     QuickSave,
+    /// The whole-save undo (L held down, or the footer pill).
+    Undo,
+    /// The save review: A on the dialog.
+    CommitReview,
+    /// The save review: B on the dialog.
+    CancelReview,
     // The item box bulk operation menu
     OpenItemMenu,
     ItemOp(usize),
@@ -1502,6 +1508,30 @@ impl GuiState {
     // Touch Screen Handler
     // -----------------------------------------------------------------------
     pub fn handle_touch(&mut self, ed: &mut Editor, touching: bool, tx: i32, ty: i32) -> bool {
+        // The save review is modal: while it is open only its two buttons
+        // answer a tap, never the list or the bar underneath.
+        if ed.review_open() {
+            if touching && !self.was_touching {
+                let hit = self
+                    .hits
+                    .iter()
+                    .rev()
+                    .find(|h| {
+                        h.contains(tx, ty)
+                            && matches!(
+                                h.action,
+                                UiAction::CommitReview | UiAction::CancelReview
+                            )
+                    })
+                    .copied();
+                if let Some(h) = hit {
+                    self.apply_action(ed, h.action);
+                }
+            }
+            self.was_touching = touching;
+            return true;
+        }
+
         let mut changed = false;
 
         if touching && !self.was_touching {
@@ -1664,17 +1694,17 @@ impl GuiState {
             UiAction::PageScroll(delta) => self.page_scroll(ed, delta),
             UiAction::Rescan => self.wants_rescan = true,
             UiAction::QuickSave => trigger_quick_save(ed),
+            // The whole-save undo, reachable from the footer pill as well as
+            // from holding L on the pad.
+            UiAction::Undo => {
+                ed.undo_last();
+            }
+            UiAction::CommitReview => crate::editor::finish_reviewed_write(ed),
+            UiAction::CancelReview => ed.cancel_save_review(),
+            // One press is one undo step, so the bulk MAX goes through the
+            // editor instead of calling the field writer eleven times.
             UiAction::CharMaxAll => {
-                if ed.save.is_some() {
-                    ed.set_char_value(1, 9_999_999);
-                    ed.set_char_value(3, 999);
-                    ed.set_char_value(4, 99_999_999);
-                    for f in 5..=9 {
-                        ed.set_char_value(f, 9_999_999);
-                    }
-                    ed.dirty = true;
-                    ed.message = String::from("所持金・HR・全ポイントを最大値に設定しました");
-                }
+                ed.maximize_character();
             }
             // Both bulk buttons run the same rows the menu runs: a touch and
             // the pad must never take two different code paths.
@@ -2895,6 +2925,11 @@ impl GuiState {
         if self.osk.is_some() {
             self.draw_osk(c);
         }
+        // The save review sits on top of everything: it is the last thing
+        // between an edit and the console's save.
+        if ed.review_open() {
+            self.draw_review(c, ed);
+        }
 
         c.present();
     }
@@ -3223,17 +3258,122 @@ impl GuiState {
             _ => "[A] 決定  [◀/▶] 調整  [L/R] サブタブ  [ZL/ZR] セクション  [X] 保存",
         };
         let hint_w = c.text_width_sized(hint, FontSize::Small);
-        c.text_right(1262, FOOTER_Y + 17, hint, t.text_secondary, FontSize::Small);
+        c.text_right(1262, FOOTER_Y + 9, hint, t.text_secondary, FontSize::Small);
 
-        // Left: Status message dynamically clipped so it NEVER collides with `hint`
+        // Left, top row: the whole-save undo. Both numbers the audit asked for
+        // are on screen at all times - how many steps are left of four and what
+        // one step costs - and the pill is the touch target for it as well.
+        // The key is L held down: a plain L is the sub-tab key everywhere.
+        let undo = format!("[L長押し] {}", ed.undo_line());
+        let undo_w = (c.text_width_sized(&undo, FontSize::Small) + 22).min(470);
+        let has_undo = ed.undo_depth() > 0;
+        let (undo_bg, undo_fg) = if has_undo {
+            (t.bg_btn_primary, t.text_primary)
+        } else {
+            (t.bg_btn, t.text_muted)
+        };
+        let undo_bd = if has_undo { t.accent_primary } else { t.border_subtle };
+        c.round_rect(14, FOOTER_Y + 4, undo_w, 26, 5, undo_bg);
+        c.round_rect_border(14, FOOTER_Y + 4, undo_w, 26, 5, 1, undo_bd);
+        c.text_clipped(24, FOOTER_Y + 9, undo_w - 12, &undo, undo_fg, FontSize::Small);
+        self.add_hit(14, FOOTER_Y + 2, undo_w, 30, UiAction::Undo);
+
+        // Left, bottom row: the status message. It is clipped before the right
+        // hand key guide so the two can never overlap, whatever it says.
         let msg = if ed.message.is_empty() {
             "Ready"
         } else {
             &ed.message
         };
-        c.circle(22, FOOTER_Y + 26, 4, if ed.dirty { t.accent_warn } else { t.accent_primary });
-        let max_msg_w = (1262 - hint_w - 60).max(180);
-        c.text_clipped(36, FOOTER_Y + 17, max_msg_w, msg, t.text_primary, FontSize::Small);
+        let max_msg_w = (1262 - hint_w - 60).max(160);
+        c.circle(22, FOOTER_Y + 38, 4, if ed.dirty { t.accent_warn } else { t.accent_primary });
+        c.text_clipped(36, FOOTER_Y + 30, max_msg_w, msg, t.text_primary, FontSize::Small);
+    }
+
+    /// The save review: what a write would change, and the two answers.
+    ///
+    /// Modal on purpose. The first press of the save key gets here instead of
+    /// writing, so a write that moves 400 bytes of somebody's equipment box is
+    /// something the user has read before it happens. The body is capped: the
+    /// core already limits the ranges, and this is the last guard against a
+    /// long summary pushing the buttons off the panel.
+    fn draw_review(&mut self, c: &mut Canvas, ed: &Editor) {
+        let Some(review) = ed.review.as_ref() else {
+            return;
+        };
+        let t = theme();
+        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 170));
+
+        let mx = 140;
+        let my = 54;
+        let mw = 1000;
+        let mh = 612;
+        c.round_rect(mx, my, mw, mh, 12, t.bg_panel);
+        c.round_rect_border(mx, my, mw, mh, 12, 2, t.border_focus);
+
+        c.text_clipped(
+            mx + 26,
+            my + 14,
+            mw - 500,
+            "保存前レビュー: 変更内容",
+            t.text_primary,
+            FontSize::Large,
+        );
+        c.text_right(
+            mx + mw - 26,
+            my + 20,
+            &review.headline(),
+            t.accent_warn,
+            FontSize::Small,
+        );
+        c.hline(mx + 20, my + 52, mw - 40, t.border_subtle);
+
+        let mut y = my + 64;
+        for line in review.lines.iter().take(17) {
+            if line.is_empty() {
+                y += 10;
+                continue;
+            }
+            let color = if line.starts_with('■') {
+                t.accent_primary
+            } else {
+                t.text_primary
+            };
+            c.text_clipped(mx + 30, y, mw - 60, line, color, FontSize::Small);
+            y += 23;
+        }
+
+        let foot_y = my + mh - 56;
+        c.hline(mx + 20, foot_y - 12, mw - 40, t.border_subtle);
+        c.text_sized(
+            mx + 30,
+            foot_y + 12,
+            "1回目は確認だけです。2回目で本体セーブに書き込みます",
+            t.text_secondary,
+            FontSize::Small,
+        );
+
+        let a_w = 190;
+        let a_x = mx + mw - 26 - a_w;
+        c.round_rect(a_x, foot_y, a_w, 42, 6, t.accent_primary);
+        btn_text(
+            c,
+            a_x,
+            foot_y,
+            a_w,
+            42,
+            "[A] この内容で保存",
+            white_or_dark(t.accent_primary),
+            FontSize::Small,
+        );
+        self.add_hit(a_x, foot_y, a_w, 42, UiAction::CommitReview);
+
+        let b_w = 150;
+        let b_x = a_x - 12 - b_w;
+        c.round_rect(b_x, foot_y, b_w, 42, 6, t.bg_btn);
+        c.round_rect_border(b_x, foot_y, b_w, 42, 6, 1, t.border_subtle);
+        btn_text(c, b_x, foot_y, b_w, 42, "[B] 中止", t.text_primary, FontSize::Small);
+        self.add_hit(b_x, foot_y, b_w, 42, UiAction::CancelReview);
     }
 
     // -----------------------------------------------------------------------

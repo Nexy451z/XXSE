@@ -1086,6 +1086,708 @@ fn box_total(items: &[ItemSlot]) -> u32 {
         .sum()
 }
 
+// ---------------------------------------------------------------------------
+// Whole save undo
+//
+// The item box has had its own sixteen step undo since the beginning, but that
+// is one box. A step here is the parsed save itself, taken before an edit
+// writes it, so every screen that writes the save can take its edit back the
+// same way. The depth is four because memory is the thing this console does not
+// have: one step is the 4,726,152 byte body plus the 36 byte Switch header
+// (4,726,188 bytes, printed as 4.5MB), so four steps cost 18.0MB on top of the
+// save that is open.
+// ---------------------------------------------------------------------------
+
+/// How many whole-save undo steps the editor keeps.
+pub const UNDO_STEPS: usize = 4;
+
+/// Bytes one undo step costs: the Switch header plus the body.
+pub const UNDO_STEP_BYTES: usize = crate::save::SWITCH_SIZE;
+
+/// Bytes as the screen prints them, in tenths of a MiB and without floats.
+///
+/// The arithmetic is integer on purpose: the console build has no libm, and a
+/// number the user can check against save::SWITCH_SIZE is worth more than a
+/// pretty one. 4,726,188 bytes prints as "4.5MB".
+pub fn bytes_mb_text(bytes: usize) -> String {
+    let tenths = (bytes as u64 * 10 + (1 << 19)) / (1 << 20);
+    format!("{}.{}MB", tenths / 10, tenths % 10)
+}
+
+/// What one undo step costs, e.g. "4.5MB".
+pub fn undo_step_text() -> String {
+    bytes_mb_text(UNDO_STEP_BYTES)
+}
+
+/// What the whole stack can cost, e.g. "18.0MB".
+pub fn undo_total_text() -> String {
+    bytes_mb_text(UNDO_STEP_BYTES * UNDO_STEPS)
+}
+
+/// One step of the whole-save undo: the save as it was before an edit.
+pub struct SaveUndo {
+    /// What the edit was called, for the status line.
+    pub label: String,
+    /// The slot that was open, put back with the bytes.
+    pub slot: usize,
+    /// The save before the edit.
+    pub save: Save,
+}
+
+// ---------------------------------------------------------------------------
+// The save layout, for naming what a write changes
+//
+// Every boundary below is an existing constant from mhnx-core, so the names
+// cannot drift away from the offsets the writers use. Ranges nothing in this
+// crate writes are left out; a change there is reported as "その他".
+// ---------------------------------------------------------------------------
+
+/// One named part of the save.
+struct Layout {
+    /// Offset from the slot base (slot parts) or from the body start.
+    start: usize,
+    /// End offset, same base as start.
+    end: usize,
+    /// What the part holds.
+    name: &'static str,
+    /// Bytes per record when the part is an array, 0 when it is not.
+    unit: usize,
+    /// What one record is called, e.g. "枠".
+    unit_name: &'static str,
+}
+
+/// The parts of one character slot, relative to its base.
+const SLOT_LAYOUT: &[Layout] = &[
+    Layout { start: 0x0000, end: 0x0080, name: "キャラクター情報", unit: 0, unit_name: "" },
+    Layout {
+        start: crate::save::OFF_ITEM_BOX,
+        end: crate::myset::OFF_ITEM_SETS,
+        name: "アイテムボックス",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::myset::OFF_ITEM_SETS,
+        end: crate::myset::OFF_POUCH,
+        name: "アイテムマイセット",
+        unit: crate::myset::ITEM_SET_SIZE,
+        unit_name: "セット",
+    },
+    Layout {
+        start: crate::myset::OFF_POUCH,
+        end: crate::save::OFF_HR_POINTS,
+        name: "ポーチ",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::save::OFF_HR_POINTS,
+        end: crate::questprogress::OFF_CLEARED,
+        name: "所持金・HR ポイント",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::questprogress::OFF_CLEARED,
+        end: crate::awards::MAP_OFF,
+        name: "クエスト進行状況",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::awards::MAP_OFF,
+        end: crate::awards::MAP_OFF + crate::awards::MAP_LEN,
+        name: "勲章（解禁マップ）",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::awards::NOTICE_OFF,
+        end: crate::awards::NOTICE_OFF + crate::awards::NOTICE_LEN,
+        name: "勲章（通知）",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::save::OFF_MONSTER_HUNT,
+        end: crate::save::OFF_MONSTER_SIZE + crate::save::MONSTER_SIZE_TABLE_SIZE,
+        name: "狩猟記録",
+        unit: 2,
+        unit_name: "匹",
+    },
+    Layout {
+        start: crate::save::OFF_EQUIPMENT_BOX,
+        end: crate::save::OFF_EQUIPMENT_BOX + crate::save::EQUIPMENT_BOX_SIZE,
+        name: "装備ボックス",
+        unit: crate::save::EQUIPMENT_RECORD,
+        unit_name: "枠",
+    },
+    Layout {
+        start: crate::palicogear::PALICO_EQUIP_OFFSET,
+        end: crate::palicogear::PALICO_EQUIP_OFFSET + crate::save::PALICO_EQUIPMENT_SIZE,
+        name: "オトモ装備ボックス",
+        unit: crate::save::EQUIPMENT_RECORD,
+        unit_name: "枠",
+    },
+    Layout {
+        start: crate::myset::OFF_EQUIP_SETS,
+        end: crate::myset::OFF_EQUIP_SETS
+            + crate::myset::EQUIP_SETS * crate::myset::EQUIP_SET_SIZE,
+        name: "装備マイセット",
+        unit: crate::myset::EQUIP_SET_SIZE,
+        unit_name: "セット",
+    },
+    Layout {
+        start: crate::save::OFF_NAME,
+        end: crate::save::OFF_NAME + 32,
+        name: "名前",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::palico::OFF_ROSTER,
+        end: crate::palico::OFF_ROSTER + crate::palico::SLOTS * crate::palico::RECORD,
+        name: "オトモ",
+        unit: crate::palico::RECORD,
+        unit_name: "匹",
+    },
+    Layout {
+        start: crate::guildcard::OFF_GUILD_CARD,
+        end: crate::guildcard::OFF_GUILD_CARD + crate::guildcard::GC_SIZE,
+        name: "ギルドカード",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::awards::CARD_OFF,
+        end: crate::awards::CARD_OFF + crate::awards::CARD_LEN,
+        name: "勲章（カード側）",
+        unit: 0,
+        unit_name: "",
+    },
+    Layout {
+        start: crate::guildcard::OFF_ARENA,
+        end: crate::guildcard::OFF_ARENA
+            + crate::guildcard::ARENA_COUNT
+                * crate::guildcard::ARENA_RANKS
+                * crate::guildcard::ARENA_ENTRY,
+        name: "闘技大会の記録",
+        unit: crate::guildcard::ARENA_ENTRY,
+        unit_name: "件",
+    },
+    Layout {
+        start: crate::guildcard::GC_CARDS_INFO,
+        end: crate::guildcard::GC_INBOX,
+        name: "受信カード一覧",
+        unit: crate::guildcard::CARD_INFO_LEN,
+        unit_name: "枚",
+    },
+    Layout {
+        start: crate::guildcard::GC_INBOX_INFO,
+        end: crate::guildcard::GC_INBOX_INFO
+            + crate::guildcard::INBOX_LIST_LEN * crate::guildcard::INBOX_INFO_LEN,
+        name: "受信箱の情報",
+        unit: crate::guildcard::INBOX_INFO_LEN,
+        unit_name: "枚",
+    },
+    Layout {
+        start: crate::save::OFF_MANUAL_SHOUTOUTS,
+        end: crate::save::OFF_AUTO_SHOUTOUTS,
+        name: "定型文（手動）",
+        unit: crate::save::SHOUTOUT_ENTRY,
+        unit_name: "件",
+    },
+    Layout {
+        start: crate::save::OFF_AUTO_SHOUTOUTS,
+        end: crate::save::OFF_AUTO_SHOUTOUTS + crate::save::AUTO_SHOUTOUT_SIZE,
+        name: "定型文（自動）",
+        unit: crate::save::SHOUTOUT_ENTRY,
+        unit_name: "件",
+    },
+];
+
+/// The parts that sit in the body itself rather than in a character slot.
+const BODY_LAYOUT: &[Layout] = &[
+    Layout { start: 0x00, end: 0x04, name: "本体ヘッダ", unit: 0, unit_name: "" },
+    Layout { start: 0x04, end: 0x07, name: "スロット使用フラグ", unit: 0, unit_name: "" },
+    Layout { start: 0x0C, end: 0x10, name: "DLC セクションの位置", unit: 0, unit_name: "" },
+    Layout { start: 0x10, end: 0x1C, name: "スロット基点", unit: 0, unit_name: "" },
+    Layout {
+        start: crate::save::OFF_BRIGHTNESS,
+        end: crate::save::OFF_DLC_PALICO + 1,
+        name: "本体オプションと DLC オトモ枠",
+        unit: 0,
+        unit_name: "",
+    },
+];
+
+/// The download-quest section, whose offset the save itself carries.
+const DLC_SECTION: Layout = Layout {
+    start: 0,
+    end: crate::dlc::EQUIP_ARRAY_OFFSET + crate::dlc::EQUIP_SLOTS * crate::dlc::EQUIP_SLOT_SIZE,
+    name: "DLC クエスト",
+    unit: 0,
+    unit_name: "",
+};
+
+/// One stretch of bytes a write changes, named by what lives there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRange {
+    /// Character slot this belongs to, None for the body-wide parts.
+    pub slot: Option<usize>,
+    /// What the layout calls this place, e.g. "装備ボックス".
+    pub name: &'static str,
+    /// Distance from the start of the named part.
+    pub rel: usize,
+    /// How many bytes differ inside the stretch.
+    pub len: usize,
+    /// Records the stretch touches, when the part has a known record size.
+    pub records: Option<(usize, &'static str)>,
+}
+
+impl DiffRange {
+    /// "スロット1 装備ボックス" - the place, without the size.
+    pub fn head(&self) -> String {
+        match self.slot {
+            Some(i) => format!("スロット{} {}", i + 1, self.name),
+            None => String::from(self.name),
+        }
+    }
+
+    /// The line the review prints for this stretch, e.g.
+    /// "スロット1 装備ボックス 3 バイト（1 枠）".
+    pub fn line(&self) -> String {
+        let mut out = format!("{} {} バイト", self.head(), self.len);
+        if let Some((n, what)) = self.records {
+            out.push_str(&format!("（{} {}）", n, what));
+        }
+        out
+    }
+}
+
+/// What one write would change: the named stretches and a feature summary.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SaveDiff {
+    /// How many bytes differ from the file on disk.
+    pub changed: usize,
+    /// Feature level lines, e.g. "スロット1: 名前、装備ボックス 1 枠".
+    pub summary: Vec<String>,
+    /// The stretches themselves, in file order.
+    pub ranges: Vec<DiffRange>,
+}
+
+/// How many ranges the review names before it says "ほか N 件".
+pub const REVIEW_RANGES: usize = 8;
+
+impl SaveDiff {
+    /// Is there anything to review at all?
+    pub fn is_empty(&self) -> bool {
+        self.changed == 0
+    }
+
+    /// The review body: what changes, then where. shown caps the ranges so a
+    /// difference in hundreds of places cannot push the buttons off screen.
+    pub fn lines(&self, shown: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        out.push(String::from("■ 変更される内容"));
+        if self.summary.is_empty() {
+            out.push(format!("・変更 {} バイト", self.changed));
+        }
+        for line in &self.summary {
+            out.push(format!("・{}", line));
+        }
+        out.push(String::new());
+        out.push(String::from("■ 変更される範囲"));
+        if self.ranges.is_empty() {
+            out.push(String::from("・特定できる違いはありません"));
+        }
+        for range in self.ranges.iter().take(shown) {
+            out.push(format!("・{}", range.line()));
+        }
+        if self.ranges.len() > shown {
+            out.push(format!("・ほか {} 件", self.ranges.len() - shown));
+        }
+        out
+    }
+}
+
+/// The layout entry that contains body_off, preferring the narrowest.
+///
+/// Overlapping entries are resolved by span: the arena log and the award map
+/// both sit inside the guild card block, and naming a change after the
+/// narrowest piece is what tells the user which one moved.
+fn region_at(save: &Save, body_off: usize) -> Option<(Option<usize>, &'static Layout)> {
+    fn consider(
+        best: &mut Option<(usize, Option<usize>, &'static Layout)>,
+        body_off: usize,
+        slot: Option<usize>,
+        layout: &'static Layout,
+        start: usize,
+    ) {
+        let end = start + (layout.end - layout.start);
+        if body_off >= start && body_off < end {
+            let span = end - start;
+            if best.map(|(s, _, _)| span < s).unwrap_or(true) {
+                *best = Some((span, slot, layout));
+            }
+        }
+    }
+    let mut best: Option<(usize, Option<usize>, &'static Layout)> = None;
+    for layout in BODY_LAYOUT {
+        consider(&mut best, body_off, None, layout, layout.start);
+    }
+    for slot in 0..crate::save::MAX_SLOTS {
+        let Some(base) = save.slot_base(slot) else {
+            continue;
+        };
+        for layout in SLOT_LAYOUT {
+            consider(&mut best, body_off, Some(slot), layout, base as usize + layout.start);
+        }
+    }
+    let dlc = save.dlc_section_offset() as usize;
+    let dlc_end = dlc + DLC_SECTION.end;
+    if dlc > 0 && dlc_end <= save.body().len() {
+        consider(&mut best, body_off, None, &DLC_SECTION, dlc);
+    }
+    best.map(|(_, slot, layout)| (slot, layout))
+}
+
+/// Where the named parts start, so an unnamed gap ends where the next begins.
+fn region_starts(save: &Save) -> Vec<usize> {
+    let mut starts: Vec<usize> = BODY_LAYOUT.iter().map(|l| l.start).collect();
+    for slot in 0..crate::save::MAX_SLOTS {
+        if let Some(base) = save.slot_base(slot) {
+            starts.extend(SLOT_LAYOUT.iter().map(|l| base as usize + l.start));
+        }
+    }
+    let dlc = save.dlc_section_offset() as usize;
+    if dlc > 0 {
+        starts.push(dlc);
+    }
+    starts
+}
+
+/// The differing stretches of two files, named with the save layout.
+///
+/// header_len is the Switch header the body does not contain. Differences
+/// closer together than 32 bytes are reported as one stretch: a record that has
+/// been rewritten is one line, not thirty.
+pub fn diff_ranges(
+    old: &[u8],
+    new: &[u8],
+    header_len: usize,
+    save: &Save,
+) -> (usize, Vec<DiffRange>) {
+    const GAP: usize = 32;
+    let common = old.len().min(new.len());
+    let mut changed = 0usize;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<(usize, usize)> = None;
+    for i in 0..common {
+        if old[i] == new[i] {
+            continue;
+        }
+        changed += 1;
+        open = match open {
+            Some((s, e)) if i <= e + GAP => Some((s, i + 1)),
+            Some((s, e)) => {
+                runs.push((s, e));
+                Some((i, i + 1))
+            }
+            None => Some((i, i + 1)),
+        };
+    }
+    if let Some(run) = open {
+        runs.push(run);
+    }
+    if old.len() != new.len() {
+        let trailing = old.len().max(new.len());
+        changed += trailing - common;
+        match runs.last_mut() {
+            Some((_, end)) if common <= *end + GAP => *end = trailing,
+            _ => runs.push((common, trailing)),
+        }
+    }
+
+    let mut out: Vec<DiffRange> = Vec::new();
+    for (run_start, run_end) in runs {
+        let mut at = run_start;
+        while at < run_end {
+            if at < header_len {
+                let end = run_end.min(header_len);
+                out.push(DiffRange {
+                    slot: None,
+                    name: "ファイルヘッダ",
+                    rel: at,
+                    len: end - at,
+                    records: None,
+                });
+                at = end;
+                continue;
+            }
+            let body = at - header_len;
+            match region_at(save, body) {
+                Some((slot, layout)) => {
+                    let start = match slot {
+                        Some(i) => save.slot_base(i).map(|b| b as usize).unwrap_or(0) + layout.start,
+                        None => layout.start,
+                    };
+                    let region_end = start + (layout.end - layout.start);
+                    let end = region_end.min(body + (run_end - at));
+                    let stop = (header_len + end).min(run_end);
+                    let len = stop - at;
+                    let records = if layout.unit > 0 {
+                        Some(((len + layout.unit - 1) / layout.unit, layout.unit_name))
+                    } else {
+                        None
+                    };
+                    out.push(DiffRange {
+                        slot,
+                        name: layout.name,
+                        rel: body.saturating_sub(start),
+                        len,
+                        records,
+                    });
+                    at = stop;
+                }
+                None => {
+                    let next = region_starts(save)
+                        .into_iter()
+                        .filter(|s| *s > body)
+                        .min()
+                        .unwrap_or(run_end - header_len);
+                    let stop = (header_len + next).min(run_end);
+                    out.push(DiffRange {
+                        slot: None,
+                        name: "その他",
+                        rel: body,
+                        len: stop - at,
+                        records: None,
+                    });
+                    at = stop;
+                }
+            }
+        }
+    }
+    (changed, out)
+}
+
+/// Which character fields differ between the two saves.
+fn character_fields_changed(old: &Save, new: &Save, slot: usize) -> Vec<&'static str> {
+    let (Some(a), Some(b)) = (old.read_character(slot), new.read_character(slot)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if a.name != b.name || a.name_preview != b.name_preview {
+        out.push("名前");
+    }
+    if a.play_time != b.play_time {
+        out.push("プレイ時間");
+    }
+    if a.funds != b.funds {
+        out.push("所持金");
+    }
+    if a.hunter_rank != b.hunter_rank {
+        out.push("ハンターランク");
+    }
+    if a.hr_points != b.hr_points {
+        out.push("HR ポイント");
+    }
+    if a.academy_points != b.academy_points {
+        out.push("学園ポイント");
+    }
+    if a.village_points != b.village_points {
+        out.push("村ポイント");
+    }
+    if a.voice != b.voice
+        || a.eye_color != b.eye_color
+        || a.clothing != b.clothing
+        || a.gender != b.gender
+        || a.hairstyle != b.hairstyle
+        || a.face != b.face
+        || a.features != b.features
+        || a.skin_color != b.skin_color
+        || a.hair_color != b.hair_color
+        || a.features_color != b.features_color
+        || a.clothing_color != b.clothing_color
+    {
+        out.push("外見");
+    }
+    out
+}
+
+/// How many download quests the write adds, removes or rewrites.
+fn quests_changed(old: &Save, new: &Save) -> usize {
+    let before = crate::dlc::list_quests(old);
+    let after = crate::dlc::list_quests(new);
+    let mut n = 0usize;
+    for q in &after {
+        match before.iter().find(|b| b.quest_id == q.quest_id) {
+            Some(b) if b.data == q.data => {}
+            _ => n += 1,
+        }
+    }
+    n + before
+        .iter()
+        .filter(|b| !after.iter().any(|q| q.quest_id == b.quest_id))
+        .count()
+}
+
+/// The feature level lines shown above the byte ranges.
+///
+/// One line per character slot naming what changed there, one for the body,
+/// one for the download section: the example the audit asked for is
+/// "スロット1: 装備ボックス 1 枠" and "DLC: クエスト 2 件".
+pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String> {
+    let mut per_slot: Vec<(usize, Vec<String>)> = Vec::new();
+    let mut body: Vec<String> = Vec::new();
+    let mut dlc: Vec<String> = Vec::new();
+    for range in ranges {
+        let part = match (range.slot, range.name) {
+            (Some(slot), "キャラクター情報") => {
+                let fields = character_fields_changed(old, new, slot);
+                if fields.is_empty() {
+                    String::from("キャラクター情報")
+                } else {
+                    fields.join("、")
+                }
+            }
+            (Some(_), name) => match range.records {
+                Some((n, what)) => format!("{} {} {}", name, n, what),
+                None => String::from(name),
+            },
+            (None, "DLC クエスト") => {
+                let n = quests_changed(old, new);
+                if n > 0 {
+                    format!("クエスト {} 件", n)
+                } else {
+                    String::from("クエスト")
+                }
+            }
+            (None, "ファイルヘッダ") => String::from("ファイルヘッダ（名前のハッシュなど）"),
+            (None, name) => String::from(name),
+        };
+        match range.slot {
+            Some(slot) => match per_slot.iter_mut().find(|(s, _)| *s == slot) {
+                Some((_, parts)) => {
+                    if !parts.contains(&part) {
+                        parts.push(part);
+                    }
+                }
+                None => per_slot.push((slot, alloc::vec![part])),
+            },
+            None => {
+                let list = if range.name == "DLC クエスト" {
+                    &mut dlc
+                } else {
+                    &mut body
+                };
+                if !list.contains(&part) {
+                    list.push(part);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (slot, parts) in per_slot {
+        out.push(format!("スロット{}: {}", slot + 1, parts.join("、")));
+    }
+    if !dlc.is_empty() {
+        out.push(format!("DLC: {}", dlc.join("、")));
+    }
+    if !body.is_empty() {
+        out.push(format!("本体: {}", body.join("、")));
+    }
+    out
+}
+
+/// Count the bytes two slices disagree on, without naming them.
+fn count_changed(old: &[u8], new: &[u8]) -> usize {
+    let common = old.len().min(new.len());
+    let mut n = old.iter().take(common).zip(new.iter()).filter(|(a, b)| a != b).count();
+    n += old.len().max(new.len()) - common;
+    n
+}
+
+/// What one save write would change, as the review shows it.
+///
+/// Both sides are parsed when they parse, so the ranges can be named; when one
+/// does not (a file that is not a save, a header that disagrees) the count of
+/// differing bytes is still reported, under "セーブファイル".
+pub fn diff_save(old: &[u8], new: &[u8]) -> SaveDiff {
+    // The layout below is one format's; a 3DS body compared against a Switch
+    // file would name every offset wrongly, so a kind change is reported as a
+    // plain count instead of a guess.
+    let parsed = match (Save::from_bytes(old), Save::from_bytes(new)) {
+        (Ok(a), Ok(b)) if a.kind() == b.kind() => Some((a, b)),
+        _ => None,
+    };
+    let Some((old_save, new_save)) = parsed else {
+        let changed = count_changed(old, new);
+        let mut diff = SaveDiff::default();
+        if changed > 0 {
+            diff.changed = changed;
+            diff.summary = alloc::vec![format!("セーブ全体: {} バイト", changed)];
+            diff.ranges = alloc::vec![DiffRange {
+                slot: None,
+                name: "セーブファイル",
+                rel: 0,
+                len: changed,
+                records: None,
+            }];
+        }
+        return diff;
+    };
+    let header_len = if new_save.kind().has_header() {
+        crate::save::SWITCH_HEADER_SIZE
+    } else {
+        0
+    };
+    let (changed, ranges) = diff_ranges(old, new, header_len, &new_save);
+    let summary = if changed > 0 {
+        diff_summary(&ranges, &old_save, &new_save)
+    } else {
+        Vec::new()
+    };
+    SaveDiff {
+        changed,
+        summary,
+        ranges,
+    }
+}
+
+/// A save write waiting for the user to agree to what it changes.
+///
+/// The bytes themselves are not held here: Editor::confirm_save_review builds
+/// them again from the save that is still open, so the review costs the name of
+/// the changes and nothing else.
+pub struct SaveReview {
+    /// Lines ready to draw, headers included.
+    pub lines: Vec<String>,
+    /// The feature level lines, for tests and the size note.
+    pub summary: Vec<String>,
+    /// The named stretches.
+    pub ranges: Vec<DiffRange>,
+    /// How many bytes differ from the file on disk.
+    pub changed: usize,
+    /// Size of what is on disk now.
+    pub old_len: usize,
+    /// Size of what the write would put there.
+    pub new_len: usize,
+    /// The file the bytes would land in.
+    pub path: String,
+}
+
+impl SaveReview {
+    /// The one line above the body: what changes and how big the file is.
+    pub fn headline(&self) -> String {
+        format!(
+            "変更 {} バイト（{} バイト → {} バイト）",
+            self.changed, self.old_len, self.new_len
+        )
+    }
+}
+
 /// The editor.
 pub struct Editor {
     /// Current screen.
@@ -1305,6 +2007,17 @@ pub struct Editor {
     pub quit: bool,
     /// Anything changed since the last write?
     pub dirty: bool,
+    /// Whole-save undo steps, newest last. At most [UNDO_STEPS].
+    ///
+    /// A step is the whole parsed save, so every screen that writes the save
+    /// shares one stack. The oldest step is dropped first; four steps is what
+    /// the console's heap affords (see [UNDO_STEPS]).
+    pub undo: Vec<SaveUndo>,
+    /// A console write waiting for its second press, with the review it shows.
+    ///
+    /// The review holds the names of the changes, not the bytes: the second
+    /// press rebuilds them from the save that is still open.
+    pub review: Option<SaveReview>,
     /// Status line.
     pub message: String,
 
@@ -1414,6 +2127,8 @@ impl Editor {
             arc_path: None,
             quit: false,
             dirty: false,
+            undo: Vec::new(),
+            review: None,
             message: String::new(),
             pending_request: None,
             pending_write: None,
@@ -1468,6 +2183,7 @@ impl Editor {
 
     /// The I/O layer answers a character-name request with this.
     pub fn apply_name(&mut self, text: String) {
+        self.push_undo("名前");
         if let Some(mut c) = self.character() {
             c.name = text;
             c.slot = self.slot;
@@ -1477,6 +2193,47 @@ impl Editor {
                 self.message = String::from("名前を更新しました（A でセーブに書き込み）");
             }
         }
+    }
+
+    /// The guild card comment for the open slot, as one undo step.
+    ///
+    /// The console gets this text from its own keyboard, so the switch layer
+    /// used to write the comment itself - which is why the comment was the one
+    /// guild card edit the undo could not see. Going through the editor keeps
+    /// the step and the message in the same place as every other write.
+    pub fn set_guild_comment(&mut self, text: &str) -> bool {
+        if self.save.is_none() {
+            return false;
+        }
+        self.push_undo("ギルドカードのコメント");
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        if !crate::guildcard::set_comment(save, slot, text) {
+            return false;
+        }
+        self.dirty = true;
+        self.message = String::from("コメントを変更しました（[X] でセーブ保存）");
+        true
+    }
+
+    /// Rename one palico of the open slot, as one undo step.
+    pub fn rename_palico(&mut self, which: usize, name: &str) -> bool {
+        if self.save.is_none() {
+            return false;
+        }
+        self.push_undo("オトモの名前");
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        if !crate::palico::set_name(save, slot, which, name) {
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!("オトモ {} の名前を変更しました", which);
+        true
     }
 
     // ------------------------------------------------------------- loading
@@ -1491,6 +2248,10 @@ impl Editor {
                 self.save = Some(s);
                 self.save_path = Some(path.to_string());
                 self.dirty = false;
+                // A step names the file and the slot it was taken in, so a
+                // different file must not be able to reach it.
+                self.undo.clear();
+                self.review = None;
                 self.screen = Screen::Slots;
                 self.cursor = 0;
             }
@@ -1655,10 +2416,35 @@ impl Editor {
             _ => {}
         }
         c.slot = self.slot;
+        self.push_undo("キャラクター値");
         if let Some(s) = &mut self.save {
             let _ = s.write_character(&c);
             self.dirty = true;
         }
+    }
+
+    /// The one press "資金・P 一括MAX" of the console, as one undo step.
+    ///
+    /// The screen used to call set_char_value eleven times, which would have
+    /// left four undo steps for one press and three of them naming the same ten
+    /// fields. One press, one step, one label.
+    pub fn maximize_character(&mut self) -> bool {
+        let Some(mut c) = self.character() else {
+            return false;
+        };
+        self.push_undo("資金・ポイント一括MAX");
+        c.funds = 9_999_999;
+        c.hunter_rank = 999;
+        c.hr_points = 99_999_999;
+        c.academy_points = 9_999_999;
+        c.village_points = [9_999_999; 4];
+        c.slot = self.slot;
+        if let Some(s) = &mut self.save {
+            let _ = s.write_character(&c);
+            self.dirty = true;
+        }
+        self.message = String::from("所持金・HR・全ポイントを最大値にしました");
+        true
     }
 
     /// Indices of the item slots currently visible.
@@ -1851,6 +2637,7 @@ impl Editor {
                 if let Some(c) = list.get(self.cursor) {
                     let idx = c.index;
                     let slot = self.slot;
+                    self.push_undo("お守りの削除");
                     let ok = match &mut self.save {
                         Some(s) => s.clear_charm(slot, idx),
                         None => false,
@@ -1958,6 +2745,7 @@ impl Editor {
                     skill2: e.skill2,
                     points2: e.points2,
                 };
+                self.push_undo("お守りの書き込み");
                 if let Some(s) = &mut self.save {
                     if s.set_charm_with_grade(self.slot, &c, e.grade) {
                         self.dirty = true;
@@ -2023,6 +2811,7 @@ impl Editor {
                     .as_ref()
                     .map(|s| s.has_dlc_palico(id))
                     .unwrap_or(false);
+                self.push_undo("配信オトモ");
                 if let Some(s) = &mut self.save {
                     if installed {
                         if let Some(sl) = s.dlc_palicoes().iter().find(|c| c.id == id).map(|c| c.index) {
@@ -2075,6 +2864,7 @@ impl Editor {
             Lang::Jp => dlcats::JP_IDS,
             Lang::En => dlcats::EN_IDS,
         };
+        self.push_undo("配信オトモの一括導入");
         let Some(s) = &mut self.save else {
             self.message = String::from("先にセーブを開いてください");
             return;
@@ -2102,6 +2892,7 @@ impl Editor {
             Key::Down => self.option_cursor = (self.option_cursor + 1) % 4,
             Key::Left | Key::Right => {
                 let d: i64 = if key == Key::Right { 1 } else { -1 };
+                self.push_undo("設定");
                 let Some(s) = &mut self.save else { return };
                 let mut o = s.options();
                 match self.option_cursor {
@@ -2354,6 +3145,7 @@ impl Editor {
         if kind == CsvKind::Items {
             match crate::csvout::parse_items(text) {
                 Ok(rows) => {
+                    self.push_undo("CSV の適用");
                     if let Some(s) = &mut self.save {
                         report = Some(crate::csvout::apply_items(s, slot, &rows));
                     }
@@ -2367,6 +3159,7 @@ impl Editor {
         } else {
             match crate::csvout::parse_equipment(text) {
                 Ok(rows) => {
+                    self.push_undo("CSV の適用");
                     if let Some(s) = &mut self.save {
                         report = Some(crate::csvout::apply_equipment(s, slot, &rows));
                     }
@@ -2469,6 +3262,184 @@ impl Editor {
         }
         let n = len as i64;
         self.cursor = (((self.cursor as i64 + delta) % n + n) % n) as usize;
+    }
+
+    // ------------------------------------------------- whole save undo
+
+    /// Keep the save as it is now, before an edit changes it.
+    ///
+    /// Called by every writer on the save, so a screen never has to grow its
+    /// own undo. The oldest step is dropped first: four steps is what the heap
+    /// affords (see [UNDO_STEPS]), and the newest step is the one a user reaches
+    /// for.
+    pub fn push_undo(&mut self, label: impl Into<String>) {
+        let Some(save) = self.save.clone() else {
+            return;
+        };
+        self.undo.push(SaveUndo {
+            label: label.into(),
+            slot: self.slot,
+            save,
+        });
+        while self.undo.len() > UNDO_STEPS {
+            self.undo.remove(0);
+        }
+    }
+
+    /// How many steps are on the stack right now.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// What the next undo would take back, if anything.
+    pub fn undo_label(&self) -> Option<&str> {
+        self.undo.last().map(|step| step.label.as_str())
+    }
+
+    /// The line the screen prints, e.g.
+    /// "元に戻す: 3/4（1回 4.5MB を使用）".
+    ///
+    /// Both halves the audit asked for are here: how many steps are left of
+    /// the four, and how much memory one of them costs.
+    pub fn undo_line(&self) -> String {
+        format!(
+            "元に戻す: {}/{}（1回 {} を使用）",
+            self.undo.len(),
+            UNDO_STEPS,
+            undo_step_text()
+        )
+    }
+
+    /// "3/4" - the count alone, for the top bar.
+    pub fn undo_count_text(&self) -> String {
+        format!("{}/{}", self.undo.len(), UNDO_STEPS)
+    }
+
+    /// Put the whole save, and the slot it belonged to, back the way it was.
+    ///
+    /// Returns whether anything was taken back. Steps whose bytes match the
+    /// save already in memory are skipped: a writer that pushed before an edit
+    /// it then refused leaves one, and pressing undo on it must not look like a
+    /// step that did nothing. The save is marked dirty, because the file on
+    /// disk is no longer what this editor holds.
+    pub fn undo_last(&mut self) -> bool {
+        while let Some(step) = self.undo.pop() {
+            let same = match &self.save {
+                Some(current) => {
+                    current.kind() == step.save.kind() && current.body() == step.save.body()
+                }
+                None => false,
+            };
+            if same {
+                continue;
+            }
+            self.slot = step.slot.min(crate::save::MAX_SLOTS - 1);
+            self.save = Some(step.save);
+            self.dirty = true;
+            self.after_undo();
+            self.message = format!("元に戻しました: {}", step.label);
+            return true;
+        }
+        self.message = String::from("戻せる操作がありません");
+        false
+    }
+
+    /// Drop the state that named the bytes the undo just replaced.
+    ///
+    /// A form open on a record the restored save may not hold, or a per-tab
+    /// stack whose entries describe the old boxes, would write the wrong bytes
+    /// on the next press. Selections are clamped instead of cleared so the user
+    /// stays where they were looking.
+    fn after_undo(&mut self) {
+        self.charm_edit = None;
+        self.equip_edit = None;
+        self.equip_delete_armed = None;
+        self.set_edit = None;
+        self.set_clear_armed = None;
+        self.set_warnings.clear();
+        self.item_set_edit = None;
+        self.item_set_armed = None;
+        self.item_set_warnings.clear();
+        self.item_dedupe_armed = false;
+        self.item_menu_open = false;
+        self.csv_armed = None;
+        self.review = None;
+        self.item_undo.clear();
+        let charms = self.charms().len();
+        self.charm_cursor = self.charm_cursor.min(charms.saturating_sub(1));
+        let equip = self.equipment().len();
+        self.equip_cursor = self.equip_cursor.min(equip.saturating_sub(1));
+        let palicos = self.palicos().len();
+        self.roster_cursor = self.roster_cursor.min(palicos.saturating_sub(1));
+        let quests = self.filtered_quests().len();
+        self.save_quest_cursor = self.save_quest_cursor.min(quests.saturating_sub(1));
+        self.cursor = self.cursor.min(self.lines_len_hint());
+    }
+
+    /// A cheap upper bound for the cursor on the current screen.
+    ///
+    /// Only used to keep a cursor inside the restored save; every screen clips
+    /// its own list anyway, so being generous here costs nothing.
+    fn lines_len_hint(&self) -> usize {
+        match self.screen {
+            Screen::Slots => 2,
+            Screen::Char => CHAR_FIELDS.len().saturating_sub(1),
+            _ => usize::MAX,
+        }
+    }
+
+    // ---------------------------------------------------- pre-save review
+
+    /// Is a save write waiting for its second press?
+    pub fn review_open(&self) -> bool {
+        self.review.is_some()
+    }
+
+    /// Compare a console write with what the console holds now.
+    ///
+    /// Called by the I/O layer after it reads the file that is about to be
+    /// replaced and before it writes the new bytes. Returns true when the write
+    /// differs from the file and must wait for a second press: the review is
+    /// then on [Editor::review] and the message says so. A write that changes
+    /// nothing returns false and is written at once, the way it always was.
+    pub fn stage_save_review(&mut self, path: &str, old: &[u8], new: &[u8]) -> bool {
+        let diff = diff_save(old, new);
+        if diff.is_empty() {
+            self.review = None;
+            return false;
+        }
+        let lines = diff.lines(REVIEW_RANGES);
+        self.message = format!(
+            "変更 {} バイト。内容を確認して [A] でもう一度押すと保存します（[B] 中止）",
+            diff.changed
+        );
+        self.review = Some(SaveReview {
+            lines,
+            summary: diff.summary,
+            ranges: diff.ranges,
+            changed: diff.changed,
+            old_len: old.len(),
+            new_len: new.len(),
+            path: String::from(path),
+        });
+        true
+    }
+
+    /// The second press: hand the write back so the I/O layer can perform it.
+    ///
+    /// The bytes are built again from the save that is still open, so the
+    /// review never holds a second copy of the 4.5MB file.
+    pub fn confirm_save_review(&mut self) -> Option<Write> {
+        self.review.take()?;
+        self.request_write_save();
+        self.pending_write.take()
+    }
+
+    /// The B press: keep the edit in memory and write nothing.
+    pub fn cancel_save_review(&mut self) {
+        if self.review.take().is_some() {
+            self.message = String::from("保存を中止しました（変更はこの画面に残っています）");
+        }
     }
 
     fn request_write_save(&mut self) {
@@ -2653,6 +3624,7 @@ impl Editor {
                         // build has always clamped at); 127 could be stored
                         // but no item in this game is handed out above 99.
                         items[idx].count = c.clamp(0, MAX_COUNT as i64) as u8;
+                        self.push_undo("アイテム個数");
                         if let Some(s) = &mut self.save {
                             let _ = s.write_item_box(self.slot, &items);
                             self.dirty = true;
@@ -3066,6 +4038,9 @@ impl Editor {
 
     /// Remember the item box before replacing an entry.
     fn push_item_undo(&mut self) {
+        // The whole-save stack records the same press: the box stack can only
+        // take back the box, this one takes back everything together.
+        self.push_undo("アイテムボックス");
         let snapshot = self
             .save
             .as_ref()
@@ -3258,6 +4233,7 @@ impl Editor {
                 } else {
                     -HUNT_STEPS[self.step]
                 };
+                self.push_undo("狩猟記録");
                 let Some(save) = &mut self.save else { return };
                 let slot = self.slot;
                 let ok = match self.hunt_field {
@@ -3311,6 +4287,7 @@ impl Editor {
             Key::Left | Key::Right => {
                 let up = key == Key::Right;
                 let slot = self.slot;
+                self.push_undo("ギルドカード");
                 let Some(save) = &mut self.save else { return };
                 let ok = match self.guild_field {
                     0 => {
@@ -3650,6 +4627,7 @@ impl Editor {
     fn progress_toggle(&mut self) {
         let slot = self.slot;
         let row = self.progress_cursor();
+        self.push_undo("進行状況");
         match self.progress_view() {
             PROGRESS_AWARDS => {
                 let Some(save) = &mut self.save else {
@@ -3735,6 +4713,7 @@ impl Editor {
     fn progress_quest_seen(&mut self) {
         let slot = self.slot;
         let index = self.progress_cursor() + 1;
+        self.push_undo("クエスト既読");
         let Some(save) = &mut self.save else {
             self.message = String::from("先にセーブを開いてください");
             return;
@@ -3796,6 +4775,7 @@ impl Editor {
                 };
                 let up = key == Key::Right;
                 let slot = self.slot;
+                self.push_undo("オトモ");
                 let Some(save) = &mut self.save else { return };
                 let ok = match self.roster_field {
                     0 => {
@@ -4033,6 +5013,7 @@ impl Editor {
     pub fn palico_equip_assign(&mut self, palico: usize, part: usize, index: u16) -> bool {
         let slot = self.slot;
         let part_name = palico_part_name(part);
+        self.push_undo("オトモ装備");
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -4083,6 +5064,7 @@ impl Editor {
     pub fn palico_equip_release(&mut self, palico: usize, part: usize) -> bool {
         let slot = self.slot;
         let part_name = palico_part_name(part);
+        self.push_undo("オトモ装備の解除");
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -4453,6 +5435,7 @@ impl Editor {
             self.message = format!("{} の ID は 1..={} です", list_name, max);
             return false;
         }
+        self.push_undo("オトモスキル");
         let Some(save) = self.save.as_mut() else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -4663,6 +5646,7 @@ impl Editor {
                         };
                         let next = (t.count as i64 + step).clamp(0, 99) as u8;
                         if next != t.count {
+                            self.push_undo("クエスト装備");
                             if let Some(s) = &mut self.save {
                                 if crate::dlc::set_quest_equipment_item(
                                     s,
@@ -5091,6 +6075,7 @@ impl Editor {
         let slot = self.slot;
         let set = e.set;
         let label = self.set_part_label(part);
+        self.push_undo("装備マイセット");
         let wrote = match &mut self.save {
             Some(s) => crate::myset::set_part(s, slot, set, part, idx),
             None => false,
@@ -5148,6 +6133,7 @@ impl Editor {
         let slot = self.slot;
         let set = e.set;
         self.set_clear_armed = None;
+        self.push_undo("マイセットの部位解除");
         let wrote = match &mut self.save {
             Some(s) => crate::myset::clear_part(s, slot, set, part),
             None => false,
@@ -5176,6 +6162,7 @@ impl Editor {
         };
         let slot = self.slot;
         let set = e.set;
+        self.push_undo("マイセット名");
         let wrote = match &mut self.save {
             Some(s) => crate::myset::set_name(s, slot, set, &text),
             None => false,
@@ -5408,6 +6395,7 @@ impl Editor {
         let item = e.pick[row];
         let slot = self.slot;
         let set = e.set;
+        self.push_undo("アイテムマイセット");
         let wrote = match &mut self.save {
             Some(s) => {
                 if item.id == 0 {
@@ -5473,6 +6461,7 @@ impl Editor {
             self.message = String::from("ポーチを読めないため取り込めませんでした");
             return;
         }
+        self.push_undo("ポーチからセットへ");
         let n = match &mut self.save {
             Some(s) => crate::myset::copy_from_pouch(s, slot, set),
             None => 0,
@@ -5510,6 +6499,7 @@ impl Editor {
         self.item_set_armed = None;
         let slot = self.slot;
         let set = e.set;
+        self.push_undo("セットをポーチへ");
         let n = match &mut self.save {
             Some(s) => crate::myset::apply_to_pouch(s, slot, set),
             None => 0,
@@ -5687,6 +6677,7 @@ impl Editor {
         }
 
         // Second press: go ahead. `force` is what the armed state earned.
+        self.push_undo("装備の削除");
         let Some(save) = &mut self.save else {
             self.equip_delete_armed = None;
             self.message = String::from("先にセーブを開いてください");
@@ -5947,6 +6938,7 @@ impl Editor {
                 return;
             }
         };
+        self.push_undo("装備の編集");
         let identity_changed = current.kind != e.kind || current.id != e.id;
 
         if identity_changed {
@@ -6021,6 +7013,7 @@ impl Editor {
     /// Create the form's values in the first blank record of the box.
     fn write_new_equip(&mut self, e: &EquipEdit) {
         let slot = self.slot;
+        self.push_undo("装備の新規作成");
         let Some(save) = &mut self.save else {
             self.message = String::from("先にセーブを開いてください");
             return;
@@ -6261,6 +7254,7 @@ impl Editor {
                         let t = self.qe_target;
                         let slot = self.slot;
                         let slot_index = self.cursor;
+                        self.push_undo("クエスト装備");
                         if let Some(s) = &mut self.save {
                             if crate::dlc::set_quest_equipment_item(
                                 s,
@@ -6420,6 +7414,7 @@ impl Editor {
             self.message = String::from("クエストIDが読めません（.mib がない）");
             return;
         };
+        self.push_undo("クエストの追加");
         let Some(save) = &mut self.save else {
             return;
         };
@@ -6501,6 +7496,7 @@ impl Editor {
     /// Install bundled quests matching the specified categories into the open save.
     #[cfg(feature = "gamedata")]
     pub fn install_dlc_category(&mut self, official: bool, dead: bool, label: &str) {
+        self.push_undo("DLC クエストの一括導入");
         let Some(save) = &mut self.save else {
             self.message = String::from("先にセーブデータを開いてください");
             return;
@@ -6527,6 +7523,7 @@ impl Editor {
     /// Toggle one bundled quest (install into free slot or remove from save).
     #[cfg(feature = "gamedata")]
     pub fn toggle_bundled_quest(&mut self, quest_id: i32) {
+        self.push_undo("クエストの導入と削除");
         let Some(save) = &mut self.save else {
             self.message = String::from("先にセーブデータを開いてください");
             return;
@@ -6559,6 +7556,7 @@ impl Editor {
     #[cfg(feature = "gamedata")]
     pub fn remove_save_quest(&mut self, quest_id: i32) {
         let title = self.quest_title(quest_id).to_string();
+        self.push_undo("クエストの削除");
         let Some(save) = &mut self.save else {
             self.message = String::from("先にセーブデータを開いてください");
             return;
@@ -6937,6 +7935,7 @@ impl Editor {
                 return;
             }
         };
+        self.push_undo("クエストの書き込み");
         let Some(s) = &mut self.save else {
             self.message = String::from("先にセーブを開いてください");
             return;
@@ -9812,5 +10811,243 @@ mod tests {
         assert_eq!(ed.request_flag_label(300), "依頼 #000 受理 村長の依頼");
         assert_eq!(ed.request_flag_label(301), "依頼 #000 完了 村長の依頼");
         assert_eq!(ed.request_flag_label(302), "イベント");
+    }
+
+    // ------------------------------------------------------- whole save undo
+
+    #[test]
+    fn the_undo_stack_keeps_four_steps_and_drops_the_oldest() {
+        let mut ed = editor_on_a_used_slot();
+        assert_eq!(ed.undo_depth(), 0);
+        assert_eq!(ed.undo_label(), None);
+        for i in 0..6 {
+            ed.push_undo(format!("手順 {}", i));
+        }
+        assert_eq!(ed.undo_depth(), UNDO_STEPS);
+        assert_eq!(UNDO_STEPS, 4);
+        // The two oldest are gone; the newest is what the footer names.
+        assert_eq!(ed.undo_label(), Some("手順 5"));
+        assert_eq!(ed.undo_line(), "元に戻す: 4/4（1回 4.5MB を使用）");
+        assert_eq!(ed.undo_count_text(), "4/4");
+    }
+
+    #[test]
+    fn undo_puts_the_save_and_the_slot_back_and_marks_it_dirty() {
+        let mut ed = editor_on_a_used_slot();
+        ed.slot = 0;
+        let funds = ed.char_value(1);
+        ed.dirty = false;
+
+        ed.set_char_value(1, 1234);
+        assert_eq!(ed.char_value(1), 1234);
+        assert!(ed.dirty);
+        assert_eq!(ed.undo_depth(), 1);
+        assert_eq!(ed.undo_label(), Some("キャラクター値"));
+
+        ed.dirty = false;
+        assert!(ed.undo_last(), "the step has to come back");
+        assert_eq!(ed.char_value(1), funds);
+        assert!(ed.dirty, "the file on disk no longer matches the editor");
+        assert!(ed.message.contains("元に戻しました: キャラクター値"), "{}", ed.message);
+        assert_eq!(ed.undo_depth(), 0);
+
+        // Nothing left: the key says so instead of doing nothing quietly.
+        assert!(!ed.undo_last());
+        assert!(ed.message.contains("戻せる操作がありません"), "{}", ed.message);
+    }
+
+    #[test]
+    fn every_major_screen_records_a_step_before_it_writes() {
+        let mut ed = editor_on_a_used_slot();
+
+        // キャラクター
+        ed.set_char_value(1, 1234);
+        assert_eq!(ed.undo_label(), Some("キャラクター値"));
+
+        // ギルドカード
+        assert!(ed.set_guild_comment("テスト"), "{}", ed.message);
+        assert_eq!(ed.undo_label(), Some("ギルドカードのコメント"));
+
+        // オトモ
+        assert!(ed.rename_palico(0, "アイルー"), "{}", ed.message);
+        assert_eq!(ed.undo_label(), Some("オトモの名前"));
+
+        // 設定
+        ed.screen = Screen::Options;
+        ed.input(Key::Right);
+        assert_eq!(ed.undo_label(), Some("設定"));
+
+        // 装備
+        ed.screen = Screen::Equip;
+        ed.input(Key::Plus);
+        ed.input(Key::A);
+        assert_eq!(ed.undo_label(), Some("装備の新規作成"), "{}", ed.message);
+
+        // アイテムボックス (一括操作)
+        let mut items = itembox::decode(&alloc::vec![0u8; crate::itembox::ITEM_BOX_SIZE]);
+        items[0] = ItemSlot { id: 1, count: 1 };
+        ed.save
+            .as_mut()
+            .expect("save")
+            .write_item_box(0, &items)
+            .expect("the box takes a record");
+        ed.screen = Screen::Items;
+        ed.open_item_menu();
+        ed.run_item_op(ITEM_OP_FILL);
+        assert_eq!(ed.undo_label(), Some("アイテムボックス"), "{}", ed.message);
+
+        // 進行状況
+        ed.open_progress();
+        ed.input(Key::A);
+        assert_eq!(ed.undo_label(), Some("進行状況"), "{}", ed.message);
+
+        // 護石: the form writes through set_charm_with_grade.
+        ed.open_charms();
+        ed.input(Key::L);
+        ed.input(Key::A);
+        assert_eq!(ed.undo_label(), Some("お守りの書き込み"), "{}", ed.message);
+
+        // DLC
+        ed.install_dlc_category(true, false, "公式");
+        assert_eq!(
+            ed.undo_label(),
+            Some("DLC クエストの一括導入"),
+            "{}",
+            ed.message
+        );
+
+        // Four is the ceiling, and one press of a bulk MAX is one step.
+        assert_eq!(ed.undo_depth(), UNDO_STEPS);
+    }
+
+    #[test]
+    fn one_press_of_the_bulk_max_is_one_undo_step() {
+        let mut ed = editor_on_a_used_slot();
+        assert!(ed.maximize_character(), "{}", ed.message);
+        assert_eq!(ed.undo_depth(), 1);
+        assert_eq!(ed.undo_label(), Some("資金・ポイント一括MAX"));
+        assert_eq!(ed.char_value(1), 9_999_999);
+        assert_eq!(ed.char_value(3), 999);
+    }
+
+    #[test]
+    fn the_undo_line_names_the_count_and_the_memory() {
+        let mut ed = editor_on_a_used_slot();
+        assert_eq!(ed.undo_line(), "元に戻す: 0/4（1回 4.5MB を使用）");
+        ed.set_char_value(3, 5);
+        let line = ed.undo_line();
+        assert!(line.contains("1/4"), "{}", line);
+        assert!(line.contains("4.5MB"), "{}", line);
+        // The number is the constant, not a sentence that can drift from it.
+        assert_eq!(UNDO_STEP_BYTES, crate::save::SWITCH_SIZE);
+        assert_eq!(undo_step_text(), "4.5MB");
+        assert_eq!(undo_total_text(), "18.0MB");
+    }
+
+    // ---------------------------------------------------- pre-save review
+
+    #[test]
+    fn the_review_names_the_equipment_box_it_would_change() {
+        let save = crate::save::empty_switch_save();
+        let base = save.slot_base(0).expect("slot base") as usize;
+        let old = save.to_bytes();
+        let mut new_save = save.clone();
+        let at = base + crate::save::OFF_EQUIPMENT_BOX;
+        new_save.body_mut()[at..at + 3].copy_from_slice(&[1, 2, 3]);
+        let new = new_save.to_bytes();
+
+        let diff = diff_save(&old, &new);
+        assert_eq!(diff.changed, 3);
+        assert_eq!(diff.ranges.len(), 1, "{:?}", diff.ranges);
+        let line = diff.ranges[0].line();
+        assert!(line.contains("スロット1 装備ボックス"), "{}", line);
+        assert!(line.contains("3 バイト"), "{}", line);
+        assert!(line.contains("1 枠"), "{}", line);
+        let summary = diff.summary.join(" / ");
+        assert!(summary.contains("スロット1: 装備ボックス 1 枠"), "{}", summary);
+
+        // The same bytes are not a change, and the dialog is not shown for them.
+        assert!(diff_save(&old, &old).is_empty());
+    }
+
+    #[cfg(feature = "gamedata")]
+    fn quest_arc(id: u32) -> Vec<u8> {
+        let mut mib = alloc::vec![0u8; crate::quest::MIB_SIZE];
+        mib[0x0C..0x10].copy_from_slice(&id.to_le_bytes());
+        let a = Arc {
+            version: crate::arc::ARC_VERSION,
+            header8: 0xFFFF_FFFE,
+            entries: alloc::vec![crate::arc::ArcEntry {
+                name: String::from("questData\\questData_00"),
+                type_hash: 0x1BBF_D18E,
+                data: mib,
+                original: None,
+                original_offset: None,
+            }],
+        };
+        a.to_bytes().expect("the archive rebuilds")
+    }
+
+    #[cfg(feature = "gamedata")]
+    #[test]
+    fn the_review_counts_the_quests_a_dlc_write_adds() {
+        let old = crate::save::empty_switch_save();
+        let mut new = old.clone();
+        let ids = [
+            crate::gamedata::DLC_CATALOG[0],
+            crate::gamedata::DLC_CATALOG[1],
+        ];
+        for id in ids {
+            dlc::add_quest(&mut new, id, &quest_arc(id as u32)).expect("a free quest slot");
+        }
+        let diff = diff_save(&old.to_bytes(), &new.to_bytes());
+        let summary = diff.summary.join(" / ");
+        assert!(summary.contains("DLC: クエスト 2 件"), "{}", summary);
+        assert!(
+            diff.ranges.iter().any(|r| r.name == "DLC クエスト"),
+            "{:?}",
+            diff.ranges
+        );
+        assert_eq!(quests_changed(&old, &new), 2);
+    }
+
+    #[test]
+    fn a_review_is_asked_for_only_when_the_bytes_differ() {
+        let mut ed = editor_on_a_used_slot();
+        let old = ed.save.as_ref().expect("save").to_bytes();
+
+        // The same bytes: written at once, exactly the way it used to be.
+        assert!(!ed.stage_save_review("nand:/system", &old, &old));
+        assert!(!ed.review_open());
+
+        // One byte different: the write waits for the second press.
+        let mut changed = old.clone();
+        changed[crate::save::SWITCH_HEADER_SIZE + 0x1000] ^= 0x01;
+        assert!(ed.stage_save_review("nand:/system", &old, &changed));
+        assert!(ed.review_open());
+        let review = ed.review.as_ref().expect("a review");
+        assert_eq!(review.changed, 1);
+        assert!(review.headline().contains("変更 1 バイト"), "{}", review.headline());
+        assert!(review.lines.iter().any(|l| l.contains("変更される内容")));
+        assert!(review.lines.iter().any(|l| l.contains("変更される範囲")));
+        assert!(ed.message.contains("もう一度"), "{}", ed.message);
+
+        // The second press hands the write back, built from the open save.
+        let write = ed.confirm_save_review().expect("the second press writes");
+        match write {
+            Write::File { path, bytes } => {
+                assert_eq!(path, "C:/mhnx/test/system");
+                assert_eq!(bytes, old);
+            }
+        }
+        assert!(!ed.review_open());
+
+        // B keeps the edit and writes nothing at all.
+        assert!(ed.stage_save_review("nand:/system", &old, &changed));
+        ed.cancel_save_review();
+        assert!(!ed.review_open());
+        assert!(ed.message.contains("中止"), "{}", ed.message);
+        // Nothing was written: the save in memory is still the file on disk.
+        assert_eq!(ed.save.as_ref().expect("save").to_bytes(), old);
     }
 }

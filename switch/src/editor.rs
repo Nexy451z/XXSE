@@ -85,6 +85,13 @@ pub const OUT_QUEST_DIR: &str = "/switch/XXSE/mhxx/quest/arc";
 /// simple and predictable. This many frames must pass before a repeat.
 const REPEAT_DELAY: u32 = 12;
 
+/// How long L has to be held before it means "元に戻す" instead of the sub-tab.
+///
+/// L is the sub-tab key on every screen, so the undo cannot be a plain L press.
+/// About half a second is the usual long-press threshold, and the footer pill
+/// names the key next to the count and the memory it costs.
+const L_UNDO_FRAMES: u32 = 30;
+
 // ---------------------------------------------------------------------------
 // file helpers
 // ---------------------------------------------------------------------------
@@ -404,6 +411,7 @@ pub fn install_arc_file_into_save(ed: &mut Editor, idx: usize) {
         ed.message = String::from("クエストIDが読めません（.mib が含まれていません）");
         return;
     };
+    ed.push_undo("クエストの追加");
     let Some(save) = &mut ed.save else {
         return;
     };
@@ -447,7 +455,7 @@ struct WriteReport {
 
 /// Write the save back to the console, keeping a copy on the SD card first,
 /// then read the same area back and compare it with what was written.
-fn write_console_save(bytes: &[u8]) -> Result<WriteReport, String> {
+fn write_console_save(bytes: &[u8], pre_read: Option<&[u8]>) -> Result<WriteReport, String> {
     // The console save is a header plus a 4,726,152 byte body. A 3DS save is
     // the bare body, and writing one through the in place path would leave the
     // file at its old length with the tail of the old save still on the end.
@@ -462,13 +470,18 @@ fn write_console_save(bytes: &[u8]) -> Result<WriteReport, String> {
     // Keep what the console holds now, so a bad edit can be undone without
     // having thought about it beforehand.
     make_dirs(SAFETY_DIR);
-    let old = match mount.read() {
-        Ok(b) => b,
-        Err(_) => {
-            return Err(String::from(
-                "いまのセーブを読み直せないため控えを作れません。セーブは変更していません",
-            ))
-        }
+    // The review already read the file it compared against, so the common path
+    // does not pay for a second 4.5MB read of the console save.
+    let old = match pre_read {
+        Some(b) => b.to_vec(),
+        None => match mount.read() {
+            Ok(b) => b,
+            Err(_) => {
+                return Err(String::from(
+                    "いまのセーブを読み直せないため控えを作れません。セーブは変更していません",
+                ))
+            }
+        },
     };
     let stamp = crate::savedata::stamp();
     let backup_path = alloc::format!("{}/system_{}.bak", SAFETY_DIR, stamp);
@@ -519,6 +532,52 @@ fn write_console_save(bytes: &[u8]) -> Result<WriteReport, String> {
             "書き込み後の照合に失敗し、戻しにも失敗しました（{} / {}）。控え {} を SD カードから手動で戻してください",
             detail, why, backup_path
         )),
+    }
+}
+
+/// Write the console save and put the result, the check and the way back into
+/// one message.
+///
+/// Split out of the service loop because the save review writes on its own key
+/// press now, and a write that landed must read the same whether it came from
+/// the first press (nothing changed) or the second (a reviewed change).
+fn finish_console_write(ed: &mut Editor, bytes: &[u8], pre_read: Option<&[u8]>) {
+    let n = bytes.len();
+    match write_console_save(bytes, pre_read) {
+        Ok(report) => {
+            ed.message = match report.mismatch {
+                None => {
+                    ed.dirty = false;
+                    alloc::format!(
+                        "本体のセーブに {} バイト書き込みました（控え: {}）。書き込みと照合が完了しました。{}",
+                        n,
+                        report.backup,
+                        snapshot_note(&report.snapshot)
+                    )
+                }
+                // The edit is not on the console: leave the save marked dirty so
+                // the user knows the change still only exists in memory.
+                Some(detail) => alloc::format!(
+                    "書き込み後の照合に失敗したので戻しました（{} / 控え: {}）。{}",
+                    detail,
+                    report.backup,
+                    snapshot_note(&report.snapshot)
+                ),
+            };
+        }
+        Err(msg) => ed.message = msg,
+    }
+}
+
+/// The A press of the save review: write what the review just showed.
+///
+/// The UI layer calls this from a tap on the dialog's button, so the key path
+/// and the touch path run the same code.
+pub(crate) fn finish_reviewed_write(ed: &mut Editor) {
+    if let Some(Write::File { bytes, .. }) = ed.confirm_save_review() {
+        // No pre-read: the console may have changed between the review and this
+        // press, and the copy write_console_save keeps has to be what is there.
+        finish_console_write(ed, &bytes, None);
     }
 }
 
@@ -819,6 +878,15 @@ impl Painter {
                 }
                 sys::log_line("");
                 sys::log_line(&format!(">> {}", ed.message));
+                // The canvas UI draws these two as a footer pill and a dialog;
+                // the text console has neither, so it prints them here.
+                sys::log_line(&ed.undo_line());
+                if let Some(review) = ed.review.as_ref() {
+                    for line in review.lines.iter() {
+                        sys::log_line(line);
+                    }
+                    sys::log_line("[A] この内容で保存   [B] 中止");
+                }
                 let mut bar = alloc::string::String::new();
                 for (k, label) in actions(ed.screen) {
                     if !bar.is_empty() {
@@ -1095,21 +1163,16 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         // the record it belongs to is the one on screen.
         ed.apply_set_name(s);
     } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
-        if let Some(save) = &mut ed.save {
-            let slot = ed.slot;
-            mhnx_core::guildcard::set_comment(save, slot, &s);
-            ed.dirty = true;
-            ed.message = String::from("コメントを変更しました");
+        // Through the editor, not straight into the save: the comment is a
+        // guild card edit like any other and has to reach the undo stack.
+        if !ed.set_guild_comment(&s) {
+            ed.message = String::from("コメントを変更できませんでした");
         }
     } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME {
         let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
-        if let Some(save) = &mut ed.save {
-            let slot = ed.slot;
-            let clipped: String = s.chars().take(20).collect();
-            if mhnx_core::palico::set_name(save, slot, which, &clipped) {
-                ed.dirty = true;
-                ed.message = alloc::format!("オトモ {} の名前を変更しました", which);
-            }
+        let clipped: String = s.chars().take(20).collect();
+        if !ed.rename_palico(which, &clipped) {
+            ed.message = alloc::format!("オトモ {} の名前を変更できませんでした", which);
         }
     } else {
         ed.apply_text(idx, s);
@@ -1226,30 +1289,26 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                 if path == mhnx_core::hbedit::CONSOLE_SAVE
                     || path == "nand:/system_backup"
                 {
-                    match write_console_save(&bytes) {
-                        Ok(report) => {
-                            ed.message = match report.mismatch {
-                                None => {
-                                    ed.dirty = false;
-                                    alloc::format!(
-                                        "本体のセーブに {} バイト書き込みました（控え: {}）。書き込みと照合が完了しました。{}",
-                                        n,
-                                        report.backup,
-                                        snapshot_note(&report.snapshot)
-                                    )
-                                }
-                                // The edit is not on the console: leave the
-                                // save marked dirty so the user knows the
-                                // change still only exists in memory.
-                                Some(detail) => alloc::format!(
-                                    "書き込み後の照合に失敗したので戻しました（{} / 控え: {}）。{}",
-                                    detail,
-                                    report.backup,
-                                    snapshot_note(&report.snapshot)
-                                ),
-                            };
+                    // The console save is reviewed before it is written. The
+                    // first press reads what the console holds now and shows
+                    // what would change; the second press writes. A write that
+                    // changes nothing goes out at once, the way it always did.
+                    match read_console_save() {
+                        Ok(old) => {
+                            if ed.stage_save_review(&path, &old, &bytes) {
+                                ed.take_request();
+                                return true;
+                            }
+                            // Nothing differs: write it right away, and reuse
+                            // the bytes just read as the copy to keep.
+                            finish_console_write(ed, &bytes, Some(&old));
                         }
-                        Err(msg) => ed.message = msg,
+                        Err(msg) => {
+                            // Without the current bytes there is no copy and no
+                            // review, and write_console_save would refuse for
+                            // the same reason. Say it once, write nothing.
+                            ed.message = msg;
+                        }
                     }
                     ed.take_request();
                     return force_redraw;
@@ -1369,6 +1428,11 @@ pub fn run() -> i32 {
 
     let mut held: u64 = 0;
     let mut hold_frames: u32 = 0;
+    // L: held for the undo, tapped for the sub-tab (see L_UNDO_FRAMES).
+    let mut l_pending = false;
+    let mut l_fired = false;
+    let mut l_clean = true;
+    let mut l_frames: u32 = 0;
 
     unsafe {
         sys::padConfigureInput(1, HID_NPAD_STYLE_SET_NPAD_STANDARD);
@@ -1401,6 +1465,10 @@ pub fn run() -> i32 {
             }
 
             if painter.gui.osk.is_some() {
+                // L answers the keyboard here, not the list: drop the deferred
+                // press so a release inside the keyboard cannot reach it later.
+                l_pending = false;
+                l_fired = false;
                 if down & BTN_ZL != 0 {
                     key = Some(Key::L);
                 } else if down & BTN_ZR != 0 {
@@ -1412,6 +1480,8 @@ pub fn run() -> i32 {
                     }
                 }
             } else if painter.gui.mib_picker.is_some() {
+                l_pending = false;
+                l_fired = false;
                 if down & BTN_RSTICK_UP != 0 {
                     painter.gui.scroll_mib_picker(-8);
                     need_draw = true;
@@ -1422,6 +1492,26 @@ pub fn run() -> i32 {
                 if let Some(k) = key {
                     if painter.gui.handle_mib_picker_key(&mut ed, k) {
                         need_draw = true;
+                    }
+                }
+            } else if ed.review_open() {
+                l_pending = false;
+                l_fired = false;
+                // The save review is modal: A writes, B goes back, and nothing
+                // else is heard. The UI drops taps on anything but its two
+                // buttons for the same reason - a tap must not reach the list
+                // under the dialog.
+                if let Some(k) = key {
+                    match k {
+                        Key::A => {
+                            finish_reviewed_write(&mut ed);
+                            need_draw = true;
+                        }
+                        Key::B => {
+                            ed.cancel_save_review();
+                            need_draw = true;
+                        }
+                        _ => {}
                     }
                 }
             } else {
@@ -1467,9 +1557,43 @@ pub fn run() -> i32 {
                     need_draw = true;
                 }
 
+                // L is the sub-tab key on every screen, so a plain L cannot also
+                // be the undo key. Holding it is the undo; a tap still does what
+                // L always did. The tap is answered on release, which is what
+                // keeps the two answers from firing off the same press.
+                if down & BTN_L != 0 {
+                    l_pending = true;
+                    l_fired = false;
+                    l_clean = true;
+                    l_frames = 0;
+                }
+                if l_pending {
+                    if cur & BTN_L == 0 {
+                        l_pending = false;
+                        // A press that did something else on the way does not
+                        // also count as a tab press: the sub-tab would move
+                        // under a screen the user just opened.
+                        if !l_fired && l_clean {
+                            painter.gui.handle_pad_key(&mut ed, Key::L, cur);
+                            need_draw = true;
+                        }
+                        l_fired = false;
+                    } else if !l_fired {
+                        l_frames += 1;
+                        if l_frames >= L_UNDO_FRAMES {
+                            l_fired = true;
+                            if ed.undo_last() {
+                                need_draw = true;
+                            }
+                        }
+                    }
+                }
+
                 if let Some(k) = key {
-                    // Don't double-send Key::Z when ZR was already used for tab cycling
-                    if k != Key::Z {
+                    // Don't double-send Key::Z when ZR was already used for tab cycling,
+                    // and Key::L is answered above (tap on release, hold for undo).
+                    if k != Key::Z && k != Key::L {
+                        l_clean = false;
                         painter.gui.handle_pad_key(&mut ed, k, cur);
                         need_draw = true;
                     }
