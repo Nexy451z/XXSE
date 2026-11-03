@@ -9,6 +9,7 @@ use mhnx_core::arc::{extension_for, Arc};
 use mhnx_core::awards;
 use mhnx_core::check::{self, Finding, Severity};
 use mhnx_core::csvout::{self, ApplyReport, EquipmentRow};
+use mhnx_core::diffvalues::{ValueChange, VALUE_SHOWN};
 use mhnx_core::dlc;
 use mhnx_core::equipops::{self, EquipError};
 use mhnx_core::equiprefs::EquipRef;
@@ -619,69 +620,27 @@ impl DiffRange {
     }
 }
 
-/// How many value lines a dialog prints before it counts the rest.
+/// The ranges in the shape mhnx_core's value walk reads.
 ///
-/// The reference editor lists every target; a save-wide edit here can move
-/// thousands of bits (a bulk quest unlock), and a dialog taller than the
-/// window helps nobody. Thirty lines is about a screen of values; the count
-/// says what was folded away.
-pub const VALUE_SHOWN: usize = 30;
-
-/// One value that differs between the two sides of a review or a comparison.
-///
-/// The ranges say *where* the bytes moved; this says *what* they became. Every
-/// value is read back through an accessor mhnx-core already has, so an area
-/// nobody reads is never guessed at: it keeps its byte range and gets no value
-/// line. The line reads "スロット1 名前: アイルー → アイルー2".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValueChange {
-    /// Character slot it belongs to, None for the body-wide parts.
-    pub slot: Option<usize>,
-    /// What the value is called, e.g. "装備ボックス #12 レベル".
-    pub field: String,
-    /// What it was.
-    pub old: String,
-    /// What it became.
-    pub new: String,
-}
-
-impl ValueChange {
-    /// The line the review and the comparison print for this value.
-    pub fn line(&self) -> String {
-        let head = match self.slot {
-            Some(i) => format!("スロット{} {}", i + 1, self.field),
-            None => self.field.clone(),
-        };
-        let word = |value: &str| {
-            if value.is_empty() {
-                String::from("（空）")
-            } else {
-                value.to_owned()
-            }
-        };
-        format!("{}: {} → {}", head, word(&self.old), word(&self.new))
-    }
-}
-
-/// Push a value line, but only when the two sides really differ.
-///
-/// A field that did not change would otherwise bury the ones that did: only
-/// the write target's differences are listed, the way the byte ranges do it.
-fn differing(
-    out: &mut Vec<ValueChange>,
-    slot: Option<usize>,
-    field: impl Into<String>,
-    old: String,
-    new: String,
-) {
-    if old != new {
-        out.push(ValueChange {
-            slot,
-            field: field.into(),
-            old,
-            new,
-        });
-    }
+/// The layout here and the one inside mhnx-core name the same bytes; the
+/// download section is the one part the two spell differently (「DLC セクション」
+/// here, 「DLC クエスト」 in the library), so the name is translated on the way
+/// in. Without that the walk would open for every other area and stay shut for
+/// a quest payload, which is a value change like any other.
+fn value_ranges(ranges: &[DiffRange]) -> Vec<mhnx_core::hbedit::DiffRange> {
+    ranges
+        .iter()
+        .map(|range| mhnx_core::hbedit::DiffRange {
+            slot: range.slot,
+            name: match range.name {
+                "DLC セクション" => "DLC クエスト",
+                other => other,
+            },
+            rel: range.rel,
+            len: range.len,
+            records: range.records,
+        })
+        .collect()
 }
 
 /// What one write would change: the named stretches and a feature summary.
@@ -1009,764 +968,6 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
         out.push(format!("本体: {}", body.join("、")));
     }
     out
-}
-
-
-/// The value level lines: which field became what.
-///
-/// The byte ranges say where a change is; these say what it is. Every value is
-/// read back through an accessor mhnx-core already had, so nothing is decoded
-/// by hand and an area with no getter (定型文, 受信カード一覧, ...) simply keeps
-/// its byte range and contributes no line here. The walk is gated on the
-/// ranges, so only the parts that really moved are read.
-///
-/// titles spells the 称号 out when the romfs tables are loaded; without them
-/// the three ids are shown, which is still the value that gets written.
-pub fn diff_values(
-    ranges: &[DiffRange],
-    old: &Save,
-    new: &Save,
-    titles: Option<&mhnx_core::guildcard::TitleTable>,
-) -> Vec<ValueChange> {
-    let mut out: Vec<ValueChange> = Vec::new();
-    if ranges.iter().any(|range| range.slot.is_none()) {
-        body_values(ranges, old, new, &mut out);
-    }
-    let mut slots: Vec<usize> = ranges.iter().filter_map(|range| range.slot).collect();
-    slots.sort_unstable();
-    slots.dedup();
-    for slot in slots {
-        slot_values(ranges, old, new, slot, titles, &mut out);
-    }
-    // The request flags are the one slot value with no layout entry of their
-    // own: they sit between the named parts and are reported as その他, a range
-    // that does not name the slot it came from. So when such a range moved,
-    // every slot is asked, and the getters decide which one really changed.
-    if touched(ranges, None, &["その他"]) {
-        for slot in 0..mhnx_core::save::MAX_SLOTS {
-            request_values(old, new, slot, &mut out);
-        }
-    }
-    out
-}
-
-/// Does a range name this part of this slot?
-///
-/// The value walk is gated on it so an unrelated getter cannot add a line to a
-/// change that did not touch its bytes.
-fn touched(ranges: &[DiffRange], slot: Option<usize>, names: &[&str]) -> bool {
-    ranges
-        .iter()
-        .any(|range| range.slot == slot && names.contains(&range.name))
-}
-
-/// The body wide values: the options, the slot flags and the DLC block.
-fn body_values(ranges: &[DiffRange], old: &Save, new: &Save, out: &mut Vec<ValueChange>) {
-    let (a, b) = (old.options(), new.options());
-    differing(out, None, "オプション 明るさ", a.brightness.to_string(), b.brightness.to_string());
-    differing(out, None, "オプション 振動", a.rumble.to_string(), b.rumble.to_string());
-    differing(out, None, "オプション 3D 無効", a.disable_3d.to_string(), b.disable_3d.to_string());
-    differing(
-        out,
-        None,
-        "オプション 拡張スライドパッド",
-        a.circle_pad_pro.to_string(),
-        b.circle_pad_pro.to_string(),
-    );
-    for slot in 0..mhnx_core::save::MAX_SLOTS {
-        differing(
-            out,
-            None,
-            format!("スロット使用フラグ スロット{}", slot + 1),
-            on_word(old.slot_used(slot)),
-            on_word(new.slot_used(slot)),
-        );
-    }
-    let (a, b) = (old.dlc_palicoes(), new.dlc_palicoes());
-    for (x, y) in a.iter().zip(b.iter()) {
-        differing(
-            out,
-            None,
-            format!("DLC オトモ #{}", x.index + 1),
-            dlc_palico_line(x.id, &x.name),
-            dlc_palico_line(y.id, &y.name),
-        );
-    }
-    // Download quests are the one expensive body area to walk, so they are
-    // only read when a range says the section really moved. They are named by
-    // their id, which is the value a replacement keeps: the payload size says
-    // whether the row itself changed.
-    if !touched(ranges, None, &["DLC セクション"]) {
-        return;
-    }
-    let before: std::collections::HashMap<i32, Vec<u8>> = dlc::list_quests(old)
-        .into_iter()
-        .map(|q| (q.quest_id, q.data))
-        .collect();
-    let after = dlc::list_quests(new);
-    for quest in &after {
-        let size = quest.data.len();
-        let field = format!("DLC クエスト {}", quest.quest_id);
-        match before.get(&quest.quest_id) {
-            // The payload is compared, not only its length: a quest whose
-            // contents changed at the same size is still a change.
-            Some(data) if *data == quest.data => {}
-            Some(data) => differing(
-                out,
-                None,
-                field,
-                format!("内容 {} バイト", data.len()),
-                format!("書き換え {} バイト", size),
-            ),
-            None => differing(out, None, field, String::from("なし"), format!("追加 {} バイト", size)),
-        }
-    }
-    let ids: std::collections::HashSet<i32> = after.iter().map(|q| q.quest_id).collect();
-    let mut gone: Vec<i32> = before
-        .keys()
-        .copied()
-        .filter(|id| !ids.contains(id))
-        .collect();
-    gone.sort_unstable();
-    for id in gone {
-        differing(
-            out,
-            None,
-            format!("DLC クエスト {}", id),
-            format!("{} バイト", before[&id].len()),
-            String::from("なし"),
-        );
-    }
-}
-
-/// One download Palico as a value: id and name, or なし.
-fn dlc_palico_line(id: u8, name: &str) -> String {
-    let name = name.trim();
-    if id == 0 && name.is_empty() {
-        String::from("なし")
-    } else if name.is_empty() {
-        format!("名前なし（ID {}）", id)
-    } else {
-        format!("{}（ID {}）", name, id)
-    }
-}
-
-/// Everything inside one character slot that has a readable value.
-///
-/// Each getter runs only for the parts its own bytes cover, so a change in one
-/// tab cannot pick up a line from another: a getter that reads further than its
-/// records (a whole box, a whole roster) still only reports what differs
-/// inside the part that moved.
-fn slot_values(
-    ranges: &[DiffRange],
-    old: &Save,
-    new: &Save,
-    slot: usize,
-    titles: Option<&mhnx_core::guildcard::TitleTable>,
-    out: &mut Vec<ValueChange>,
-) {
-    let moved = |names: &[&str]| touched(ranges, Some(slot), names);
-    if moved(&["キャラクター情報", "名前"]) {
-        character_values(old, new, slot, out);
-    }
-    if moved(&["ギルドカード"]) {
-        card_values(old, new, slot, titles, out);
-    }
-    if moved(&["闘技大会の記録"]) {
-        arena_values(old, new, slot, out);
-    }
-    if moved(&["装備ボックス"]) {
-        equipment_values(old, new, slot, out);
-    }
-    if moved(&["アイテムボックス"]) {
-        item_values(old, new, slot, out);
-    }
-    if moved(&["アイテムマイセット", "装備マイセット"]) {
-        set_values(old, new, slot, out);
-    }
-    if moved(&["オトモ"]) {
-        palico_values(old, new, slot, out);
-    }
-    if moved(&["クエスト進行状況"]) {
-        quest_values(old, new, slot, out);
-    }
-    if moved(&["勲章（解禁マップ）", "勲章（通知）", "勲章（カード側）"]) {
-        award_values(old, new, slot, out);
-    }
-}
-
-/// The character sheet: name, rank, money, play time and the look.
-fn character_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let (Some(a), Some(b)) = (old.read_character(slot), new.read_character(slot)) else {
-        return;
-    };
-    let at = Some(slot);
-    differing(out, at, "名前", a.name.clone(), b.name.clone());
-    differing(out, at, "画面の名前", a.name_preview.clone(), b.name_preview.clone());
-    differing(out, at, "プレイ時間", play_clock(a.play_time), play_clock(b.play_time));
-    differing(out, at, "所持金", format!("{} z", a.funds), format!("{} z", b.funds));
-    differing(
-        out,
-        at,
-        "ハンターランク",
-        a.hunter_rank.to_string(),
-        b.hunter_rank.to_string(),
-    );
-    differing(out, at, "HR ポイント", a.hr_points.to_string(), b.hr_points.to_string());
-    differing(
-        out,
-        at,
-        "学園ポイント",
-        a.academy_points.to_string(),
-        b.academy_points.to_string(),
-    );
-    for (i, name) in ["ベルナ", "ココット", "ポッケ", "ユクモ"].iter().enumerate() {
-        differing(
-            out,
-            at,
-            format!("{}ポイント", name),
-            a.village_points[i].to_string(),
-            b.village_points[i].to_string(),
-        );
-    }
-    for (field, x, y) in [
-        ("声", a.voice, b.voice),
-        ("目の色", a.eye_color, b.eye_color),
-        ("服装", a.clothing, b.clothing),
-        ("性別", a.gender, b.gender),
-        ("髪型", a.hairstyle, b.hairstyle),
-        ("顔", a.face, b.face),
-        ("特徴", a.features, b.features),
-    ] {
-        differing(out, at, field, x.to_string(), y.to_string());
-    }
-    for (field, x, y) in [
-        ("肌の色", a.skin_color, b.skin_color),
-        ("髪の色", a.hair_color, b.hair_color),
-        ("特徴の色", a.features_color, b.features_color),
-        ("服の色", a.clothing_color, b.clothing_color),
-    ] {
-        differing(out, at, field, rgba(x), rgba(y));
-    }
-}
-
-/// The guild card itself: comment, title, rank, play time and quest count.
-fn card_values(
-    old: &Save,
-    new: &Save,
-    slot: usize,
-    titles: Option<&mhnx_core::guildcard::TitleTable>,
-    out: &mut Vec<ValueChange>,
-) {
-    let at = Some(slot);
-    differing(
-        out,
-        at,
-        "コメント",
-        mhnx_core::guildcard::comment(old, slot).unwrap_or_default(),
-        mhnx_core::guildcard::comment(new, slot).unwrap_or_default(),
-    );
-    if let (Some(x), Some(y)) = (
-        mhnx_core::guildcard::title(old, slot),
-        mhnx_core::guildcard::title(new, slot),
-    ) {
-        differing(out, at, "称号", title_text(titles, x), title_text(titles, y));
-    }
-    differing(
-        out,
-        at,
-        "ギルドカードの HR",
-        mhnx_core::guildcard::hunter_rank(old, slot)
-            .unwrap_or(0)
-            .to_string(),
-        mhnx_core::guildcard::hunter_rank(new, slot)
-            .unwrap_or(0)
-            .to_string(),
-    );
-    differing(
-        out,
-        at,
-        "ギルドカードのプレイ時間",
-        play_clock(
-            mhnx_core::guildcard::play_time(old, slot)
-                .unwrap_or(0)
-                .min(i32::MAX as u32) as i32,
-        ),
-        play_clock(
-            mhnx_core::guildcard::play_time(new, slot)
-                .unwrap_or(0)
-                .min(i32::MAX as u32) as i32,
-        ),
-    );
-    differing(
-        out,
-        at,
-        "クエスト達成数",
-        mhnx_core::guildcard::quest_total(old, slot).to_string(),
-        mhnx_core::guildcard::quest_total(new, slot).to_string(),
-    );
-}
-
-/// The arena log and the weapon usage grid of one card.
-fn arena_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let at = Some(slot);
-    let (a, b) = (
-        mhnx_core::guildcard::arena(old, slot),
-        mhnx_core::guildcard::arena(new, slot),
-    );
-    for (x, y) in a.iter().zip(b.iter()) {
-        if x.centis == y.centis {
-            continue;
-        }
-        differing(
-            out,
-            at,
-            format!("闘技大会 {} の {} 位", x.arena + 1, x.rank + 1),
-            MhnxEditor::arena_clock(x.centis),
-            MhnxEditor::arena_clock(y.centis),
-        );
-    }
-    let (a, b) = (
-        mhnx_core::guildcard::weapon_usage(old, slot),
-        mhnx_core::guildcard::weapon_usage(new, slot),
-    );
-    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        differing(
-            out,
-            at,
-            format!("武器使用数 {} 番", i + 1),
-            x.to_string(),
-            y.to_string(),
-        );
-    }
-}
-
-/// The equipment box: every changed record, as a piece or as a talisman.
-fn equipment_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let (Some(a), Some(b)) = (old.equipment_box(slot), new.equipment_box(slot)) else {
-        return;
-    };
-    let charms_a = charm_map(a);
-    let charms_b = charm_map(b);
-    let records = (a.len() / mhnx_core::charm::CHARM_RECORD)
-        .min(b.len() / mhnx_core::charm::CHARM_RECORD)
-        .min(mhnx_core::charm::CHARM_COUNT);
-    for i in 0..records {
-        let at = i * mhnx_core::charm::CHARM_RECORD;
-        let ra = &a[at..at + mhnx_core::charm::CHARM_RECORD];
-        let rb = &b[at..at + mhnx_core::charm::CHARM_RECORD];
-        if ra == rb {
-            continue;
-        }
-        let ca = charms_a.get(&i).copied();
-        let cb = charms_b.get(&i).copied();
-        if ca.is_some()
-            || cb.is_some()
-            || mhnx_core::charm::is_talisman(ra)
-            || mhnx_core::charm::is_talisman(rb)
-        {
-            charm_values(out, slot, i, ra, rb, ca, cb);
-        } else {
-            equip_values(out, slot, i, ra, rb);
-        }
-    }
-}
-
-/// The talismans of one equipment box, by record index.
-fn charm_map(
-    box_bytes: &[u8],
-) -> std::collections::HashMap<usize, mhnx_core::charm::Charm> {
-    mhnx_core::charm::decode_box(box_bytes)
-        .into_iter()
-        .map(|charm| (charm.index, charm))
-        .collect()
-}
-
-/// One talisman's owned fields, old against new.
-fn charm_values(
-    out: &mut Vec<ValueChange>,
-    slot: usize,
-    index: usize,
-    old_rec: &[u8],
-    new_rec: &[u8],
-    old_charm: Option<mhnx_core::charm::Charm>,
-    new_charm: Option<mhnx_core::charm::Charm>,
-) {
-    let at = Some(slot);
-    differing(
-        out,
-        at,
-        format!("護石 #{} スキル1", index + 1),
-        charm_skill(old_charm, true),
-        charm_skill(new_charm, true),
-    );
-    differing(
-        out,
-        at,
-        format!("護石 #{} スキル2", index + 1),
-        charm_skill(old_charm, false),
-        charm_skill(new_charm, false),
-    );
-    differing(
-        out,
-        at,
-        format!("護石 #{} スロット", index + 1),
-        charm_slots(old_charm),
-        charm_slots(new_charm),
-    );
-    differing(
-        out,
-        at,
-        format!("護石 #{} レア度", index + 1),
-        charm_rarity(old_rec),
-        charm_rarity(new_rec),
-    );
-}
-
-/// One talisman skill as "攻撃 +5", or なし.
-fn charm_skill(charm: Option<mhnx_core::charm::Charm>, first: bool) -> String {
-    let Some(charm) = charm else {
-        return String::from("なし");
-    };
-    let (name, points) = if first {
-        (charm.skill1_name(), charm.points1)
-    } else {
-        (charm.skill2_name(), charm.points2)
-    };
-    match name {
-        Some(name) => format!("{} {:+}", name, points),
-        None => String::from("なし"),
-    }
-}
-
-/// The decoration slot count of one talisman, or なし.
-fn charm_slots(charm: Option<mhnx_core::charm::Charm>) -> String {
-    match charm {
-        Some(charm) => format!("{} 個", charm.slots),
-        None => String::from("なし"),
-    }
-}
-
-/// The rarity of one raw record, as the charm module words it.
-fn charm_rarity(rec: &[u8]) -> String {
-    if mhnx_core::charm::is_talisman(rec) {
-        match mhnx_core::charm::rarity_of_record(rec) {
-            Some(grade) => format!("{}（R{}）", grade.name(), grade.rarity()),
-            None => String::from("—"),
-        }
-    } else if mhnx_core::charm::is_empty_record(rec) {
-        String::from("なし")
-    } else {
-        String::from("—")
-    }
-}
-
-/// One record of the equipment box that is not a talisman.
-fn equip_values(out: &mut Vec<ValueChange>, slot: usize, index: usize, old_rec: &[u8], new_rec: &[u8]) {
-    let (Some(a), Some(b)) = (
-        mhnx_core::equip::decode_record(index, old_rec),
-        mhnx_core::equip::decode_record(index, new_rec),
-    ) else {
-        return;
-    };
-    let at = Some(slot);
-    let field = |what: &str| format!("装備ボックス #{} {}", index + 1, what);
-    differing(
-        out,
-        at,
-        field("種別"),
-        mhnx_core::equip::type_name(a.kind).to_owned(),
-        mhnx_core::equip::type_name(b.kind).to_owned(),
-    );
-    differing(out, at, field("ID"), a.id.to_string(), b.id.to_string());
-    differing(
-        out,
-        at,
-        field("名前"),
-        mhnx_core::equip::name(&a).to_owned(),
-        mhnx_core::equip::name(&b).to_owned(),
-    );
-    differing(out, at, field("レベル"), a.level.to_string(), b.level.to_string());
-    differing(out, at, field("強化先"), transmog_label(&a), transmog_label(&b));
-    differing(out, at, field("装飾品"), deco_list(index, old_rec), deco_list(index, new_rec));
-}
-
-/// The three decoration sockets of one record, named.
-fn deco_list(index: usize, rec: &[u8]) -> String {
-    mhnx_core::equip::Equipment::decorations(index, rec)
-        .iter()
-        .map(|id| deco_label(*id))
-        .collect::<Vec<String>>()
-        .join(" / ")
-}
-
-/// The item box: every changed record as "name ×count".
-fn item_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let (Some(a), Some(b)) = (old.read_item_box(slot), new.read_item_box(slot)) else {
-        return;
-    };
-    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-        if x == y {
-            continue;
-        }
-        differing(
-            out,
-            Some(slot),
-            format!("アイテムボックス #{}", i + 1),
-            item_line(x),
-            item_line(y),
-        );
-    }
-}
-
-/// One item box record as the item box tab words it.
-fn item_line(slot: &ItemSlot) -> String {
-    if slot.id == 0 {
-        String::from("なし")
-    } else {
-        format!("{} ×{}", item_name(slot.id), slot.count)
-    }
-}
-
-/// The item and equipment sets: the names and the seven parts.
-fn set_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let at = Some(slot);
-    let (a, b) = (
-        mhnx_core::myset::item_sets(old, slot),
-        mhnx_core::myset::item_sets(new, slot),
-    );
-    for (x, y) in a.iter().zip(b.iter()) {
-        differing(
-            out,
-            at,
-            format!("アイテムマイセット #{} 名前", x.index + 1),
-            set_name(&x.name),
-            set_name(&y.name),
-        );
-        let (ua, ub) = (x.used_items(), y.used_items());
-        if ua != ub {
-            differing(
-                out,
-                at,
-                format!("アイテムマイセット #{} 中身", x.index + 1),
-                format!("{} 件", ua.len()),
-                format!("{} 件", ub.len()),
-            );
-        }
-    }
-    let (a, b) = (
-        mhnx_core::myset::equip_sets(old, slot),
-        mhnx_core::myset::equip_sets(new, slot),
-    );
-    for (x, y) in a.iter().zip(b.iter()) {
-        differing(
-            out,
-            at,
-            format!("装備マイセット #{} 名前", x.index + 1),
-            set_name(&x.name),
-            set_name(&y.name),
-        );
-        for part in 0..mhnx_core::myset::EQUIP_SET_PARTS {
-            if x.parts[part] == y.parts[part] {
-                continue;
-            }
-            differing(
-                out,
-                at,
-                format!(
-                    "装備マイセット #{} {}",
-                    x.index + 1,
-                    mhnx_core::myset::PART_NAMES[part]
-                ),
-                part_label(old, slot, x.parts[part]),
-                part_label(new, slot, y.parts[part]),
-            );
-        }
-    }
-}
-
-/// A saved set's name, with the game's "unused" marker kept.
-fn set_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        String::from("（名前なし）")
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-/// What a set's part index points at in that save's equipment box.
-fn part_label(save: &Save, slot: usize, index: u16) -> String {
-    if index == mhnx_core::myset::NONE {
-        return String::from("なし");
-    }
-    match save.equipment_at(slot, index as usize) {
-        Some(eq) if !eq.is_empty() => format!("{} Lv{}", mhnx_core::equip::name(&eq), eq.level),
-        _ => format!("#{}", index),
-    }
-}
-
-/// The otomon roster: name, level, tendency and equipped skills.
-fn palico_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let (a, b) = (
-        mhnx_core::palico::roster(old, slot),
-        mhnx_core::palico::roster(new, slot),
-    );
-    for (x, y) in a.iter().zip(b.iter()) {
-        // Only records that really differ: an untouched empty slot is skipped
-        // by the equality test, but a record the game never named still has a
-        // level and a tendency, and those are values like any other.
-        if x == y {
-            continue;
-        }
-        let at = Some(slot);
-        let label = format!("オトモ #{}", x.index + 1);
-        differing(out, at, format!("{} 名前", label), palico_name(&x.name), palico_name(&y.name));
-        differing(out, at, format!("{} レベル", label), x.level.to_string(), y.level.to_string());
-        differing(
-            out,
-            at,
-            format!("{} 傾向", label),
-            x.system_name().to_owned(),
-            y.system_name().to_owned(),
-        );
-        differing(out, at, format!("{} スキル", label), palico_skills(x), palico_skills(y));
-    }
-}
-
-/// A palico name, with the empty name called なし.
-fn palico_name(name: &str) -> String {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        String::from("なし")
-    } else {
-        trimmed.to_owned()
-    }
-}
-
-/// The equipped skills of one palico, named.
-fn palico_skills(palico: &mhnx_core::palico::Palico) -> String {
-    let names: Vec<String> = palico
-        .skills()
-        .into_iter()
-        .map(mhnx_core::palico::skill_name)
-        .collect();
-    if names.is_empty() {
-        String::from("なし")
-    } else {
-        names.join("・")
-    }
-}
-
-/// The three quest progress maps, one changed bit at a time.
-fn quest_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let at = Some(slot);
-    for (kind, word) in [
-        (Progress::Cleared, "クリア"),
-        (Progress::Seen, "既読"),
-        (Progress::Failed, "失敗"),
-    ] {
-        for index in 0..questprogress::BITS {
-            match (
-                questprogress::get(old, slot, kind, index),
-                questprogress::get(new, slot, kind, index),
-            ) {
-                (Some(x), Some(y)) if x != y => differing(
-                    out,
-                    at,
-                    format!("クエスト #{} {}", index, word),
-                    on_word(x),
-                    on_word(y),
-                ),
-                _ => {}
-            }
-        }
-    }
-}
-
-/// The request flags, one changed bit at a time.
-fn request_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let at = Some(slot);
-    for index in 0..requests::FLAGS {
-        match (
-            requests::get(old, slot, index),
-            requests::get(new, slot, index),
-        ) {
-            (Some(x), Some(y)) if x != y => differing(
-                out,
-                at,
-                format!("依頼フラグ #{}", index),
-                on_word(x),
-                on_word(y),
-            ),
-            _ => {}
-        }
-    }
-}
-
-/// The 132 award bits of the card copy.
-///
-/// An award is unreadable (None) on a side whose slot holds no character, which
-/// is exactly the first save of a new character: reading that side as "not
-/// held" is what lets the review say なし → 取得 instead of dropping the line.
-fn award_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
-    let at = Some(slot);
-    for index in 0..awards::AWARDS {
-        let before = awards::has(old, slot, index);
-        let after = awards::has(new, slot, index);
-        if before.is_none() && after.is_none() {
-            continue;
-        }
-        let (before, after) = (before.unwrap_or(false), after.unwrap_or(false));
-        if before != after {
-            differing(
-                out,
-                at,
-                format!("勲章ビット #{}", index),
-                award_word(before),
-                award_word(after),
-            );
-        }
-    }
-}
-
-/// A progress or request bit as a word.
-fn on_word(on: bool) -> String {
-    String::from(if on { "済" } else { "未" })
-}
-
-/// An award bit as a word.
-fn award_word(on: bool) -> String {
-    String::from(if on { "取得" } else { "なし" })
-}
-
-/// Seconds of play time, with a negative (unreadable) value shown as zero.
-fn play_clock(seconds: i32) -> String {
-    MhnxEditor::clock_text(seconds.max(0) as u32)
-}
-
-/// An RGBA colour as four numbers.
-fn rgba(c: [u8; 4]) -> String {
-    format!("{}/{}/{}/{}", c[0], c[1], c[2], c[3])
-}
-
-/// The 称号 spelled out from the romfs tables, or its three ids.
-fn title_text(
-    titles: Option<&mhnx_core::guildcard::TitleTable>,
-    title: mhnx_core::guildcard::Title,
-) -> String {
-    let ids = format!("{} / {} / {}", title.first, title.link, title.last);
-    match titles {
-        Some(table) if !table.is_empty() => {
-            let text = table.text(title);
-            if text.is_empty() {
-                ids
-            } else {
-                text
-            }
-        }
-        _ => ids,
-    }
 }
 
 /// The three sections a difference is printed as.
@@ -2619,7 +1820,12 @@ impl MhnxEditor {
         let (summary, values) = match Save::from_bytes(&right_bytes) {
             Ok(other) if other.kind() == left_save.kind() => (
                 diff_summary(&ranges, &left_save, &other),
-                diff_values(&ranges, &left_save, &other, Some(&self.title_table)),
+                mhnx_core::diffvalues::diff_values(
+                    &value_ranges(&ranges),
+                    &left_save,
+                    &other,
+                    Some(&self.title_table),
+                ),
             ),
             _ => (Vec::new(), Vec::new()),
         };
@@ -3007,7 +2213,12 @@ impl MhnxEditor {
         let (summary, values) = match Save::from_bytes(&old) {
             Ok(previous) if previous.kind() == save.kind() => (
                 diff_summary(&ranges, &previous, &save),
-                diff_values(&ranges, &previous, &save, Some(&self.title_table)),
+                mhnx_core::diffvalues::diff_values(
+                    &value_ranges(&ranges),
+                    &previous,
+                    &save,
+                    Some(&self.title_table),
+                ),
             ),
             _ => (Vec::new(), Vec::new()),
         };
@@ -16148,6 +15359,40 @@ mod tests {
         let ranges_at = text.find("■ 変更される範囲").expect("ranges section");
         assert!(values_at < ranges_at, "{}", text);
         assert!(text.contains("この内容で保存しますか？"), "{}", text);
+    }
+
+    /// 所持金 has a layout entry of its own (「所持金・HR ポイント」), apart from
+    /// キャラクター情報, and the value walk here used to open only for the
+    /// latter: a file whose money and nothing else had moved was compared as
+    /// byte ranges with no value at all. The walk in mhnx_core opens for both,
+    /// so this says the comparison does too.
+    #[test]
+    fn a_money_only_difference_still_names_the_value() {
+        let dir = Scratch::new("comparemoney");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        // The snapshot is what the editor would write, with the money alone
+        // changed in its bytes: the only named range is 所持金・HR ポイント.
+        let mut baseline = planned_bytes(&app);
+        let at = {
+            let save = app.save.as_ref().expect("save");
+            mhnx_core::save::SWITCH_HEADER_SIZE
+                + save.slot_base(0).expect("the first slot") as usize
+                + mhnx_core::save::OFF_FUNDS
+        };
+        baseline[at..at + 2].copy_from_slice(&777u16.to_le_bytes());
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = String::from("system-20261105-000000.sav");
+        std::fs::write(snaps.join(&name), &baseline).expect("snapshot");
+        app.refresh_snapshots();
+        app.compare_snapshot(name, None);
+        let text = app.compare.as_ref().expect("a comparison").text();
+        println!("{}", text);
+        assert!(text.contains("■ 変更される値（旧 → 新）"), "{}", text);
+        assert!(text.contains("スロット1 所持金: 777 z → 0 z"), "{}", text);
     }
 
     /// Too many values must not push the buttons off the window: the list is
