@@ -3295,7 +3295,7 @@ fn the_console_entry_is_labelled_in_the_list() {
 // ===========================================================================
 
 /// Every Screen variant, so the reachability test cannot miss a new one.
-const AUDIT_SCREENS: [Screen; 27] = [
+const AUDIT_SCREENS: [Screen; 28] = [
     Screen::SaveList,
     Screen::Slots,
     Screen::Char,
@@ -3323,6 +3323,7 @@ const AUDIT_SCREENS: [Screen; 27] = [
     Screen::Gmd,
     Screen::Check,
     Screen::Csv,
+    Screen::Progress,
 ];
 
 /// Keys that could plausibly start an edit on a record screen.
@@ -3367,6 +3368,8 @@ fn audit_screen_name(s: Screen) -> &'static str {
         // Added with the CSV screen: the audit walks every screen, so the new
         // one has to have a name for its report.
         Screen::Csv => "Csv",
+        // Added with the progress screen: awards / requests / quest bits.
+        Screen::Progress => "Progress",
     }
 }
 
@@ -3569,6 +3572,19 @@ fn audit_every_screen_is_reachable_by_keys() {
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Equip);
     press!(Key::L);
+    assert_eq!(ed.screen, Screen::Guild);
+    // [-] on the card is the progress screen: one slot's awards, request
+    // flags and quest bits, with its three views on the sub-tab bar.
+    press!(Key::Minus);
+    assert_eq!(ed.screen, Screen::Progress);
+    // L / R walk the three views without leaving the screen.
+    press!(Key::R);
+    assert_eq!(ed.progress_view(), 1);
+    press!(Key::R);
+    assert_eq!(ed.progress_view(), 2);
+    press!(Key::L);
+    assert_eq!(ed.progress_view(), 1);
+    press!(Key::B);
     assert_eq!(ed.screen, Screen::Guild);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Slots);
@@ -4346,7 +4362,7 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
         .collect();
     assert_eq!(
         arms.len(),
-        27,
+        28,
         "arms: {:?}",
         arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     );

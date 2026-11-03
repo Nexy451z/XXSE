@@ -30,7 +30,8 @@ use mhnx_core::hbedit::{
     decoration_name_of, item_name_of, monster_name, palico_part_name, Editor, ItemSetOp, Key,
     PalicoEquipRow, Screen, CHAR_FIELDS, CONSOLE_SAVE, CSV_DIR, ITEM_OP_ADD, ITEM_OP_CLAMP,
     ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS,
-    PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
+    PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_QUESTS,
+    PROGRESS_REQUESTS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -211,7 +212,10 @@ pub fn section_of(screen: Screen) -> MainSection {
         | Screen::EquipEdit
         | Screen::JewelPick
         | Screen::Sets => MainSection::Gear,
-        Screen::Roster | Screen::Palico | Screen::Hunts | Screen::Guild => {
+        // The progress screen is the fifth tab of the records section: awards,
+        // requests and quest bits are what the character has done, the same
+        // kind of thing the hunt record and the card are.
+        Screen::Roster | Screen::Palico | Screen::Hunts | Screen::Guild | Screen::Progress => {
             MainSection::PalicoRecord
         }
         Screen::SaveQuests
@@ -582,6 +586,13 @@ impl GuiState {
     // L / R: Sub-Tab System Inside the Current Section!
     // -----------------------------------------------------------------------
     fn sub_tabs_for(&self, ed: &Editor) -> (&'static [&'static str], usize) {
+        // The progress screen carries the three views itself: one screen with
+        // three tabs, the same shape the quest entries have, so the bar names
+        // them and L / R walk them. B goes back to the card.
+        if ed.screen == Screen::Progress {
+            let labels: &'static [&'static str] = &["勲章", "依頼", "クエスト"];
+            return (labels, ed.progress_view().min(2));
+        }
         if is_quest_inner(ed.screen) {
             let labels: &'static [&'static str] = &[
                 "条件(.mib)",
@@ -680,13 +691,16 @@ impl GuiState {
                     "配信オトモ",
                     "狩猟記録",
                     "ギルドカード",
+                    "進行状況",
                 ];
                 let active = match ed.screen {
                     Screen::Roster => 0,
                     Screen::Palico => 1,
                     Screen::Hunts => 2,
                     Screen::Guild => 3,
-                    _ => 0,
+                    // The progress screen returns above with its own three
+                    // tabs, so this arm is only reached when it is not showing.
+                    _ => 4,
                 };
                 (labels, active)
             }
@@ -733,6 +747,13 @@ impl GuiState {
         ed.csv_armed = None;
         // Same rule for the palico equipment panel.
         self.close_palico_panel(ed);
+
+        // On the progress screen the sub-tabs are its three views, so a tab
+        // press (or a tap on the bar) switches the view, not the section.
+        if ed.screen == Screen::Progress {
+            ed.progress_tab = idx.min(2);
+            return;
+        }
 
         if is_quest_inner(ed.screen) {
             safe_flush_quest_entry(ed);
@@ -900,8 +921,15 @@ impl GuiState {
                     ed.screen = Screen::Hunts;
                     ed.hunt_cursor = 0;
                 }
-                _ => {
+                3 => {
                     ed.screen = Screen::Guild;
+                }
+                _ => {
+                    if ed.save.is_none() {
+                        ed.message = String::from("先にセーブデータを開いてください");
+                        return;
+                    }
+                    ed.open_progress();
                 }
             },
             MainSection::Quest => match idx {
@@ -2185,6 +2213,8 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::JewelPick => ed.jewel_pick_cursor,
         Screen::Hunts => ed.hunt_cursor,
         Screen::Guild => ed.guild_field,
+        // One cursor per view: the screen swaps the list under it.
+        Screen::Progress => ed.progress_cursor(),
         // The panel's row while it is open, the list's row otherwise.
         Screen::Roster => match ed.palico_equip {
             Some(state) => state.field,
@@ -2251,6 +2281,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::JewelPick => ed.jewel_pick_matches().len(),
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => 3,
+        Screen::Progress => ed.progress_len(),
         Screen::Roster => match ed.palico_equip {
             Some(_) => PALICO_EQUIP_ROWS,
             None => ed.palicos().len(),
@@ -2401,6 +2432,7 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         Screen::JewelPick => ed.jewel_pick_cursor = clamped,
         Screen::Hunts => ed.hunt_cursor = clamped,
         Screen::Guild => ed.guild_field = clamped,
+        Screen::Progress => ed.set_progress_cursor(clamped),
         Screen::Roster => {
             if let Some(mut state) = ed.palico_equip {
                 // A tap on another row is a cursor move, so the pending release
@@ -3133,6 +3165,14 @@ impl GuiState {
             Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [L/R] サブタブ  [X] 保存",
             Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
             Screen::Hunts => "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [L/R] サブタブ  [X] 保存",
+            // The three views of the progress screen, one line each: Y is the
+            // second bit on the quest view and the tab key on the other two.
+            Screen::Progress if ed.progress_view() == PROGRESS_QUESTS => {
+                "[A] クリア  [Y] 既読  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
+            }
+            Screen::Progress => {
+                "[A] ビット切替  [Y] タブ  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
+            }
             Screen::SaveQuests => "[A] 編集/導入  [Y] 検索  [L/R] サブタブ  [X] 保存",
             Screen::ArcEntries => "[A] 開く  [Y] 検査  [L/R] サブタブ  [X] 保存  [B] 戻る",
             Screen::Mib => "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存",
@@ -3183,6 +3223,7 @@ impl GuiState {
             Screen::Palico => self.draw_palico(c, ed),
             Screen::Hunts => self.draw_hunts(c, ed),
             Screen::Guild => self.draw_guild(c, ed),
+            Screen::Progress => self.draw_progress(c, ed),
             Screen::SaveQuests => self.draw_save_quests(c, ed),
             Screen::QuestEquip => self.draw_quest_equip(c, ed),
             Screen::ArcList => self.draw_arc_list(c, ed),
@@ -4134,6 +4175,43 @@ impl GuiState {
                         UiAction::QuickSave,
                     );
                 }
+            }
+            // The progress screen has no bulk edit to offer, so the deck gives
+            // its three views instead: the pad's L / R do the same, and this is
+            // where a touch player reaches for it. The save pill stays under
+            // them, because [X] is the key that leaves this screen's edits on
+            // the card.
+            Screen::Progress => {
+                c.text_sized(ix + 20, cur_y, "表示切替", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    half_w,
+                    38,
+                    "◀ 前の表示",
+                    UiAction::CycleSubTab(false),
+                );
+                self.draw_tool_button(
+                    c,
+                    ix + 28 + half_w,
+                    cur_y,
+                    half_w,
+                    38,
+                    "次の表示 ▶",
+                    UiAction::CycleSubTab(true),
+                );
+                cur_y += 44;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[X] 変更を保存",
+                    UiAction::QuickSave,
+                );
             }
             _ => {
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
@@ -5484,6 +5562,159 @@ impl GuiState {
             ed.guild_field.min(2),
             true,
             "編集",
+        );
+    }
+
+
+    /// The progress screen: the three bit maps of the character slot.
+    ///
+    /// Awards, request flags and quest indices are all one bit (or one index)
+    /// per row, so the row is the whole interface: the title names the bit, the
+    /// value says what the bit is now, and [A] flips it. The header carries the
+    /// count the player checks (取得 80 / 132, 立っているビット 742) and the
+    /// amber strip carries the facts a write needs: the three award copies
+    /// disagreeing, the flags set outside the request bands, the cleared-in-seen
+    /// invariant the core reports and deliberately never repairs.
+    ///
+    /// The rows are the *whole* list of the view (132 / 380 / 1508) and the
+    /// list widget windows them around the cursor, exactly like the item box
+    /// does with 5463 slots: one code path, one place where a row can overlap
+    /// another.
+    fn draw_progress(&mut self, c: &mut Canvas, ed: &Editor) {
+        let mut rows: Vec<(usize, String, String, String, String)> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let header: String;
+        match ed.progress_view() {
+            PROGRESS_AWARDS => {
+                let (held, total) = ed.progress_awards();
+                header = format!("勲章  取得 {} / {}", held, total);
+                rows.reserve(total);
+                for award in 0..total {
+                    let on = ed
+                        .save
+                        .as_ref()
+                        .and_then(|s| mhnx_core::awards::has(s, ed.slot, award))
+                        .unwrap_or(false);
+                    let name = ed.award_name(award);
+                    let title = if name.is_empty() {
+                        format!("勲章 {:03}", award + 1)
+                    } else {
+                        format!("勲章 {:03}  {}", award + 1, name)
+                    };
+                    rows.push((
+                        award,
+                        title,
+                        String::from("ギルドカード勲章 / 3コピー同時"),
+                        String::from(if on { "取得" } else { "未取得" }),
+                        format!("#{:03}", award + 1),
+                    ));
+                }
+                // A disagreement is not something [A] fixes; say it before the
+                // first press rather than after it.
+                if ed.progress_awards_agree() == Some(false) {
+                    warnings.push(String::from("勲章の3つのコピーが一致しません"));
+                    warnings.push(String::from(
+                        "書き込みは3コピー同時です。先に中身を確認してください",
+                    ));
+                }
+            }
+            PROGRESS_REQUESTS => {
+                let set = ed.progress_request_count();
+                header = format!(
+                    "依頼フラグ  立っているビット {} / {}",
+                    set,
+                    mhnx_core::requests::FLAGS
+                );
+                let flags = ed.request_flags();
+                rows.reserve(flags.len());
+                for (row, &flag) in flags.iter().enumerate() {
+                    let on = ed
+                        .save
+                        .as_ref()
+                        .and_then(|s| mhnx_core::requests::get(s, ed.slot, flag))
+                        .unwrap_or(false);
+                    rows.push((
+                        row,
+                        format!("フラグ {:04}", flag),
+                        ed.request_flag_label(flag),
+                        String::from(if on { "ON" } else { "OFF" }),
+                        format!("#{:03}", row + 1),
+                    ));
+                }
+                // The flag space is shared with other unlocks; a player who
+                // reads "742 bits" as "742 requests" is wrong by 444.
+                let outside = set.saturating_sub(ed.progress_request_band_count());
+                if outside > 0 {
+                    warnings.push(format!(
+                        "依頼の帯の外にも {} ビット立っています（他のイベント）",
+                        outside
+                    ));
+                }
+            }
+            _ => {
+                let (cleared, seen, failed) = ed.progress_quest_counts();
+                header = format!(
+                    "クエスト進捗  クリア {} / 既読 {} / 失敗 {}",
+                    cleared, seen, failed
+                );
+                let total = mhnx_core::questprogress::BITS - 1;
+                rows.reserve(total);
+                for row in 0..total {
+                    let (is_cleared, is_seen, is_failed) = ed.progress_quest_state(row);
+                    let value = if is_cleared {
+                        "クリア"
+                    } else if is_seen {
+                        "既読のみ"
+                    } else {
+                        "-"
+                    };
+                    rows.push((
+                        row,
+                        format!("クエスト {:04}", row + 1),
+                        format!(
+                            "クリア{} / 既読{} / 失敗{}",
+                            if is_cleared { "○" } else { "-" },
+                            if is_seen { "○" } else { "-" },
+                            if is_failed { "○" } else { "-" }
+                        ),
+                        String::from(value),
+                        format!("#{:04}", row + 1),
+                    ));
+                }
+                let (page, pages) = ed.progress_quest_page();
+                // Two short facts on one line: the page the cursor is on and
+                // the rule that makes [A] and [Y] interact. Both are clipped
+                // by the strip if a font metric makes them wider than the
+                // panel, so they are ordered by importance.
+                warnings.push(format!(
+                    "ページ {} / {}（[◀/▶] {}件ずつ）・クリアで既読も立つ",
+                    page,
+                    pages,
+                    mhnx_core::hbedit::PROGRESS_JUMP
+                ));
+                let broken = ed.progress_clears_without_seen();
+                if broken > 0 {
+                    warnings.push(format!(
+                        "クリア済みなのに未読が {} 件あります（自動修正はしません）",
+                        broken
+                    ));
+                }
+            }
+        }
+        let a_label = match ed.progress_view() {
+            PROGRESS_AWARDS => "取得切替",
+            PROGRESS_REQUESTS => "フラグ切替",
+            _ => "クリア切替",
+        };
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            &header,
+            &rows,
+            ed.progress_cursor(),
+            false,
+            a_label,
+            &warnings,
         );
     }
 

@@ -21,6 +21,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::arc::{extension_for, Arc};
+use crate::awards;
 use crate::check::{self, Finding, Severity};
 use crate::charm::{self, Charm, CHARM_COUNT};
 use crate::dlc;
@@ -31,6 +32,9 @@ use crate::save::Options;
 use crate::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT, TOTAL_ITEM_SLOTS};
 use crate::quest::{Gmd, Mib};
 use crate::questfields::{self, FieldKind};
+use crate::questprogress::{self, Progress};
+use crate::requests;
+use crate::romfstables::RequestRecord;
 use crate::save::{Character, Save, SaveKind};
 
 /// Which screen is showing.
@@ -94,7 +98,50 @@ pub enum Screen {
     /// to do with the record that is open, and the two keys that matter (write
     /// the boxes out, apply a file) are the whole screen.
     Csv,
+    /// Per-slot progress: guild card awards, request flags and quest bits.
+    ///
+    /// One screen with three views (勲章 / 依頼 / クエスト) rather than three
+    /// screens: they are the same question - what has this character done -
+    /// about three bit maps that all sit inside the character slot, and they
+    /// share the same two keys (a row, and one bit on that row).
+    ///
+    /// Every action here flips **one bit per press**. Nothing on this screen
+    /// takes a second press to confirm, because nothing here can lose a record:
+    /// an award or a quest bit is a single flag the game itself re-merges, so
+    /// pressing the same key again is the undo.
+    Progress,
 }
+
+/// The three views of [Screen::Progress], in the order L / R walks them.
+pub const PROGRESS_AWARDS: usize = 0;
+/// The request / event flag view.
+pub const PROGRESS_REQUESTS: usize = 1;
+/// The quest cleared / seen / failed view.
+pub const PROGRESS_QUESTS: usize = 2;
+/// How many views the progress screen has.
+pub const PROGRESS_TABS: usize = 3;
+
+/// Rows Left / Right jump on the progress screen.
+///
+/// One page of quests (1508 indices over this step is 31 pages), and a
+/// comfortable stride over 132 awards or 380 request flags.
+pub const PROGRESS_JUMP: usize = 50;
+
+/// The two request flag bands, as `[start, end)` numbers into the flag map.
+///
+/// The game's own request table uses 300..555 and 1270..1395 (see
+/// romfstables: every record owns an accept / complete pair, and the second
+/// band starts at 1270). The other flags in the 1536 bit map belong to
+/// other unlocks, so the request view shows these two bands and reports how
+/// many bits are set outside them rather than pretending they are requests.
+pub const REQUEST_BANDS: [(usize, usize); 2] = [(300, 555), (1270, 1395)];
+
+/// Rows the request view lists: the two bands, end to end (380).
+///
+/// Written as the sum of the bands rather than as 380, so a band that moves
+/// cannot leave the row count disagreeing with the list.
+pub const REQUEST_ROWS: usize =
+    (REQUEST_BANDS[0].1 - REQUEST_BANDS[0].0) + (REQUEST_BANDS[1].1 - REQUEST_BANDS[1].0);
 
 /// A button press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -943,6 +990,35 @@ pub struct Editor {
     pub roster_field: usize,
     /// Which guild card field (rank, clock, comment) is being changed.
     pub guild_field: usize,
+    /// Which view of the progress screen is showing.
+    ///
+    /// One of PROGRESS_AWARDS / PROGRESS_REQUESTS / PROGRESS_QUESTS. The three
+    /// share the screen but not the cursor: switching away and back keeps the
+    /// row the user was on, which is what a list of 1508 indices needs.
+    pub progress_tab: usize,
+    /// Award index under the cursor on the award view (0..AWARDS).
+    pub award_cursor: usize,
+    /// Row under the cursor on the request view, an index into the flag list
+    /// the two request bands describe (0..380).
+    pub request_cursor: usize,
+    /// Row under the cursor on the quest view.
+    ///
+    /// A row, not an index: row 0 is quest progress index 1, because index 0
+    /// lines up with the dummy quest and is never used.
+    pub quest_cursor: usize,
+    /// Award names from the user's own romfs, 132 entries, or empty.
+    ///
+    /// Game text, so this crate never ships it: a caller that has the dump
+    /// hands the names over and the screen appends them, and a caller that
+    /// has none (the console, which cannot read romfs) shows the number alone.
+    pub romfs_awards: Vec<String>,
+    /// Request names from the same dump, one per request record, or empty.
+    pub romfs_requests: Vec<String>,
+    /// The request table from the same dump, or empty.
+    ///
+    /// Carries the accept / complete flag numbers, which is what ties a flag
+    /// in the map to a request in the table.
+    pub romfs_records: Vec<RequestRecord>,
     /// Whether the quest-equipment screen is showing the items of one slot.
     pub qe_open: bool,
     /// Cursor inside that item list.
@@ -1115,6 +1191,13 @@ impl Editor {
             roster_cursor: 0,
             roster_field: 0,
             guild_field: 0,
+            progress_tab: 0,
+            award_cursor: 0,
+            request_cursor: 0,
+            quest_cursor: 0,
+            romfs_awards: Vec::new(),
+            romfs_requests: Vec::new(),
+            romfs_records: Vec::new(),
             qe_open: false,
             qe_item_cursor: 0,
             qe_target: crate::dlc::QuestEquipItem {
@@ -1271,6 +1354,9 @@ impl Editor {
             // On the two palico screens Minus opens the equipment panel, so it
             // cannot also rescan there: one press would do both at once.
             Screen::Roster | Screen::Palico => true,
+            // Minus on the guild card opens the progress screen for the same
+            // reason: the rescan would fire on the same press.
+            Screen::Guild => true,
             _ => false,
         }
     }
@@ -1447,6 +1533,7 @@ impl Editor {
             Screen::QuestEquip => self.input_quest_equip(key),
             Screen::Hunts => self.input_hunts(key),
             Screen::Guild => self.input_guild(key),
+            Screen::Progress => self.input_progress(key),
             Screen::Roster => self.input_roster(key),
             Screen::Sets => self.input_sets(key),
             Screen::EntryView => match key {
@@ -3099,12 +3186,419 @@ impl Editor {
                     }
                 }
             }
+            // The card is the last record of this kind and the progress screen
+            // continues it: awards, request flags and quest bits of the same
+            // slot. [-] rather than a new screen-wide key, because A / Y / L /
+            // R on the card already mean something.
+            Key::Minus => self.open_progress(),
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
             }
             Key::Plus => self.quit = true,
             _ => {}
+        }
+    }
+
+
+    // -----------------------------------------------------------------------
+    // Progress screen: awards, request flags and quest bits
+    //
+    // Three bit maps that all live inside the character slot, asked the same
+    // question: what has this character done? The screen is one screen with
+    // three views so the cursor, the tab and the save target are shared - and
+    // so the console's sub-tab bar (L / R) is the only navigation it needs.
+    // -----------------------------------------------------------------------
+
+    /// Open the progress screen for the current slot.
+    pub fn open_progress(&mut self) {
+        self.screen = Screen::Progress;
+        // Every view clamps against its own length, so opening on an empty
+        // save cannot leave a cursor past the end of a list.
+        let row = self.progress_cursor();
+        self.set_progress_cursor(row);
+        self.message = if self.save.is_some() {
+            String::from("A でビットを切り替え（2回押しは不要）  L / R でタブ切替")
+        } else {
+            String::from("先にセーブを開いてください")
+        };
+    }
+
+    /// Which view of the progress screen is showing.
+    pub fn progress_view(&self) -> usize {
+        if self.progress_tab < PROGRESS_TABS {
+            self.progress_tab
+        } else {
+            PROGRESS_AWARDS
+        }
+    }
+
+    /// How many rows the showing view has.
+    pub fn progress_len(&self) -> usize {
+        match self.progress_view() {
+            PROGRESS_AWARDS => awards::AWARDS,
+            PROGRESS_REQUESTS => REQUEST_ROWS,
+            // Index 0 is the unused dummy, so the rows are 1..=1508.
+            _ => questprogress::BITS - 1,
+        }
+    }
+
+    /// Row the cursor is on in the showing view.
+    ///
+    /// The three views keep their own cursor, so switching tabs and coming
+    /// back lands on the row that was left - the alternative is losing the
+    /// place in a list of 1508.
+    pub fn progress_cursor(&self) -> usize {
+        let last = self.progress_len().saturating_sub(1);
+        let cur = match self.progress_view() {
+            PROGRESS_AWARDS => self.award_cursor,
+            PROGRESS_REQUESTS => self.request_cursor,
+            _ => self.quest_cursor,
+        };
+        cur.min(last)
+    }
+
+    /// Put the cursor on a row, clipped to the showing view.
+    pub fn set_progress_cursor(&mut self, row: usize) {
+        let last = self.progress_len().saturating_sub(1);
+        let row = row.min(last);
+        match self.progress_view() {
+            PROGRESS_AWARDS => self.award_cursor = row,
+            PROGRESS_REQUESTS => self.request_cursor = row,
+            _ => self.quest_cursor = row,
+        }
+    }
+
+    /// Hand over the names and the request table from the user's own romfs.
+    ///
+    /// Nothing here reads a file and nothing here ships game text: the I/O
+    /// layer parses the dump (romfstables) and this only keeps the result. The
+    /// lengths are not required to match, so a table of the wrong size simply
+    /// does not name every row instead of shifting the names by one.
+    pub fn set_romfs_tables(
+        &mut self,
+        awards: Vec<String>,
+        requests: Vec<String>,
+        records: Vec<RequestRecord>,
+    ) {
+        self.romfs_awards = awards;
+        self.romfs_requests = requests;
+        self.romfs_records = records;
+    }
+
+    /// Name of one award, or "" when no table was supplied.
+    pub fn award_name(&self, award: usize) -> &str {
+        self.romfs_awards
+            .get(award)
+            .map(|s| s.as_str())
+            .unwrap_or("")
+    }
+
+    /// (held, total) awards of the current slot.
+    pub fn progress_awards(&self) -> (usize, usize) {
+        let held = match &self.save {
+            Some(save) => awards::count(save, self.slot),
+            None => 0,
+        };
+        (held, awards::AWARDS)
+    }
+
+    /// Do the three copies of the award map hold the same bits?
+    ///
+    /// None when there is no character to compare. Some(false) means the save
+    /// is already in the state the game repairs by OR, so the screen says so
+    /// before a write picks a side - the card copy may be the stale one.
+    pub fn progress_awards_agree(&self) -> Option<bool> {
+        let save = self.save.as_ref()?;
+        if !save.slot_used(self.slot) {
+            return None;
+        }
+        Some(awards::copies_agree(save, self.slot))
+    }
+
+    /// The flag numbers the request view lists: the two request bands, end to
+    /// end and in ascending order.
+    pub fn request_flags(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(REQUEST_ROWS);
+        for (start, end) in REQUEST_BANDS {
+            out.extend(start..end);
+        }
+        out
+    }
+
+    /// The flag a request row stands for, without building the whole list.
+    pub fn request_flag_at(&self, row: usize) -> Option<usize> {
+        let mut left = row;
+        for (start, end) in REQUEST_BANDS {
+            let len = end - start;
+            if left < len {
+                return Some(start + left);
+            }
+            left -= len;
+        }
+        None
+    }
+
+    /// How many of the 1536 event flags are set.
+    ///
+    /// Not the number of requests: the flag space is shared with other
+    /// unlocks, so the screen labels this as bits, not requests.
+    pub fn progress_request_count(&self) -> usize {
+        match &self.save {
+            Some(save) => requests::count(save, self.slot),
+            None => 0,
+        }
+    }
+
+    /// How many of the request band flags are set.
+    pub fn progress_request_band_count(&self) -> usize {
+        let Some(save) = &self.save else {
+            return 0;
+        };
+        self.request_flags()
+            .into_iter()
+            .filter(|&flag| requests::get(save, self.slot, flag) == Some(true))
+            .count()
+    }
+
+    /// What a request flag number is, when the request table was supplied.
+    ///
+    /// Without the table (the console, which has no romfs) a flag number is
+    /// only an event flag: the save does not say which request it opens.
+    pub fn request_flag_label(&self, flag: usize) -> String {
+        let Some(rec) = self
+            .romfs_records
+            .iter()
+            .find(|r| r.accept_flag as usize == flag || r.complete_flag as usize == flag)
+        else {
+            return String::from("イベント");
+        };
+        let step = if rec.accept_flag as usize == flag {
+            "受理"
+        } else {
+            "完了"
+        };
+        let name = self
+            .romfs_requests
+            .get(rec.index)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if name.is_empty() {
+            alloc::format!("依頼 #{:03} {}", rec.index, step)
+        } else {
+            alloc::format!("依頼 #{:03} {} {}", rec.index, step, name)
+        }
+    }
+
+    /// (cleared, seen, failed) counts of the current slot.
+    pub fn progress_quest_counts(&self) -> (usize, usize, usize) {
+        let Some(save) = &self.save else {
+            return (0, 0, 0);
+        };
+        (
+            questprogress::count(save, self.slot, Progress::Cleared),
+            questprogress::count(save, self.slot, Progress::Seen),
+            questprogress::count(save, self.slot, Progress::Failed),
+        )
+    }
+
+    /// The quest progress index the cursor is on: the row plus one, because
+    /// index 0 lines up with the unused dummy quest.
+    pub fn progress_quest_index(&self) -> usize {
+        self.quest_cursor.min(questprogress::BITS - 2) + 1
+    }
+
+    /// (page, pages) of the quest view, 1 based, in pages of PROGRESS_JUMP.
+    pub fn progress_quest_page(&self) -> (usize, usize) {
+        let total = questprogress::BITS - 1;
+        (
+            self.progress_cursor() / PROGRESS_JUMP + 1,
+            total.div_ceil(PROGRESS_JUMP),
+        )
+    }
+
+    /// (cleared, seen, failed) of one quest row.
+    pub fn progress_quest_state(&self, row: usize) -> (bool, bool, bool) {
+        let index = row + 1;
+        let Some(save) = &self.save else {
+            return (false, false, false);
+        };
+        (
+            questprogress::get(save, self.slot, Progress::Cleared, index) == Some(true),
+            questprogress::get(save, self.slot, Progress::Seen, index) == Some(true),
+            questprogress::get(save, self.slot, Progress::Failed, index) == Some(true),
+        )
+    }
+
+    /// How many quests are cleared without being seen: the invariant the core
+    /// reports and deliberately does not repair.
+    pub fn progress_clears_without_seen(&self) -> usize {
+        match &self.save {
+            Some(save) => questprogress::clears_without_seen(save, self.slot).len(),
+            None => 0,
+        }
+    }
+
+    fn input_progress(&mut self, key: Key) {
+        match key {
+            // The three views are this screen's sub-tabs, so L / R walk them
+            // the same way every other sub-tab bar does.
+            Key::L => {
+                self.progress_tab = (self.progress_view() + PROGRESS_TABS - 1) % PROGRESS_TABS;
+            }
+            Key::R => {
+                self.progress_tab = (self.progress_view() + 1) % PROGRESS_TABS;
+            }
+            // Y is the second bit of the quest view (seen). The other two views
+            // have no second bit to give - an award or a request flag is one
+            // bit - so there it cycles the view instead. The chips on screen
+            // name whichever it is on the view in front of the user.
+            Key::Y => {
+                if self.progress_view() == PROGRESS_QUESTS {
+                    self.progress_quest_seen();
+                } else {
+                    self.progress_tab = (self.progress_view() + 1) % PROGRESS_TABS;
+                }
+            }
+            Key::Up => {
+                let row = self.progress_cursor();
+                self.set_progress_cursor(row.saturating_sub(1));
+            }
+            Key::Down => {
+                let row = self.progress_cursor();
+                self.set_progress_cursor(row.saturating_add(1));
+            }
+            Key::Left => {
+                let row = self.progress_cursor();
+                self.set_progress_cursor(row.saturating_sub(PROGRESS_JUMP));
+            }
+            Key::Right => {
+                let row = self.progress_cursor();
+                self.set_progress_cursor(row.saturating_add(PROGRESS_JUMP));
+            }
+            Key::A => self.progress_toggle(),
+            Key::B => {
+                self.screen = Screen::Guild;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    /// Flip the bit under the cursor. One press, because one press is the undo.
+    fn progress_toggle(&mut self) {
+        let slot = self.slot;
+        let row = self.progress_cursor();
+        match self.progress_view() {
+            PROGRESS_AWARDS => {
+                let Some(save) = &mut self.save else {
+                    self.message = String::from("先にセーブを開いてください");
+                    return;
+                };
+                let before = awards::has(save, slot, row).unwrap_or(false);
+                if awards::set(save, slot, row, !before) {
+                    self.dirty = true;
+                    self.message = alloc::format!(
+                        "勲章 {:03} を{}にしました（3つのコピーすべて）",
+                        row + 1,
+                        if before { "未取得" } else { "取得" }
+                    );
+                } else {
+                    self.message =
+                        String::from("勲章を書き換えられませんでした（この枠にキャラがいません）");
+                }
+            }
+            PROGRESS_REQUESTS => {
+                let Some(flag) = self.request_flag_at(row) else {
+                    return;
+                };
+                // Named before the save is borrowed: the label reads the romfs
+                // table, which lives in the same struct.
+                let label = self.request_flag_label(flag);
+                let Some(save) = &mut self.save else {
+                    self.message = String::from("先にセーブを開いてください");
+                    return;
+                };
+                let before = requests::get(save, slot, flag).unwrap_or(false);
+                if requests::set(save, slot, flag, !before) {
+                    self.dirty = true;
+                    self.message = alloc::format!(
+                        "フラグ {} を {} にしました（{}）",
+                        flag,
+                        if before { "OFF" } else { "ON" },
+                        label
+                    );
+                } else {
+                    self.message =
+                        String::from("フラグを書き換えられませんでした（この枠にフラグ表がありません）");
+                }
+            }
+            _ => {
+                let index = row + 1;
+                let Some(save) = &mut self.save else {
+                    self.message = String::from("先にセーブを開いてください");
+                    return;
+                };
+                match questprogress::get(save, slot, Progress::Cleared, index) {
+                    // Taking the clear off leaves the seen bit alone: "seen but
+                    // not cleared" is a state the game writes itself.
+                    Some(true) => {
+                        if questprogress::set(save, slot, Progress::Cleared, index, false) {
+                            self.dirty = true;
+                            self.message = alloc::format!(
+                                "クエスト {} のクリアを取り消しました（既読はそのまま）",
+                                index
+                            );
+                        }
+                    }
+                    Some(false) => {
+                        if questprogress::set(save, slot, Progress::Cleared, index, true) {
+                            self.dirty = true;
+                            self.message = alloc::format!(
+                                "クエスト {} をクリアにしました（既読も立ちます）",
+                                index
+                            );
+                        }
+                    }
+                    None => {
+                        self.message =
+                            String::from("クエスト進捗を読めません（MHGU のセーブは未対応です）")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Y on the quest view: the seen bit, which the core refuses to clear while
+    /// the quest is still cleared.
+    fn progress_quest_seen(&mut self) {
+        let slot = self.slot;
+        let index = self.progress_cursor() + 1;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        };
+        match questprogress::get(save, slot, Progress::Seen, index) {
+            Some(true) => {
+                if questprogress::set(save, slot, Progress::Seen, index, false) {
+                    self.dirty = true;
+                    self.message = alloc::format!("クエスト {} の既読を取り消しました", index);
+                } else {
+                    self.message = alloc::format!(
+                        "クエスト {} はクリア済みなので既読を外せません（先に A でクリアを取り消してください）",
+                        index
+                    );
+                }
+            }
+            Some(false) => {
+                if questprogress::set(save, slot, Progress::Seen, index, true) {
+                    self.dirty = true;
+                    self.message = alloc::format!("クエスト {} を既読にしました", index);
+                }
+            }
+            None => {
+                self.message = String::from("クエスト進捗を読めません（MHGU のセーブは未対応です）")
+            }
         }
     }
 
@@ -7531,6 +8025,178 @@ impl Editor {
                     false,
                 );
             }
+            Screen::Progress => {
+                let tab = self.progress_view();
+                match tab {
+                    PROGRESS_AWARDS => {
+                        let (have, total) = self.progress_awards();
+                        push(
+                            &mut out,
+                            alloc::format!("進捗 [勲章]  取得 {} / {}", have, total),
+                            false,
+                            false,
+                        );
+                    }
+                    PROGRESS_REQUESTS => push(
+                        &mut out,
+                        alloc::format!(
+                            "進捗 [依頼]  立っているビット {} / {}",
+                            self.progress_request_count(),
+                            requests::FLAGS
+                        ),
+                        false,
+                        false,
+                    ),
+                    _ => {
+                        let (cleared, seen, failed) = self.progress_quest_counts();
+                        let (page, pages) = self.progress_quest_page();
+                        push(
+                            &mut out,
+                            alloc::format!(
+                                "進捗 [クエスト]  クリア {} / 既読 {} / 失敗 {}   p.{}/{}",
+                                cleared,
+                                seen,
+                                failed,
+                                page,
+                                pages
+                            ),
+                            false,
+                            false,
+                        );
+                    }
+                }
+                // A window of rows around the cursor: 1508 of anything does not
+                // fit on the console, and the same window is what the canvas
+                // build pages through.
+                let visible = 14usize;
+                let len = self.progress_len();
+                let cur = self.progress_cursor();
+                let start = if len <= visible {
+                    0
+                } else {
+                    cur.saturating_sub(visible / 2).min(len - visible)
+                };
+                for row in start..(start + visible).min(len) {
+                    let text = match tab {
+                        PROGRESS_AWARDS => {
+                            let held = match &self.save {
+                                Some(save) => awards::has(save, self.slot, row).unwrap_or(false),
+                                None => false,
+                            };
+                            let name = self.award_name(row);
+                            if name.is_empty() {
+                                alloc::format!(
+                                    "  勲章 {:03}  {}",
+                                    row + 1,
+                                    if held { "取得" } else { "未取得" }
+                                )
+                            } else {
+                                alloc::format!(
+                                    "  勲章 {:03}  {:6}  {}",
+                                    row + 1,
+                                    if held { "取得" } else { "未取得" },
+                                    name
+                                )
+                            }
+                        }
+                        PROGRESS_REQUESTS => {
+                            let flag = self.request_flag_at(row).unwrap_or(0);
+                            let on = match &self.save {
+                                Some(save) => {
+                                    requests::get(save, self.slot, flag).unwrap_or(false)
+                                }
+                                None => false,
+                            };
+                            alloc::format!(
+                                "  フラグ {:04}  {}  {}",
+                                flag,
+                                if on { "ON " } else { "OFF" },
+                                self.request_flag_label(flag)
+                            )
+                        }
+                        _ => {
+                            let (cleared, seen, failed) = self.progress_quest_state(row);
+                            alloc::format!(
+                                "  クエスト {:04}  {}  {}  {}",
+                                row + 1,
+                                if cleared { "クリア" } else { "------" },
+                                if seen { "既読" } else { "----" },
+                                if failed { "失敗" } else { "----" }
+                            )
+                        }
+                    };
+                    push(&mut out, clip_text(&text, 76), true, row == cur);
+                }
+                if start > 0 {
+                    push(
+                        &mut out,
+                        alloc::format!("  … 上に {} 行", start),
+                        false,
+                        false,
+                    );
+                }
+                // The facts a write needs, in the order they matter.
+                match tab {
+                    PROGRESS_AWARDS => {
+                        if self.progress_awards_agree() == Some(false) {
+                            push(
+                                &mut out,
+                                String::from(
+                                    "  警告: 勲章の3つのコピーが一致しません（書き込みは3つ同時です）",
+                                ),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    PROGRESS_REQUESTS => {
+                        let outside = self
+                            .progress_request_count()
+                            .saturating_sub(self.progress_request_band_count());
+                        push(
+                            &mut out,
+                            alloc::format!(
+                                "  この帯の外にも {} ビット立っています（依頼以外のイベント）",
+                                outside
+                            ),
+                            false,
+                            false,
+                        );
+                    }
+                    _ => {
+                        push(
+                            &mut out,
+                            String::from("  クリアを立てると既読も立ちます（Y は既読だけ）"),
+                            false,
+                            false,
+                        );
+                        let broken = self.progress_clears_without_seen();
+                        if broken > 0 {
+                            push(
+                                &mut out,
+                                alloc::format!(
+                                    "  クリア済みなのに未読のクエストが {} 件あります（修正はしません）",
+                                    broken
+                                ),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                }
+                let keys = match tab {
+                    PROGRESS_AWARDS => {
+                        "  Up/Down 行  Left/Right ±50  A 取得切替  L/R タブ  X 保存  B back"
+                    }
+                    PROGRESS_REQUESTS => {
+                        "  Up/Down 行  Left/Right ±50  A フラグ切替  L/R タブ  X 保存  B back"
+                    }
+                    _ => {
+                        "  Up/Down 行  Left/Right ±50  A クリア  Y 既読  L/R タブ  X 保存  B back"
+                    }
+                };
+                push(&mut out, String::from(keys), false, false);
+            }
             Screen::Options => {
                 push(&mut out, String::from("設定"), false, false);
                 let o = self
@@ -8110,5 +8776,193 @@ mod tests {
             ed.save.as_ref().expect("save").read_item_box(0).expect("box")[0].id,
             7
         );
+    }
+
+    /// An editor holding a blank Switch save whose slot 0 holds a character.
+    ///
+    /// Every writer on the progress screen refuses an unused slot, so the flag
+    /// has to be set or the tests would be asserting refusals.
+    fn editor_on_a_used_slot() -> Editor {
+        let mut save = crate::save::empty_switch_save();
+        save.set_slot_used(0, true);
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        ed
+    }
+
+    #[test]
+    fn one_press_flips_one_award_bit_in_all_three_copies() {
+        let mut ed = editor_on_a_used_slot();
+        ed.open_progress();
+        assert_eq!(ed.screen, Screen::Progress);
+        assert_eq!(ed.progress_view(), PROGRESS_AWARDS);
+        assert_eq!(ed.progress_len(), awards::AWARDS);
+        // Row 11 is the twelfth award, the one the header example names.
+        ed.set_progress_cursor(11);
+        assert_eq!(ed.progress_awards(), (0, awards::AWARDS));
+        ed.input(Key::A);
+        assert_eq!(ed.progress_awards(), (1, awards::AWARDS));
+        assert!(ed.dirty);
+
+        // All three copies hold it, so the OR the game repairs with has
+        // nothing to undo - and copies_agree proves it bit for bit.
+        assert_eq!(ed.progress_awards_agree(), Some(true));
+        let save = ed.save.as_ref().expect("a save");
+        assert_eq!(awards::has(save, 0, 11), Some(true));
+        for (off, _) in awards::COPIES {
+            let at = save.slot_base(0).expect("a slot") as usize + off;
+            assert!(
+                save.body()[at + 11 / 8] & (1 << (11 % 8)) != 0,
+                "the copy at {:#X} was not written",
+                off
+            );
+        }
+
+        // One press again is the undo: no screen on this page asks twice.
+        ed.input(Key::A);
+        assert_eq!(ed.progress_awards(), (0, awards::AWARDS));
+        assert_eq!(ed.progress_awards_agree(), Some(true));
+        // The console renderer shows the count the player checks.
+        assert_eq!(ed.lines().iter().filter(|l| l.cursor).count(), 1);
+        let shown = ed
+            .lines()
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("
+");
+        assert!(shown.contains("取得 0 / 132"), "{}", shown);
+    }
+
+    #[test]
+    fn the_three_views_keep_their_own_cursor_and_move_by_a_page() {
+        let mut ed = editor_on_a_used_slot();
+        ed.open_progress();
+        ed.set_progress_cursor(7);
+
+        // R walks to the request view, which starts on its own first row.
+        ed.input(Key::R);
+        assert_eq!(ed.progress_view(), PROGRESS_REQUESTS);
+        assert_eq!(ed.progress_len(), REQUEST_ROWS);
+        assert_eq!(ed.progress_cursor(), 0, "each view keeps its own cursor");
+        assert_eq!(ed.request_flag_at(0), Some(300));
+        assert_eq!(ed.request_flag_at(REQUEST_ROWS - 1), Some(1394));
+        assert_eq!(ed.request_flag_at(REQUEST_ROWS), None);
+        ed.input(Key::Right);
+        assert_eq!(ed.progress_cursor(), PROGRESS_JUMP);
+        ed.input(Key::Left);
+        assert_eq!(ed.progress_cursor(), 0, "Left at the top stays there");
+
+        // R again: the quest view pages its 1508 indices by PROGRESS_JUMP.
+        ed.input(Key::R);
+        assert_eq!(ed.progress_view(), PROGRESS_QUESTS);
+        assert_eq!(ed.progress_len(), 1508);
+        assert_eq!(ed.progress_quest_page(), (1, 31));
+        assert_eq!(ed.progress_quest_index(), 1);
+        ed.input(Key::Right);
+        assert_eq!(ed.progress_quest_page(), (2, 31));
+        assert_eq!(ed.progress_quest_index(), 51);
+
+        // Y on this view is the seen bit, not the view key.
+        ed.input(Key::Y);
+        assert_eq!(ed.progress_view(), PROGRESS_QUESTS, "Y is not the tab here");
+        assert_eq!(ed.progress_quest_state(50), (false, true, false));
+
+        // L back to the award view: the cursor is where it was left.
+        ed.input(Key::L);
+        ed.input(Key::L);
+        assert_eq!(ed.progress_view(), PROGRESS_AWARDS);
+        assert_eq!(ed.progress_cursor(), 7);
+
+        // B leaves for the guild card, the record this screen continues.
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::Guild);
+    }
+
+    #[test]
+    fn clearing_a_quest_also_marks_it_seen_and_seen_cannot_go_first() {
+        let mut ed = editor_on_a_used_slot();
+        ed.open_progress();
+        ed.progress_tab = PROGRESS_QUESTS;
+        ed.set_progress_cursor(0);
+
+        ed.input(Key::A);
+        assert_eq!(ed.progress_quest_state(0), (true, true, false));
+        assert!(ed.dirty);
+        let save = ed.save.as_ref().expect("a save");
+        assert_eq!(questprogress::get(save, 0, Progress::Cleared, 1), Some(true));
+        assert_eq!(questprogress::get(save, 0, Progress::Seen, 1), Some(true));
+        assert_eq!(ed.progress_quest_counts(), (1, 1, 0));
+
+        // Y cannot take the seen bit off while the quest is still cleared: the
+        // core refuses and the screen says why instead of doing nothing.
+        ed.input(Key::Y);
+        assert_eq!(ed.progress_quest_state(0), (true, true, false));
+        assert!(ed.message.contains("クリア済み"), "{}", ed.message);
+
+        // A again takes the clear off and leaves the seen bit, which is a state
+        // the game itself writes.
+        ed.input(Key::A);
+        assert_eq!(ed.progress_quest_state(0), (false, true, false));
+        assert_eq!(ed.progress_quest_counts(), (0, 1, 0));
+        // 失敗 is read only, so nothing on this screen can set it.
+        assert_eq!(ed.progress_quest_state(0).2, false);
+    }
+
+    #[test]
+    fn the_request_view_lists_the_two_bands_and_writes_one_flag() {
+        let mut ed = editor_on_a_used_slot();
+        ed.open_progress();
+        ed.progress_tab = PROGRESS_REQUESTS;
+        assert_eq!(ed.progress_len(), REQUEST_ROWS);
+
+        // The bands are contiguous and the second one starts at 1270.
+        let flags = ed.request_flags();
+        assert_eq!(flags.len(), 380);
+        assert_eq!(flags[0], 300);
+        assert_eq!(flags[254], 554, "the first band ends before 555");
+        assert_eq!(flags[255], 1270);
+        assert_eq!(flags[379], 1394);
+
+        assert_eq!(ed.progress_request_count(), 0);
+        ed.set_progress_cursor(0);
+        ed.input(Key::A);
+        assert_eq!(ed.progress_request_count(), 1);
+        assert_eq!(ed.progress_request_band_count(), 1);
+        let save = ed.save.as_ref().expect("a save");
+        assert_eq!(requests::get(save, 0, 300), Some(true));
+        // Without the romfs table a flag can only be called what it is.
+        assert_eq!(ed.request_flag_label(300), "イベント");
+        assert!(ed.message.contains("フラグ 300"), "{}", ed.message);
+
+        ed.input(Key::A);
+        assert_eq!(ed.progress_request_count(), 0);
+        assert!(!ed
+            .save
+            .as_ref()
+            .expect("a save")
+            .body()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_supplied_request_table_names_the_flag_it_owns() {
+        let mut ed = editor_on_a_used_slot();
+        ed.set_romfs_tables(
+            alloc::vec![String::from("勲章の名前")],
+            alloc::vec![String::from("村長の依頼")],
+            alloc::vec![RequestRecord {
+                index: 0,
+                kind: 0,
+                quest_id: 1_010_000,
+                accept_flag: 300,
+                complete_flag: 301,
+            }],
+        );
+        assert_eq!(ed.award_name(0), "勲章の名前");
+        assert_eq!(ed.award_name(1), "", "a short table names nothing else");
+        assert_eq!(ed.request_flag_label(300), "依頼 #000 受理 村長の依頼");
+        assert_eq!(ed.request_flag_label(301), "依頼 #000 完了 村長の依頼");
+        assert_eq!(ed.request_flag_label(302), "イベント");
     }
 }

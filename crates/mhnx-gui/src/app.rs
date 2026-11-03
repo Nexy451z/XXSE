@@ -6,6 +6,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use mhnx_core::arc::{extension_for, Arc};
+use mhnx_core::awards;
 use mhnx_core::check::{self, Finding, Severity};
 use mhnx_core::csvout::{self, ApplyReport, EquipmentRow};
 use mhnx_core::dlc;
@@ -15,6 +16,9 @@ use mhnx_core::gamedata::LAST_ITEM_ID;
 use mhnx_core::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT};
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::questfields::FieldKind;
+use mhnx_core::questprogress::{self, Progress};
+use mhnx_core::requests;
+use mhnx_core::romfstables::{self, RequestRecord};
 use mhnx_core::save::{Character, Save, SaveKind, BODY_SIZE, SWITCH_SIZE};
 use mhnx_core::snapshot;
 use mhnx_core::verify;
@@ -114,6 +118,8 @@ pub enum Tab {
     Equip,
     Hunts,
     Guild,
+    /// 勲章・依頼・クエストの進行状況.
+    Progress,
     Palico,
     Sets,
     Extras,
@@ -156,6 +162,13 @@ pub enum Confirm {
         id: u16,
         /// Level to write.
         level: u16,
+    },
+    /// Let a request's 完了 flag go. The dialog asks whether 受理 goes with it:
+    /// the pair is consecutive flags, and clearing only one of them leaves a
+    /// state the game never writes on its own.
+    RequestIncomplete {
+        /// Position in the activityData record table.
+        record: usize,
     },
     /// Raise every used record to the cap. The count is what the box measured
     /// when the button was pressed, so the dialog can say what it will touch.
@@ -215,6 +228,73 @@ pub struct SnapshotEntry {
     pub name: String,
     /// Size on disk, for the list.
     pub size: u64,
+}
+
+/// What the 進行状況 tab is showing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProgressSection {
+    /// The 132 guild card awards.
+    #[default]
+    Awards,
+    /// The 184 village requests.
+    Requests,
+    /// Quest progress, indices 1..=1508.
+    Quests,
+}
+
+impl ProgressSection {
+    /// The label on the switcher.
+    pub fn label(self) -> &'static str {
+        match self {
+            ProgressSection::Awards => "勲章",
+            ProgressSection::Requests => "依頼",
+            ProgressSection::Quests => "クエスト",
+        }
+    }
+}
+
+/// One step of the 進行状況 undo stack.
+///
+/// All three sections change bits inside fixed, known ranges of a character
+/// slot, so a step is kept as the bytes those ranges held before the change.
+/// Putting them back restores the exact bits, including the ones next to the
+/// bit that was clicked, which a single toggle must not touch.
+pub struct ProgressUndo {
+    /// What the step changed, for the status line and the tooltip.
+    pub label: String,
+    /// Character slot the bytes came from.
+    pub slot: usize,
+    /// Offset relative to the slot base, and the bytes that were there.
+    pub regions: Vec<(usize, Vec<u8>)>,
+}
+
+/// The three tables of a romfs folder, as found on disk.
+///
+/// The paths are kept before they are read so the report can name the folder
+/// that answered: a user with two dumps needs to know which one is in use.
+struct RomfsTables {
+    /// Folder the files were found in.
+    dir: PathBuf,
+    /// `GC_Medal*.gmd`, the 132 award names (and their descriptions).
+    award: Option<PathBuf>,
+    /// `activityData*.gmd`, the request names.
+    names: Option<PathBuf>,
+    /// `activityData.atd`, the request records with their two flags.
+    atd: Option<PathBuf>,
+}
+
+/// What one 読み込む found, before it is copied into the editor.
+struct RomfsLoad {
+    /// Folder the tables came from.
+    dir: PathBuf,
+    /// The line under the path field.
+    report: String,
+    /// 132 names, empty when the medal table could not be read.
+    award_names: Vec<String>,
+    /// 184 names, empty when the activity table could not be read.
+    request_names: Vec<String>,
+    /// 184 records, empty when the `.atd` could not be read.
+    request_records: Vec<RequestRecord>,
 }
 
 pub struct MhnxEditor {
@@ -365,6 +445,34 @@ pub struct MhnxEditor {
     pub dlc_files: Vec<PathBuf>,
     pub dlc_log: Vec<String>,
 
+    // ---- progress (進行状況) ----
+    /// romfs folder the user typed or picked. Nothing is read from it until
+    /// 読み込む is pressed.
+    pub romfs_path: String,
+    /// What the last 読み込む found, shown under the path field.
+    pub romfs_status: String,
+    /// Folder the loaded names came from; None when nothing is loaded.
+    pub romfs_dir: Option<PathBuf>,
+    /// The 132 award names, empty when the medal table was not read.
+    pub award_names: Vec<String>,
+    /// The 184 request names, empty when the activity table was not read.
+    pub request_names: Vec<String>,
+    /// The 184 request records (accept / complete flag numbers).
+    pub request_records: Vec<RequestRecord>,
+    /// Which of the three sections is open.
+    pub progress_section: ProgressSection,
+    /// Undo steps of the three sections, newest last.
+    pub progress_undo: Vec<ProgressUndo>,
+    /// Text filter of the request list.
+    pub request_filter: String,
+    /// Text filter of the quest list.
+    pub quest_filter: String,
+    /// Show only quests that are not cleared.
+    pub quest_missing_only: bool,
+    /// Set once the launch-time hooks this file owns have been applied, so a
+    /// later frame cannot run them again.
+    pub launch_env_done: bool,
+
     // ---- headless screenshot / smoke test mode ----
     /// When set, the app renders a few frames, saves a PNG there and exits.
     pub screenshot_path: Option<PathBuf>,
@@ -461,6 +569,18 @@ impl Default for MhnxEditor {
             snapshots: Vec::new(),
             dlc_files: Vec::new(),
             dlc_log: Vec::new(),
+            romfs_path: String::new(),
+            romfs_status: String::new(),
+            romfs_dir: None,
+            award_names: Vec::new(),
+            request_names: Vec::new(),
+            request_records: Vec::new(),
+            progress_section: ProgressSection::default(),
+            progress_undo: Vec::new(),
+            request_filter: String::new(),
+            quest_filter: String::new(),
+            quest_missing_only: false,
+            launch_env_done: false,
             screenshot_path: None,
             screenshot_frames: 0,
             screenshot_requested: false,
@@ -514,6 +634,10 @@ impl MhnxEditor {
         // Keeping them across a slot change let one press of undo write the
         // previous character's 186 items into the new character's box.
         self.item_undo.clear();
+        // The 進行状況 undo holds bytes taken from the slot that was open, for
+        // the same reason: putting them back after a slot switch would write
+        // one character's awards into another's.
+        self.progress_undo.clear();
         // The same for the set editor: the selection points into a character's
         // own forty records, so it cannot survive a slot change.
         self.set_selected = None;
@@ -1401,6 +1525,9 @@ impl MhnxEditor {
 
 impl eframe::App for MhnxEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // The hooks main.rs does not know about are resolved here; see
+        // apply_launch_env.
+        self.apply_launch_env();
         // Closing the window with unwritten edits used to lose them silently.
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.discard_ok {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1449,6 +1576,7 @@ impl MhnxEditor {
             Tab::Equip => self.tab_equip(ui),
             Tab::Hunts => self.tab_hunts(ui),
             Tab::Guild => self.tab_guild(ui),
+            Tab::Progress => self.tab_progress(ui),
             Tab::Palico => self.tab_palico_detail(ui),
             Tab::Sets => self.tab_sets(ui),
             Tab::Extras => self.tab_extras(ui),
@@ -1607,6 +1735,7 @@ impl MhnxEditor {
                     (Tab::Equip, "装備"),
                     (Tab::Hunts, "狩猟記録"),
                     (Tab::Guild, "ギルド"),
+                    (Tab::Progress, "進行状況"),
                     (Tab::Palico, "オトモ"),
                     (Tab::Sets, "マイセット"),
                     (Tab::Extras, "設定/オトモ"),
@@ -2089,6 +2218,19 @@ impl MhnxEditor {
                 ),
                 "差し替える",
             ),
+            Confirm::RequestIncomplete { record } => {
+                let title = self.request_title(*record);
+                (
+                    "依頼の「完了」を外します",
+                    format!(
+                        "依頼「{}」の完了フラグを外します。\n\
+                         受理フラグも一緒に外しますか？\n\
+                         「完了だけ外す」を選ぶと、受理はそのまま残ります。",
+                        title
+                    ),
+                    "受理も外す",
+                )
+            }
             Confirm::ItemFillAll { changed } => (
                 "全部 99 個にします",
                 format!(
@@ -2201,6 +2343,10 @@ impl MhnxEditor {
             }
         };
         let mut answer: Option<bool> = None;
+        // The request pair has two ways out, so the dialog offers both rather
+        // than deciding for the user.
+        let incomplete = matches!(self.confirm, Confirm::RequestIncomplete { .. });
+        let mut complete_only = false;
         egui::Window::new(title)
             .collapsible(false)
             .resizable(false)
@@ -2218,6 +2364,12 @@ impl MhnxEditor {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
+                    // The safer of the two answers sits first: taking the accept
+                    // bit with it is one more thing to lose.
+                    if incomplete && ui.button("完了だけ外す").clicked() {
+                        answer = Some(true);
+                        complete_only = true;
+                    }
                     if ui.button(yes).clicked() {
                         answer = Some(true);
                     }
@@ -2248,6 +2400,11 @@ impl MhnxEditor {
                         level,
                     } => {
                         self.equip_replace(index, kind, id, level);
+                    }
+                    // The two answers differ in one bit: 受理 follows 完了
+                    // only when the user said so.
+                    Confirm::RequestIncomplete { record } => {
+                        self.set_request_complete(record, false, !complete_only);
                     }
                     Confirm::ItemFillAll { .. } => {
                         self.item_fill_all();
@@ -7685,6 +7842,1072 @@ impl MhnxEditor {
     }
 }
 
+// ----------------------------------------------------- progress (進行状況)
+
+impl MhnxEditor {
+    /// Resolve the launch-time hooks that main.rs does not know about.
+    ///
+    /// main.rs turns MHNXEDITOR_OPEN_TAB into a Tab before the window exists,
+    /// and its list predates this tab; the section and the romfs folder have no
+    /// list at all. Both are read here, once, so an ordinary run reads no
+    /// environment and the screenshot harness can reach every section without
+    /// a human click.
+    fn apply_launch_env(&mut self) {
+        if self.launch_env_done {
+            return;
+        }
+        self.launch_env_done = true;
+        if let Ok(t) = std::env::var("MHNXEDITOR_OPEN_TAB") {
+            if t.trim().eq_ignore_ascii_case("progress") {
+                self.tab = Tab::Progress;
+            }
+        }
+        if let Ok(s) = std::env::var("MHNXEDITOR_PROGRESS_SECTION") {
+            self.progress_section = match s.trim() {
+                "requests" | "request" | "依頼" => ProgressSection::Requests,
+                "quests" | "quest" | "クエスト" => ProgressSection::Quests,
+                _ => ProgressSection::Awards,
+            };
+        }
+        if let Ok(p) = std::env::var("MHNXEDITOR_ROMFS") {
+            // The line the window opened with (the font, or the file that was
+            // opened) says more than this report until the user asks for it.
+            let opened_with = self.message.clone();
+            self.romfs_path = p;
+            self.load_romfs();
+            if !opened_with.is_empty() {
+                self.message = opened_with;
+            }
+        }
+    }
+
+    /// Find the three game tables under the folder the user named.
+    ///
+    /// The retail layout puts them in nativeNX/table; the other spellings cover
+    /// a folder that was picked one level too high (the romfs root) or too low
+    /// (the table folder itself). A folder that holds only some of them is used
+    /// for what it does hold: the medal table alone is still worth reading.
+    fn find_romfs_tables(root: &std::path::Path) -> Option<RomfsTables> {
+        // A file that was picked instead of a folder still names the folder its
+        // neighbours live in.
+        let root: PathBuf = if root.is_file() {
+            root.parent()?.to_path_buf()
+        } else {
+            root.to_path_buf()
+        };
+        let mut best: Option<RomfsTables> = None;
+        let mut best_score = 0usize;
+        for dir in [
+            root.clone(),
+            root.join("romfs"),
+            root.join("nativeNX").join("table"),
+            root.join("romfs").join("nativeNX").join("table"),
+            root.join("table"),
+        ] {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut awards: Vec<PathBuf> = Vec::new();
+            let mut names: Vec<PathBuf> = Vec::new();
+            let mut atd: Vec<PathBuf> = Vec::new();
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Some(file) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let lower = file.to_ascii_lowercase();
+                if lower.starts_with("gc_medal") && lower.ends_with(".gmd") {
+                    awards.push(path);
+                } else if lower.starts_with("activitydata") && lower.ends_with(".gmd") {
+                    names.push(path);
+                } else if lower.starts_with("activitydata") && lower.ends_with(".atd") {
+                    atd.push(path);
+                }
+            }
+            let score = (!awards.is_empty()) as usize
+                + (!names.is_empty()) as usize
+                + (!atd.is_empty()) as usize;
+            if score > best_score {
+                best_score = score;
+                best = Some(RomfsTables {
+                    dir: dir.clone(),
+                    award: Self::prefer_japanese(awards),
+                    names: Self::prefer_japanese(names),
+                    atd: Self::prefer_japanese(atd),
+                });
+            }
+        }
+        best
+    }
+
+    /// The Japanese table when a folder holds several languages, else the first.
+    ///
+    /// The interface is Japanese, and so is the dump every offset in this tool
+    /// was checked against: a folder holding GC_Medal_jpn.gmd next to
+    /// GC_Medal_eng.gmd must not show the English names.
+    fn prefer_japanese(mut files: Vec<PathBuf>) -> Option<PathBuf> {
+        files.sort();
+        let japanese = files
+            .iter()
+            .find(|p| p.to_string_lossy().to_ascii_lowercase().contains("jpn"))
+            .cloned();
+        japanese.or_else(|| files.into_iter().next())
+    }
+
+
+    /// Read the tables under root, or None when nothing there looks like romfs.
+    fn read_romfs(root: &std::path::Path) -> Option<RomfsLoad> {
+        let tables = Self::find_romfs_tables(root)?;
+        let award_names = tables
+            .award
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|b| romfstables::award_names(&b).names)
+            .unwrap_or_default();
+        let request_names = tables
+            .names
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|b| romfstables::request_names(&b))
+            .unwrap_or_default();
+        let request_records = tables
+            .atd
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok())
+            .map(|b| romfstables::request_records(&b))
+            .unwrap_or_default();
+        if award_names.is_empty() && request_names.is_empty() && request_records.is_empty() {
+            return None;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(if award_names.is_empty() {
+            String::from("勲章名 0（GC_Medal*.gmd が読めません）")
+        } else {
+            format!("勲章名 {}", award_names.len())
+        });
+        parts.push(if request_names.is_empty() {
+            String::from("依頼名 0（activityData*.gmd が読めません）")
+        } else {
+            format!("依頼名 {}", request_names.len())
+        });
+        parts.push(if request_records.is_empty() {
+            String::from("依頼レコード 0（activityData.atd が読めません）")
+        } else {
+            format!("依頼レコード {}", request_records.len())
+        });
+        Some(RomfsLoad {
+            report: format!(
+                "{} から読み込みました: {}",
+                tables.dir.display(),
+                parts.join(" / ")
+            ),
+            dir: tables.dir,
+            award_names,
+            request_names,
+            request_records,
+        })
+    }
+
+    /// Read the three tables out of the romfs folder that is in the field.
+    ///
+    /// None of this is data of this repository's: the names come from the
+    /// user's own dump, are held in memory only, and are never written into a
+    /// save or any other file.
+    pub fn load_romfs(&mut self) {
+        let raw = self.romfs_path.trim().to_owned();
+        if raw.is_empty() {
+            self.message = "romfs のフォルダを指定してください".to_owned();
+            return;
+        }
+        match Self::read_romfs(std::path::Path::new(&raw)) {
+            Some(load) => {
+                self.romfs_dir = Some(load.dir);
+                self.romfs_status = load.report.clone();
+                self.award_names = load.award_names;
+                self.request_names = load.request_names;
+                self.request_records = load.request_records;
+                self.message = load.report;
+            }
+            None => {
+                // The names of another folder must not stay on screen under
+                // this path: the tab would show one dump's text beside another
+                // dump's flag numbers.
+                self.romfs_dir = None;
+                self.award_names.clear();
+                self.request_names.clear();
+                self.request_records.clear();
+                self.romfs_status = format!(
+                    "{} に romfs の table が見つかりません（nativeNX/table を探しました）",
+                    raw
+                );
+                self.message = self.romfs_status.clone();
+            }
+        }
+    }
+
+    /// Drop the names that were read, keeping the path so it can be retried.
+    pub fn clear_romfs(&mut self) {
+        self.award_names.clear();
+        self.request_names.clear();
+        self.request_records.clear();
+        self.romfs_dir = None;
+        self.romfs_status = String::from("romfs を読み込んでいません");
+        self.message = "romfs の読み込みを解除しました".to_owned();
+    }
+
+    /// One award bit, false when the slot holds no character.
+    fn award_on(&self, award: usize) -> bool {
+        self.save
+            .as_ref()
+            .and_then(|s| awards::has(s, self.slot, award))
+            .unwrap_or(false)
+    }
+
+    /// One quest progress bit.
+    fn quest_on(&self, index: usize, kind: Progress) -> bool {
+        self.save
+            .as_ref()
+            .and_then(|s| questprogress::get(s, self.slot, kind, index))
+            .unwrap_or(false)
+    }
+
+    /// The 受理 and 完了 bits of one request record.
+    fn request_on(&self, record: usize) -> (bool, bool) {
+        let (Some(r), Some(save)) = (self.request_records.get(record), self.save.as_ref()) else {
+            return (false, false);
+        };
+        (
+            requests::get(save, self.slot, r.accept_flag as usize).unwrap_or(false),
+            requests::get(save, self.slot, r.complete_flag as usize).unwrap_or(false),
+        )
+    }
+
+    /// The name shown for a request: the table's, or its number.
+    fn request_title(&self, record: usize) -> String {
+        match self.request_names.get(record).map(|n| n.trim()) {
+            Some(n) if !n.is_empty() => n.to_owned(),
+            _ => match self.request_records.get(record) {
+                Some(r) => format!("依頼 {}", r.index + 1),
+                None => format!("依頼 {}", record + 1),
+            },
+        }
+    }
+
+    /// The accept or complete flag number of one request record.
+    fn request_flag(&self, record: usize, complete: bool) -> Option<usize> {
+        let r = self.request_records.get(record)?;
+        Some(if complete {
+            r.complete_flag as usize
+        } else {
+            r.accept_flag as usize
+        })
+    }
+
+    /// An award label short enough for a grid cell.
+    ///
+    /// Without a medal table the number is all there is, so it carries the
+    /// label on its own; with one, the number stays in front of the name so a
+    /// cell can still be matched against a guide.
+    fn award_label(&self, award: usize) -> String {
+        match self.award_names.get(award).map(|n| n.trim()) {
+            Some(n) if !n.is_empty() => format!("{:03} {}", award + 1, Self::short_name(n)),
+            _ => format!("勲章 {:03}", award + 1),
+        }
+    }
+
+    /// Cut a table name down to the cell width, keeping the start of it.
+    fn short_name(name: &str) -> String {
+        let mut out: String = name.chars().take(8).collect();
+        if name.chars().count() > 8 {
+            out.push('…');
+        }
+        out
+    }
+
+
+    /// Keep the bytes of the given regions before they are changed.
+    fn progress_snapshot(&self, label: String, regions: &[(usize, usize)]) -> Option<ProgressUndo> {
+        let save = self.save.as_ref()?;
+        let slot = self.slot;
+        let base = save.slot_base(slot)? as usize;
+        let mut kept = Vec::with_capacity(regions.len());
+        for (off, len) in regions {
+            let start = base.checked_add(*off)?;
+            let end = start.checked_add(*len)?;
+            kept.push((*off, save.body().get(start..end)?.to_vec()));
+        }
+        Some(ProgressUndo {
+            label,
+            slot,
+            regions: kept,
+        })
+    }
+
+    /// Remember one step, dropping the oldest once the stack is full.
+    fn push_progress_undo(&mut self, step: ProgressUndo) {
+        self.progress_undo.push(step);
+        if self.progress_undo.len() > 64 {
+            self.progress_undo.remove(0);
+        }
+    }
+
+    /// Put the bytes of the newest step back.
+    pub fn undo_progress(&mut self) {
+        let Some(step) = self.progress_undo.pop() else {
+            self.message = "戻せる変更がありません".to_owned();
+            return;
+        };
+        let mut restored = 0usize;
+        if let Some(save) = &mut self.save {
+            if let Some(base) = save.slot_base(step.slot).map(|b| b as usize) {
+                for (off, bytes) in &step.regions {
+                    let Some(start) = base.checked_add(*off) else {
+                        continue;
+                    };
+                    let Some(end) = start.checked_add(bytes.len()) else {
+                        continue;
+                    };
+                    if let Some(dst) = save.body_mut().get_mut(start..end) {
+                        dst.copy_from_slice(bytes);
+                        restored += 1;
+                    }
+                }
+            }
+        }
+        if restored == step.regions.len() && restored > 0 {
+            self.dirty = true;
+            self.message = format!("元に戻しました: {}", step.label);
+        } else {
+            self.message = "戻せませんでした（スロットの位置が変わりました）".to_owned();
+        }
+    }
+
+    /// Grant or revoke one award and mark the save dirty.
+    ///
+    /// awards::set writes all three copies - one copy alone is undone by the
+    /// game - so the bytes of all three are kept first and 元に戻す puts the
+    /// whole set back.
+    pub fn set_award(&mut self, award: usize, on: bool) {
+        let (label, done) = if on {
+            (
+                format!("勲章 {} を取得", award + 1),
+                format!("勲章 {} を取得しました", award + 1),
+            )
+        } else {
+            (
+                format!("勲章 {} を未取得に戻す", award + 1),
+                format!("勲章 {} を未取得に戻しました", award + 1),
+            )
+        };
+        let Some(step) = self.progress_snapshot(label, &awards::COPIES) else {
+            self.message = "先にセーブを開いてください（未使用のスロットは編集できません）".to_owned();
+            return;
+        };
+        let slot = self.slot;
+        let ok = match &mut self.save {
+            Some(save) => awards::set(save, slot, award, on),
+            None => false,
+        };
+        if !ok {
+            self.message = format!("勲章 {} は変更できませんでした", award + 1);
+            return;
+        }
+        self.push_progress_undo(step);
+        self.dirty = true;
+        self.message = format!("{}（まだファイルには書いていません）", done);
+    }
+
+    /// Set or clear one request's 受理 flag.
+    pub fn set_request_accept(&mut self, record: usize, on: bool) {
+        let Some(flag) = self.request_flag(record, false) else {
+            self.message = "依頼の表を読めていません（romfs を指定してください）".to_owned();
+            return;
+        };
+        let title = self.request_title(record);
+        let (label, done) = if on {
+            (
+                format!("依頼「{}」を受理", title),
+                format!("依頼「{}」を受理にしました", title),
+            )
+        } else {
+            (
+                format!("依頼「{}」の受理を外す", title),
+                format!("依頼「{}」の受理を外しました", title),
+            )
+        };
+        let Some(step) =
+            self.progress_snapshot(label, &[(requests::OFF_FLAGS, requests::FLAG_BYTES)])
+        else {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        };
+        let slot = self.slot;
+        let ok = match &mut self.save {
+            Some(save) => requests::set(save, slot, flag, on),
+            None => false,
+        };
+        if !ok {
+            self.message = "受理フラグを変更できませんでした".to_owned();
+            return;
+        }
+        self.push_progress_undo(step);
+        self.dirty = true;
+        self.message = format!("{}（まだファイルには書いていません）", done);
+    }
+
+    /// Set or clear one request's 完了 flag.
+    ///
+    /// Completing always accepts first: the game only completes a request it
+    /// has accepted, and the pair the other way round is a state it never
+    /// writes. Clearing leaves 受理 alone unless the caller says otherwise; the
+    /// dialog is the only caller that does, because only the user can tell
+    /// "accepted, not done" from "not accepted at all".
+    pub fn set_request_complete(&mut self, record: usize, on: bool, also_accept: bool) {
+        let (Some(complete), Some(accept)) = (
+            self.request_flag(record, true),
+            self.request_flag(record, false),
+        ) else {
+            self.message = "依頼の表を読めていません（romfs を指定してください）".to_owned();
+            return;
+        };
+        let title = self.request_title(record);
+        let (label, done) = if on {
+            (
+                format!("依頼「{}」を完了", title),
+                format!("依頼「{}」を完了にしました（受理も立てました）", title),
+            )
+        } else if also_accept {
+            (
+                format!("依頼「{}」の完了と受理を外す", title),
+                format!("依頼「{}」の完了と受理を外しました", title),
+            )
+        } else {
+            (
+                format!("依頼「{}」の完了を外す", title),
+                format!("依頼「{}」の完了を外しました（受理はそのままです）", title),
+            )
+        };
+        let Some(step) =
+            self.progress_snapshot(label, &[(requests::OFF_FLAGS, requests::FLAG_BYTES)])
+        else {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        };
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        };
+        // 完了 implies 受理, so the accept bit is written first when the pair is
+        // being set and last when it is being cleared: a half written pair is
+        // then always the harmless one.
+        let mut ok = true;
+        if on {
+            ok &= requests::set(save, slot, accept, true);
+            ok &= requests::set(save, slot, complete, true);
+        } else {
+            ok &= requests::set(save, slot, complete, false);
+            if also_accept {
+                ok &= requests::set(save, slot, accept, false);
+            }
+        }
+        if !ok {
+            self.message = "完了フラグを変更できませんでした".to_owned();
+            return;
+        }
+        self.push_progress_undo(step);
+        self.dirty = true;
+        self.message = format!("{}（まだファイルには書いていません）", done);
+    }
+
+    /// Set or clear one quest progress bit.
+    ///
+    /// questprogress keeps the invariant that a cleared quest is also seen, so
+    /// setting クリア writes 既読 too; both maps are in the undo, otherwise one
+    /// press would put back half the change. 失敗 is read only and every call
+    /// for it is refused, by the core and by the tab, which offers no box.
+    pub fn set_quest(&mut self, index: usize, kind: Progress, on: bool) {
+        let word = match kind {
+            Progress::Cleared => "クリア",
+            Progress::Seen => "既読",
+            Progress::Failed => "失敗",
+        };
+        let label = format!(
+            "クエスト {} の{}を{}",
+            index,
+            word,
+            if on { "立てる" } else { "外す" }
+        );
+        let Some(step) = self.progress_snapshot(
+            label,
+            &[
+                (questprogress::OFF_CLEARED, questprogress::MAP_SIZE),
+                (questprogress::OFF_SEEN, questprogress::MAP_SIZE),
+            ],
+        ) else {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        };
+        let slot = self.slot;
+        let ok = match &mut self.save {
+            Some(save) => questprogress::set(save, slot, kind, index, on),
+            None => false,
+        };
+        if !ok {
+            self.message = match (kind, on) {
+                (Progress::Failed, _) => "失敗は読み取り専用です".to_owned(),
+                (Progress::Seen, false) => {
+                    "クリア済みなので既読は外せません（クリアを先に外してください）".to_owned()
+                }
+                _ => format!("クエスト {} は変更できませんでした", index),
+            };
+            return;
+        }
+        self.push_progress_undo(step);
+        self.dirty = true;
+        self.message = match (kind, on) {
+            (Progress::Cleared, true) => {
+                format!("クエスト {} をクリアにしました（既読も立てました）", index)
+            }
+            (_, true) => format!("クエスト {} を{}にしました", index, word),
+            _ => format!("クエスト {} の{}を外しました", index, word),
+        };
+    }
+
+
+    // -------------------------------------------------------------- drawing
+
+    /// The 進行状況 tab: romfs on top, then one of the three sections.
+    fn tab_progress(&mut self, ui: &mut egui::Ui) {
+        ui.heading("進行状況");
+        let Some(save) = &self.save else {
+            ui.label("セーブを開くと、勲章・依頼・クエストの進行状況を一覧・編集できます");
+            return;
+        };
+        // An MHGU slot is 0x1104 bytes longer and every offset here was read
+        // off MHXX, so nothing in this tab describes an MHGU save. Refusing is
+        // the only honest answer; the core answers None / false for the same
+        // reason.
+        if save.kind() == SaveKind::Mhgu {
+            ui.label(
+                egui::RichText::new(
+                    "このセーブは MHGU です。勲章・依頼・クエストの位置は MHXX のセーブで確認したものなので、このタブでは表示も編集もしません。",
+                )
+                .color(warning_color()),
+            );
+            return;
+        }
+        self.progress_romfs_bar(ui);
+        ui.separator();
+        self.progress_section_bar(ui);
+        ui.separator();
+        match self.progress_section {
+            ProgressSection::Awards => self.progress_awards(ui),
+            ProgressSection::Requests => self.progress_requests(ui),
+            ProgressSection::Quests => self.progress_quests(ui),
+        }
+    }
+
+    /// The romfs row: the path, a folder picker, and 読み込む.
+    fn progress_romfs_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("romfs");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.romfs_path)
+                    .hint_text(r"C:\...\romfs（nativeNX/table があるフォルダ）")
+                    .desired_width(380.0),
+            );
+            if ui
+                .button("フォルダを選ぶ")
+                .on_hover_text("romfs のフォルダを選ぶと、そのまま読み込みます")
+                .clicked()
+            {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("romfs のフォルダを選択")
+                    .pick_folder()
+                {
+                    self.romfs_path = dir.display().to_string();
+                    self.load_romfs();
+                }
+            }
+            if ui.button("読み込む").clicked() {
+                self.load_romfs();
+            }
+            let loaded = !self.award_names.is_empty() || !self.request_records.is_empty();
+            if loaded
+                && ui
+                    .small_button("解除")
+                    .on_hover_text("読み込んだ名前を捨てます（セーブは変わりません）")
+                    .clicked()
+            {
+                self.clear_romfs();
+            }
+        });
+        let status = if self.romfs_status.is_empty() {
+            String::from(
+                "romfs にはゲームのテキストしかありません。名前はメモリ上だけで使い、セーブにもファイルにも書きません。",
+            )
+        } else {
+            // The report already names the folder it came from, so the line is
+            // not repeated here.
+            self.romfs_status.clone()
+        };
+        ui.label(egui::RichText::new(status).weak().small());
+    }
+
+    /// The three-way switcher and the undo button.
+    fn progress_section_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for section in [
+                ProgressSection::Awards,
+                ProgressSection::Requests,
+                ProgressSection::Quests,
+            ] {
+                ui.selectable_value(&mut self.progress_section, section, section.label());
+            }
+            ui.separator();
+            let last = self.progress_undo.last().map(|u| u.label.clone());
+            let button = ui.add_enabled(last.is_some(), egui::Button::new("元に戻す"));
+            let button = match &last {
+                Some(label) => button.on_hover_text(format!("{} を取り消します", label)),
+                None => button.on_hover_text("このタブで変更すると、ここから取り消せます"),
+            };
+            if button.clicked() {
+                self.undo_progress();
+            }
+            if let Some(label) = last {
+                ui.label(
+                    egui::RichText::new(format!("最後の変更: {}", label))
+                        .weak()
+                        .small(),
+                );
+            }
+        });
+    }
+
+    /// The 132 award cells.
+    fn progress_awards(&mut self, ui: &mut egui::Ui) {
+        let slot = self.slot;
+        let (total, used, got, agree) = {
+            let Some(save) = &self.save else {
+                return;
+            };
+            (
+                awards::AWARDS,
+                save.slot_used(slot),
+                awards::count(save, slot),
+                awards::copies_agree(save, slot),
+            )
+        };
+        if !used {
+            ui.label("このスロットは未使用です。キャラクターが居ないスロットには勲章もありません。");
+            return;
+        }
+        let states: Vec<bool> = (0..total).map(|a| self.award_on(a)).collect();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(format!("取得 {} / {}", got, total)).strong());
+            ui.label(egui::RichText::new(format!("未取得 {}", total - got)).weak());
+        });
+        if !agree {
+            // The game merges the three copies with an OR, so a copy that
+            // disagrees means the card - the one has() reads - can lag behind
+            // the map screen. Saying so is the point.
+            ui.label(
+                egui::RichText::new(
+                    "注意: 3 つの写し（カード / マップ / 通知）が一致しません。取得の表示はカード側の写しで、ゲームは 3 つを OR で統合するため、実機と食い違うことがあります。",
+                )
+                .color(warning_color()),
+            );
+        }
+        ui.label(
+            egui::RichText::new("押すと取得 / 未取得が入れ替わります（3 つの写しすべてに書きます）")
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
+        egui::ScrollArea::vertical()
+            .id_salt("awardgrid")
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for a in 0..total {
+                        let on = states[a];
+                        let label = self.award_label(a);
+                        let full = self
+                            .award_names
+                            .get(a)
+                            .map(|n| n.trim().to_owned())
+                            .unwrap_or_default();
+                        let text = egui::RichText::new(label).color(award_text(on));
+                        let response = ui.add_sized(
+                            [170.0, 26.0],
+                            egui::Button::new(text)
+                                .fill(award_fill(on))
+                                .stroke(egui::Stroke::new(1.0, award_stroke(on))),
+                        );
+                        let tip = if full.is_empty() {
+                            format!("勲章 {}（{}）", a + 1, if on { "取得済み" } else { "未取得" })
+                        } else {
+                            format!(
+                                "{}\n{}",
+                                full,
+                                if on {
+                                    "取得済み - 押すと未取得に戻します"
+                                } else {
+                                    "未取得 - 押すと取得にします"
+                                }
+                            )
+                        };
+                        if response.on_hover_text(tip).clicked() {
+                            self.set_award(a, !on);
+                        }
+                    }
+                });
+            });
+    }
+
+
+    /// The request list, or the raw flags when there is no activity table.
+    fn progress_requests(&mut self, ui: &mut egui::Ui) {
+        if self.request_records.is_empty() {
+            self.progress_raw_flags(ui);
+            return;
+        }
+        let accepted = (0..self.request_records.len())
+            .filter(|r| self.request_on(*r).0)
+            .count();
+        let completed = (0..self.request_records.len())
+            .filter(|r| self.request_on(*r).1)
+            .count();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "受理 {} / 完了 {}（{} 件）",
+                    accepted,
+                    completed,
+                    self.request_records.len()
+                ))
+                .strong(),
+            );
+            ui.separator();
+            ui.label("絞り込み");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.request_filter)
+                    .hint_text("依頼名")
+                    .desired_width(160.0),
+            );
+            if ui.small_button("クリア").clicked() {
+                self.request_filter.clear();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "受理と完了は activityData.atd の +0x33 / +0x35 のフラグです。完了を立てると受理も立ちます。完了を外すときは、受理も外すかを聞きます。",
+            )
+            .weak()
+            .small(),
+        );
+        let needle = self.request_filter.trim().to_lowercase();
+        let rows: Vec<usize> = (0..self.request_records.len())
+            .filter(|i| {
+                needle.is_empty()
+                    || self.request_title(*i).to_lowercase().contains(&needle)
+                    || format!("{}", i + 1).contains(&needle)
+            })
+            .collect();
+        let mut accept_clicked: Option<(usize, bool)> = None;
+        let mut complete_clicked: Option<(usize, bool)> = None;
+        TableBuilder::new(ui)
+            .striped(true)
+            .id_salt("requestlist")
+            .column(Column::exact(44.0))
+            .column(Column::remainder())
+            .column(Column::exact(74.0))
+            .column(Column::exact(52.0))
+            .column(Column::exact(52.0))
+            .header(22.0, |mut h| {
+                h.col(|ui| {
+                    ui.strong("#");
+                });
+                h.col(|ui| {
+                    ui.strong("依頼");
+                });
+                h.col(|ui| {
+                    ui.strong("クエストID");
+                });
+                h.col(|ui| {
+                    ui.strong("受理");
+                });
+                h.col(|ui| {
+                    ui.strong("完了");
+                });
+            })
+            .body(|body| {
+                body.rows(20.0, rows.len(), |mut row| {
+                    let record = rows[row.index()];
+                    let Some(r) = self.request_records.get(record).copied() else {
+                        return;
+                    };
+                    let (accept_on, complete_on) = self.request_on(record);
+                    row.col(|ui| {
+                        ui.label(format!("{}", record + 1));
+                    });
+                    row.col(|ui| {
+                        ui.label(self.request_title(record)).on_hover_text(format!(
+                            "record {} / kind {} / 受理フラグ {} / 完了フラグ {}",
+                            record, r.kind, r.accept_flag, r.complete_flag
+                        ));
+                    });
+                    row.col(|ui| {
+                        if r.kind == 0 {
+                            ui.label(format!("{}", r.quest_id));
+                        } else {
+                            ui.label("—").on_hover_text("クエストを持たない行です");
+                        }
+                    });
+                    row.col(|ui| {
+                        let mut on = accept_on;
+                        if ui.checkbox(&mut on, "").changed() {
+                            accept_clicked = Some((record, on));
+                        }
+                    });
+                    row.col(|ui| {
+                        let mut on = complete_on;
+                        if ui.checkbox(&mut on, "").changed() {
+                            complete_clicked = Some((record, on));
+                        }
+                    });
+                });
+            });
+        if let Some((record, on)) = accept_clicked {
+            self.set_request_accept(record, on);
+        }
+        if let Some((record, on)) = complete_clicked {
+            if on {
+                // 完了 cannot stand without 受理; the pair is written together.
+                self.set_request_complete(record, true, false);
+            } else {
+                // Clearing is the one that has to ask: the accept bit may or
+                // may not be meant to go with it.
+                self.confirm = Confirm::RequestIncomplete { record };
+            }
+        }
+    }
+
+    /// What the request section shows without an activity table: flag numbers.
+    ///
+    /// The flags are read only here. 444 of the 742 bits set in the verified
+    /// save belong to events that are not requests at all, and without the
+    /// table there is no way to tell which of them this tool may write.
+    fn progress_raw_flags(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("romfs を指定してください").strong());
+        ui.label(
+            "上の欄に romfs のフォルダ（nativeNX/table）を入れて「読み込む」を押すと、依頼名と、受理・完了のフラグ番号が読めます。",
+        );
+        ui.label(
+            egui::RichText::new(
+                "いまは生のフラグ番号だけを表示しています。どの番号が受理でどれが完了かは、ゲームのテーブルにしか書かれていません。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(4.0);
+        let slot = self.slot;
+        let set = self
+            .save
+            .as_ref()
+            .map(|s| requests::count(s, slot))
+            .unwrap_or(0);
+        ui.label(format!(
+            "セット済み {} / {} ビット（依頼以外のイベントも同じ領域にあります）",
+            set,
+            requests::FLAGS
+        ));
+        let total = requests::FLAGS;
+        egui::ScrollArea::vertical()
+            .id_salt("rawflags")
+            .show_rows(ui, 18.0, total.div_ceil(8), |ui, range| {
+                for line in range {
+                    ui.horizontal(|ui| {
+                        for column in 0..8 {
+                            let flag = line * 8 + column;
+                            if flag >= total {
+                                break;
+                            }
+                            let on = self
+                                .save
+                                .as_ref()
+                                .and_then(|s| requests::get(s, slot, flag))
+                                .unwrap_or(false);
+                            let text = if on {
+                                egui::RichText::new(format!("{:04} ●", flag))
+                                    .monospace()
+                                    .color(egui::Color32::from_rgb(226, 240, 228))
+                            } else {
+                                egui::RichText::new(format!("{:04} ·", flag))
+                                    .monospace()
+                                    .weak()
+                            };
+                            ui.add_sized([82.0, 16.0], egui::Label::new(text));
+                        }
+                    });
+                }
+            });
+    }
+
+    /// Quest progress, indices 1..=1508.
+    fn progress_quests(&mut self, ui: &mut egui::Ui) {
+        let slot = self.slot;
+        let (cleared, seen, failed, broken) = {
+            let Some(save) = &self.save else {
+                return;
+            };
+            (
+                questprogress::count(save, slot, Progress::Cleared),
+                questprogress::count(save, slot, Progress::Seen),
+                questprogress::count(save, slot, Progress::Failed),
+                questprogress::clears_without_seen(save, slot),
+            )
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "クリア {} / 既読 {} / 失敗 {}",
+                    cleared, seen, failed
+                ))
+                .strong(),
+            );
+            ui.label(
+                egui::RichText::new(format!("索引 1..{}", questprogress::BITS - 1))
+                    .weak()
+                    .small(),
+            );
+        });
+        ui.label(
+            egui::RichText::new(
+                "クリアを立てると既読も立ちます。既読を外せるのは、クリアしていないクエストだけです。失敗は読み取り専用です。",
+            )
+            .weak()
+            .small(),
+        );
+        if !broken.is_empty() {
+            // The save already violates the invariant in three places. The tool
+            // does not guess which side is wrong; it names the rows instead.
+            let list = broken
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            ui.label(
+                egui::RichText::new(format!(
+                    "注意: 既読なしでクリアになっている索引が {} 件あります（{}）。データの状態をそのまま表示しています。",
+                    broken.len(),
+                    list
+                ))
+                .color(warning_color()),
+            );
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("絞り込み");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.quest_filter)
+                    .hint_text("索引")
+                    .desired_width(80.0),
+            );
+            ui.checkbox(&mut self.quest_missing_only, "未クリアのみ");
+            if ui.small_button("クリア").clicked() {
+                self.quest_filter.clear();
+            }
+        });
+        let needle = self.quest_filter.trim().to_lowercase();
+        let rows: Vec<usize> = (1..questprogress::BITS)
+            .filter(|i| {
+                (needle.is_empty() || i.to_string().contains(&needle))
+                    && (!self.quest_missing_only || !self.quest_on(*i, Progress::Cleared))
+            })
+            .collect();
+        let mut quest_clicked: Option<(usize, Progress, bool)> = None;
+        TableBuilder::new(ui)
+            .striped(true)
+            .id_salt("questprogress")
+            .column(Column::exact(64.0))
+            .column(Column::exact(64.0))
+            .column(Column::exact(64.0))
+            .column(Column::exact(64.0))
+            .column(Column::remainder())
+            .header(22.0, |mut h| {
+                h.col(|ui| {
+                    ui.strong("索引");
+                });
+                h.col(|ui| {
+                    ui.strong("クリア");
+                });
+                h.col(|ui| {
+                    ui.strong("既読");
+                });
+                h.col(|ui| {
+                    ui.strong("失敗");
+                });
+                h.col(|ui| {
+                    ui.strong("状態");
+                });
+            })
+            .body(|body| {
+                body.rows(20.0, rows.len(), |mut row| {
+                    let index = rows[row.index()];
+                    let is_cleared = self.quest_on(index, Progress::Cleared);
+                    let is_seen = self.quest_on(index, Progress::Seen);
+                    let is_failed = self.quest_on(index, Progress::Failed);
+                    row.col(|ui| {
+                        ui.label(format!("{}", index));
+                    });
+                    row.col(|ui| {
+                        let mut on = is_cleared;
+                        if ui.checkbox(&mut on, "").changed() {
+                            quest_clicked = Some((index, Progress::Cleared, on));
+                        }
+                    });
+                    row.col(|ui| {
+                        let mut on = is_seen;
+                        // A cleared quest must stay seen; the core refuses the
+                        // clear, so the box says why instead of doing nothing.
+                        let locked = is_cleared && is_seen;
+                        let response = ui.add_enabled(!locked, egui::Checkbox::new(&mut on, ""));
+                        let response = if locked {
+                            response.on_hover_text(
+                                "クリア済みなので既読は外せません（先にクリアを外してください）",
+                            )
+                        } else {
+                            response
+                        };
+                        if response.changed() {
+                            quest_clicked = Some((index, Progress::Seen, on));
+                        }
+                    });
+                    row.col(|ui| {
+                        // 失敗 has no established meaning (58 of its 72 bits are
+                        // also cleared), so it is read only: a disabled box
+                        // shows the bit without offering to change it.
+                        let mut on = is_failed;
+                        ui.add_enabled(false, egui::Checkbox::new(&mut on, ""));
+                    });
+                    row.col(|ui| {
+                        if is_cleared && !is_seen {
+                            ui.label(
+                                egui::RichText::new("既読なしでクリア").color(warning_color()),
+                            )
+                            .on_hover_text(
+                                "データの状態をそのまま表示しています（自動では直しません）",
+                            );
+                        }
+                    });
+                });
+            });
+        if let Some((index, kind, on)) = quest_clicked {
+            self.set_quest(index, kind, on);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The write paths are the part of this file that can destroy a save, so
@@ -9004,8 +10227,280 @@ mod tests {
         assert!(app.message.contains("空"), "{}", app.message);
         assert_eq!(pouch_of(&app), before);
     }
+
+    /// A .gmd file the way the game writes one: the header, the key, then the
+    /// NUL terminated strings as the tail of the file.
+    fn gmd_bytes(strings: &[String]) -> Vec<u8> {
+        let key = b"test";
+        let mut block = Vec::new();
+        for s in strings {
+            block.extend_from_slice(s.as_bytes());
+            block.push(0);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GMD\0");
+        out.extend_from_slice(&0x0001_0302u32.to_le_bytes()); // version
+        out.extend_from_slice(&0u32.to_le_bytes()); // 0x08
+        out.extend_from_slice(&0u32.to_le_bytes()); // 0x0C tag
+        out.extend_from_slice(&0u32.to_le_bytes()); // 0x10
+        out.extend_from_slice(&0u32.to_le_bytes()); // 0x14
+        out.extend_from_slice(&(strings.len() as u32).to_le_bytes()); // 0x18 count
+        out.extend_from_slice(&0u32.to_le_bytes()); // 0x1C line table
+        out.extend_from_slice(&(block.len() as u32).to_le_bytes()); // 0x20 block length
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes()); // 0x24 key length
+        out.extend_from_slice(key);
+        out.push(0);
+        assert_eq!(out.len(), 0x28 + key.len() + 1);
+        out.extend_from_slice(&block);
+        out
+    }
+
+    /// The 264 strings of a medal table: 132 names, then 132 descriptions.
+    fn medal_strings() -> Vec<String> {
+        let mut v: Vec<String> = (0..132).map(|i| format!("勲章{}", i + 1)).collect();
+        v.extend((0..132).map(|i| format!("説明{}", i + 1)));
+        v
+    }
+
+    /// An activityData.atd holding the records a test needs. Every record owns
+    /// a consecutive flag pair, the way the real table does.
+    fn atd_bytes(records: &[(u8, u32, u16)]) -> Vec<u8> {
+        let mut out = vec![0u8; 8];
+        out[2] = 0xA0;
+        out[3] = 0x40;
+        out[4..8].copy_from_slice(&(records.len() as u32).to_le_bytes());
+        for (i, (kind, quest, accept)) in records.iter().enumerate() {
+            let mut rec = [0u8; 55];
+            rec[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+            rec[0x04] = *kind;
+            rec[0x16..0x1A].copy_from_slice(&quest.to_le_bytes());
+            rec[0x33..0x35].copy_from_slice(&accept.to_le_bytes());
+            rec[0x35..0x37].copy_from_slice(&(accept + 1).to_le_bytes());
+            out.extend_from_slice(&rec);
+        }
+        out
+    }
+
+    #[test]
+    fn the_romfs_tables_are_found_and_parsed() {
+        let dir = Scratch::new("romfs");
+        let table = dir.path().join("nativeNX").join("table");
+        std::fs::create_dir_all(&table).expect("table folder");
+        // Both languages, so the choice between them is checked as well.
+        std::fs::write(table.join("GC_Medal_jpn.gmd"), gmd_bytes(&medal_strings())).expect("medal");
+        let english: Vec<String> = (0..264).map(|i| format!("Award{}", i + 1)).collect();
+        std::fs::write(table.join("GC_Medal_eng.gmd"), gmd_bytes(&english)).expect("english");
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..184 {
+            names.push(format!("依頼{}", i + 1));
+            for _ in 0..4 {
+                names.push(String::from("dummy"));
+            }
+        }
+        std::fs::write(table.join("activityData_jpn.gmd"), gmd_bytes(&names)).expect("names");
+        let records: Vec<(u8, u32, u16)> = (0..184)
+            .map(|i| (if i == 183 { 3 } else { 0 }, i as u32 + 1, 300 + i as u16 * 2))
+            .collect();
+        std::fs::write(table.join("activityData.atd"), atd_bytes(&records)).expect("atd");
+
+        let mut app = MhnxEditor::default();
+        app.romfs_path = dir.path().display().to_string();
+        app.load_romfs();
+
+        assert_eq!(app.award_names.len(), 132);
+        assert_eq!(app.request_names.len(), 184);
+        assert_eq!(app.request_records.len(), 184);
+        assert_eq!(app.award_names[0], "勲章1", "the Japanese table is the one to use");
+        assert_eq!(app.request_names[0], "依頼1");
+        assert_eq!(app.request_records[0].accept_flag, 300);
+        assert_eq!(app.request_records[0].complete_flag, 301);
+        assert_eq!(app.request_records[183].kind, 3);
+        assert!(app.romfs_dir.is_some());
+        assert!(app.message.contains("勲章名 132"), "{}", app.message);
+        assert!(app.message.contains("依頼レコード 184"), "{}", app.message);
+    }
+
+    #[test]
+    fn a_folder_without_the_tables_drops_the_names_it_had() {
+        let dir = Scratch::new("romfsgone");
+        let table = dir.path().join("nativeNX").join("table");
+        std::fs::create_dir_all(&table).expect("table folder");
+        std::fs::write(table.join("GC_Medal_jpn.gmd"), gmd_bytes(&medal_strings())).expect("medal");
+        let mut app = MhnxEditor::default();
+        app.romfs_path = dir.path().display().to_string();
+        app.load_romfs();
+        assert_eq!(app.award_names.len(), 132);
+        assert!(app.romfs_dir.is_some());
+
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).expect("empty folder");
+        app.romfs_path = empty.display().to_string();
+        app.load_romfs();
+        assert!(
+            app.award_names.is_empty(),
+            "the previous folder's names must not stay on screen"
+        );
+        assert!(app.request_names.is_empty());
+        assert!(app.request_records.is_empty());
+        assert!(app.romfs_dir.is_none());
+        assert!(app.message.contains("見つかりません"), "{}", app.message);
+    }
+
+    #[test]
+    fn an_award_toggle_is_taken_back_by_one_press() {
+        let dir = Scratch::new("awardundo");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.save.as_mut().expect("save").set_slot_used(0, true);
+        let before = app.save.as_ref().expect("save").body().to_vec();
+        assert_eq!(awards::count(app.save.as_ref().expect("save"), 0), 0);
+
+        app.set_award(4, true);
+        assert!(app.dirty, "a toggle has to mark the save dirty");
+        assert_eq!(
+            awards::has(app.save.as_ref().expect("save"), 0, 4),
+            Some(true)
+        );
+        assert!(
+            awards::copies_agree(app.save.as_ref().expect("save"), 0),
+            "all three copies must be written together"
+        );
+        assert_eq!(awards::count(app.save.as_ref().expect("save"), 0), 1);
+        assert_eq!(app.progress_undo.len(), 1);
+
+        app.undo_progress();
+        assert_eq!(app.save.as_ref().expect("save").body(), &before[..]);
+        assert_eq!(awards::count(app.save.as_ref().expect("save"), 0), 0);
+        assert!(app.progress_undo.is_empty());
+
+        // A step belongs to the slot it was measured in; reloading drops it.
+        app.set_award(5, true);
+        assert_eq!(app.progress_undo.len(), 1);
+        app.slot = 1;
+        app.reload_from_save();
+        assert!(app.progress_undo.is_empty());
+    }
+
+    #[test]
+    fn a_request_pairs_its_two_flags_and_one_undo_step_restores_both() {
+        let dir = Scratch::new("request");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.save.as_mut().expect("save").set_slot_used(0, true);
+        app.request_records = vec![RequestRecord {
+            index: 0,
+            kind: 0,
+            quest_id: 4242,
+            accept_flag: 300,
+            complete_flag: 301,
+        }];
+        app.request_names = vec![String::from("テストの依頼")];
+        let before = app.save.as_ref().expect("save").body().to_vec();
+
+        // 完了 is only ever written together with 受理.
+        app.set_request_complete(0, true, false);
+        assert!(app.dirty);
+        assert_eq!(app.request_on(0), (true, true));
+        assert!(app.message.contains("受理も立てました"), "{}", app.message);
+
+        // 完了だけ外す leaves the accept bit alone.
+        app.set_request_complete(0, false, false);
+        assert_eq!(app.request_on(0), (true, false));
+
+        // 受理も外す takes both.
+        app.set_request_complete(0, false, true);
+        assert_eq!(app.request_on(0), (false, false));
+
+        assert_eq!(app.progress_undo.len(), 3);
+        app.undo_progress();
+        app.undo_progress();
+        app.undo_progress();
+        assert_eq!(app.save.as_ref().expect("save").body(), &before[..]);
+        assert_eq!(app.request_on(0), (false, false));
+    }
+
+    #[test]
+    fn clearing_a_quest_also_marks_it_seen_and_failure_stays_read_only() {
+        let dir = Scratch::new("quest");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let before = app.save.as_ref().expect("save").body().to_vec();
+
+        app.set_quest(821, Progress::Cleared, true);
+        assert!(app.dirty);
+        assert!(app.quest_on(821, Progress::Cleared));
+        assert!(app.quest_on(821, Progress::Seen), "クリア implies 既読");
+        assert_eq!(
+            questprogress::count(app.save.as_ref().expect("save"), 0, Progress::Cleared),
+            1
+        );
+
+        // The invariant is refused by the core, so the 既読 of a cleared quest
+        // stays set and the message says why.
+        app.set_quest(821, Progress::Seen, false);
+        assert!(app.quest_on(821, Progress::Seen));
+        assert!(app.message.contains("クリア済み"), "{}", app.message);
+        assert_eq!(app.progress_undo.len(), 1, "a refused write is not a step");
+
+        // 失敗 is read only.
+        app.set_quest(821, Progress::Failed, true);
+        assert!(!app.quest_on(821, Progress::Failed));
+        assert!(app.message.contains("読み取り専用"), "{}", app.message);
+
+        app.undo_progress();
+        assert_eq!(app.save.as_ref().expect("save").body(), &before[..]);
+        assert!(!app.quest_on(821, Progress::Cleared));
+        assert!(!app.quest_on(821, Progress::Seen));
+    }
 }
 
+
+
+/// The colour a warning about the data itself is drawn in.
+///
+/// It is the amber the 未保存 marker uses: red is kept for a write that did not
+/// come back the way it was meant to.
+fn warning_color() -> egui::Color32 {
+    egui::Color32::from_rgb(240, 180, 60)
+}
+
+/// Fill of an award cell. A held award is a muted green, a missing one is
+/// almost the panel's own colour, so the grid reads as a picture of 132 bits.
+///
+/// Measured as WCAG contrast against the text each one carries: 6.4 to 1 on
+/// the green and 5.9 to 1 on the dark fill. The dark fill is only 1.2 to 1
+/// against the panel, which is why every cell also has an outline.
+fn award_fill(on: bool) -> egui::Color32 {
+    if on {
+        egui::Color32::from_rgb(58, 92, 64)
+    } else {
+        egui::Color32::from_rgb(40, 40, 44)
+    }
+}
+
+/// The text colour of an award cell, paired with award_fill.
+fn award_text(on: bool) -> egui::Color32 {
+    if on {
+        egui::Color32::from_rgb(226, 240, 228)
+    } else {
+        egui::Color32::from_rgb(163, 163, 170)
+    }
+}
+
+/// The outline of an award cell, so the dark half of the grid is still a grid.
+fn award_stroke(on: bool) -> egui::Color32 {
+    if on {
+        egui::Color32::from_rgb(122, 152, 128)
+    } else {
+        egui::Color32::from_rgb(66, 66, 74)
+    }
+}
 
 /// Name shown for a decoration socket: a dash when it is empty.
 fn deco_label(id: u16) -> String {

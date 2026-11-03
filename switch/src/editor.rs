@@ -864,6 +864,7 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Check => "クエスト検査",
         Hunts => "狩猟記録",
         Guild => "ギルドカード",
+        Progress => "進行状況",
         Roster => "オトモ",
         Sets => "マイセット",
         Palico => "配信オトモ",
@@ -967,7 +968,24 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Gmd => &[("A", "文章編集"), ("X", ".arc 保存"), ("B", "戻る")],
         Check => &[("A", "修正"), ("X", ".arc 保存"), ("B", "戻る")],
         Hunts => &[("</>", "値"), ("X", "項目"), ("A", "反映"), ("B", "戻る")],
-        Guild => &[("</>", "値"), ("X", "項目"), ("A", "コメント"), ("B", "戻る")],
+        // Minus on the card opens this screen; here the three views are the
+        // sub-tabs above, so Y is the second bit of the quest view (seen) and
+        // the view key on the other two - the footer names which, per view.
+        Guild => &[
+            ("</>", "値"),
+            ("X", "項目"),
+            ("A", "コメント"),
+            ("-", "進行状況"),
+            ("B", "戻る"),
+        ],
+        Progress => &[
+            ("A", "ビット切替"),
+            ("Y", "タブ/既読"),
+            ("</>", "±50行"),
+            ("L/R", "タブ"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
         // Minus opens the palico equipment panel on both palico screens, and
         // inside it Minus is the two-press release, so the chip says both.
         Roster => &[
