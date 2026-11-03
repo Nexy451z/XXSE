@@ -2218,6 +2218,7 @@ fn armour_names_index_by_series_and_part() {
         index: 0,
         kind: 1,
         level: 1,
+        transmog_level: 1,
         id: 1,
         transmog: 0,
     };

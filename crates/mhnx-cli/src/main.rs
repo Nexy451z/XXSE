@@ -3,8 +3,9 @@
 //! Useful for preparing an SD card, for scripting, and for checking a save
 //! without starting the GUI.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mhnx_core::arc::Arc;
 use mhnx_core::dlc;
@@ -52,9 +53,17 @@ USAGE:
   mhnx cat                            list one downloadable Palico catalogue record
   mhnx gmd-dump <file.gmd>             dump the strings of a standalone .gmd
   mhnx arc-gmd-entry <arc> <index>     dump one .gmd entry by index
-  mhnx verify <system>                 read and write back, report any change
+  mhnx verify <system>                 compare the file with its own round trip, read only
+  mhnx snapshot <system>               keep a copy of the save in snapshots/, newest 10 kept
+  mhnx snapshots <system>              list the kept snapshots, newest first
+  mhnx restore <system> <name>         put a snapshot back, snapshotting the current save first
 
 Commands that rewrite a save in place keep a copy next to it as <file>.bak.
+Snapshots live in <save's directory>/snapshots/ and are named
+<stem>-YYYYMMDD-HHMMSS.sav.
+
+verify never writes the save: it parses the bytes, writes them back in memory
+and compares. It exits 0 when the bytes are identical, 1 when they differ.
 "#
     );
 }
@@ -261,8 +270,54 @@ fn write_in_place(path: &str, bytes: &[u8]) -> Result<(), String> {
         std::fs::write(&bak, &old).map_err(|e| format!("cannot keep a copy at {}: {}", bak, e))?;
     }
     std::fs::write(path, bytes).map_err(|e| e.to_string())?;
+
+    // Read the file back and compare it with what was meant to be written. A
+    // save that silently lost bytes on the way to the card is the one failure
+    // the user cannot see, so it has to be caught here and undone.
+    let back = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            let detail = restore_from_bak(path, &bak);
+            return Err(format!(
+                "書き込み後の読み戻しに失敗しました: {}: {}{}",
+                path, e, detail
+            ));
+        }
+    };
+    let trip = mhnx_core::verify::compare(bytes, &back);
+    if !trip.is_identical() {
+        eprintln!("書き込み後の照合に失敗しました: {}", path);
+        if let Some((want, got)) = trip.length_change {
+            eprintln!("  長さが {} → {} に変わりました", want, got);
+        }
+        if !trip.differing.is_empty() {
+            eprintln!("  {} バイトが一致しません", trip.differing.len());
+            eprintln!("  先頭の差分: {}", trip.examples(8));
+        }
+        let detail = restore_from_bak(path, &bak);
+        return Err(format!(
+            "書き込み後の照合に失敗しました: {}（{}）{}",
+            path,
+            trip.summary(),
+            detail
+        ));
+    }
     println!("kept a copy at {}", bak);
     Ok(())
+}
+
+/// Put the pre-write copy back after a failed verification.
+///
+/// Returns the sentence to append to the error: if the copy itself is gone the
+/// caller must say so, because the file on disk is then the damaged one.
+fn restore_from_bak(path: &str, bak: &str) -> String {
+    match std::fs::read(bak) {
+        Ok(old) => match std::fs::write(path, &old) {
+            Ok(()) => format!(" / {} を {} から戻しました", path, bak),
+            Err(e) => format!(" / {} から戻せませんでした: {}", bak, e),
+        },
+        Err(e) => format!(" / 控え {} を読めないため戻せません: {}", bak, e),
+    }
 }
 
 /// Do two paths name the same file on disk?
@@ -1008,6 +1063,279 @@ fn cmd_dlc_list(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Prove that this build reads the save and writes the same bytes back.
+///
+/// Nothing is written: the file is parsed, serialised in memory and the two
+/// byte strings are compared. A difference means the file as it sits on the
+/// card is not something this tool can reproduce, which is what a user needs
+/// to know before letting any other command rewrite it.
+///
+/// Returns true when the round trip was identical, so main can exit 1 when it
+/// was not; a difference is a finding, not an error message.
+fn cmd_verify(path: &str) -> Result<bool, String> {
+    let on_disk = read(path)?;
+    // The shape check runs on the raw bytes, so it still reports something for
+    // a file this build cannot parse at all.
+    let shape = mhnx_core::verify::check_shape(&on_disk);
+    let parsed = Save::from_bytes(&on_disk);
+    match &parsed {
+        Ok(s) => println!(
+            "{}: {} ({} bytes)",
+            path,
+            kind_name(s.kind()),
+            on_disk.len()
+        ),
+        Err(_) => println!("{}: {} bytes", path, on_disk.len()),
+    }
+    if shape.is_empty() {
+        println!("  shape        OK");
+    } else {
+        println!("  shape        {} finding(s)", shape.len());
+        for f in &shape {
+            println!("               {}", f.text());
+        }
+        println!("               warning: 形が想定と違います。一致していてもゲームが読めない可能性があります");
+    }
+
+    let s = parsed.map_err(|e| format!("{} をセーブとして読めません: {}", path, e))?;
+    let written = s.to_bytes();
+    let trip = mhnx_core::verify::compare(&on_disk, &written);
+
+    if trip.is_identical() {
+        println!("  round trip   {} bytes back, identical", written.len());
+        println!("identical");
+        Ok(true)
+    } else {
+        if let Some((want, got)) = trip.length_change {
+            println!("  round trip   長さが {} → {} に変わりました", want, got);
+        }
+        if !trip.differing.is_empty() {
+            println!(
+                "  round trip   {} バイトが一致しません",
+                trip.differing.len()
+            );
+            println!("  先頭の差分: {}", trip.examples(10));
+        }
+        println!("different: the file on disk is not what this build writes back");
+        Ok(false)
+    }
+}
+
+/// Snapshots kept per save. Enough to step back through a few edits.
+const SNAPSHOT_KEEP: usize = 10;
+
+/// Where the snapshots of a save live: the snapshots directory beside it.
+fn snapshot_dir(save: &str) -> PathBuf {
+    match PathBuf::from(save).parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join("snapshots"),
+        _ => PathBuf::from("snapshots"),
+    }
+}
+
+/// The part of the file name the snapshots are named after.
+fn snapshot_stem(save: &str) -> String {
+    PathBuf::from(save)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| String::from("save"))
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The file names in a snapshot directory. A missing directory is empty, not
+/// an error: nothing has been snapshotted yet.
+fn snapshot_names(dir: &Path) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(format!("{}: {}", dir.display(), e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("{}: {}", dir.display(), e))?;
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        out.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    Ok(out)
+}
+
+/// Write one snapshot of a save and drop the oldest beyond SNAPSHOT_KEEP.
+///
+/// The protect argument names a snapshot that must not be rotated away;
+/// restoring from an old snapshot would otherwise be able to delete the file
+/// being restored.
+fn write_snapshot(save: &str, protect: Option<&str>) -> Result<(PathBuf, Vec<String>), String> {
+    let bytes = std::fs::read(save).map_err(|e| format!("{}: {}", save, e))?;
+    let dir = snapshot_dir(save);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let stem = snapshot_stem(save);
+    let prefix = format!("{}-", stem);
+
+    let mut names = snapshot_names(&dir)?;
+    // Two snapshots in the same second would collide; step the stamp forward
+    // instead of overwriting the one just taken.
+    let mut unix = now_unix();
+    let mut name = mhnx_core::snapshot::name(&stem, unix);
+    while names.iter().any(|n| *n == name) || dir.join(&name).exists() {
+        unix += 1;
+        name = mhnx_core::snapshot::name(&stem, unix);
+    }
+    let out = dir.join(&name);
+    std::fs::write(&out, &bytes).map_err(|e| format!("{}: {}", out.display(), e))?;
+
+    names.push(name);
+    if let Some(p) = protect {
+        names.retain(|n| n != p);
+    }
+    let mut dropped = Vec::new();
+    for i in mhnx_core::snapshot::older_than(&names, &prefix, SNAPSHOT_KEEP) {
+        let victim = dir.join(&names[i]);
+        match std::fs::remove_file(&victim) {
+            Ok(()) => dropped.push(names[i].clone()),
+            // Rotation failing must not hide a snapshot that was written.
+            Err(e) => println!("could not drop {}: {}", victim.display(), e),
+        }
+    }
+    Ok((out, dropped))
+}
+
+/// Say which snapshots the rotation removed, after the new one was announced.
+fn report_dropped(dropped: &[String]) {
+    for n in dropped {
+        println!("dropped the oldest snapshot {}", n);
+    }
+}
+
+/// The YYYYMMDD-HHMMSS part of a snapshot name, as YYYY-MM-DD HH:MM:SS.
+fn snapshot_stamp(name: &str) -> Option<String> {
+    let body = name.strip_suffix(".sav")?;
+    let tail = body.get(body.len().checked_sub(15)?..)?;
+    let b = tail.as_bytes();
+    if b.len() != 15 || b[8] != b'-' {
+        return None;
+    }
+    if !b
+        .iter()
+        .enumerate()
+        .all(|(i, c)| i == 8 || c.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{} {}:{}:{}",
+        &tail[0..4],
+        &tail[4..6],
+        &tail[6..8],
+        &tail[9..11],
+        &tail[11..13],
+        &tail[13..15]
+    ))
+}
+
+fn cmd_snapshot(save: &str) -> Result<(), String> {
+    let (out, dropped) = write_snapshot(save, None)?;
+    let kept = snapshot_names(&snapshot_dir(save))?
+        .iter()
+        .filter(|n| n.starts_with(&format!("{}-", snapshot_stem(save))) && n.ends_with(".sav"))
+        .count();
+    println!("saved snapshot {}", out.display());
+    report_dropped(&dropped);
+    println!("{} snapshot(s) kept (limit {})", kept, SNAPSHOT_KEEP);
+    Ok(())
+}
+
+fn cmd_snapshots(save: &str) -> Result<(), String> {
+    let dir = snapshot_dir(save);
+    let prefix = format!("{}-", snapshot_stem(save));
+    let mut names: Vec<String> = snapshot_names(&dir)?
+        .into_iter()
+        .filter(|n| n.starts_with(&prefix) && n.ends_with(".sav"))
+        .collect();
+    if names.is_empty() {
+        println!("no snapshots of {} yet ({})", save, dir.display());
+        println!("take one with: mhnx snapshot {}", save);
+        return Ok(());
+    }
+    // The stamp is fixed width, so plain order is chronological order.
+    names.sort();
+    println!(
+        "{} snapshot(s) of {} in {}",
+        names.len(),
+        save,
+        dir.display()
+    );
+    for n in names.iter().rev() {
+        let p = dir.join(n);
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+        let when = snapshot_stamp(n).unwrap_or_else(|| String::from("-"));
+        println!("  {:<34} {:>10} B  {}", n, size, when);
+    }
+    println!("put one back with: mhnx restore {} <name>", save);
+    Ok(())
+}
+
+/// Put a snapshot back over the save, after snapshotting what is there now.
+fn cmd_restore(save: &str, name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || !name.ends_with(".sav")
+    {
+        return Err(format!(
+            "snapshot name must be a plain <stem>-YYYYMMDD-HHMMSS.sav name, got {:?}",
+            name
+        ));
+    }
+    let dir = snapshot_dir(save);
+    let src = dir.join(name);
+    let wanted = std::fs::read(&src).map_err(|e| {
+        format!(
+            "{}: {} (mhnx snapshots {} lists them)",
+            src.display(),
+            e,
+            save
+        )
+    })?;
+    // A file that no longer parses would turn a bad restore into a dead save.
+    let restored = Save::from_bytes(&wanted)
+        .map_err(|e| format!("{} はセーブとして読めません: {}", src.display(), e))?;
+
+    // Restoring a 3DS body over a Switch container (or the reverse) would
+    // change the size under the game; refuse instead of guessing.
+    let current = Save::from_bytes(&read(save)?).map_err(|e| e.to_string())?;
+    if current.kind() != restored.kind() {
+        return Err(format!(
+            "{} は {} ですが、{} は {} です",
+            save,
+            kind_name(current.kind()),
+            name,
+            kind_name(restored.kind())
+        ));
+    }
+
+    let (made, dropped) = write_snapshot(save, Some(name))?;
+    println!("現在の内容を {} に残しました", made.display());
+    report_dropped(&dropped);
+    write_in_place(save, &wanted)?;
+    println!(
+        "restored {} ({} bytes, {}) from {}",
+        save,
+        wanted.len(),
+        kind_name(restored.kind()),
+        name
+    );
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
@@ -1082,6 +1410,15 @@ fn main() -> ExitCode {
             Err(e) => Err(e),
         },
         "cat-del" if args.len() == 3 => (|| cmd_cat_del(&args[1], num(&args[2], "index")?))(),
+        "verify" if args.len() == 2 => match cmd_verify(&args[1]) {
+            Ok(true) => Ok(()),
+            // A difference is a finding, so say it once and exit 1.
+            Ok(false) => return ExitCode::from(1),
+            Err(e) => Err(e),
+        },
+        "snapshot" if args.len() == 2 => cmd_snapshot(&args[1]),
+        "snapshots" if args.len() == 2 => cmd_snapshots(&args[1]),
+        "restore" if args.len() == 3 => cmd_restore(&args[1], &args[2]),
         other => {
             eprintln!("unknown or incomplete command: {}\n", other);
             usage();

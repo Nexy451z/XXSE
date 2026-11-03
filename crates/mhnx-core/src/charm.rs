@@ -317,6 +317,11 @@ pub fn create_charm(box_bytes: &mut [u8], index: usize, template: &[u8], charm: 
         return false;
     }
     box_bytes[o..o + CHARM_RECORD].copy_from_slice(template);
+    // The template supplies the grade pair, not its decorations: a talisman
+    // with more socketed gems than it has sockets is a record the game never
+    // writes. The three decoration ids are cleared here, and slots decides
+    // how many the caller wants.
+    box_bytes[o + 0x06..o + 0x0C].fill(0);
     box_bytes[o + 0x0C] = charm.skill1;
     box_bytes[o + 0x0D] = charm.skill2;
     box_bytes[o + 0x0E] = charm.points1 as u8;
@@ -329,14 +334,15 @@ pub fn create_charm(box_bytes: &mut [u8], index: usize, template: &[u8], charm: 
 ///
 /// Picks the modal (rarity, +0x02) pair. The sample saves are dominated by
 /// rarity 100 with 0x0A at +0x02, so that is what a new talisman looks like.
-/// Is this a "clean" talisman: the modal shape with nothing in the four bytes
-/// at +0x06..+0x09?
+/// Is this a "clean" talisman: the modal shape with no decorations in it?
 ///
-/// 15 of the 650 talismans in the sample saves carry data there, and they all
-/// sit in the modal (rarity 100, +0x02 = 0x0A) class. Cloning one of those
-/// copies junk into every new talisman, so a clean record is preferred.
+/// The three decoration sockets are u16 at +0x06, +0x08 and +0x0A, so the
+/// check has to reach +0x0B; stopping at +0x0A left the third socket out and a
+/// template with something in it handed that decoration to every new talisman.
+/// 15 of the 650 talismans in the sample saves carry data here, and they all
+/// sit in the modal (rarity 100, +0x02 = 0x0A) class.
 fn is_clean(rec: &[u8]) -> bool {
-    rec[0x06..0x0A].iter().all(|b| *b == 0)
+    rec[0x06..0x0C].iter().all(|b| *b == 0)
 }
 
 pub fn template_from_box(box_bytes: &[u8]) -> Option<[u8; CHARM_RECORD]> {
@@ -842,7 +848,13 @@ mod tests {
         assert_eq!(rec[0x0C], 2);
         assert_eq!(rec[0x12], template[0x12], "the template rarity carries over");
         assert_eq!(rec[0x02], template[0x02]);
-        assert_eq!(rec[0x06], template[0x06], "unknown bytes carry over");
+        // The template supplies the grade pair, not its gems: this template
+        // carries decoration 2856 at +0x06, and a new talisman must not
+        // inherit it (it would have more gems than sockets).
+        assert_eq!(rec[0x06..0x0C], [0u8; 6], "the decorations are not copied");
+        // Everything else the template carried still comes along.
+        assert_eq!(rec[0x13], template[0x13], "unknown bytes carry over");
+        assert_eq!(rec[0x11], template[0x11]);
         assert_eq!(decode_box(&b).len(), 2);
     }
 

@@ -1,10 +1,20 @@
 //! Equipment box records: decoding and Japanese names.
 //!
-//! A record is 36 bytes. The reference editor reads it like this
-//! (MainForm.cs:336): the first two bytes hold the type and the level packed
-//! into 16 bits, little endian, with the type in the top five bits and the
-//! level in the low eleven. The id is a u16 at +0x02 and the transmog id a u16
-//! at +0x04.
+//! A record is 36 bytes. The first two bytes are one 16 bit word, little
+//! endian, holding three fields:
+//!
+//! - bits 0..5   type
+//! - bits 5..10  level - 1
+//! - bits 10..15 transmog source level - 1
+//!
+//! The level is stored minus one, the same convention the palico record uses.
+//! Reading the whole word from bit 5 up, which this module did until it was
+//! checked, folded the transmog level into the level: harmless in a save that
+//! has never transmogged anything, wrong in one that has.
+//!
+//! The id is a u16 at +0x02, the transmog id a u16 at +0x04, and a weapon or
+//! piece of armour carries up to three decoration ids as u16 at +0x06, +0x08
+//! and +0x0A.
 //!
 //! Types come from EQUIPMENT_TYPES. 1..5 are the armour parts, 6 is the
 //! talisman, and the weapons run 7..21 with 12 deliberately unused: the JP
@@ -27,8 +37,12 @@ pub struct Equipment {
     pub index: usize,
     /// EQUIPMENT_TYPES index.
     pub kind: u8,
-    /// Level, low 11 bits of the first word.
+    /// Level, bits 5..10 of the first word plus one.
     pub level: u16,
+    /// Level of the piece this one was transmogged from, plus one.
+    ///
+    /// 1 when the record has never been transmogged.
+    pub transmog_level: u16,
     /// Weapon or armour id.
     pub id: u16,
     /// Transmog (layered) id.
@@ -37,9 +51,32 @@ pub struct Equipment {
 
 impl Equipment {
     /// Is the slot empty?
+    ///
+    /// A record counts as used when any byte is set. Checking only the type
+    /// byte is not enough for deciding whether it is safe to write: a record
+    /// with the type cleared but the rest of the bytes still there would have
+    /// been overwritten without a word.
     pub fn is_empty(&self) -> bool {
         self.kind == 0
     }
+
+    /// Decoration ids at +0x06, +0x08 and +0x0A. Zero means an empty socket.
+    pub fn decorations(index: usize, rec: &[u8]) -> [u16; 3] {
+        let _ = index;
+        if rec.len() < EQUIP_RECORD {
+            return [0; 3];
+        }
+        [
+            u16::from_le_bytes([rec[0x06], rec[0x07]]),
+            u16::from_le_bytes([rec[0x08], rec[0x09]]),
+            u16::from_le_bytes([rec[0x0A], rec[0x0B]]),
+        ]
+    }
+}
+
+/// True when every byte of the record is zero.
+pub fn record_is_blank(rec: &[u8]) -> bool {
+    rec.iter().take(EQUIP_RECORD).all(|b| *b == 0)
 }
 
 /// Decode one 36 byte record.
@@ -54,7 +91,9 @@ pub fn decode_record(index: usize, rec: &[u8]) -> Option<Equipment> {
     Some(Equipment {
         index,
         kind: (head & 0x1F) as u8,
-        level: head >> 5,
+        // Stored minus one, five bits wide.
+        level: ((head >> 5) & 0x1F) + 1,
+        transmog_level: ((head >> 10) & 0x1F) + 1,
         id: u16::from_le_bytes([rec[2], rec[3]]),
         transmog: u16::from_le_bytes([rec[4], rec[5]]),
     })

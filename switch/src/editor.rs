@@ -363,8 +363,23 @@ pub fn install_arc_file_into_save(ed: &mut Editor, idx: usize) {
     }
 }
 
-/// Write the save back to the console, keeping a copy on the SD card first.
-fn write_console_save(bytes: &[u8]) -> Result<String, String> {
+/// What a write to the console save actually did.
+///
+/// Built by `write_console_save` so the caller can say all of it in one
+/// message: the write, the check afterwards, and where the way back is.
+struct WriteReport {
+    /// The .bak on the SD card holding the save as it was before this write.
+    backup: String,
+    /// The snapshot file name, or why there is none.
+    snapshot: Result<String, String>,
+    /// `Some(detail)` when the console did not give back the bytes written.
+    /// The pre-write save has already been written back when this is set.
+    mismatch: Option<String>,
+}
+
+/// Write the save back to the console, keeping a copy on the SD card first,
+/// then read the same area back and compare it with what was written.
+fn write_console_save(bytes: &[u8]) -> Result<WriteReport, String> {
     // The console save is a header plus a 4,726,152 byte body. A 3DS save is
     // the bare body, and writing one through the in place path would leave the
     // file at its old length with the tail of the old save still on the end.
@@ -378,38 +393,104 @@ fn write_console_save(bytes: &[u8]) -> Result<String, String> {
     let mount = crate::savedata::Mount::open().map_err(|e| e.describe())?;
     // Keep what the console holds now, so a bad edit can be undone without
     // having thought about it beforehand.
-    let backup = String::from(SAFETY_DIR);
     make_dirs(SAFETY_DIR);
-    let old = mount.read().ok();
+    let old = match mount.read() {
+        Ok(b) => b,
+        Err(_) => {
+            return Err(String::from(
+                "いまのセーブを読み直せないため控えを作れません。セーブは変更していません",
+            ))
+        }
+    };
     let stamp = crate::savedata::stamp();
-    let backup_path = alloc::format!("{}/system_{}.bak", backup, stamp);
+    let backup_path = alloc::format!("{}/system_{}.bak", SAFETY_DIR, stamp);
     // A copy that silently failed is worse than no copy, because the message
     // afterwards claims one exists. Refuse to write the save unless the copy
     // really is on the card and reads back the same length.
-    if let Some(old) = old.as_ref() {
-        if !write_file(&backup_path, old) {
-            return Err(alloc::format!(
-                "控えを書けませんでした（{}）。セーブは変更していません",
-                backup_path
-            ));
-        }
-        prune_old_backups(10);
-    } else {
-        return Err(String::from(
-            "いまのセーブを読み直せないため控えを作れません。セーブは変更していません",
-        ));
-    }
-    // The write goes out in blocks and cannot be rolled back. It is refused
-    // unless the copy above is on the card, so a failure half way through is
-    // recoverable: say where from, in the message the user actually sees.
-    if let Err(err) = mount.write_diff(bytes, old.as_deref()) {
+    if !write_file(&backup_path, &old) {
         return Err(alloc::format!(
-            "本体セーブへの書き込みに失敗しました（{}）。書き込み途中の可能性があるので、控え {} を SD カードから戻してください",
-            err.describe(),
+            "控えを書けませんでした（{}）。セーブは変更していません",
             backup_path
         ));
     }
-    Ok(backup_path)
+    prune_old_backups(10);
+    // A second, rotating copy. The .bak above only covers the newest write,
+    // and a mistake noticed two saves later needs one of these.
+    let snapshot = save_snapshot(&old);
+    // The write goes out in blocks and cannot be rolled back. It is refused
+    // unless the copy above is on the card, so a failure half way through is
+    // recoverable: say where from, in the message the user actually sees.
+    let trip = match mount.write_diff(bytes, Some(&old)) {
+        Ok(trip) => trip,
+        Err(err) => {
+            return Err(alloc::format!(
+                "本体セーブへの書き込み、または書き込みの確認に失敗しました（{}）。内容が中途半端な可能性があるので、控え {} を SD カードから戻してください",
+                err.describe(),
+                backup_path
+            ))
+        }
+    };
+    if trip.is_identical() {
+        return Ok(WriteReport {
+            backup: backup_path,
+            snapshot,
+            mismatch: None,
+        });
+    }
+    // The console returned something other than the bytes that were written.
+    // Put the pre-write save back before saying anything else, and only then
+    // report: an edit that did not land must never look like one that did.
+    let detail = round_trip_detail(&trip);
+    match restore_save(&mount, &backup_path, &old) {
+        Ok(()) => Ok(WriteReport {
+            backup: backup_path,
+            snapshot,
+            mismatch: Some(detail),
+        }),
+        Err(why) => Err(alloc::format!(
+            "書き込み後の照合に失敗し、戻しにも失敗しました（{} / {}）。控え {} を SD カードから手動で戻してください",
+            detail, why, backup_path
+        )),
+    }
+}
+
+/// A one line description of a mismatch, with a few offsets when there are any.
+fn round_trip_detail(trip: &mhnx_core::verify::RoundTrip) -> String {
+    let examples = trip.examples(3);
+    if examples.is_empty() {
+        trip.summary()
+    } else {
+        alloc::format!("{} / {}", trip.summary(), examples)
+    }
+}
+
+/// Write `old` back over a save whose write did not verify.
+///
+/// The copy on the SD card is preferred over the in-memory one because that is
+/// the file the failure message tells the user to fall back on, so restoring
+/// from it also proves the card copy is good. The restored bytes are read back
+/// and compared like any other write.
+fn restore_save(
+    mount: &crate::savedata::Mount,
+    backup_path: &str,
+    old: &[u8],
+) -> Result<(), String> {
+    let from_card = read_file(backup_path);
+    let restore = from_card.as_deref().unwrap_or(old);
+    // No diff: the point of a rollback is that every byte is written again.
+    // Trusting the console's contents to match what we think is there is the
+    // mistake that produced the mismatch in the first place.
+    match mount.write_diff(restore, None) {
+        Err(e) => Err(alloc::format!(
+            "戻しの書き込みに失敗しました（{}）",
+            e.describe()
+        )),
+        Ok(trip) if trip.is_identical() => Ok(()),
+        Ok(trip) => Err(alloc::format!(
+            "戻した内容の照合も失敗しました（{}）",
+            round_trip_detail(&trip)
+        )),
+    }
 }
 
 /// Keep at most `max_keep` backup files in `SAFETY_DIR` so the SD card never fills up.
@@ -441,6 +522,182 @@ fn prune_old_backups(max_keep: usize) {
 /// /switch/mhnxeditor/backups and are untouched; nothing reads them
 /// automatically, so if one is needed it has to be restored by hand.
 const SAFETY_DIR: &str = "/switch/XXSE/backups";
+
+/// Where the rotating snapshots of the console save are kept.
+///
+/// Separate from `SAFETY_DIR` on purpose: the .bak there is the one copy a
+/// rollback of the *last* write needs, while a snapshot is what makes a write
+/// from a day ago reachable again. Both are kept.
+const SNAPSHOT_DIR: &str = "/switch/XXSE/snapshots";
+/// The same folder as a C string, for `list_dir`.
+const SNAPSHOT_DIR_C: &CStr = c"/switch/XXSE/snapshots";
+/// Every snapshot of the console save is named from this stem.
+const SNAPSHOT_STEM: &str = "system";
+/// How many snapshots of the console save stay on the SD card.
+const SNAPSHOT_KEEP: usize = 10;
+
+/// Take one snapshot of the save as it is about to be replaced.
+///
+/// Returns the file name that now holds `bytes`, or a Japanese reason why
+/// there is none. A snapshot that failed quietly would leave the user
+/// believing they can undo a write that they cannot, so the caller is expected
+/// to pass the reason on to the message the user sees.
+fn save_snapshot(bytes: &[u8]) -> Result<String, String> {
+    let unix = match crate::savedata::now_unix() {
+        Some(t) => t,
+        None => {
+            return Err(String::from(
+                "本体の時計から時刻を取得できないためスナップショットを作成できません",
+            ))
+        }
+    };
+    make_dirs(SNAPSHOT_DIR);
+    let name = mhnx_core::snapshot::name(SNAPSHOT_STEM, unix);
+    let path = format!("{}/{}", SNAPSHOT_DIR, name);
+    if !write_file(&path, bytes) {
+        return Err(alloc::format!("スナップショットを書き込めません: {}", path));
+    }
+    prune_snapshots();
+    Ok(name)
+}
+
+/// Snapshot file names in `SNAPSHOT_DIR`, in no particular order.
+fn snapshot_names() -> Vec<String> {
+    list_dir(SNAPSHOT_DIR_C)
+        .into_iter()
+        .filter(|e| e.is_file && e.name.ends_with(".sav"))
+        .map(|e| e.name)
+        .collect()
+}
+
+/// Delete the oldest snapshots so that `SNAPSHOT_KEEP` stay.
+fn prune_snapshots() {
+    let names = snapshot_names();
+    for idx in mhnx_core::snapshot::older_than(&names, SNAPSHOT_STEM, SNAPSHOT_KEEP) {
+        let Some(name) = names.get(idx) else { continue };
+        let full = format!("{}/{}", SNAPSHOT_DIR, name);
+        let cpath = to_cstring(&full);
+        unsafe {
+            let _ = remove(cpath.as_ptr() as *const c_char);
+        }
+    }
+}
+
+/// A short note about the snapshot for the message after a write.
+fn snapshot_note(snapshot: &Result<String, String>) -> String {
+    match snapshot {
+        Ok(name) => alloc::format!("スナップショット: {}", name),
+        Err(reason) => alloc::format!("スナップショットは作成できませんでした（{}）", reason),
+    }
+}
+
+/// Put the newest snapshot back on the console and reload it into the editor.
+///
+/// The save currently on the console is copied into `SAFETY_DIR` first:
+/// restoring is a write like any other and can itself go wrong, and a restore
+/// that fails must not cost the save it replaced.
+pub fn restore_latest_snapshot(ed: &mut Editor) {
+    let mut names = snapshot_names();
+    if names.is_empty() {
+        ed.message = alloc::format!(
+            "スナップショットがありません（本体セーブを保存すると {} に作られます）",
+            SNAPSHOT_DIR
+        );
+        return;
+    }
+    names.sort();
+    let Some(name) = names.pop() else { return };
+    let path = format!("{}/{}", SNAPSHOT_DIR, name);
+    let bytes = match read_file(&path) {
+        Some(b) => b,
+        None => {
+            ed.message = alloc::format!("スナップショットを読み込めません: {}", path);
+            return;
+        }
+    };
+    if !crate::savedata::looks_like_save(&bytes) {
+        ed.message = alloc::format!(
+            "スナップショットのサイズが想定と違います（{} バイト）",
+            bytes.len()
+        );
+        return;
+    }
+    let findings = mhnx_core::verify::check_shape(&bytes);
+    if let Some(finding) = findings.first().copied() {
+        ed.message = alloc::format!(
+            "スナップショットの形が不正なため戻しません: {}",
+            finding.text()
+        );
+        return;
+    }
+    let mount = match crate::savedata::Mount::open() {
+        Ok(m) => m,
+        Err(e) => {
+            ed.message = e.describe();
+            return;
+        }
+    };
+    let current = match mount.read() {
+        Ok(b) => b,
+        Err(e) => {
+            ed.message = alloc::format!(
+                "いまのセーブを読み直せないため戻しません（{}）",
+                e.describe()
+            );
+            return;
+        }
+    };
+    make_dirs(SAFETY_DIR);
+    let backup_path = format!("{}/system_{}.bak", SAFETY_DIR, crate::savedata::stamp());
+    if !write_file(&backup_path, &current) {
+        ed.message = alloc::format!("控えを書けないため戻しませんでした（{}）", backup_path);
+        return;
+    }
+    prune_old_backups(10);
+    match mount.write_diff(&bytes, Some(&current)) {
+        Err(e) => {
+            ed.message = alloc::format!(
+                "スナップショットの書き込みに失敗しました（{}）。控え {} を SD カードから戻してください",
+                e.describe(),
+                backup_path
+            );
+        }
+        Ok(trip) if trip.is_identical() => {
+            // Reload from what is now on the console, but stay on the screen
+            // the user pressed the button on.
+            let screen = ed.screen;
+            let cursor = ed.cursor;
+            ed.open_save_bytes(mhnx_core::hbedit::CONSOLE_SAVE, &bytes);
+            ed.screen = screen;
+            ed.cursor = cursor;
+            ed.message = alloc::format!(
+                "スナップショット {} を本体セーブに戻しました（書き込みと照合が完了しました / 控え: {}）",
+                name,
+                backup_path
+            );
+        }
+        Ok(trip) => {
+            let detail = round_trip_detail(&trip);
+            match restore_save(&mount, &backup_path, &current) {
+                Ok(()) => {
+                    ed.message = alloc::format!(
+                        "スナップショットの照合に失敗したので、戻す前のセーブに戻しました（{}）",
+                        detail
+                    );
+                }
+                Err(why) => {
+                    ed.message = alloc::format!(
+                        "スナップショットの照合に失敗し、戻しにも失敗しました（{} / {}）。控え {} を SD カードから手動で戻してください",
+                        detail,
+                        why,
+                        backup_path
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Collect .arc quest files from every candidate folder.
 fn scan_quests() -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -619,7 +876,12 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Roster => &[("</>", "値"), ("X", "項目"), ("A", "名前"), ("B", "戻る")],
         Sets => &[("B", "戻る")],
         Palico => &[("A", "追加/削除"), ("L", "言語"), ("R", "言語"), ("X", "保存"), ("B", "戻る")],
-        Options => &[("</>", "値変更"), ("A", "保存"), ("B", "戻る")],
+        Options => &[
+            ("</>", "値変更"),
+            ("A", "保存"),
+            ("Y", "スナップショット"),
+            ("B", "戻る"),
+        ],
     }
 }
 
@@ -728,6 +990,11 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
         install_arc_file_into_save(ed, arc_idx);
         force_redraw = true;
     }
+    if gui.wants_restore_snapshot {
+        gui.wants_restore_snapshot = false;
+        restore_latest_snapshot(ed);
+        force_redraw = true;
+    }
 
     if let Some(req) = ed.take_request() {
         match req {
@@ -788,12 +1055,27 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                     || path == "nand:/system_backup"
                 {
                     match write_console_save(&bytes) {
-                        Ok(backup) => {
-                            ed.dirty = false;
-                            ed.message = format!(
-                                "本体のセーブに {} バイト書き込みました（控え: {}）",
-                                n, backup
-                            );
+                        Ok(report) => {
+                            ed.message = match report.mismatch {
+                                None => {
+                                    ed.dirty = false;
+                                    alloc::format!(
+                                        "本体のセーブに {} バイト書き込みました（控え: {}）。書き込みと照合が完了しました。{}",
+                                        n,
+                                        report.backup,
+                                        snapshot_note(&report.snapshot)
+                                    )
+                                }
+                                // The edit is not on the console: leave the
+                                // save marked dirty so the user knows the
+                                // change still only exists in memory.
+                                Some(detail) => alloc::format!(
+                                    "書き込み後の照合に失敗したので戻しました（{} / 控え: {}）。{}",
+                                    detail,
+                                    report.backup,
+                                    snapshot_note(&report.snapshot)
+                                ),
+                            };
                         }
                         Err(msg) => ed.message = msg,
                     }

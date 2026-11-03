@@ -13,6 +13,8 @@ use mhnx_core::itembox::ItemSlot;
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::questfields::FieldKind;
 use mhnx_core::save::{Character, Save, SaveKind, BODY_SIZE, SWITCH_SIZE};
+use mhnx_core::snapshot;
+use mhnx_core::verify;
 
 /// Which page is visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +55,19 @@ pub enum Confirm {
 pub struct CharmConfirm {
     /// The charm waiting for a second click.
     pub delete: Option<usize>,
+}
+
+/// One file in the `snapshots` folder next to the open save.
+///
+/// The list is read from disk rather than rebuilt every frame: the folder can
+/// hold ten 4.7 MB files and a frame loop should not stat them sixty times a
+/// second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    /// File name inside `snapshots/`, e.g. `system-20261104-012812.sav`.
+    pub name: String,
+    /// Size on disk, for the list.
+    pub size: u64,
 }
 
 pub struct MhnxEditor {
@@ -145,6 +160,10 @@ pub struct MhnxEditor {
     pub charm_points2: i8,
     pub charm_slots: u8,
 
+    // ---- snapshots ----
+    /// Snapshots next to the open save, newest first.
+    pub snapshots: Vec<SnapshotEntry>,
+
     // ---- dlc ----
     pub dlc_files: Vec<PathBuf>,
     pub dlc_log: Vec<String>,
@@ -210,6 +229,7 @@ impl Default for MhnxEditor {
             charm_skill2: 0,
             charm_points2: 0,
             charm_slots: 0,
+            snapshots: Vec::new(),
             dlc_files: Vec::new(),
             dlc_log: Vec::new(),
             screenshot_path: None,
@@ -251,6 +271,7 @@ impl MhnxEditor {
                     format!("読み込みました: {}", path.display())
                 };
                 self.reload_from_save();
+                self.refresh_snapshots();
             }
             Err(e) => self.message = format!("読み込み失敗: {}", e),
         }
@@ -343,6 +364,204 @@ impl MhnxEditor {
         }
     }
 
+    // ------------------------------------------------------------ snapshots
+
+    /// Folder the automatic snapshots live in: next to the save itself.
+    fn snapshot_dir(path: &std::path::Path) -> PathBuf {
+        path.parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("snapshots")
+    }
+
+    /// The save's name without its extension, the stem snapshots are named by.
+    fn snapshot_stem(path: &std::path::Path) -> String {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_owned())
+            .unwrap_or_else(|| String::from("save"))
+    }
+
+    /// Seconds since the epoch; 0 if the clock is before 1970.
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Keep `bytes` as a snapshot of `stem` next to `path`.
+    ///
+    /// Returns the file name that was created. Only the newest ten survive:
+    /// the single `.bak` generation was the whole safety net, and the second
+    /// save already overwrote it.
+    fn push_snapshot(
+        path: &std::path::Path,
+        stem: &str,
+        bytes: &[u8],
+    ) -> std::io::Result<String> {
+        let dir = Self::snapshot_dir(path);
+        std::fs::create_dir_all(&dir)?;
+        let mut unix = Self::unix_now();
+        let mut name = snapshot::name(stem, unix);
+        // Two saves inside the same second would overwrite the earlier
+        // snapshot. The stamp is fixed width, so stepping the second forward
+        // keeps the list in the right order.
+        let mut tries = 0;
+        while dir.join(&name).exists() && tries < 120 {
+            unix += 1;
+            name = snapshot::name(stem, unix);
+            tries += 1;
+        }
+        std::fs::write(dir.join(&name), bytes)?;
+        let existing: Vec<String> = std::fs::read_dir(&dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter_map(|e| e.file_name().to_str().map(|n| n.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let prefix = format!("{}-", stem);
+        for i in snapshot::older_than(&existing, &prefix, 10) {
+            // A snapshot that will not delete is not worth a dialog; it only
+            // means one file more than the limit is kept.
+            let _ = std::fs::remove_file(dir.join(&existing[i]));
+        }
+        Ok(name)
+    }
+
+    /// What the status bar says about the snapshot a save just made.
+    ///
+    /// A snapshot that could not be written is reported rather than dropped:
+    /// the save itself is fine, but the extra safety net is not there.
+    fn snapshot_note(made: std::io::Result<String>) -> String {
+        match made {
+            Ok(name) => format!("（スナップショット: {}）", name),
+            Err(e) => format!("（スナップショットを作れませんでした: {}）", e),
+        }
+    }
+
+    /// Re-read the snapshot folder next to the open save, newest first.
+    pub fn refresh_snapshots(&mut self) {
+        self.snapshots.clear();
+        let Some(path) = self.save_path.clone() else {
+            return;
+        };
+        let dir = Self::snapshot_dir(&path);
+        let prefix = format!("{}-", Self::snapshot_stem(&path));
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let mut found: Vec<SnapshotEntry> = rd
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_str()?.to_owned();
+                if !name.starts_with(&prefix) || !name.ends_with(".sav") {
+                    return None;
+                }
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                Some(SnapshotEntry { name, size })
+            })
+            .collect();
+        // The stamp is fixed width inside the name, so a descending name sort
+        // is newest first.
+        found.sort_by(|a, b| b.name.cmp(&a.name));
+        self.snapshots = found;
+    }
+
+    // ---------------------------------------------------- writing, verified
+
+    /// Put a file back the way it was after a write that did not land.
+    ///
+    /// `trip` is the comparison that failed, or `None` when reading the file
+    /// back failed at all. The message always contains 「照合に失敗」 so the
+    /// bottom bar can draw it in red.
+    fn undo_bad_write(
+        path: &std::path::Path,
+        backup: &Option<PathBuf>,
+        trip: Option<&verify::RoundTrip>,
+        why: &str,
+    ) -> String {
+        let detail = match trip {
+            Some(t) => match t.length_change {
+                Some((a, b)) => format!("長さが {} → {} バイトに変わりました", a, b),
+                None => format!("差分 {} 件: {}", t.differing.len(), t.examples(3)),
+            },
+            None => why.to_owned(),
+        };
+        match backup {
+            Some(b) => match std::fs::copy(b, path) {
+                Ok(_) => format!(
+                    "照合に失敗したので戻しました（{}）。{} から復元しました",
+                    detail,
+                    b.display()
+                ),
+                Err(e) => format!(
+                    "照合に失敗し、{} からの復元にも失敗しました（{}）。{} は壊れたままの可能性があります: {}",
+                    b.display(),
+                    detail,
+                    path.display(),
+                    e
+                ),
+            },
+            None => format!(
+                "照合に失敗しました（{}）。戻せる控え (.bak) がないため、{} は今の状態のままです",
+                detail,
+                path.display()
+            ),
+        }
+    }
+
+    /// Write `bytes`, read the file back and compare the two.
+    ///
+    /// `fs::write` only reports that the call did not fail; it says nothing
+    /// about what the file now holds. On a mismatch the file is put back from
+    /// the `.bak` copy taken just before the write. Returns the backup path
+    /// (when one was made) and a success line, or the failure message.
+    fn write_and_verify(
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> std::result::Result<(Option<PathBuf>, String), String> {
+        let backup = Self::backup_before_write(path);
+        if let Err(e) = std::fs::write(path, bytes) {
+            // A failed write may still have truncated the file, so put the
+            // copy back before saying anything else.
+            let put_back = match &backup {
+                Some(b) => match std::fs::copy(b, path) {
+                    Ok(_) => format!("（元の控え {} から戻しました）", b.display()),
+                    Err(e2) => format!(
+                        "（{} からの復元にも失敗しました: {}）",
+                        b.display(),
+                        e2
+                    ),
+                },
+                None => String::new(),
+            };
+            return Err(format!(
+                "書き出し失敗: {}: {}{}",
+                path.display(),
+                e,
+                put_back
+            ));
+        }
+        let read_back = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(Self::undo_bad_write(
+                    path,
+                    &backup,
+                    None,
+                    &format!("読み戻しに失敗: {}", e),
+                ))
+            }
+        };
+        let trip = verify::compare(bytes, &read_back);
+        if trip.is_identical() {
+            Ok((backup, format!("照合OK: {} バイト一致", bytes.len())))
+        } else {
+            Err(Self::undo_bad_write(path, &backup, Some(&trip), ""))
+        }
+    }
+
     pub fn write_current(&mut self, path: PathBuf) {
         // See open_save: the offsets are MHXX's, so writing an MHGU save back
         // would corrupt it.
@@ -365,22 +584,30 @@ impl MhnxEditor {
         // the save only if the user pressed the apply button first: writing
         // straight from the table silently dropped the changes.
         self.apply_hunts();
-        let Some(s) = &self.save else { return };
-        let backup = Self::backup_before_write(&path);
-        match std::fs::write(&path, s.to_bytes()) {
-            Ok(_) => {
+        let Some(bytes) = self.save.as_ref().map(|s| s.to_bytes()) else {
+            return;
+        };
+        match Self::write_and_verify(&path, &bytes) {
+            Ok((backup, check)) => {
                 self.dirty = false;
                 self.save_path = Some(path.clone());
-                self.message = match backup {
-                    Some(b) => format!(
-                        "書き出しました: {}（元のファイルは {} に退避）",
-                        path.display(),
-                        b.display()
-                    ),
-                    None => format!("書き出しました: {}", path.display()),
-                };
+                // The snapshot is the very bytes that were just proven to be
+                // on disk, so every entry in the list is a save that happened.
+                let stamped = Self::push_snapshot(&path, &Self::snapshot_stem(&path), &bytes);
+                self.refresh_snapshots();
+                let mut m = format!("書き出しました: {}", path.display());
+                m += &format!("（{}）", check);
+                if let Some(b) = backup {
+                    m += &format!("（元のファイルは {} に退避）", b.display());
+                }
+                m += &Self::snapshot_note(stamped);
+                self.message = m;
             }
-            Err(e) => self.message = format!("書き出し失敗: {}", e),
+            Err(e) => {
+                // Nothing landed, so the edits are still only in memory.
+                self.dirty = true;
+                self.message = e;
+            }
         }
     }
 
@@ -405,15 +632,18 @@ impl MhnxEditor {
         // This pair is what the console actually loads, so replacing it
         // deserves the same copy the single file overwrite keeps. Two files go
         // out, two come back.
-        let saved_a = Self::backup_before_write(&dir.join("system"));
-        let saved_b = Self::backup_before_write(&dir.join("system_backup"));
-        let r1 = std::fs::write(dir.join("system"), &a);
-        let r2 = std::fs::write(dir.join("system_backup"), &b);
-        self.message = match (r1, r2) {
-            (Ok(_), Ok(_)) => {
+        let r1 = Self::write_and_verify(&dir.join("system"), &a);
+        let r2 = Self::write_and_verify(&dir.join("system_backup"), &b);
+        match (r1, r2) {
+            (Ok((saved_a, _)), Ok((saved_b, _))) => {
                 self.dirty = false;
+                // system_backup carries the same body as system, so one
+                // snapshot of the pair is enough; a second copy would double
+                // the disk use for identical bytes.
+                let stamped = Self::push_snapshot(&dir.join("system"), "system", &a);
+                self.refresh_snapshots();
                 let kept = saved_a.iter().chain(saved_b.iter()).count();
-                if kept > 0 {
+                let mut m = if kept > 0 {
                     format!(
                         "system と system_backup を書き出しました（元のファイルは {} 件退避）: {}",
                         kept,
@@ -421,24 +651,114 @@ impl MhnxEditor {
                     )
                 } else {
                     format!("system と system_backup を書き出しました: {}", dir.display())
-                }
+                };
+                m += &format!("（照合OK: 2 ファイル {} バイト一致）", a.len());
+                let note = stamped.map(|s| format!("{}/snapshots/{}", dir.display(), s));
+                m += &Self::snapshot_note(note);
+                self.message = m;
             }
-            _ => "書き出しに失敗しました".to_owned(),
-        };
+            (e1, e2) => {
+                // At least one of the two did not land; say which and why.
+                self.dirty = true;
+                let mut parts: Vec<String> = Vec::new();
+                if let Err(e) = e1 {
+                    parts.push(format!("system: {}", e));
+                }
+                if let Err(e) = e2 {
+                    parts.push(format!("system_backup: {}", e));
+                }
+                self.message = parts.join(" / ");
+            }
+        }
     }
 
     /// Export the body as a 3DS save.
     pub fn export_3ds(&mut self, path: PathBuf) {
         self.apply_to_save();
         self.apply_hunts();
-        let Some(s) = &self.save else { return };
-        match std::fs::write(&path, s.to_3ds_bytes()) {
-            Ok(_) => {
+        let Some(bytes) = self.save.as_ref().map(|s| s.to_3ds_bytes()) else {
+            return;
+        };
+        match Self::write_and_verify(&path, &bytes) {
+            Ok((backup, check)) => {
                 self.dirty = false;
-                self.message = format!("3DS 形式で書き出しました: {}", path.display());
+                let mut m = format!("3DS 形式で書き出しました: {}", path.display());
+                m += &format!("（{}）", check);
+                if let Some(b) = backup {
+                    m += &format!("（元のファイルは {} に退避）", b.display());
+                }
+                self.message = m;
             }
-            Err(e) => self.message = format!("書き出し失敗: {}", e),
+            Err(e) => {
+                self.dirty = true;
+                self.message = e;
+            }
         }
+    }
+
+    /// Put a snapshot back over the save file.
+    ///
+    /// Whatever is there now goes into the list first, so the restore itself
+    /// can be undone from the same panel.
+    pub fn restore_snapshot(&mut self, name: String) {
+        let Some(path) = self.save_path.clone() else {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        };
+        let src = Self::snapshot_dir(&path).join(&name);
+        let bytes = match std::fs::read(&src) {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = format!("スナップショットを読めません: {}: {}", name, e);
+                return;
+            }
+        };
+        // Never write something the save parser refuses: a truncated copy would
+        // otherwise replace a working save with a file nothing can open.
+        if let Err(e) = Save::from_bytes(&bytes) {
+            self.message = format!(
+                "スナップショット {} はセーブとして読めないので戻しません: {}",
+                name, e
+            );
+            return;
+        }
+        // The current contents are kept before they are replaced.
+        let mut note = String::new();
+        if let Ok(current) = std::fs::read(&path) {
+            if current != bytes {
+                let stem = Self::snapshot_stem(&path);
+                note = match Self::push_snapshot(&path, &stem, &current) {
+                    Ok(s) => format!("（戻す前の内容は {} に退避）", s),
+                    Err(e) => format!("（戻す前の内容を控えられませんでした: {}）", e),
+                };
+            }
+        }
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            self.message = format!("スナップショットから戻せません: {}{}", e, note);
+            return;
+        }
+        let read_back = std::fs::read(&path).unwrap_or_default();
+        let trip = verify::compare(&bytes, &read_back);
+        if !trip.is_identical() {
+            let detail = match trip.length_change {
+                Some((a, b)) => format!("長さが {} → {} バイトに変わりました", a, b),
+                None => format!("差分 {} 件: {}", trip.differing.len(), trip.examples(3)),
+            };
+            self.message = format!(
+                "スナップショットの照合に失敗しました（{}）。{} は書き換わっている可能性があります{}",
+                detail,
+                path.display(),
+                note
+            );
+            return;
+        }
+        if let Ok(s) = Save::from_bytes(&bytes) {
+            self.save = Some(s);
+        }
+        self.dirty = false;
+        self.reload_from_save();
+        self.refresh_snapshots();
+        self.message = format!("スナップショット {} の時点に戻しました{}", name, note);
     }
 
     /// Import a 3DS body into the currently open Switch save.
@@ -1184,8 +1504,83 @@ impl MhnxEditor {
                             });
                         }
                     }
+
+                    ui.separator();
+                    self.snapshots_panel(ui);
                 });
             });
+    }
+
+    /// The snapshot section of the side panel.
+    ///
+    /// The list is read from the folder once (see refresh_snapshots) instead of
+    /// every frame: the entries are 4.7 MB files and the panel is redrawn
+    /// continuously.
+    fn snapshots_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("スナップショット").strong());
+        let Some(path) = self.save_path.clone() else {
+            ui.label("セーブを開くと、保存のたびにここへ控えが残ります");
+            return;
+        };
+        let dir = Self::snapshot_dir(&path);
+        // The full path is wider than the panel, so it lives in the tooltip.
+        ui.label(
+            egui::RichText::new("snapshots/（最新 10 件 / 時刻は UTC）")
+                .weak()
+                .small(),
+        )
+        .on_hover_text(dir.display().to_string());
+        if ui.small_button("一覧を更新").clicked() {
+            self.refresh_snapshots();
+        }
+        if self.snapshots.is_empty() {
+            ui.label("まだありません（保存すると 1 件できます）");
+            return;
+        }
+        // A copy: the buttons below call back into self.
+        let list: Vec<(String, u64)> = self
+            .snapshots
+            .iter()
+            .map(|s| (s.name.clone(), s.size))
+            .collect();
+        let mut restore: Option<String> = None;
+        for (name, size) in &list {
+            ui.horizontal(|ui| {
+                ui.label(Self::snapshot_stamp(name))
+                    .on_hover_text(name.as_str());
+                ui.label(egui::RichText::new(Self::human_size(*size)).weak().small());
+                if ui
+                    .small_button("この時点に戻す")
+                    .on_hover_text("いまの内容は自動でスナップショットに退避してから戻します")
+                    .clicked()
+                {
+                    restore = Some(name.clone());
+                }
+            });
+        }
+        if let Some(n) = restore {
+            self.restore_snapshot(n);
+        }
+    }
+
+    /// The timestamp part of a snapshot name (`system-20261104-012812.sav`).
+    fn snapshot_stamp(name: &str) -> &str {
+        let stem = name.strip_suffix(".sav").unwrap_or(name);
+        let at = stem.len().saturating_sub(15);
+        if at > 0 && stem.is_char_boundary(at) {
+            &stem[at..]
+        } else {
+            stem
+        }
+    }
+
+    /// A size for the snapshot list.
+    fn human_size(n: u64) -> String {
+        if n >= 1024 * 1024 {
+            format!("{:.2} MB", n as f64 / (1024.0 * 1024.0))
+        } else {
+            format!("{:.0} KB", n as f64 / 1024.0)
+        }
     }
 
     fn bottom_bar(&mut self, ctx: &egui::Context) {
@@ -1197,12 +1592,29 @@ impl MhnxEditor {
                     ui.label("○ 変更なし");
                 }
                 ui.separator();
-                ui.label(self.message.clone());
+                // A write that did not survive the round trip is the one
+                // message that must not look like an ordinary note.
+                let text = egui::RichText::new(self.message.clone());
+                let text = if Self::message_is_failure(&self.message) {
+                    text.color(egui::Color32::from_rgb(229, 72, 77))
+                } else {
+                    text
+                };
+                ui.label(text);
             });
             if !self.status.is_empty() {
                 ui.label(egui::RichText::new(self.status.clone()).weak().small());
             }
         });
+    }
+
+    /// Whether a status message reports a failed round trip.
+    ///
+    /// Only the messages that say a written file did not read back the way it
+    /// was meant are drawn in red; the wording is fixed by undo_bad_write, so
+    /// this cannot drift out of step with it silently.
+    fn message_is_failure(message: &str) -> bool {
+        message.contains("照合に失敗")
     }
 
     /// A button that destroys something.
@@ -4141,6 +4553,203 @@ impl MhnxEditor {
             egui::RichText::new("実機での動作は未検証です。必ずセーブを控えてから使ってください。")
                 .weak(),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The write paths are the part of this file that can destroy a save, so
+    //! they are checked without a window: everything here goes straight at the
+    //! filesystem helpers and the editor state, never at egui.
+
+    use super::*;
+
+    /// A scratch folder that removes itself.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let mut p = std::env::temp_dir();
+            p.push(format!("mhnx-gui-{}-{}", tag, std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("scratch folder");
+            Scratch(p)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A Switch save with the body marker the parser checks, written out.
+    fn write_a_save(dir: &std::path::Path, name: &str) -> PathBuf {
+        let mut body = vec![0u8; BODY_SIZE];
+        body[0] = 0xC6;
+        let save = Save::from_3ds_body(&body, name).expect("a save");
+        let path = dir.join(name);
+        std::fs::write(&path, save.to_bytes()).expect("write the fixture");
+        path
+    }
+
+    #[test]
+    fn stamp_and_size_are_read_out_of_the_name() {
+        assert_eq!(
+            MhnxEditor::snapshot_stamp("system-20261104-012812.sav"),
+            "20261104-012812"
+        );
+        assert_eq!(
+            MhnxEditor::snapshot_stamp("system_backup-20261104-012812.sav"),
+            "20261104-012812"
+        );
+        assert_eq!(MhnxEditor::human_size(4_726_188), "4.51 MB");
+        assert_eq!(MhnxEditor::human_size(2048), "2 KB");
+    }
+
+    #[test]
+    fn only_the_newest_ten_snapshots_survive() {
+        let dir = Scratch::new("rotate");
+        let save = dir.path().join("system");
+        std::fs::write(&save, b"x").expect("save");
+        let snaps = MhnxEditor::snapshot_dir(&save);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        // A different stem in the same folder must not be rotated away.
+        std::fs::write(snaps.join("system_backup-20260101-000000.sav"), b"keep").expect("other");
+        for _ in 0..13 {
+            MhnxEditor::push_snapshot(&save, "system", b"body").expect("snapshot");
+        }
+        let names: Vec<String> = std::fs::read_dir(&snaps)
+            .expect("folder")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with("system-")).count(),
+            10
+        );
+        assert!(names.iter().any(|n| n == "system_backup-20260101-000000.sav"));
+    }
+
+    #[test]
+    fn a_write_is_compared_with_what_came_back() {
+        let dir = Scratch::new("verify");
+        let path = dir.path().join("system");
+        std::fs::write(&path, b"old").expect("old");
+        let (backup, line) = MhnxEditor::write_and_verify(&path, b"new").expect("a match");
+        assert!(line.contains("照合OK"), "{}", line);
+        assert_eq!(std::fs::read(&path).expect("read"), b"new");
+        let backup = backup.expect("the replaced file is kept");
+        assert_eq!(std::fs::read(backup).expect("bak"), b"old");
+    }
+
+    #[test]
+    fn a_failed_comparison_puts_the_backup_back() {
+        let dir = Scratch::new("undo");
+        let path = dir.path().join("system");
+        let bak = dir.path().join("system.bak");
+        std::fs::write(&path, b"bad").expect("bad");
+        std::fs::write(&bak, b"old").expect("bak");
+        let trip = verify::compare(b"want", b"bad!");
+        assert!(!trip.is_identical());
+        let msg = MhnxEditor::undo_bad_write(&path, &Some(bak), Some(&trip), "");
+        assert!(msg.starts_with("照合に失敗したので戻しました"), "{}", msg);
+        assert!(msg.contains("差分 3 件"), "{}", msg);
+        assert!(MhnxEditor::message_is_failure(&msg));
+        assert_eq!(std::fs::read(&path).expect("read"), b"old");
+    }
+
+    #[test]
+    fn a_snapshot_can_be_put_back_and_what_it_replaced_is_kept() {
+        let dir = Scratch::new("restore");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let original = std::fs::read(&path).expect("read");
+        let mut older = original.clone();
+        older[SWITCH_SIZE - 1] ^= 0xFF;
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = snapshot::name("system", 1_760_000_000);
+        std::fs::write(snaps.join(&name), &older).expect("snapshot");
+        app.restore_snapshot(name.clone());
+        assert_eq!(std::fs::read(&path).expect("read"), older);
+        assert!(app.message.contains("の時点に戻しました"), "{}", app.message);
+        app.refresh_snapshots();
+        let kept = app
+            .snapshots
+            .iter()
+            .find(|s| s.name != name)
+            .expect("the replaced contents are kept");
+        assert_eq!(
+            std::fs::read(snaps.join(&kept.name)).expect("read"),
+            original
+        );
+        assert!(!app.dirty);
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_a_save_is_refused() {
+        let dir = Scratch::new("refuse");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        let before = std::fs::read(&path).expect("read");
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = snapshot::name("system", 1_760_000_001);
+        std::fs::write(snaps.join(&name), b"not a save").expect("snapshot");
+        app.restore_snapshot(name);
+        assert!(app.message.contains("読めないので戻しません"), "{}", app.message);
+        assert_eq!(std::fs::read(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn the_switch_pair_is_written_and_verified() {
+        let dir = Scratch::new("pair");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).expect("out");
+        app.write_switch_pair(out.clone());
+        let a = std::fs::read(out.join("system")).expect("system");
+        let b = std::fs::read(out.join("system_backup")).expect("system_backup");
+        assert_eq!(a.len(), SWITCH_SIZE);
+        assert_eq!(b.len(), SWITCH_SIZE);
+        assert!(app.message.contains("照合OK"), "{}", app.message);
+        assert!(!app.dirty);
+        let snaps: Vec<_> = std::fs::read_dir(MhnxEditor::snapshot_dir(&out.join("system")))
+            .expect("snapshot folder")
+            .flatten()
+            .collect();
+        assert_eq!(snaps.len(), 1);
+    }
+
+    #[test]
+    fn the_3ds_export_is_written_and_verified() {
+        let dir = Scratch::new("export");
+        let path = write_a_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        let out = dir.path().join("system.3ds");
+        app.export_3ds(out.clone());
+        // The export applies the working copies first, so the file has to be
+        // compared against what the save holds after that, not before.
+        let want = app.save.as_ref().expect("save").to_3ds_bytes();
+        let got = std::fs::read(&out).expect("read");
+        assert_eq!(got.len(), BODY_SIZE);
+        assert!(got == want, "the exported body is not the save's body");
+        assert!(
+            app.message.starts_with("3DS 形式で書き出しました"),
+            "{}",
+            app.message
+        );
+        assert!(app.message.contains("照合OK"), "{}", app.message);
     }
 }
 

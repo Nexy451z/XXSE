@@ -9,6 +9,8 @@
 
 use core::ffi::{c_char, c_void, CStr};
 
+use mhnx_core::verify::RoundTrip;
+
 use crate::sys;
 
 /// MHXX's title id, the base game rather than the update.
@@ -159,19 +161,35 @@ impl Mount {
 
     /// Replace the save file's contents in-place.
     pub fn write(&self, bytes: &[u8]) -> Result<(), SaveError> {
-        self.write_diff(bytes, None)
+        self.write_diff(bytes, None).map(|_| ())
     }
 
     /// Write `save:/system` in-place (only writing modified 16 KB blocks when
     /// `old` is provided) and also keep `save:/system_backup` in sync if it
     /// exists on the console.
-    pub fn write_diff(&self, bytes: &[u8], old: Option<&[u8]>) -> Result<(), SaveError> {
+    ///
+    /// Returns the comparison of what was meant to be written with what the
+    /// console gives back, so a caller that got a successful return value
+    /// still has to look at it: a write can be accepted and land differently.
+    pub fn write_diff(&self, bytes: &[u8], old: Option<&[u8]>) -> Result<RoundTrip, SaveError> {
         unsafe {
             if remove(c"save:/system.new".as_ptr()) == 0 {
                 let _ = sys::fsdevCommitDevice(DEVICE.as_ptr());
             }
         }
         write_save_in_place(SAVE_FILE, bytes, old)?;
+
+        // Reading the same area back through this mount is what the next
+        // launch will see. Every chunk above was committed, so the bytes are
+        // expected to be final by now.
+        let read_back = self.read()?;
+        let trip = mhnx_core::verify::compare(bytes, &read_back);
+        if !trip.is_identical() {
+            // The companion copy must never be rebuilt from bytes the console
+            // did not keep, so report the mismatch before touching it and let
+            // the caller decide to roll back.
+            return Ok(trip);
+        }
 
         if bytes.len() > mhnx_core::save::SWITCH_HEADER_SIZE {
             if let Some(old_bak) = read_file(SAVE_BACKUP_FILE) {
@@ -185,7 +203,7 @@ impl Mount {
                 }
             }
         }
-        Ok(())
+        Ok(trip)
     }
 
     /// Push the written bytes to the console.
@@ -198,6 +216,22 @@ impl Mount {
                 Err(SaveError::IoDetail("commit", rc))
             }
         }
+    }
+
+    /// Commit, then read the same area back and compare it with `expected`.
+    ///
+    /// `commit` only says the console accepted the request; this is the step
+    /// that says the bytes which landed are the bytes that were meant. Use it
+    /// after any commit that a separate write step already did.
+    pub fn commit_verified(&self, expected: &[u8]) -> Result<RoundTrip, SaveError> {
+        self.commit()?;
+        self.verify(expected)
+    }
+
+    /// Read the save back and compare it with what was meant to be written.
+    pub fn verify(&self, expected: &[u8]) -> Result<RoundTrip, SaveError> {
+        let read_back = self.read()?;
+        Ok(mhnx_core::verify::compare(expected, &read_back))
     }
 }
 
@@ -344,6 +378,21 @@ fn write_save_in_place(
 pub fn stamp() -> alloc::string::String {
     let t = unsafe { time(core::ptr::null_mut()) };
     alloc::format!("{}", t)
+}
+
+/// The console's clock as a Unix second count.
+///
+/// libnx' `time()` reports 0 (or a negative value) while the time service has
+/// no value yet. A snapshot stamped from that would be named 1970 and sort
+/// below every real one, so it is reported as "no time" and the caller says so
+/// rather than writing a file that looks older than the save itself.
+pub fn now_unix() -> Option<u64> {
+    let t = unsafe { time(core::ptr::null_mut()) };
+    if t > 0 {
+        Some(t as u64)
+    } else {
+        None
+    }
 }
 
 /// Is this the length of an MHXX save in Switch form?

@@ -326,6 +326,8 @@ pub struct GuiState {
     pub wants_rescan: bool,
     pub wants_extract_official_arcs: bool,
     pub wants_install_arc_idx: Option<usize>,
+    /// The snapshot button was pressed; the I/O layer owns the folder.
+    pub wants_restore_snapshot: bool,
     pub quest_tab: usize,
     pub quest_cat_cursor: [usize; 4],
     pub mib_picker: Option<MibPickerState>,
@@ -351,6 +353,7 @@ impl GuiState {
             wants_rescan: false,
             wants_extract_official_arcs: false,
             wants_install_arc_idx: None,
+            wants_restore_snapshot: false,
             quest_tab: 0,
             quest_cat_cursor: [0; 4],
             mib_picker: None,
@@ -1266,6 +1269,13 @@ impl GuiState {
                     ed.gmd = None;
                     ed.screen = Screen::ArcEntries;
                 }
+                other => ed.input(other),
+            },
+            // Y is the only key this screen leaves free: ◀/▶ change a value,
+            // A/X write the save, B goes back. It puts the newest snapshot
+            // within one press instead of a new screen.
+            Screen::Options => match key {
+                Key::Y => self.wants_restore_snapshot = true,
                 other => ed.input(other),
             },
             Screen::EntryView => {
@@ -2721,6 +2731,7 @@ impl GuiState {
             Screen::CharmEdit => {
                 "[A] BOXへ反映  [▲/▼] 行  [◀/▶] 値  [Y] スキル選択  [X] 刻み  [B] 戻る"
             }
+            Screen::Options => "[◀/▶] 値変更  [Y] 直近スナップショットへ戻す  [X] 保存  [B] 戻る",
             Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [L/R] サブタブ  [X] 保存",
             Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [L/R] サブタブ  [X] 保存",
             Screen::Hunts => "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [L/R] サブタブ  [X] 保存",
