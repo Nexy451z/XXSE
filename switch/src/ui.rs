@@ -28,7 +28,8 @@ use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
     decoration_name_of, item_name_of, monster_name, Editor, Key, Screen, CHAR_FIELDS,
-    CONSOLE_SAVE, STEPS,
+    CONSOLE_SAVE, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO,
+    ITEM_OPS, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -250,9 +251,11 @@ pub enum UiAction {
     PageScroll(i32),
     Rescan,
     QuickSave,
+    // The item box bulk operation menu
+    OpenItemMenu,
+    ItemOp(usize),
     // One-tap Bulk Cheats & Presets
     CharMaxAll,
-    ItemsMaxAll,
     CharmLegalMax,
     CharmPreset(u8),
     NewCharm,
@@ -976,6 +979,15 @@ impl GuiState {
     pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
         // Picker screens use L/R for fast ±10 page jump; EVERY other screen uses L/R for Sub-Tab switching!
         if matches!(key, Key::L | Key::R) {
+            // The second stage of the bulk add is one number: L/R step it
+            // instead of paging the list underneath.
+            if ed.screen == Screen::ItemPick
+                && ed.item_pick_mode == 3
+                && ed.item_pick_stage == 1
+            {
+                ed.input(if key == Key::R { Key::Right } else { Key::Left });
+                return;
+            }
             if matches!(
                 ed.screen,
                 Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
@@ -1054,17 +1066,21 @@ impl GuiState {
                 }
             }
             Screen::Items => match key {
+                // While the bulk menu is open the list underneath is frozen:
+                // A runs the highlighted row and every other key is the
+                // menu's (`-` / B close it, Up / Down move it).
+                Key::A if ed.item_menu_open => ed.input(Key::A),
                 Key::A => {
                     // A opens the Item Picker for the selected slot!
                     ed.input(Key::R);
                 }
+                Key::Y if ed.item_menu_open => {}
                 Key::Y => {
                     ed.step = (ed.step + 1) % STEPS.len();
                     ed.message = format!("個数の刻み幅を ±{} に切り替えました", STEPS[ed.step]);
                 }
-                Key::Minus => {
-                    ed.input(Key::L); // Undo last item change
-                }
+                // Minus is the bulk menu now; 元に戻す is one of its rows
+                // (and still L, as before).
                 other => ed.input(other),
             },
             Screen::ItemPick => match key {
@@ -1508,21 +1524,14 @@ impl GuiState {
                     ed.message = String::from("所持金・HR・全ポイントを最大値に設定しました");
                 }
             }
-            UiAction::ItemsMaxAll => {
-                if let Some(mut items) = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot)) {
-                    let mut count = 0usize;
-                    for slot in items.iter_mut() {
-                        if slot.id != 0 && slot.count < 99 {
-                            slot.count = 99;
-                            count += 1;
-                        }
-                    }
-                    if let Some(s) = &mut ed.save {
-                        let _ = s.write_item_box(ed.slot, &items);
-                        ed.dirty = true;
-                        ed.message = format!("所持アイテム {} 枠を×99に設定しました", count);
-                    }
-                }
+            // Both bulk buttons run the same rows the menu runs: a touch and
+            // the pad must never take two different code paths.
+            UiAction::OpenItemMenu => ed.open_item_menu(),
+            UiAction::ItemOp(op) => {
+                ed.open_item_menu();
+                ed.item_menu_cursor = op.min(ITEM_OPS.len() - 1);
+                ed.item_dedupe_armed = false;
+                ed.run_item_op(ed.item_menu_cursor);
             }
             UiAction::CharmLegalMax => {
                 if let Some(mut ce) = ed.charm_edit {
@@ -2029,6 +2038,13 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Slots => ed.slot,
         Screen::Char => ed.field,
         Screen::CharmEdit => ed.charm_edit.map(|c| c.field).unwrap_or(0),
+        Screen::Items => {
+            if ed.item_menu_open {
+                ed.item_menu_cursor
+            } else {
+                ed.cursor
+            }
+        }
         Screen::ItemPick => ed.item_pick_cursor,
         Screen::SkillPick => ed.skill_pick_cursor,
         Screen::Equip => ed.equip_cursor,
@@ -2067,7 +2083,13 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::SaveList => ed.save_files.len(),
         Screen::Slots => 3,
         Screen::Char => CHAR_FIELDS.len(),
-        Screen::Items => ed.visible_items().len(),
+        Screen::Items => {
+            if ed.item_menu_open {
+                ITEM_OPS.len()
+            } else {
+                ed.visible_items().len()
+            }
+        }
         Screen::ItemPick => ed.item_pick_matches().len(),
         Screen::Charms => ed.charms().len(),
         Screen::CharmEdit => 7,
@@ -2158,6 +2180,16 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
             if let Some(mut ce) = ed.charm_edit {
                 ce.field = clamped;
                 ed.charm_edit = Some(ce);
+            }
+        }
+        Screen::Items => {
+            if ed.item_menu_open {
+                // A tap on another row is a cursor move: the armed dedupe
+                // belongs to the row it was armed on.
+                ed.item_menu_cursor = clamped;
+                ed.item_dedupe_armed = false;
+            } else {
+                ed.cursor = clamped;
             }
         }
         Screen::ItemPick => ed.item_pick_cursor = clamped,
@@ -2341,6 +2373,13 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
                     ed.input(Key::Right);
                 }
                 ed.entry_row_cursor = prev;
+            }
+        }
+        // [MAX] on the second stage of the bulk add asks for a full stack.
+        Screen::ItemPick => {
+            if ed.item_pick_mode == 3 && ed.item_pick_stage == 1 {
+                ed.item_pick_add_count = mhnx_core::itembox::MAX_COUNT;
+                ed.message = ed.item_add_message();
             }
         }
         _ => {}
@@ -2728,10 +2767,17 @@ impl GuiState {
                 btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::SetStep(next_step));
 
+                // The bulk edits live in one menu now, so the pill opens it
+                // instead of promising a single *99 that is only one row.
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "所持品 全枠×99", t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::ItemsMaxAll);
+                if ed.item_menu_open {
+                    btn_text(c, 1108, sy, 158, sh, "[-] 閉じる", t.text_primary, FontSize::Small);
+                    self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Minus));
+                } else {
+                    btn_text(c, 1108, sy, 158, sh, "[-] 一括操作", t.text_primary, FontSize::Small);
+                    self.add_hit(1108, sy, 158, sh, UiAction::OpenItemMenu);
+                }
             }
             Screen::Charms => {
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
@@ -2802,7 +2848,13 @@ impl GuiState {
             Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
             Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
             Screen::Char => "[◀/▶] 増減  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
-            Screen::Items => "[A] 変更  [◀/▶] 個数  [Y] 刻み  [L/R] ページ  [X] 保存",
+            Screen::Items if ed.item_menu_open => {
+                "[▲/▼] 選択  [A] 実行  [-] 閉じる  [B] 戻る  [X] 保存"
+            }
+            Screen::Items => "[A] 変更  [-] 一括操作  [◀/▶] 個数  [Y] 刻み  [L/R] ページ  [X] 保存",
+            Screen::ItemPick if ed.item_pick_mode == 3 && ed.item_pick_stage == 1 => {
+                "[◀/▶] 個数  [▲/▼] ±10  [A] この個数を追加  [B] 選び直す"
+            }
             Screen::ItemPick | Screen::SkillPick => "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る",
             Screen::Charms => "[A] 編集  [Y×2] 削除  [-] 新規  [L/R] サブタブ  [X] 保存",
             Screen::CharmEdit => {
@@ -3351,17 +3403,91 @@ impl GuiState {
                 );
             }
             Screen::Items => {
-                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
-                cur_y += 24;
-                self.draw_tool_button(
-                    c,
-                    ix + 20,
-                    cur_y,
-                    full_w,
-                    38,
-                    "所持アイテム 全枠×99",
-                    UiAction::ItemsMaxAll,
-                );
+                if ed.item_menu_open {
+                    // In the menu the panel explains the highlighted row: the
+                    // dedupe row's numbers are the ones a second press needs.
+                    c.text_sized(ix + 20, cur_y, "一括操作メニュー", t.text_muted, FontSize::Small);
+                    cur_y += 24;
+                    if ed.item_menu_cursor == ITEM_OP_DEDUPE {
+                        let p = ed.item_menu_stats().dedupe;
+                        // Two short lines: a single line with the "press again"
+                        // tail would be clipped inside this 388px panel.
+                        let warn = format!("解放 {} 枠 / 消失 {} 個", p.freed, p.lost);
+                        c.text_clipped(ix + 20, cur_y, full_w, &warn, t.accent_warn, FontSize::Small);
+                        cur_y += 26;
+                        if ed.item_dedupe_armed {
+                            c.text_clipped(
+                                ix + 20,
+                                cur_y,
+                                full_w,
+                                "もう一度 [A] で実行",
+                                t.accent_warn,
+                                FontSize::Small,
+                            );
+                            cur_y += 26;
+                        }
+                    }
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[-] メニューを閉じる",
+                        UiAction::Key(Key::Minus),
+                    );
+                } else {
+                    c.text_sized(ix + 20, cur_y, "一括操作", t.text_muted, FontSize::Small);
+                    cur_y += 24;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        36,
+                        "[-] 一括操作メニュー",
+                        UiAction::OpenItemMenu,
+                    );
+                    cur_y += 42;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        36,
+                        "重複を整理（確認 → 実行）",
+                        UiAction::ItemOp(ITEM_OP_DEDUPE),
+                    );
+                    cur_y += 42;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        half_w,
+                        36,
+                        "空きを詰める",
+                        UiAction::ItemOp(ITEM_OP_COMPACT),
+                    );
+                    self.draw_tool_button(
+                        c,
+                        ix + 28 + half_w,
+                        cur_y,
+                        half_w,
+                        36,
+                        "上限を丸める",
+                        UiAction::ItemOp(ITEM_OP_CLAMP),
+                    );
+                    cur_y += 42;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        36,
+                        "アイテムを追加（個数指定）",
+                        UiAction::ItemOp(ITEM_OP_ADD),
+                    );
+                }
             }
             Screen::Charms | Screen::CharmEdit => {
                 // The slot count on these labels is whatever the current grade
@@ -3903,6 +4029,10 @@ impl GuiState {
     }
 
     fn draw_items(&mut self, c: &mut Canvas, ed: &Editor) {
+        if ed.item_menu_open {
+            self.draw_item_menu(c, ed);
+            return;
+        }
         let vis = ed.visible_items();
         let all_slots = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot));
         let mut rows = Vec::with_capacity(vis.len());
@@ -3951,19 +4081,93 @@ impl GuiState {
         );
     }
 
+    /// The bulk operation menu (`-` on the item screen).
+    ///
+    /// Every row shows how much it would change before it runs, and the
+    /// dedupe row shows what the merge would drop: the two rows that can lose
+    /// data never run on the first press.
+    fn draw_item_menu(&mut self, c: &mut Canvas, ed: &Editor) {
+        let stats = ed.item_menu_stats();
+        let mut rows = Vec::with_capacity(ITEM_OPS.len());
+        for (i, (label, note)) in ITEM_OPS.iter().enumerate() {
+            let value = stats.value(i);
+            let armed_row = i == ITEM_OP_DEDUPE && ed.item_dedupe_armed;
+            // "2回" says a second press is wanted without pushing the value
+            // column past its 230px ceiling.
+            let badge = if armed_row {
+                "2回"
+            } else if i == ITEM_OP_UNDO {
+                "-"
+            } else {
+                "A"
+            };
+            rows.push((
+                i,
+                String::from(*label),
+                String::from(*note),
+                value,
+                String::from(badge),
+            ));
+        }
+        let armed = ed.item_dedupe_armed && ed.item_menu_cursor == ITEM_OP_DEDUPE;
+        let hdr = if armed {
+            String::from("アイテム一括操作 — もう一度 [A] で実行（[B] 中止）")
+        } else {
+            format!(
+                "アイテム一括操作  (使用 {} 枠 / 空き {} 枠)",
+                mhnx_core::itembox::TOTAL_ITEM_SLOTS - stats.holes,
+                stats.holes
+            )
+        };
+        let a_lbl = if armed {
+            "実行する"
+        } else if ed.item_menu_cursor == ITEM_OP_ADD {
+            "選ぶ"
+        } else {
+            "実行"
+        };
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            &hdr,
+            "",
+            &rows,
+            ed.item_menu_cursor.min(ITEM_OPS.len().saturating_sub(1)),
+            false,
+            a_lbl,
+        );
+    }
+
     fn draw_item_pick(&mut self, c: &mut Canvas, ed: &Editor) {
         let matches = ed.item_pick_matches();
+        let adding = ed.item_pick_mode == 3;
+        // Stage 2 of the bulk add: the list stays (it names the item) but the
+        // number under the cursor is what Left / Right is changing.
+        let count_stage = adding && ed.item_pick_stage == 1;
         let mut rows = Vec::with_capacity(matches.len());
         for (i, &id) in matches.iter().enumerate() {
+            let val = if count_stage && i == ed.item_pick_cursor {
+                format!("×{}", ed.item_pick_add_count)
+            } else {
+                String::new()
+            };
             rows.push((
                 i,
                 item_name_of(id),
                 format!("Item ID: {}", id),
-                String::new(),
+                val,
                 format!("{:04}", id),
             ));
         }
-        let hdr = if ed.item_pick_filter.is_empty() {
+        let hdr = if count_stage {
+            format!(
+                "アイテム追加 2/2  個数: {} ×{}",
+                item_name_of(ed.item_pick_add_id),
+                ed.item_pick_add_count
+            )
+        } else if adding {
+            String::from("アイテム追加 1/2  アイテムを選択")
+        } else if ed.item_pick_filter.is_empty() {
             String::from("アイテム選択")
         } else {
             format!("アイテム選択 (検索: {})", ed.item_pick_filter)
@@ -3975,8 +4179,8 @@ impl GuiState {
             "",
             &rows,
             ed.item_pick_cursor.min(rows.len().saturating_sub(1)),
-            false,
-            "決定",
+            count_stage,
+            if count_stage { "この個数を追加" } else { "決定" },
         );
     }
 

@@ -11,7 +11,7 @@ use mhnx_core::dlc;
 use mhnx_core::equipops::{self, EquipError};
 use mhnx_core::equiprefs::EquipRef;
 use mhnx_core::gamedata::LAST_ITEM_ID;
-use mhnx_core::itembox::ItemSlot;
+use mhnx_core::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT};
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::questfields::FieldKind;
 use mhnx_core::save::{Character, Save, SaveKind, BODY_SIZE, SWITCH_SIZE};
@@ -72,6 +72,31 @@ pub enum Confirm {
         /// Level to write.
         level: u16,
     },
+    /// Raise every used record to the cap. The count is what the box measured
+    /// when the button was pressed, so the dialog can say what it will touch.
+    ItemFillAll {
+        /// Records whose count will change.
+        changed: usize,
+    },
+    /// Merge duplicate stacks. The numbers come from dedupe_preview, measured
+    /// before the dialog is shown: a merge that takes items with it has to say
+    /// so before it runs.
+    ItemDedupe {
+        /// Records that will be freed.
+        freed: usize,
+        /// Items dropped because a stack stops at the cap.
+        lost: u32,
+    },
+    /// Move the used records to the front, which reorders them.
+    ItemCompact {
+        /// Records that will change place.
+        moved: usize,
+    },
+    /// Pull stacks above the cap back down.
+    ItemClamp {
+        /// Records whose count will change.
+        changed: usize,
+    },
 }
 
 /// Two-step confirmation for the destructive charm delete.
@@ -128,6 +153,14 @@ pub struct MhnxEditor {
     /// The download quest slot waiting for the delete confirmation.
     pub pending_dlc_slot: Option<usize>,
     pub item_show_empty: bool,
+    /// Whether the bulk-add strip under the item buttons is open.
+    pub item_bulk_open: bool,
+    /// Search text of the bulk-add picker.
+    pub item_bulk_filter: String,
+    /// Item the bulk-add strip will insert, 0 = nothing picked yet.
+    pub item_bulk_id: u16,
+    /// How many of it the bulk-add strip will insert.
+    pub item_bulk_count: u16,
 
     // ---- quest ----
     pub arc_path: Option<PathBuf>,
@@ -240,6 +273,10 @@ impl Default for MhnxEditor {
         discard_ok: false,
         pending_dlc_slot: None,
             item_show_empty: false,
+            item_bulk_open: false,
+            item_bulk_filter: String::new(),
+            item_bulk_id: 0,
+            item_bulk_count: 10,
             arc_path: None,
             arc: None,
             arc_selected: 0,
@@ -1825,6 +1862,9 @@ impl MhnxEditor {
 
     /// A modal that asks before something irreversible happens.
     fn confirm_dialog(&mut self, ctx: &egui::Context) {
+        // A dedupe that takes items with it is the one dialog that has to look
+        // different: the line saying what is lost is drawn in the warning colour.
+        let mut warn = false;
         let (title, body, yes) = match &self.confirm {
             Confirm::None => return,
             Confirm::Quit => (
@@ -1892,6 +1932,49 @@ impl MhnxEditor {
                 ),
                 "差し替える",
             ),
+            Confirm::ItemFillAll { changed } => (
+                "全部 99 個にします",
+                format!(
+                    "使っている {} 枠の個数を、すべて 99 個にします。\n\
+                     今の個数は失われます（この操作は元に戻せます）。",
+                    changed
+                ),
+                "99 個にする",
+            ),
+            Confirm::ItemDedupe { freed, lost } => {
+                let (line, warning) = Self::dedupe_confirm_text(DedupePreview {
+                    freed: *freed,
+                    lost: *lost,
+                });
+                warn = warning;
+                let mut body = String::from("同じアイテムの 2 枠目以降を 1 枠にまとめます。\n");
+                body += &line;
+                body += "\n";
+                if *lost > 0 {
+                    body += "1 枠に 99 個までしか入らないため、あふれた分は失われます。\n";
+                }
+                body += "この操作は元に戻せます。";
+                ("重複を整理します", body, "整理する")
+            }
+            Confirm::ItemCompact { moved } => (
+                "空きを詰めます",
+                format!(
+                    "空き枠を消して、使っている {} 枠を前へ詰めます。\n\
+                     順序が変わります（アイテムと個数はそのままです）。\n\
+                     この操作は元に戻せます。",
+                    moved
+                ),
+                "詰める",
+            ),
+            Confirm::ItemClamp { changed } => (
+                "個数を 99 に丸めます",
+                format!(
+                    "99 を超えている {} 枠の個数を 99 に戻します。\n\
+                     超えた分は失われます（この操作は元に戻せます）。",
+                    changed
+                ),
+                "丸める",
+            ),
         };
         let mut answer: Option<bool> = None;
         egui::Window::new(title)
@@ -1899,7 +1982,16 @@ impl MhnxEditor {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.label(body);
+                if warn {
+                    // A merge that takes items with it must not look like the
+                    // harmless tidy-up the other dialogs are.
+                    ui.label(
+                        egui::RichText::new(body.as_str())
+                            .color(egui::Color32::from_rgb(229, 72, 77)),
+                    );
+                } else {
+                    ui.label(body.clone());
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.button(yes).clicked() {
@@ -1933,6 +2025,18 @@ impl MhnxEditor {
                     } => {
                         self.equip_replace(index, kind, id, level);
                     }
+                    Confirm::ItemFillAll { .. } => {
+                        self.item_fill_all();
+                    }
+                    Confirm::ItemDedupe { .. } => {
+                        self.item_dedupe();
+                    }
+                    Confirm::ItemCompact { .. } => {
+                        self.item_compact();
+                    }
+                    Confirm::ItemClamp { .. } => {
+                        self.item_clamp();
+                    }
                     Confirm::None => {}
                 }
             }
@@ -1951,46 +2055,56 @@ impl MhnxEditor {
             ui.label("絞り込み");
             ui.text_edit_singleline(&mut self.item_filter);
             ui.checkbox(&mut self.item_show_empty, "空きスロットも表示");
-            if Self::danger_button(ui, "全アイテムを 99 個にする")
-                .on_hover_text("1 回で戻せます")
-                .clicked()
-            {
-                self.push_item_undo();
-                for s in self.items.iter_mut() {
-                    if s.id != 0 {
-                        s.count = 99;
-                    }
-                }
-                self.apply_to_save();
-            }
-            // Dedupe throws stacks away, so it asks first.
-            ui.menu_button("重複を除去", |ui| {
-                ui.label(egui::RichText::new("同じアイテムの 2 個目以降を空にします").small());
-                if ui.button("実行").clicked() {
-                    self.push_item_undo();
-                    let mut seen = std::collections::HashSet::new();
-                    let mut removed = 0;
-                    for s in self.items.iter_mut() {
-                        if s.id == 0 {
-                            continue;
-                        }
-                        if !seen.insert(s.id) {
-                            s.id = 0;
-                            s.count = 0;
-                            removed += 1;
-                        }
-                    }
-                    self.apply_to_save();
-                    self.message = format!("重複を {} 件消しました（元に戻せます）", removed);
-                    ui.close();
-                }
-            });
             if ui
                 .add_enabled(!self.item_undo.is_empty(), egui::Button::new("元に戻す"))
                 .on_hover_text("直前のアイテム変更を取り消します")
                 .clicked()
             {
                 self.undo_item();
+            }
+        });
+
+        // The bulk operations. Every one that can change what the box holds
+        // only opens the confirmation here; dedupe in particular has to say how
+        // many items it will drop before it drops them.
+        ui.horizontal_wrapped(|ui| {
+            // The toggle keeps its pressed look while the strip is open; the
+            // triangle glyphs some fonts lack are not needed for that.
+            let open = self.item_bulk_open;
+            if ui
+                .add(egui::Button::new("まとめて追加").selected(open))
+                .on_hover_text("アイテム名と個数を決めて、空き枠へまとめて入れます")
+                .clicked()
+            {
+                self.item_bulk_open = !self.item_bulk_open;
+            }
+            // These three are not destructive on their own - each one asks
+            // first - so they read as normal buttons. Colouring a row of them
+            // red made every bulk action look like a delete.
+            if ui.button("全部99に")
+                .on_hover_text("使っている枠の個数をすべて 99 にします（確認あり）")
+                .clicked()
+            {
+                self.ask_fill_all();
+            }
+            if ui.button("重複を整理")
+                .on_hover_text("同じアイテムの 2 枠目以降を 1 枠にまとめます。99 を超える分は失います（確認あり）")
+                .clicked()
+            {
+                self.ask_dedupe();
+            }
+            if ui
+                .button("空きを詰める")
+                .on_hover_text("空き枠を消して前へ詰めます。並び順が変わります（確認あり）")
+                .clicked()
+            {
+                self.ask_compact();
+            }
+            if ui.button("上限超えを丸める")
+                .on_hover_text("99 を超えた個数を 99 に戻します（確認あり）")
+                .clicked()
+            {
+                self.ask_clamp();
             }
             // Adding is the first thing anyone wants from an item editor, so
             // it gets its own button instead of "turn on empty slots and
@@ -2004,6 +2118,9 @@ impl MhnxEditor {
                 self.add_item_to_box(9);
             }
         });
+        if self.item_bulk_open {
+            self.item_bulk_panel(ui);
+        }
 
         // The detail panel sits above the table: the table fills whatever is
         // left, so anything below it ends up off the bottom of the window.
@@ -2146,6 +2263,294 @@ impl MhnxEditor {
         self.scroll_to_item = Some(slot);
         self.apply_to_save();
         self.message = format!("{} を箱 {} に追加しました", item_name(id), slot + 1);
+    }
+
+    // ------------------------------------------------------- bulk operations
+
+    /// Ask before setting every used record to the cap.
+    pub fn ask_fill_all(&mut self) {
+        if self.items.is_empty() {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        }
+        let changed = self
+            .items
+            .iter()
+            .filter(|s| !s.is_blank() && s.count != MAX_COUNT as u8)
+            .count();
+        if changed == 0 {
+            self.message = "すべての枠が 99 個です（変わりません）".to_owned();
+            return;
+        }
+        self.confirm = Confirm::ItemFillAll { changed };
+    }
+
+    /// Ask before merging stacks, saying what the merge would cost.
+    pub fn ask_dedupe(&mut self) {
+        if self.items.is_empty() {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        }
+        let preview = itembox::dedupe_preview(&self.items);
+        if preview.freed == 0 {
+            self.message = "重複した枠はありません（変わりません）".to_owned();
+            return;
+        }
+        self.confirm = Confirm::ItemDedupe {
+            freed: preview.freed,
+            lost: preview.lost,
+        };
+    }
+
+    /// Ask before moving the used records to the front.
+    pub fn ask_compact(&mut self) {
+        if self.items.is_empty() {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        }
+        // Counted on a copy: compact() is destructive and the number is what
+        // the dialog needs before the user has agreed to anything.
+        let mut copy = self.items.clone();
+        let moved = itembox::compact(&mut copy);
+        if moved == 0 {
+            self.message = "空き枠は先頭に詰まっています（変わりません）".to_owned();
+            return;
+        }
+        self.confirm = Confirm::ItemCompact { moved };
+    }
+
+    /// Ask before pulling counts over the cap back down.
+    pub fn ask_clamp(&mut self) {
+        if self.items.is_empty() {
+            self.message = "先にセーブを開いてください".to_owned();
+            return;
+        }
+        let changed = self
+            .items
+            .iter()
+            .filter(|s| !s.is_blank() && s.count > MAX_COUNT as u8)
+            .count();
+        if changed == 0 {
+            self.message = "99 を超えた個数はありません（変わりません）".to_owned();
+            return;
+        }
+        self.confirm = Confirm::ItemClamp { changed };
+    }
+
+    /// The line the dedupe confirmation puts above its buttons.
+    ///
+    /// The flag says whether that line has to be drawn in the warning colour:
+    /// a merge that frees slots but takes items with it is not the harmless
+    /// tidy-up the button looks like.
+    fn dedupe_confirm_text(preview: DedupePreview) -> (String, bool) {
+        (
+            format!(
+                "{} 枠を解放、{} 個を失います",
+                preview.freed, preview.lost
+            ),
+            preview.lost > 0,
+        )
+    }
+
+    /// What the status bar says after an add that did not fully fit.
+    fn bulk_add_message(name: &str, wanted: u16, added: u32) -> String {
+        let left = (wanted as u32).saturating_sub(added);
+        if left == 0 {
+            format!("{} を {} 個追加しました", name, added)
+        } else if added == 0 {
+            format!(
+                "{} は入りませんでした（{} 個は入りきりませんでした）",
+                name, left
+            )
+        } else {
+            format!(
+                "{} を {} 個追加しました（{} 個は入りきりませんでした）",
+                name, added, left
+            )
+        }
+    }
+
+    /// Add a whole stack in one go, and report what did not fit.
+    ///
+    /// Returns how many actually landed. A request that fits nowhere leaves
+    /// the box, the undo list and the dirty flag alone.
+    pub fn add_items_bulk(&mut self, id: u16, count: u16) -> u32 {
+        if self.items.is_empty() {
+            self.message = "先にセーブを開いてください".to_owned();
+            return 0;
+        }
+        if id == 0 || count == 0 {
+            self.message = "アイテムと個数を指定してください".to_owned();
+            return 0;
+        }
+        // A trial run on a copy: an add that fits nothing must not leave an
+        // undo step behind or mark a save dirty for a change that never
+        // happened.
+        let mut trial = self.items.clone();
+        let added = itembox::add(&mut trial, id, count);
+        if added == 0 {
+            self.message = Self::bulk_add_message(&item_name(id), count, 0);
+            return 0;
+        }
+        self.push_item_undo();
+        self.items = trial;
+        self.item_show_empty = true;
+        if let Some(slot) = self.items.iter().position(|s| s.id == id) {
+            self.item_selected = Some(slot);
+            self.scroll_to_item = Some(slot);
+        }
+        self.apply_to_save();
+        self.message = Self::bulk_add_message(&item_name(id), count, added);
+        added
+    }
+
+    /// Set every used record to the cap, after the dialog said yes.
+    pub fn item_fill_all(&mut self) -> usize {
+        if self.items.is_empty() {
+            return 0;
+        }
+        self.push_item_undo();
+        let changed = itembox::fill_all(&mut self.items, MAX_COUNT);
+        self.apply_to_save();
+        self.message = format!("{} 枠を 99 個にしました（元に戻せます）", changed);
+        changed
+    }
+
+    /// Merge duplicate stacks, after the dialog said yes.
+    pub fn item_dedupe(&mut self) -> DedupePreview {
+        if self.items.is_empty() {
+            return DedupePreview::default();
+        }
+        let preview = itembox::dedupe_preview(&self.items);
+        self.push_item_undo();
+        let freed = itembox::dedupe(&mut self.items);
+        self.apply_to_save();
+        self.message = if preview.lost == 0 {
+            format!(
+                "{} 枠を解放しました（失ったアイテムはありません）／元に戻せます",
+                freed
+            )
+        } else {
+            format!(
+                "{} 枠を解放し、{} 個を失いました／元に戻せます",
+                freed, preview.lost
+            )
+        };
+        DedupePreview {
+            freed,
+            lost: preview.lost,
+        }
+    }
+
+    /// Move the used records to the front, after the dialog said yes.
+    pub fn item_compact(&mut self) -> usize {
+        if self.items.is_empty() {
+            return 0;
+        }
+        self.push_item_undo();
+        let moved = itembox::compact(&mut self.items);
+        self.item_selected = None;
+        self.apply_to_save();
+        self.message = format!("{} 枠を前に詰めました（元に戻せます）", moved);
+        moved
+    }
+
+    /// Pull counts over the cap back down, after the dialog said yes.
+    pub fn item_clamp(&mut self) -> usize {
+        if self.items.is_empty() {
+            return 0;
+        }
+        self.push_item_undo();
+        let changed = itembox::clamp_counts(&mut self.items, MAX_COUNT);
+        self.apply_to_save();
+        self.message = format!("{} 枠の個数を 99 に丸めました（元に戻せます）", changed);
+        changed
+    }
+
+    /// One row plus a picker, shown under the bulk buttons.
+    fn item_bulk_panel(&mut self, ui: &mut egui::Ui) {
+        ui.group(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("まとめて追加").strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.item_bulk_filter)
+                        .hint_text("アイテム名で検索")
+                        .desired_width(200.0),
+                );
+                ui.label("ID");
+                ui.add(
+                    egui::DragValue::new(&mut self.item_bulk_id)
+                        .range(0..=(LAST_ITEM_ID as i32))
+                        .prefix("#"),
+                );
+                ui.label("個数");
+                ui.add(
+                    egui::DragValue::new(&mut self.item_bulk_count)
+                        .speed(1.0)
+                        .range(1..=MAX_COUNT),
+                );
+                let picked = if self.item_bulk_id == 0 {
+                    String::from("未選択")
+                } else {
+                    item_name(self.item_bulk_id)
+                };
+                ui.label(picked);
+                if ui
+                    .add_enabled(self.item_bulk_id != 0, egui::Button::new("追加する"))
+                    .on_hover_text("入りきらなかった数はメッセージに出ます")
+                    .clicked()
+                {
+                    let (id, count) = (self.item_bulk_id, self.item_bulk_count);
+                    self.add_items_bulk(id, count);
+                }
+                if ui.small_button("閉じる").clicked() {
+                    self.item_bulk_open = false;
+                }
+            });
+            let needle = self.item_bulk_filter.trim().to_lowercase();
+            if needle.is_empty() {
+                ui.label(
+                    egui::RichText::new("名前で絞り込むか、ID を直接入力してください")
+                        .weak()
+                        .small(),
+                );
+                return;
+            }
+            let mut hits: Vec<(u16, &'static str)> = Vec::new();
+            for (id, name) in mhnx_core::gamedata::ITEM_NAME_LIST.iter().enumerate() {
+                if id == 0 || id > LAST_ITEM_ID {
+                    continue;
+                }
+                if name.to_lowercase().contains(&needle) {
+                    hits.push((id as u16, name));
+                }
+                if hits.len() >= 40 {
+                    break;
+                }
+            }
+            if hits.is_empty() {
+                ui.label(egui::RichText::new("一致するアイテムがありません").weak());
+                return;
+            }
+            egui::ScrollArea::vertical()
+                .id_salt("itembulk")
+                .max_height(120.0)
+                .min_scrolled_height(120.0)
+                .show(ui, |ui| {
+                    for (id, name) in &hits {
+                        if ui
+                            .selectable_label(
+                                self.item_bulk_id == *id,
+                                format!("{:<6} {}", id, name),
+                            )
+                            .clicked()
+                        {
+                            self.item_bulk_id = *id;
+                            self.item_show_empty = true;
+                        }
+                    }
+                });
+        });
     }
     fn item_detail_panel(&mut self, ui: &mut egui::Ui) {
         let Some(i) = self.item_selected else {
@@ -5583,6 +5988,178 @@ mod tests {
             // An id the table does not know still reads back as something.
             assert_eq!(deco_name(65535), "#65535");
         }
+    }
+
+    /// Three stacks of one item: the merge frees two records and drops
+    /// everything over the 99 cap, which the dialog has to say out loud.
+    #[test]
+    fn the_dedupe_dialog_says_what_the_merge_would_cost() {
+        let dir = Scratch::new("dedupeask");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let mut items = vec![ItemSlot::default(); 8];
+        items[0] = ItemSlot { id: 5, count: 99 };
+        items[1] = ItemSlot { id: 5, count: 99 };
+        items[2] = ItemSlot { id: 5, count: 52 };
+        app.items = items;
+
+        // The button only arms the dialog; the box is untouched until it is
+        // answered.
+        app.ask_dedupe();
+        assert!(
+            matches!(app.confirm, Confirm::ItemDedupe { freed: 2, lost: 151 }),
+            "the preview has to count both the freed records and the lost items"
+        );
+        assert!(!app.dirty, "asking must not write anything");
+
+        let (line, warn) = MhnxEditor::dedupe_confirm_text(DedupePreview {
+            freed: 2,
+            lost: 151,
+        });
+        assert_eq!(line, "2 枠を解放、151 個を失います");
+        assert!(
+            warn,
+            "a merge that loses items is drawn in the warning colour"
+        );
+        let (line, warn) = MhnxEditor::dedupe_confirm_text(DedupePreview { freed: 3, lost: 0 });
+        assert_eq!(line, "3 枠を解放、0 個を失います");
+        assert!(!warn, "a merge that loses nothing needs no warning colour");
+
+        // Answering yes merges the three stacks into one capped one.
+        assert_eq!(
+            app.item_dedupe(),
+            DedupePreview {
+                freed: 2,
+                lost: 151
+            }
+        );
+        assert_eq!(app.items[0], ItemSlot { id: 5, count: 99 });
+        assert!(app.items[1].is_blank());
+        assert!(app.dirty);
+        assert!(app.message.contains("151 個を失いました"), "{}", app.message);
+        let stored = app
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(0))
+            .expect("box");
+        assert_eq!(itembox::count_of(&stored, 5), 99);
+        // One undo puts all three stacks back.
+        app.undo_item();
+        assert_eq!(itembox::count_of(&app.items, 5), 250);
+    }
+
+    /// A stack that is nearly full takes only the room it has left, and a box
+    /// with no blank record has to report the number it could not store.
+    #[test]
+    fn adding_more_than_fits_reports_the_leftover() {
+        let dir = Scratch::new("bulkadd");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // No blank record: only the room in the existing stack is usable.
+        app.items = vec![
+            ItemSlot { id: 1, count: 99 },
+            ItemSlot { id: 2, count: 50 },
+        ];
+        app.dirty = false;
+        assert_eq!(app.add_items_bulk(2, 100), 49);
+        assert_eq!(app.items[1], ItemSlot { id: 2, count: 99 });
+        assert!(app.message.contains("49 個追加"), "{}", app.message);
+        assert!(
+            app.message.contains("51 個は入りきりませんでした"),
+            "{}",
+            app.message
+        );
+        assert!(app.dirty, "a real add has to mark the save dirty");
+        // The save holds what apply_to_save wrote, not just the working copy.
+        let stored = app
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(0))
+            .expect("box");
+        assert_eq!(itembox::count_of(&stored, 2), 99);
+
+        // Nothing fits: the box, the undo list and the dirty flag stay put,
+        // and the number that did not fit is still said.
+        let before = app.items.clone();
+        let undo_before = app.item_undo.len();
+        app.dirty = false;
+        assert_eq!(app.add_items_bulk(9, 5), 0);
+        assert!(
+            app.message.contains("5 個は入りきりませんでした"),
+            "{}",
+            app.message
+        );
+        assert_eq!(app.items, before);
+        assert_eq!(
+            app.item_undo.len(),
+            undo_before,
+            "an add that fits nothing needs no undo step"
+        );
+        assert!(
+            !app.dirty,
+            "an add that fits nothing must not dirty the save"
+        );
+    }
+
+    /// Every bulk button only arms the dialog: the box changes when the dialog
+    /// is answered, and then the change reaches the save.
+    #[test]
+    fn the_bulk_buttons_ask_before_they_touch_the_box() {
+        let dir = Scratch::new("bulkask");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let mut items = vec![ItemSlot::default(); 6];
+        items[0] = ItemSlot { id: 1, count: 5 };
+        items[2] = ItemSlot { id: 2, count: 7 };
+        items[4] = ItemSlot { id: 1, count: 3 };
+        app.items = items.clone();
+        app.dirty = false;
+
+        // 全部99に asks first.
+        app.ask_fill_all();
+        assert!(matches!(app.confirm, Confirm::ItemFillAll { changed: 3 }));
+        assert_eq!(app.items, items, "asking must not change the box");
+        assert!(!app.dirty, "asking must not write anything");
+        app.confirm = Confirm::None;
+        assert_eq!(app.item_fill_all(), 3);
+        assert!(app.dirty);
+        assert!(app.message.contains("3 枠"), "{}", app.message);
+
+        // 空きを詰める asks first, then moves the used rows to the front.
+        app.items = items.clone();
+        app.dirty = false;
+        app.ask_compact();
+        assert!(matches!(app.confirm, Confirm::ItemCompact { moved: 2 }));
+        assert_eq!(app.items, items);
+        app.confirm = Confirm::None;
+        assert_eq!(app.item_compact(), 2);
+        let stored = app
+            .save
+            .as_ref()
+            .and_then(|s| s.read_item_box(0))
+            .expect("box");
+        assert_eq!(stored[0], ItemSlot { id: 1, count: 5 });
+        assert_eq!(stored[1], ItemSlot { id: 2, count: 7 });
+        assert_eq!(stored[2], ItemSlot { id: 1, count: 3 });
+        assert!(stored[3].is_blank());
+
+        // 上限超えを丸める asks first too.
+        app.items = items.clone();
+        app.items[1] = ItemSlot { id: 3, count: 127 };
+        app.dirty = false;
+        app.ask_clamp();
+        assert!(matches!(app.confirm, Confirm::ItemClamp { changed: 1 }));
+        app.confirm = Confirm::None;
+        assert_eq!(app.item_clamp(), 1);
+        assert_eq!(app.items[1], ItemSlot { id: 3, count: 99 });
+        assert!(app.dirty);
     }
 }
 

@@ -28,7 +28,7 @@ use crate::dlcats::{self, Lang};
 use crate::equipops::{self, EquipError};
 use crate::equiprefs;
 use crate::save::Options;
-use crate::itembox::ItemSlot;
+use crate::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT, TOTAL_ITEM_SLOTS};
 use crate::quest::{Gmd, Mib};
 use crate::questfields::{self, FieldKind};
 use crate::save::{Character, Save, SaveKind};
@@ -430,6 +430,98 @@ pub const STEPS: [i64; 5] = [1, 10, 100, 1_000, 10_000];
 /// Steps the hunt screen cycles through: counts are small, so 10000 is useless.
 const HUNT_STEPS: [i64; 5] = [1, 10, 100, 1000, -1];
 
+// ---------------------------------------------------------------------------
+// Item box bulk operations
+//
+// The item screen shows one row per box record; these are the edits that touch
+// every record at once. They live here (not in the console UI) so the Switch
+// build, the PC build and the tests all run the same code, and so the two rows
+// that can drop data can say what they would drop before they run.
+// ---------------------------------------------------------------------------
+
+/// The rows of the item box operation menu, opened with `-`.
+///
+/// The first four are the requested bulk edits, then the two rows that do not
+/// fit that shape: adding through the picker and taking the last edit back.
+/// Order is menu order; the constants below name the rows.
+pub const ITEM_OPS: [(&str, &str); 6] = [
+    (
+        "すべて 99 に",
+        "所持している全枠の個数を 99 にそろえます（空き枠はそのまま）",
+    ),
+    (
+        "重複を整理",
+        "同じアイテムの枠を1つにまとめます。99 を超えた分は失われます",
+    ),
+    (
+        "空きを詰める",
+        "空き枠を後ろへ寄せ、所持品を前から順に並べ直します",
+    ),
+    (
+        "上限を丸める",
+        "99 を超えている個数を 99 に戻します（空き枠は触りません）",
+    ),
+    (
+        "アイテムを追加",
+        "名前で選んで個数を決め、空き枠へまとめて追加します",
+    ),
+    (
+        "直前の操作を元に戻す",
+        "この画面での直前の変更を1つ取り消します",
+    ),
+];
+
+/// "すべて 99 に" - itembox::fill_all.
+pub const ITEM_OP_FILL: usize = 0;
+/// "重複を整理" - itembox::dedupe, behind a preview and a second press.
+pub const ITEM_OP_DEDUPE: usize = 1;
+/// "空きを詰める" - itembox::compact.
+pub const ITEM_OP_COMPACT: usize = 2;
+/// "上限を丸める" - itembox::clamp_counts.
+pub const ITEM_OP_CLAMP: usize = 3;
+/// "アイテムを追加" - opens the picker in its two-stage add mode (mode 3).
+pub const ITEM_OP_ADD: usize = 4;
+/// "直前の操作を元に戻す" - pops Editor::item_undo.
+pub const ITEM_OP_UNDO: usize = 5;
+
+/// What the operation menu shows next to each row, read from the box once.
+///
+/// The console redraws this every frame, so the numbers are collected in one
+/// pass instead of one decode per row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ItemMenuStats {
+    /// Used records below the cap: what "すべて 99 に" would raise.
+    pub fill: usize,
+    /// Blank records: what "空きを詰める" would close.
+    pub holes: usize,
+    /// Used records above the cap: what "上限を丸める" would pull down.
+    pub over: usize,
+    /// What "重複を整理" would free and drop.
+    pub dedupe: DedupePreview,
+}
+
+impl ItemMenuStats {
+    /// The short right-hand text for one menu row, empty when nothing to do.
+    pub fn value(&self, op: usize) -> String {
+        match op {
+            ITEM_OP_FILL if self.fill > 0 => format!("{} 枠", self.fill),
+            ITEM_OP_DEDUPE => format!("{} 枠 / {} 個", self.dedupe.freed, self.dedupe.lost),
+            ITEM_OP_COMPACT if self.holes > 0 => format!("{} 枠", self.holes),
+            ITEM_OP_CLAMP if self.over > 0 => format!("{} 枠", self.over),
+            _ => String::new(),
+        }
+    }
+}
+
+/// How many items the box holds in total.
+fn box_total(items: &[ItemSlot]) -> u32 {
+    items
+        .iter()
+        .filter(|s| !s.is_blank())
+        .map(|s| s.count as u32)
+        .sum()
+}
+
 /// The editor.
 pub struct Editor {
     /// Current screen.
@@ -523,6 +615,19 @@ pub struct Editor {
     pub item_pick_cursor: usize,
     /// Box index the picker will write to.
     pub item_pick_target: usize,
+    /// Which stage of the bulk add the picker is in: 0 picks the item,
+    /// 1 picks how many of it to add (only while item_pick_mode == 3).
+    pub item_pick_stage: u8,
+    /// The item the bulk add will put into the box.
+    pub item_pick_add_id: u16,
+    /// How many of it, chosen with Left / Right in stage 1.
+    pub item_pick_add_count: u16,
+    /// Is the item box operation menu open?
+    pub item_menu_open: bool,
+    /// Which row of that menu is highlighted.
+    pub item_menu_cursor: usize,
+    /// Has the dedupe preview been shown and its second press not arrived yet?
+    pub item_dedupe_armed: bool,
     /// Cursor inside the save's own quest list.
     pub save_quest_cursor: usize,
     /// Cursor inside the download Palico catalogue.
@@ -615,6 +720,12 @@ impl Editor {
             item_pick_filter: String::new(),
             item_pick_cursor: 0,
             item_pick_target: 0,
+            item_pick_stage: 0,
+            item_pick_add_id: 0,
+            item_pick_add_count: 1,
+            item_menu_open: false,
+            item_menu_cursor: 0,
+            item_dedupe_armed: false,
             save_quest_cursor: 0,
             palico_cursor: 0,
             palico_lang: 0,
@@ -712,12 +823,13 @@ impl Editor {
     /// Does the current screen consume the Minus button itself?
     ///
     /// The Switch layer uses Minus to rescan folders everywhere else. The
-    /// equipment list uses it for the two-press delete, so the rescan must not
-    /// fire there.
+    /// equipment list uses it for the two-press delete and the item screen
+    /// uses it for the bulk operation menu, so the rescan must not fire there
+    /// (on the item screen it used to fire *and* undo, both at once).
     pub fn uses_minus(&self) -> bool {
         matches!(
             self.screen,
-            Screen::ArcEntries | Screen::SaveQuests | Screen::Equip
+            Screen::ArcEntries | Screen::SaveQuests | Screen::Equip | Screen::Items
         )
     }
 
@@ -1547,6 +1659,13 @@ impl Editor {
     }
 
     fn input_items(&mut self, key: Key) {
+        // The bulk menu is a mode of this screen, not a screen of its own:
+        // while it is open the list underneath keeps its place and every key
+        // drives the menu instead.
+        if self.item_menu_open {
+            self.input_item_menu(key);
+            return;
+        }
         let vis = self.visible_items();
         let n = vis.len();
         match key {
@@ -1564,7 +1683,7 @@ impl Editor {
                         // 99 is the ceiling the game itself uses (and the PC
                         // build has always clamped at); 127 could be stored
                         // but no item in this game is handed out above 99.
-                        items[idx].count = c.clamp(0, 99) as u8;
+                        items[idx].count = c.clamp(0, MAX_COUNT as i64) as u8;
                         if let Some(s) = &mut self.save {
                             let _ = s.write_item_box(self.slot, &items);
                             self.dirty = true;
@@ -1592,6 +1711,9 @@ impl Editor {
                     self.message = format!("枠 #{} のアイテムを選んでください", idx + 1);
                 }
             }
+            // The bulk menu hangs off Minus: X is the step key on this screen
+            // and A writes the save, so this is the only key it had free.
+            Key::Minus => self.open_item_menu(),
             Key::A => self.request_write_save(),
             Key::B => {
                 self.screen = Screen::Slots;
@@ -1600,6 +1722,271 @@ impl Editor {
             Key::Plus => self.quit = true,
             _ => {}
         }
+    }
+
+    // ---------------------------------------------------- item bulk operations
+
+    /// Open the item box operation menu (Minus on the item screen).
+    ///
+    /// The menu is a mode of the item screen instead of a screen of its own,
+    /// so it needs no extra place in every match on Screen: the list
+    /// underneath keeps its place and B or Minus goes back to it.
+    pub fn open_item_menu(&mut self) {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        }
+        self.item_menu_open = true;
+        if self.item_menu_cursor >= ITEM_OPS.len() {
+            self.item_menu_cursor = 0;
+        }
+        self.item_dedupe_armed = false;
+        self.message = self.item_op_hint();
+    }
+
+    /// Close the menu and go back to the item list.
+    pub fn close_item_menu(&mut self) {
+        self.item_menu_open = false;
+        self.item_dedupe_armed = false;
+        self.message = String::from("アイテム一覧に戻りました");
+    }
+
+    fn input_item_menu(&mut self, key: Key) {
+        let n = ITEM_OPS.len();
+        match key {
+            // Moving off a row cancels a pending dedupe: the second press must
+            // never land on a row the user has stopped looking at.
+            Key::Up => {
+                self.item_menu_cursor = (self.item_menu_cursor + n - 1) % n;
+                self.item_dedupe_armed = false;
+                self.message = self.item_op_hint();
+            }
+            Key::Down => {
+                self.item_menu_cursor = (self.item_menu_cursor + 1) % n;
+                self.item_dedupe_armed = false;
+                self.message = self.item_op_hint();
+            }
+            Key::A | Key::Right => self.run_item_op(self.item_menu_cursor),
+            Key::B | Key::Minus => self.close_item_menu(),
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    /// The label and the one-line explanation of a menu row.
+    pub fn item_op_label(op: usize) -> (&'static str, &'static str) {
+        ITEM_OPS.get(op).copied().unwrap_or(("", ""))
+    }
+
+    /// The numbers the menu shows, read from the box in one pass.
+    pub fn item_menu_stats(&self) -> ItemMenuStats {
+        let Some(items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return ItemMenuStats::default();
+        };
+        let mut stats = ItemMenuStats {
+            holes: items.iter().filter(|s| s.is_blank()).count(),
+            ..ItemMenuStats::default()
+        };
+        for slot in &items {
+            if slot.is_blank() {
+                continue;
+            }
+            if (slot.count as u16) < MAX_COUNT {
+                stats.fill += 1;
+            }
+            if (slot.count as u16) > MAX_COUNT {
+                stats.over += 1;
+            }
+        }
+        stats.dedupe = itembox::dedupe_preview(&items);
+        stats
+    }
+
+    /// One line about the highlighted row, shown in the footer.
+    pub fn item_op_hint(&self) -> String {
+        let (label, note) = Self::item_op_label(self.item_menu_cursor);
+        if self.item_dedupe_armed && self.item_menu_cursor == ITEM_OP_DEDUPE {
+            let p = self.item_menu_stats().dedupe;
+            return format!(
+                "{}: {} 枠解放 / {} 個消失します。もう一度 [A] で実行、[B] で中止",
+                label, p.freed, p.lost
+            );
+        }
+        format!("{}: {}", label, note)
+    }
+
+    /// Run one row of the operation menu.
+    ///
+    /// Every row that can drop data says what it would drop before it does
+    /// it, and every row keeps the box it replaced in Editor::item_undo, so
+    /// "直前の操作を元に戻す" (or L) can put the box back.
+    pub fn run_item_op(&mut self, op: usize) {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        }
+        match op {
+            ITEM_OP_FILL => self.item_op_fill(),
+            ITEM_OP_DEDUPE => self.item_op_dedupe(),
+            ITEM_OP_COMPACT => self.item_op_compact(),
+            ITEM_OP_CLAMP => self.item_op_clamp(),
+            ITEM_OP_ADD => self.open_item_add(),
+            ITEM_OP_UNDO => self.undo_item(),
+            _ => {}
+        }
+    }
+
+    /// Write an edited box back and mark the save dirty.
+    fn store_item_box(&mut self, items: &[ItemSlot]) {
+        if let Some(s) = &mut self.save {
+            if s.write_item_box(self.slot, items).is_ok() {
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// すべて 99 に: raise every used record to the cap.
+    fn item_op_fill(&mut self) {
+        if self.item_menu_stats().fill == 0 {
+            self.message = String::from("所持している枠はすでにすべて 99 です");
+            return;
+        }
+        let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return;
+        };
+        self.push_item_undo();
+        let changed = itembox::fill_all(&mut items, MAX_COUNT);
+        self.store_item_box(&items);
+        self.message = format!("{} 枠を ×99 にしました（[A] でセーブ保存）", changed);
+    }
+
+    /// 重複を整理: preview first, run on the second press.
+    ///
+    /// The preview is not a courtesy. Merging stacks cannot keep more than the
+    /// cap of one item, and on this save 185 of the 187 duplicated ids are
+    /// already past it, so the merge drops items. Saying so before the press
+    /// is the difference between a tool and a trap.
+    fn item_op_dedupe(&mut self) {
+        let Some(items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return;
+        };
+        let preview = itembox::dedupe_preview(&items);
+        if preview.freed == 0 && preview.lost == 0 {
+            self.item_dedupe_armed = false;
+            self.message = String::from("重複はありません（まとめても枠は空きません）");
+            return;
+        }
+        if !self.item_dedupe_armed {
+            self.item_dedupe_armed = true;
+            self.message = format!(
+                "重複整理: {} 枠解放 / {} 個消失します。もう一度 [A] で実行、[B] で中止",
+                preview.freed, preview.lost
+            );
+            return;
+        }
+        self.item_dedupe_armed = false;
+        let before = box_total(&items);
+        let mut items = items;
+        self.push_item_undo();
+        let freed = itembox::dedupe(&mut items);
+        let lost = before.saturating_sub(box_total(&items));
+        self.store_item_box(&items);
+        self.message = format!("{}枠解放・{}個消失（重複を整理しました）", freed, lost);
+    }
+
+    /// 空きを詰める: move the used records to the front, in order.
+    fn item_op_compact(&mut self) {
+        let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return;
+        };
+        if items.iter().all(|s| !s.is_blank()) {
+            self.message = String::from("空き枠はありません（すべて使用中）");
+            return;
+        }
+        self.push_item_undo();
+        let moved = itembox::compact(&mut items);
+        let holes = items.iter().filter(|s| s.is_blank()).count();
+        self.store_item_box(&items);
+        self.message = format!("空きを詰めました（{} 枠移動、空きは {} 枠）", moved, holes);
+    }
+
+    /// 上限を丸める: pull every stack above the cap back down to it.
+    fn item_op_clamp(&mut self) {
+        let over = self.item_menu_stats().over;
+        if over == 0 {
+            self.message = String::from("99 を超えている個数はありません");
+            return;
+        }
+        let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return;
+        };
+        self.push_item_undo();
+        let changed = itembox::clamp_counts(&mut items, MAX_COUNT);
+        self.store_item_box(&items);
+        self.message = format!("99 を超えていた {} 枠を 99 に戻しました", changed);
+    }
+
+    /// Open the picker for the two-stage bulk add: item first, then count.
+    fn open_item_add(&mut self) {
+        self.item_pick_mode = 3;
+        self.item_pick_stage = 0;
+        self.item_pick_cursor = 0;
+        self.item_pick_filter.clear();
+        self.item_pick_add_id = 0;
+        self.item_pick_add_count = 1;
+        self.screen = Screen::ItemPick;
+        self.message = String::from("追加するアイテムを選んでください（選んだあと [◀/▶] で個数）");
+    }
+
+    /// The footer line of the add stage: which item and how many.
+    pub fn item_add_message(&self) -> String {
+        format!(
+            "{} を {} 個追加 — [◀/▶] ±1、[▲/▼] ±10、[A] 決定、[B] 選び直す",
+            item_name_of(self.item_pick_add_id),
+            self.item_pick_add_count
+        )
+    }
+
+    /// Put the chosen number of the chosen item into the box.
+    fn apply_item_add(&mut self) {
+        let id = self.item_pick_add_id;
+        if id == 0 {
+            self.message = String::from("アイテムが選ばれていません");
+            self.item_pick_stage = 0;
+            return;
+        }
+        let want = self.item_pick_add_count.clamp(1, MAX_COUNT);
+        let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return;
+        };
+        self.push_item_undo();
+        let got = itembox::add(&mut items, id, want);
+        if got == 0 {
+            // Nothing fit: drop the undo entry that was pushed for a write
+            // that is not going to happen.
+            self.item_undo.pop();
+            self.message = String::from("空き枠がなく、1 個も入りませんでした");
+            self.item_pick_stage = 0;
+            return;
+        }
+        self.store_item_box(&items);
+        let name = item_name_of(id);
+        let short = want as u32 - got;
+        self.message = if short > 0 {
+            format!(
+                "{} を {} 個追加しました（{} 個は枠が足りず入りません）",
+                name, got, short
+            )
+        } else {
+            format!("{} を {} 個追加しました（[A] でセーブ保存）", name, got)
+        };
+        // Back to the menu, on the row that was just used, so adding another
+        // stack is one press away.
+        self.item_pick_stage = 0;
+        self.screen = Screen::Items;
+        self.item_menu_open = true;
+        self.item_menu_cursor = ITEM_OP_ADD;
+        self.item_dedupe_armed = false;
     }
 
     /// Item ids whose name matches the current filter, in id order.
@@ -2781,6 +3168,37 @@ impl Editor {
     }
 
     fn input_item_pick(&mut self, key: Key) {
+        // Stage two of "アイテムを追加": the item is chosen, so Left / Right
+        // now pick the count and A adds it. The list underneath is kept on
+        // screen (it still names the item) but no longer moves.
+        if self.item_pick_mode == 3 && self.item_pick_stage == 1 {
+            match key {
+                Key::Left => {
+                    self.item_pick_add_count = self.item_pick_add_count.saturating_sub(1).max(1);
+                    self.message = self.item_add_message();
+                }
+                Key::Right => {
+                    self.item_pick_add_count = (self.item_pick_add_count + 1).min(MAX_COUNT);
+                    self.message = self.item_add_message();
+                }
+                Key::Up => {
+                    self.item_pick_add_count = (self.item_pick_add_count + 10).min(MAX_COUNT);
+                    self.message = self.item_add_message();
+                }
+                Key::Down => {
+                    self.item_pick_add_count = self.item_pick_add_count.saturating_sub(10).max(1);
+                    self.message = self.item_add_message();
+                }
+                Key::A => self.apply_item_add(),
+                Key::B => {
+                    self.item_pick_stage = 0;
+                    self.message = String::from("追加するアイテムを選び直してください");
+                }
+                Key::Plus => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
         let n = self.item_pick_matches().len();
         match key {
             Key::Up => self.item_pick_cursor = (self.item_pick_cursor + n.saturating_sub(1)) % n.max(1),
@@ -2847,6 +3265,19 @@ impl Editor {
                     self.screen = Screen::QuestEquip;
                     return;
                 }
+                // Mode 3 is the bulk add: A only chooses the item, the count
+                // comes next and nothing is written yet.
+                if self.item_pick_mode == 3 {
+                    if let Some(&id) = matches.get(self.item_pick_cursor) {
+                        self.item_pick_add_id = id;
+                        self.item_pick_stage = 1;
+                        if self.item_pick_add_count == 0 {
+                            self.item_pick_add_count = 1;
+                        }
+                        self.message = self.item_add_message();
+                    }
+                    return;
+                }
                 if let Some(&id) = matches.get(self.item_pick_cursor) {
                     let slot = self.slot;
                     let box_i = self.item_pick_target;
@@ -2875,6 +3306,13 @@ impl Editor {
                 } else if self.item_pick_mode == 2 {
                     self.screen = Screen::QuestEquip;
                 } else {
+                    // Back to the box, and back into the menu the add started
+                    // from when it came from there.
+                    if self.item_pick_mode == 3 {
+                        self.item_pick_stage = 0;
+                        self.item_menu_open = true;
+                        self.item_menu_cursor = ITEM_OP_ADD;
+                    }
                     self.screen = Screen::Items;
                     self.cursor = 0;
                 }
@@ -3587,6 +4025,56 @@ impl Editor {
                 push(&mut out, format!("  step {}   (X)", STEPS[self.step]), false, false);
             }
             Screen::Items => {
+                // The bulk menu replaces the list while it is open; the list
+                // is one press away (B or Minus) and nothing below it moves.
+                if self.item_menu_open {
+                    let stats = self.item_menu_stats();
+                    push(
+                        &mut out,
+                        format!(
+                            "ITEM OPS  box {}  ({} used, {} free)",
+                            self.slot + 1,
+                            TOTAL_ITEM_SLOTS - stats.holes,
+                            stats.holes
+                        ),
+                        false,
+                        false,
+                    );
+                    for (i, (label, note)) in ITEM_OPS.iter().enumerate() {
+                        let armed = i == ITEM_OP_DEDUPE && self.item_dedupe_armed;
+                        push(
+                            &mut out,
+                            format!(
+                                "  {:<12} {}{}",
+                                label,
+                                stats.value(i),
+                                if armed { "  << press A again" } else { "" }
+                            ),
+                            true,
+                            i == self.item_menu_cursor,
+                        );
+                        if i == self.item_menu_cursor {
+                            push(&mut out, format!("      {}", note), false, false);
+                        }
+                    }
+                    let p = stats.dedupe;
+                    push(
+                        &mut out,
+                        format!(
+                            "  重複整理の予定: {} 枠解放 / {} 個消失",
+                            p.freed, p.lost
+                        ),
+                        false,
+                        false,
+                    );
+                    push(
+                        &mut out,
+                        String::from("  Up/Down row  A run  - close"),
+                        false,
+                        false,
+                    );
+                    return out;
+                }
                 let vis = self.visible_items();
                 push(
                     &mut out,
@@ -3623,6 +4111,14 @@ impl Editor {
                         false,
                     );
                 }
+                push(
+                    &mut out,
+                    String::from(
+                        "  Up/Down row  Left/Right count  - ops  R item  Y empty  L undo  A save",
+                    ),
+                    false,
+                    false,
+                );
             }
             Screen::EntryView => {
                 use crate::entries::{Esl, ItemTable, Qdp, QuestLink, SemEntry};
@@ -3770,6 +4266,60 @@ impl Editor {
             }
             Screen::ItemPick => {
                 let matches = self.item_pick_matches();
+                if self.item_pick_mode == 3 {
+                    // The bulk add has two stages and the header says which
+                    // one is showing, because the list looks the same in both.
+                    let head = if self.item_pick_stage == 0 {
+                        format!(
+                            "ADD ITEM   1) 選ぶ   ({} match)",
+                            matches.len()
+                        )
+                    } else {
+                        format!(
+                            "ADD ITEM   2) 個数   {} x{}",
+                            item_name_of(self.item_pick_add_id),
+                            self.item_pick_add_count
+                        )
+                    };
+                    push(&mut out, head, false, false);
+                    push(
+                        &mut out,
+                        format!(
+                            "filter: {}   ({} match)",
+                            if self.item_pick_filter.is_empty() {
+                                "(all)"
+                            } else {
+                                &self.item_pick_filter
+                            },
+                            matches.len()
+                        ),
+                        false,
+                        false,
+                    );
+                    let mut start = self.item_pick_cursor.saturating_sub(8);
+                    if start + 14 > matches.len() {
+                        start = matches.len().saturating_sub(14);
+                    }
+                    for (i, id) in matches.iter().enumerate().skip(start).take(14) {
+                        push(
+                            &mut out,
+                            format!("  {:<6} {}", id, item_name_of(*id)),
+                            true,
+                            i == self.item_pick_cursor,
+                        );
+                    }
+                    push(
+                        &mut out,
+                        if self.item_pick_stage == 0 {
+                            String::from("  A choose  Y filter  X clear  Up/Down  Left/Right +-10  B back")
+                        } else {
+                            String::from("  Left/Right +-1  Up/Down +-10  A add  B choose again")
+                        },
+                        false,
+                        false,
+                    );
+                    return out;
+                }
                 let cur = self.save
                     .as_ref()
                     .and_then(|s| s.read_item_box(self.slot))
