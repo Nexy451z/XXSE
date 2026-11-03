@@ -4144,22 +4144,66 @@ fn gap_the_quest_equipment_list_is_display_only() {
     assert!(!list.is_empty(), "the DLC section has the 45 entries");
 }
 
+/// The my-sets screen used to be a list with no editor at all. This is the
+/// guard that it now edits the equipment sets, and that the editor is a
+/// **mode** of the screen rather than a screen of its own: the audit above
+/// counts the Screen variants, and adding one just for a form would have made
+/// every match on it (and this table) wrong.
 #[test]
-fn gap_the_my_sets_screen_is_display_only() {
+fn audit_the_my_sets_can_be_edited() {
     if !real_save().exists() {
         return;
     }
-    audit_assert_read_only(
-        "Sets",
-        |ed| {
-            ed.input(Key::A);
-            ed.input(Key::Y);
-            assert_eq!(ed.screen, Screen::Sets);
-        },
-        &AUDIT_EDIT_KEYS,
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::A);
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::Sets);
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Sets, "the editor is a mode, not a screen");
+    assert!(ed.set_editor_open(), "A on the list must open the editor");
+    assert!(
+        ed.uses_minus(),
+        "the editor owns Minus (the two-press part clear)"
     );
-    // myset::set_item_set_name / set_equip_set_name / set_item_set_entry exist
-    // and are tested, but this screen only lists the sets.
+
+    // The first part row: walk it to another record and write it.
+    ed.input(Key::Down);
+    ed.input(Key::Right);
+    let pick = ed.set_pick(0);
+    assert_ne!(pick, mhnx_core::myset::NONE, "the row must land on a record");
+    let set = ed.editing_set().expect("the editor knows its set").index;
+    ed.input(Key::A);
+    assert!(ed.dirty, "A must write the part into the set");
+
+    // Whatever it wrote, the set and the equipment record now agree about the
+    // decoration ids as well as the index - that is the whole point of
+    // set_part writing both copies.
+    let slot = ed.slot;
+    let save = ed.save.as_ref().expect("a save");
+    let rec = mhnx_core::myset::equip_sets(save, slot)[set].clone();
+    assert_eq!(rec.parts[0], pick, "the part must name the chosen record");
+    let box_bytes = save.equipment_box(slot).expect("an equipment box");
+    let at = pick as usize * mhnx_core::equip::EQUIP_RECORD;
+    let want = mhnx_core::equip::Equipment::decorations(
+        pick as usize,
+        &box_bytes[at..at + mhnx_core::equip::EQUIP_RECORD],
+    );
+    assert_eq!(
+        rec.decos[0], want,
+        "the set's decoration copy must follow the record"
+    );
+
+    // X reports, it does not repair: the body is byte for byte what it was.
+    let before = ed.save.as_ref().expect("a save").body().to_vec();
+    ed.input(Key::X);
+    let expected = mhnx_core::myset::warnings(ed.save.as_ref().expect("a save"), slot, set);
+    assert_eq!(ed.set_warnings, expected, "X must report exactly warnings()");
+    assert_eq!(
+        ed.save.as_ref().expect("a save").body(),
+        before.as_slice(),
+        "asking for the warnings must not touch the save"
+    );
 }
 
 #[test]

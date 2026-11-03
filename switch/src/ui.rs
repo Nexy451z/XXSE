@@ -29,7 +29,7 @@ use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
     decoration_name_of, item_name_of, monster_name, Editor, Key, Screen, CHAR_FIELDS,
     CONSOLE_SAVE, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO,
-    ITEM_OPS, STEPS,
+    ITEM_OPS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -495,9 +495,24 @@ impl GuiState {
         self.goto_section(ed, allowed[next]);
     }
 
+    /// Put the set editor away when a section or sub-tab jump leaves the
+    /// my-sets screen.
+    ///
+    /// The key path closes it through B, but a touch or a ZL / ZR jump changes
+    /// `ed.screen` without going through the state machine, and a form left
+    /// open on a record no screen shows is a trap.
+    fn close_set_form(&mut self, ed: &mut Editor) {
+        if ed.set_edit.is_some() {
+            ed.set_edit = None;
+            ed.set_clear_armed = None;
+            ed.set_warnings.clear();
+        }
+    }
+
     fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
         self.pending_delete = None;
         self.pending_delete_charm = None;
+        self.close_set_form(ed);
         if sec != MainSection::File && sec != MainSection::Quest && ed.save.is_none() {
             ed.message = String::from("先にセーブデータを開いてください");
             return;
@@ -687,6 +702,9 @@ impl GuiState {
     pub fn select_sub_tab(&mut self, ed: &mut Editor, idx: usize) {
         self.pending_delete = None;
         self.pending_delete_charm = None;
+        // The マイセット tab means the list, so a tab press also closes the
+        // set editor; leaving the screen any other way does too.
+        self.close_set_form(ed);
 
         if is_quest_inner(ed.screen) {
             safe_flush_quest_entry(ed);
@@ -896,6 +914,11 @@ impl GuiState {
             return;
         }
         if ed.screen == Screen::Sets {
+            // The set editor has eight rows on one panel; there is nothing to
+            // page there and scrolling must not move the list under it.
+            if ed.set_edit.is_some() {
+                return;
+            }
             let len = sets_len(ed, self.sets_tab);
             if len > 0 {
                 let next = (self.sets_cursor as i32 + delta).clamp(0, len as i32 - 1) as usize;
@@ -979,6 +1002,12 @@ impl GuiState {
     pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
         // Picker screens use L/R for fast ±10 page jump; EVERY other screen uses L/R for Sub-Tab switching!
         if matches!(key, Key::L | Key::R) {
+            // The set editor is a mode of the my-sets screen and holds every
+            // key while it is open: cycling the sub-tab under it would leave a
+            // form on screen editing a set the list no longer shows.
+            if ed.screen == Screen::Sets && ed.set_edit.is_some() {
+                return;
+            }
             // The second stage of the bulk add is one number: L/R step it
             // instead of paging the list underneath.
             if ed.screen == Screen::ItemPick
@@ -1000,13 +1029,15 @@ impl GuiState {
             return;
         }
 
-        // Global X = QuickSave (except on ItemPick / SkillPick where X clears search filter)
-        if key == Key::X
-            && !matches!(
-                ed.screen,
-                Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
-            )
-        {
+        // Global X = QuickSave (except on the pickers, where X clears the
+        // search filter). The set editor used to take X for its warnings, which
+        // cost the pad its only way to save from that screen; the warnings moved
+        // to Y instead.
+        let x_is_the_screens = matches!(
+            ed.screen,
+            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
+        );
+        if key == Key::X && !x_is_the_screens {
             self.apply_action(ed, UiAction::QuickSave);
             return;
         }
@@ -1164,6 +1195,16 @@ impl GuiState {
                 }
                 other => ed.input(other),
             },
+            // The set editor is a mode of this screen: while it is open every
+            // key belongs to it and the list underneath cannot move, the same
+            // shape the item bulk menu uses. The list's own cursor lives in
+            // this struct, so A is what hands the selected record to the state
+            // machine.
+            Screen::Sets if ed.set_edit.is_some() => match key {
+                Key::Up | Key::Down | Key::Left | Key::Right | Key::A | Key::Y | Key::Minus
+                | Key::B => ed.input(key),
+                _ => {},
+            },
             Screen::Sets => match key {
                 Key::Up => {
                     self.sets_cursor = self.sets_cursor.saturating_sub(1);
@@ -1174,6 +1215,19 @@ impl GuiState {
                         self.sets_cursor = (self.sets_cursor + 1).min(len - 1);
                     }
                 }
+                Key::A => {
+                    // Only the equipment sets have an editor. Saying so beats
+                    // a key that silently does nothing.
+                    if self.sets_tab == 0 {
+                        ed.message = String::from(
+                            "アイテムセットはまだ編集できません（[◀/▶] で装備セットへ）",
+                        );
+                    } else if let Some(set) = equip_set_at(ed, self.sets_cursor) {
+                        ed.open_set_editor(set);
+                    } else {
+                        ed.message = String::from("編集できる装備セットがありません");
+                    }
+                }
                 Key::Left | Key::Right | Key::Y => {
                     self.sets_tab = 1 - self.sets_tab;
                     self.sets_cursor = 0;
@@ -1181,7 +1235,7 @@ impl GuiState {
                 Key::B => {
                     ed.open_charms();
                 }
-                _ => {}
+                _ => {},
             },
             Screen::SaveQuests => match key {
                 Key::Up if self.quest_tab > 0 => {
@@ -2018,6 +2072,18 @@ fn apply_sem_preset(ed: &mut Editor, preset: u8) {
     }
 }
 
+/// The equipment set array index of one row of the my-sets list.
+///
+/// The list the console draws skips the empty records, so its row number is
+/// not the record index the state machine needs.
+fn equip_set_at(ed: &Editor, row: usize) -> Option<usize> {
+    ed.equip_sets()
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .nth(row)
+        .map(|s| s.index)
+}
+
 fn sets_len(ed: &Editor, tab: usize) -> usize {
     let Some(save) = &ed.save else { return 0 };
     if tab == 0 {
@@ -2053,7 +2119,12 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Hunts => ed.hunt_cursor,
         Screen::Guild => ed.guild_field,
         Screen::Roster => ed.roster_cursor,
-        Screen::Sets => gui.sets_cursor,
+        // The list's row while the list is showing, and the form's row while
+        // the set editor is open: the editor is a mode of this screen.
+        Screen::Sets => match ed.set_edit {
+            Some(e) => e.field,
+            None => gui.sets_cursor,
+        },
         Screen::SaveQuests => {
             if gui.quest_tab > 0 {
                 gui.quest_cat_cursor[gui.quest_tab]
@@ -2103,7 +2174,13 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => 3,
         Screen::Roster => ed.palicos().len(),
-        Screen::Sets => sets_len(ed, gui.sets_tab),
+        Screen::Sets => {
+            if ed.set_edit.is_some() {
+                SET_EDIT_ROWS
+            } else {
+                sets_len(ed, gui.sets_tab)
+            }
+        }
         Screen::SaveQuests => {
             if gui.quest_tab > 0 {
                 bundled_quests_for_tab(gui.quest_tab, &ed.quest_filter).len()
@@ -2156,6 +2233,15 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         return;
     }
     if ed.screen == Screen::Sets {
+        // While the editor is open a tap moves its row cursor, not the list's.
+        // A tap on another row is a cursor move like any other, so a pending
+        // part clear (which belongs to the row it was armed on) is dropped.
+        if let Some(mut e) = ed.set_edit {
+            e.field = idx.min(SET_EDIT_ROWS - 1);
+            ed.set_edit = Some(e);
+            ed.set_clear_armed = None;
+            return;
+        }
         let n = sets_len(ed, gui.sets_tab);
         if n > 0 {
             gui.sets_cursor = idx.min(n - 1);
@@ -2284,6 +2370,12 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
                     }
                 }
             }
+        }
+        // The set form has no maximum: the rows name records, not numbers.
+        // Taking a part out is [-], which asks for a second press, so MAX must
+        // never do it in one.
+        Screen::Sets => {
+            ed.message = String::from("この行に最大値はありません（[-] 2回で部位を外せます）");
         }
         // [MAX] on the equipment form is per row: the level goes to its
         // ceiling, a decoration is taken out, and the two id rows have no
@@ -2869,6 +2961,12 @@ impl GuiState {
             Screen::JewelPick => {
                 "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [▲/▼] 行  [B] 戻る"
             }
+            // The set editor is a mode of the my-sets screen, so the chips
+            // change with it: X stops saving and reads the set back instead.
+            Screen::Sets if ed.set_edit.is_some() => {
+                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-]×2 外す  [Y] 警告  [X] 保存  [B] 一覧"
+            }
+            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
             Screen::Options => "[◀/▶] 値変更  [Y] 直近スナップショットへ戻す  [X] 保存  [B] 戻る",
             Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [L/R] サブタブ  [X] 保存",
             Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [L/R] サブタブ  [X] 保存",
@@ -3541,6 +3639,61 @@ impl GuiState {
                     "[＋] 新規装備を追加",
                     UiAction::Key(Key::Plus),
                 );
+            }
+            // The set editor is a mode of the my-sets screen; a touch press
+            // goes through the same key path the pad uses, so a tap can never
+            // clear a part the pad would ask twice about.
+            Screen::Sets => {
+                if ed.set_edit.is_some() {
+                    c.text_sized(ix + 20, cur_y, "このセットの操作", t.text_muted, FontSize::Small);
+                    cur_y += 24;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[Y] 警告を読み直す",
+                        UiAction::Key(Key::X),
+                    );
+                    cur_y += 44;
+                    let clear_label = if ed.set_clear_armed.is_some() {
+                        "もう一度タップで部位を外す"
+                    } else {
+                        "[-] 部位を外す（2回）"
+                    };
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        clear_label,
+                        UiAction::Key(Key::Minus),
+                    );
+                    cur_y += 44;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[B] 一覧に戻る",
+                        UiAction::Key(Key::B),
+                    );
+                } else {
+                    c.text_sized(ix + 20, cur_y, "マイセット", t.text_muted, FontSize::Small);
+                    cur_y += 24;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[◀/▶] アイテム / 装備を切替",
+                        UiAction::Key(Key::Right),
+                    );
+                }
             }
             Screen::Roster => {
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
@@ -4608,6 +4761,12 @@ impl GuiState {
     }
 
     fn draw_sets(&mut self, c: &mut Canvas, ed: &Editor) {
+        // The editor is a mode of this screen, so it owns the panel while it
+        // is open and the list comes back on B.
+        if ed.set_edit.is_some() {
+            self.draw_set_edit(c, ed);
+            return;
+        }
         let Some(save) = &ed.save else {
             return;
         };
@@ -4629,7 +4788,13 @@ impl GuiState {
         } else {
             for (i, s) in mhnx_core::myset::equip_sets(save, ed.slot).into_iter().enumerate() {
                 if !s.is_empty() {
-                    let n = s.parts.iter().filter(|&&p| p != 0).count();
+                    // NONE is 0xFFFF, not 0: counting "not zero" used to call
+                    // an empty part a used one and print 7 部位 for every set.
+                    let n = s
+                        .parts
+                        .iter()
+                        .filter(|&&p| p != mhnx_core::myset::NONE)
+                        .count();
                     let idx = rows.len();
                     rows.push((
                         idx,
@@ -4654,7 +4819,70 @@ impl GuiState {
             &rows,
             self.sets_cursor.min(rows.len().saturating_sub(1)),
             false,
-            "切替",
+            if self.sets_tab == 1 { "編集" } else { "切替" },
+        );
+    }
+
+    /// The equipment set form: one row for the name, one per part.
+    ///
+    /// Every row fits on the panel at once (eight rows), so there is nothing to
+    /// page and the cursor is the row. The amber strip carries `myset::warnings`
+    /// for the record as it is stored: [X] re-reads them, they are collected when
+    /// the editor opens and after every write, never while drawing.
+    fn draw_set_edit(&mut self, c: &mut Canvas, ed: &Editor) {
+        let Some(e) = ed.set_edit else {
+            return;
+        };
+        let name = ed.editing_set().map(|r| r.name).unwrap_or_default();
+        let shown_name = if name.is_empty() {
+            String::from("(無題)")
+        } else {
+            name.clone()
+        };
+        let mut rows = Vec::with_capacity(SET_EDIT_ROWS);
+        rows.push((
+            SET_ROW_NAME,
+            String::from("名前"),
+            String::from("全角10文字まで / ◀ ▶ でも入力を開く"),
+            shown_name,
+            String::from("#01"),
+        ));
+        for part in 0..mhnx_core::myset::EQUIP_SET_PARTS {
+            let row = part + 1;
+            let idx = ed.set_pick(part);
+            let meta = if idx == mhnx_core::myset::NONE {
+                String::from("◀ ▶ で装備BOX の使用中を巡回")
+            } else {
+                format!("枠 #{:04} / ◀ ▶ で巡回  [A] で決定", idx)
+            };
+            let armed = ed.set_clear_armed == Some(part);
+            rows.push((
+                row,
+                String::from(mhnx_core::myset::PART_NAMES[part]),
+                meta,
+                ed.set_part_label(part),
+                if armed {
+                    String::from("外す?")
+                } else {
+                    format!("#{:02}", row + 1)
+                },
+            ));
+        }
+        let notice: Vec<String> = ed.set_warnings.clone();
+        let hdr = format!("マイセット (装備) #{:02} を編集", e.set + 1);
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            &hdr,
+            &rows,
+            e.field.min(rows.len().saturating_sub(1)),
+            e.field != SET_ROW_NAME,
+            if e.field == SET_ROW_NAME {
+                "名前入力"
+            } else {
+                "決定"
+            },
+            &notice,
         );
     }
 

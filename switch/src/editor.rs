@@ -900,7 +900,18 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Hunts => &[("</>", "値"), ("X", "項目"), ("A", "反映"), ("B", "戻る")],
         Guild => &[("</>", "値"), ("X", "項目"), ("A", "コメント"), ("B", "戻る")],
         Roster => &[("</>", "値"), ("X", "項目"), ("A", "名前"), ("B", "戻る")],
-        Sets => &[("B", "戻る")],
+        // Two modes on one screen: the list, and the set editor that [A] opens.
+        // The chips name both, because this table is per screen and Y means
+        // different things in the two (tab switch on the list, warnings in the
+        // form). X saves on both.
+        Sets => &[
+            ("A", "編集"),
+            ("</>", "装備を巡回"),
+            ("-", "外す(2回)"),
+            ("Y", "警告/タブ切替"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
         Palico => &[("A", "追加/削除"), ("L", "言語"), ("R", "言語"), ("X", "保存"), ("B", "戻る")],
         Options => &[
             ("</>", "値変更"),
@@ -965,6 +976,10 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.equip_cursor = 0;
     } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
         ed.apply_jewel_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_SET_NAME {
+        // The set editor stays open: a rename is one field of the form, and
+        // the record it belongs to is the one on screen.
+        ed.apply_set_name(s);
     } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
         if let Some(save) = &mut ed.save {
             let slot = ed.slot;
@@ -1162,6 +1177,8 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("装備名か種類で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
             ("装飾品名で絞り込み", 60)
+        } else if idx == mhnx_core::hbedit::TEXT_SET_NAME {
+            ("マイセットの名前 (最大31B / 全角10文字)", 31)
         } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
             ("ギルドカードのコメント", 54)
         } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME

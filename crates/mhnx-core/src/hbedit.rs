@@ -261,6 +261,46 @@ impl EquipEdit {
     }
 }
 
+/// Rows on the equipment set editor: 0 is the name, 1..=7 the seven parts.
+pub const SET_EDIT_ROWS: usize = 1 + crate::myset::EQUIP_SET_PARTS;
+
+/// The set editor's row that renames the set.
+pub const SET_ROW_NAME: usize = 0;
+
+/// The equipment set being edited on the Sets screen.
+///
+/// This is a **mode of the my-sets screen**, not a screen of its own: opening
+/// it does not add a variant to `Screen` (and therefore does not have to be
+/// taught to every match on it or to the console audit), and the list
+/// underneath keeps its cursor - the console layer owns that one, because the
+/// rows it shows are the records that are not empty.
+///
+/// `pick` is what [A] would write: one equipment box index per part, seeded
+/// from the record when the editor opens. It is kept apart from the record on
+/// purpose. `myset::set_part` writes the part **and** copies that record's
+/// decoration ids into the set, so merely walking the rows must not write;
+/// only [A] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetEdit {
+    /// Index into the equipment set array (0..EQUIP_SETS).
+    pub set: usize,
+    /// Which row the cursor is on: 0 name, 1..=7 weapon..talisman.
+    pub field: usize,
+    /// Box index [A] would write, per part. `myset::NONE` is an empty part.
+    pub pick: [u16; crate::myset::EQUIP_SET_PARTS],
+}
+
+impl Default for SetEdit {
+    fn default() -> Self {
+        SetEdit {
+            set: 0,
+            field: SET_ROW_NAME,
+            // Nothing selected, not box record 0: 0 is a real equipment slot.
+            pick: [crate::myset::NONE; crate::myset::EQUIP_SET_PARTS],
+        }
+    }
+}
+
 /// A text edit request (software keyboard).
 ///
 /// index == usize::MAX means the character name of the current slot.
@@ -359,6 +399,70 @@ pub const TEXT_GUILD_COMMENT: usize = usize::MAX - 999;
 pub const TEXT_EQUIP_FILTER: usize = usize::MAX - 5;
 /// Sentinel id for "ask for a decoration name to filter the jewel picker by".
 pub const TEXT_JEWEL_FILTER: usize = usize::MAX - 6;
+/// Sentinel id for "ask for the name of the equipment set being edited".
+///
+/// It has to stay **below** `TEXT_PALICO_NAME`, because the console layer
+/// reads one contiguous range as palico names ("TEXT_PALICO_NAME or above");
+/// a sentinel above it would be answered as a palico that does not exist.
+pub const TEXT_SET_NAME: usize = usize::MAX - 1_001;
+
+/// How many terminal cells one character takes.
+///
+/// The wide scripts this editor prints - Japanese above all - take two cells,
+/// everything else one. Used only to line the ASCII fallback console up; the
+/// canvas measures real glyphs instead.
+fn char_cells(c: char) -> usize {
+    let u = c as u32;
+    let wide = (0x1100..=0x115F).contains(&u)
+        || (0x2E80..=0xA4CF).contains(&u)
+        || (0xAC00..=0xD7A3).contains(&u)
+        || (0xF900..=0xFAFF).contains(&u)
+        || (0xFE30..=0xFE6F).contains(&u)
+        || (0xFF00..=0xFF60).contains(&u)
+        || (0xFFE0..=0xFFE6).contains(&u)
+        || (0x3000..=0x303F).contains(&u);
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// Pad text to a number of console cells, cutting it when it does not fit.
+///
+/// Cells, not characters: padding "護石" to five columns with spaces would put
+/// the next column two cells off, which is what the first version did.
+fn pad_cells(s: &str, cells: usize) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = char_cells(ch);
+        if used + w > cells {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    while used < cells {
+        out.push(' ');
+        used += 1;
+    }
+    out
+}
+
+/// Cut text to a character count for the fixed-width console lines.
+///
+/// Counted in characters, not bytes: these lines feed either the Switch's
+/// ASCII fallback console or the test reader, both of which count cells, and a
+/// byte cut would split a three byte character in half.
+fn clip_text(s: &str, max_chars: usize) -> alloc::string::String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: alloc::string::String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
 
 /// Add `step` to a value, staying in the u16 range and never going below zero.
 fn clamp_u16(value: u16, step: i64) -> u16 {
@@ -628,6 +732,24 @@ pub struct Editor {
     pub item_menu_cursor: usize,
     /// Has the dedupe preview been shown and its second press not arrived yet?
     pub item_dedupe_armed: bool,
+    /// The equipment set being edited, if the set editor is open.
+    ///
+    /// A mode of the my-sets screen, like `item_menu_open` is a mode of the
+    /// item screen. `None` means the screen shows the list.
+    pub set_edit: Option<SetEdit>,
+    /// Part whose [-] clear is waiting for its second press.
+    ///
+    /// A clear is never one press, for the same reason an equipment delete is
+    /// not: the first press only says which part would empty, and any other
+    /// key drops the pending one so a press cannot land on a part the user has
+    /// stopped looking at.
+    pub set_clear_armed: Option<usize>,
+    /// What `myset::warnings` last said about the set on screen.
+    ///
+    /// Collected when the editor opens, after every write and on [X], never
+    /// while drawing: `warnings` decodes the whole record and looks seven
+    /// parts up in the equipment box, which is more than a redraw should do.
+    pub set_warnings: Vec<String>,
     /// Cursor inside the save's own quest list.
     pub save_quest_cursor: usize,
     /// Cursor inside the download Palico catalogue.
@@ -726,6 +848,9 @@ impl Editor {
             item_menu_open: false,
             item_menu_cursor: 0,
             item_dedupe_armed: false,
+            set_edit: None,
+            set_clear_armed: None,
+            set_warnings: Vec::new(),
             save_quest_cursor: 0,
             palico_cursor: 0,
             palico_lang: 0,
@@ -827,10 +952,13 @@ impl Editor {
     /// uses it for the bulk operation menu, so the rescan must not fire there
     /// (on the item screen it used to fire *and* undo, both at once).
     pub fn uses_minus(&self) -> bool {
-        matches!(
-            self.screen,
-            Screen::ArcEntries | Screen::SaveQuests | Screen::Equip | Screen::Items
-        )
+        match self.screen {
+            Screen::ArcEntries | Screen::SaveQuests | Screen::Equip | Screen::Items => true,
+            // The set editor uses Minus for the two-press part clear. On the
+            // list above it Minus still means "rescan".
+            Screen::Sets => self.set_edit.is_some(),
+            _ => false,
+        }
     }
 
     /// The I/O layer answers an ExtractQuests request with this.
@@ -1006,14 +1134,7 @@ impl Editor {
             Screen::Hunts => self.input_hunts(key),
             Screen::Guild => self.input_guild(key),
             Screen::Roster => self.input_roster(key),
-            Screen::Sets => {
-                if key == Key::B {
-                    self.screen = Screen::Slots;
-                    self.cursor = self.slot;
-                } else if key == Key::Plus {
-                    self.quit = true;
-                }
-            }
+            Screen::Sets => self.input_sets(key),
             Screen::EntryView => match key {
                 Key::B => {
                     self.screen = Screen::ArcEntries;
@@ -2567,6 +2688,459 @@ impl Editor {
         match &self.save {
             Some(s) => crate::dlc::quest_equipment_items(s, self.cursor),
             None => Vec::new(),
+        }
+    }
+
+    // --------------------------------------------------- the set list screen
+    //
+    // The my-sets screen lists two unrelated arrays. Only the equipment sets
+    // can be edited; the item sets are still list-only, and this module says so
+    // rather than pretending.
+
+    /// The equipment sets of the current slot, as stored.
+    pub fn equip_sets(&self) -> Vec<crate::myset::EquipSet> {
+        match &self.save {
+            Some(s) => crate::myset::equip_sets(s, self.slot),
+            None => Vec::new(),
+        }
+    }
+
+    /// The item sets of the current slot, as stored.
+    pub fn item_sets(&self) -> Vec<crate::myset::ItemSet> {
+        match &self.save {
+            Some(s) => crate::myset::item_sets(s, self.slot),
+            None => Vec::new(),
+        }
+    }
+
+    /// Is the set editor open? (A mode of the my-sets screen, not a screen.)
+    pub fn set_editor_open(&self) -> bool {
+        self.set_edit.is_some()
+    }
+
+    /// The equipment set the editor is looking at, re-read from the save.
+    ///
+    /// Re-read rather than cached, so the name and the parts on screen are the
+    /// bytes that are really stored. Only the pending index of a part runs
+    /// ahead of the record, and only until [A] writes it.
+    pub fn editing_set(&self) -> Option<crate::myset::EquipSet> {
+        let e = self.set_edit?;
+        self.equip_sets().into_iter().nth(e.set)
+    }
+
+    /// Box index the given part row would write, or myset::NONE.
+    pub fn set_pick(&self, part: usize) -> u16 {
+        self.set_edit
+            .as_ref()
+            .and_then(|e| e.pick.get(part).copied())
+            .unwrap_or(crate::myset::NONE)
+    }
+
+    /// The equipment record behind a part row's pending index.
+    ///
+    /// None when the part is empty, or when the box does not hold a record at
+    /// that index any more (an edit of the box can blank one under it).
+    pub fn set_pick_equipment(&self, part: usize) -> Option<crate::equip::Equipment> {
+        let idx = self.set_pick(part);
+        if idx == crate::myset::NONE {
+            return None;
+        }
+        let save = self.save.as_ref()?;
+        save.equipment_at(self.slot, idx as usize)
+            .filter(|q| !q.is_empty())
+    }
+
+    /// "大剣 ボルジン" for a part row, "なし" for an empty one.
+    pub fn set_part_label(&self, part: usize) -> String {
+        match self.set_pick_equipment(part) {
+            Some(q) => alloc::format!(
+                "{} {}",
+                crate::equip::type_name(q.kind),
+                crate::equip::name(&q)
+            ),
+            None => {
+                if self.set_pick(part) == crate::myset::NONE {
+                    String::from("なし")
+                } else {
+                    alloc::format!("空き枠 #{}", self.set_pick(part))
+                }
+            }
+        }
+    }
+
+    /// Open the set editor on one record of the equipment set array.
+    ///
+    /// The argument is an index into the forty record array, not a row of the
+    /// list the console draws: that list skips the empty records, so the
+    /// caller maps its row back to this index.
+    pub fn open_set_editor(&mut self, set: usize) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        if set >= crate::myset::EQUIP_SETS {
+            self.message = alloc::format!("セット {} は範囲外です", set + 1);
+            return false;
+        }
+        let Some(rec) = self.equip_sets().into_iter().nth(set) else {
+            self.message = String::from("このセットは読み取れません");
+            return false;
+        };
+        let mut pick = [crate::myset::NONE; crate::myset::EQUIP_SET_PARTS];
+        for (i, p) in pick.iter_mut().enumerate() {
+            *p = rec.parts[i];
+        }
+        let used = rec
+            .parts
+            .iter()
+            .filter(|p| **p != crate::myset::NONE)
+            .count();
+        let name = if rec.name.trim().is_empty() {
+            String::from("(無題)")
+        } else {
+            rec.name.clone()
+        };
+        self.set_edit = Some(SetEdit {
+            set,
+            field: SET_ROW_NAME,
+            pick,
+        });
+        self.set_clear_armed = None;
+        let warned = self.refresh_set_warnings();
+        self.message = alloc::format!(
+            "セット #{:02} 「{}」を編集中 — {} 部位 / 警告 {} 件",
+            set + 1,
+            name,
+            used,
+            warned
+        );
+        true
+    }
+
+    /// Leave the editor and go back to the list.
+    ///
+    /// Only [A] ever writes a part, so leaving cannot lose an edit that was
+    /// already made: the bytes are in the open save and reach the file with the
+    /// save key pressed on the list.
+    pub fn close_set_editor(&mut self) {
+        self.set_edit = None;
+        self.set_clear_armed = None;
+        self.set_warnings.clear();
+        self.message = String::from("マイセット一覧に戻りました（[X] でセーブ保存）");
+    }
+
+    /// Re-read myset::warnings for the set on screen.
+    ///
+    /// Returns how many there are. Called when the editor opens, after every
+    /// write and on [X] - never from the renderer, because warnings decodes the
+    /// whole record and looks seven parts up in the equipment box.
+    pub fn refresh_set_warnings(&mut self) -> usize {
+        let Some(e) = self.set_edit else {
+            self.set_warnings.clear();
+            return 0;
+        };
+        let slot = self.slot;
+        let set = e.set;
+        self.set_warnings = match &self.save {
+            Some(s) => crate::myset::warnings(s, slot, set),
+            None => Vec::new(),
+        };
+        self.set_warnings.len()
+    }
+
+    /// One line for the footer: what the highlighted row is and what [A] does.
+    pub fn set_row_hint(&self) -> String {
+        let Some(e) = self.set_edit else {
+            return String::from("装備セットを選んで [A]");
+        };
+        if e.field == SET_ROW_NAME {
+            let name = self.editing_set().map(|r| r.name).unwrap_or_default();
+            return alloc::format!("名前「{}」— [A] で入力", name);
+        }
+        let part = (e.field - 1).min(crate::myset::EQUIP_SET_PARTS - 1);
+        alloc::format!(
+            "{} — [◀/▶] 装備BOX を巡回 / [A] 決定 / [-] 2回で外す",
+            crate::myset::PART_NAMES[part]
+        )
+    }
+
+    /// The my-sets list: A opens the editor, B leaves, everything else belongs
+    /// to the console layer (it owns the row cursor and the tab).
+    fn input_sets(&mut self, key: Key) {
+        if self.set_edit.is_some() {
+            self.input_set_edit(key);
+            return;
+        }
+        match key {
+            // The console layer opens the record its own cursor points at.
+            // This arm is the headless door the PC build and the tests use, so
+            // it takes the first set that holds something.
+            Key::A => {
+                if self.save.is_none() {
+                    self.message = String::from("先にセーブを開いてください");
+                    return;
+                }
+                match self.equip_sets().into_iter().find(|s| !s.is_empty()) {
+                    Some(s) => {
+                        self.open_set_editor(s.index);
+                    }
+                    None => {
+                        self.message = String::from("編集できる装備セットがありません");
+                    }
+                }
+            }
+            Key::B => {
+                self.screen = Screen::Slots;
+                self.cursor = self.slot;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn input_set_edit(&mut self, key: Key) {
+        let Some(mut e) = self.set_edit else {
+            return;
+        };
+        // Any key other than the confirmation itself means the user is no
+        // longer looking at the part that was armed, so the pending clear is
+        // dropped before the key does its own work.
+        if key != Key::Minus {
+            self.set_clear_armed = None;
+        }
+        match key {
+            Key::Up => e.field = (e.field + SET_EDIT_ROWS - 1) % SET_EDIT_ROWS,
+            Key::Down => e.field = (e.field + 1) % SET_EDIT_ROWS,
+            // The name row has nothing to cycle: the two arrows open the
+            // keyboard, the same way the character name row on the Char screen
+            // does.
+            Key::Left | Key::Right => {
+                self.set_edit = Some(e);
+                if e.field == SET_ROW_NAME {
+                    self.ask_set_name(e.set);
+                } else {
+                    self.move_set_pick(e.field - 1, if key == Key::Right { 1 } else { -1 });
+                }
+                return;
+            }
+            Key::A => {
+                self.set_edit = Some(e);
+                if e.field == SET_ROW_NAME {
+                    self.ask_set_name(e.set);
+                } else {
+                    self.commit_set_part();
+                }
+                return;
+            }
+            Key::Minus => {
+                self.set_edit = Some(e);
+                self.clear_set_part_under_cursor();
+                return;
+            }
+            // Y reads the record back and says what looks wrong, leaving X
+            // to save the way it does on every other screen. It repairs
+            // nothing: the game loads every case warnings reports, so a silent
+            // fix would change data the user did not ask about.
+            Key::Y => {
+                self.set_edit = Some(e);
+                let n = self.refresh_set_warnings();
+                self.message = if n == 0 {
+                    String::from("警告はありません（部位と装備の種別は一致しています）")
+                } else {
+                    alloc::format!("警告 {} 件: {}", n, self.set_warnings.join(" / "))
+                };
+                return;
+            }
+            Key::B => {
+                self.set_edit = Some(e);
+                self.close_set_editor();
+                return;
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+        self.set_edit = Some(e);
+    }
+
+    /// Ask the software keyboard for the set's name.
+    fn ask_set_name(&mut self, set: usize) {
+        let current = self
+            .equip_sets()
+            .into_iter()
+            .nth(set)
+            .map(|r| r.name)
+            .unwrap_or_default();
+        self.pending_text = Some((TEXT_SET_NAME, current));
+        self.message = String::from("セットの名前を入力してください（最大31B / 全角10文字）");
+    }
+
+    /// Walk the equipment box's used records for one part's pending index.
+    ///
+    /// Every used record is offered, not only the ones whose kind fits the
+    /// part. myset::set_part deliberately does not check the kind - the sample
+    /// save holds a set with a talisman in the head slot and the game loads it -
+    /// so a picker that filtered them out could not reach the state the save
+    /// already contains. The row shows the type name and [X] reports a mismatch.
+    fn move_set_pick(&mut self, part: usize, d: i64) {
+        if part >= crate::myset::EQUIP_SET_PARTS {
+            return;
+        }
+        let ids = self.equip_record_indices();
+        if ids.is_empty() {
+            self.message = String::from("装備BOXが空です（先に装備BOXで装備を作ってください）");
+            return;
+        }
+        let Some(mut e) = self.set_edit else {
+            return;
+        };
+        let n = ids.len() as i64;
+        let cur = e.pick[part];
+        let next = match ids.iter().position(|i| *i as u16 == cur) {
+            Some(p) => ((p as i64 + d).rem_euclid(n)) as usize,
+            // The stored index is blank or outside the box: start from an end.
+            None => {
+                if d > 0 {
+                    0
+                } else {
+                    (n - 1) as usize
+                }
+            }
+        };
+        e.pick[part] = ids[next] as u16;
+        let field = e.field;
+        self.set_edit = Some(e);
+        self.message = alloc::format!(
+            "[{}] {}（枠 #{:04} / 使用中 {} 枠中 {} 番目）— [A] で決定",
+            field,
+            self.set_part_label(part),
+            e.pick[part],
+            ids.len(),
+            next + 1
+        );
+    }
+
+    /// Write the part row's pending index into the set.
+    fn commit_set_part(&mut self) {
+        let Some(e) = self.set_edit else {
+            return;
+        };
+        if e.field == SET_ROW_NAME {
+            return;
+        }
+        let part = e.field - 1;
+        if part >= crate::myset::EQUIP_SET_PARTS {
+            return;
+        }
+        let idx = e.pick[part];
+        if idx == crate::myset::NONE {
+            self.message = alloc::format!(
+                "{} は空です（[◀/▶] で装備を選んでください）",
+                crate::myset::PART_NAMES[part]
+            );
+            return;
+        }
+        let slot = self.slot;
+        let set = e.set;
+        let label = self.set_part_label(part);
+        let wrote = match &mut self.save {
+            Some(s) => crate::myset::set_part(s, slot, set, part, idx),
+            None => false,
+        };
+        if wrote {
+            self.dirty = true;
+            let n = self.refresh_set_warnings();
+            self.message = alloc::format!(
+                "{} に「{}」を入れました（枠 #{:04} / 装飾品の写しも同時に / 警告 {} 件）",
+                crate::myset::PART_NAMES[part],
+                label,
+                idx,
+                n
+            );
+        } else {
+            self.message = alloc::format!(
+                "枠 #{:04} には書き込めません（空の装備枠か、セーブが開かれていません）",
+                idx
+            );
+        }
+    }
+
+    /// First half of the two-press clear: report, do not touch the record.
+    ///
+    /// The second half is the same key again with set_clear_armed naming the
+    /// part. Nothing else in the set moves: myset::clear_part empties the index
+    /// and its decoration copy only.
+    fn clear_set_part_under_cursor(&mut self) {
+        let Some(e) = self.set_edit else {
+            return;
+        };
+        if e.field == SET_ROW_NAME {
+            self.message = String::from("外せるのは部位の行だけです（名前は [A] で変更）");
+            return;
+        }
+        let part = e.field - 1;
+        if part >= crate::myset::EQUIP_SET_PARTS {
+            return;
+        }
+        if e.pick[part] == crate::myset::NONE {
+            self.set_clear_armed = None;
+            self.message = alloc::format!("{} はすでに空です", crate::myset::PART_NAMES[part]);
+            return;
+        }
+        if self.set_clear_armed != Some(part) {
+            self.set_clear_armed = Some(part);
+            let label = self.set_part_label(part);
+            self.message = alloc::format!(
+                "{} を外しますか？ もう一度 [-] で確定（いま「{}」）",
+                crate::myset::PART_NAMES[part],
+                label
+            );
+            return;
+        }
+        let slot = self.slot;
+        let set = e.set;
+        self.set_clear_armed = None;
+        let wrote = match &mut self.save {
+            Some(s) => crate::myset::clear_part(s, slot, set, part),
+            None => false,
+        };
+        if wrote {
+            self.dirty = true;
+            if let Some(mut ed) = self.set_edit {
+                ed.pick[part] = crate::myset::NONE;
+                self.set_edit = Some(ed);
+            }
+            let n = self.refresh_set_warnings();
+            self.message = alloc::format!(
+                "{} を外しました（装飾品の写しもゼロにしました / 警告 {} 件）",
+                crate::myset::PART_NAMES[part],
+                n
+            );
+        } else {
+            self.message = String::from("外せませんでした");
+        }
+    }
+
+    /// The io layer answers a set-name request with this.
+    pub fn apply_set_name(&mut self, text: String) {
+        let Some(e) = self.set_edit else {
+            return;
+        };
+        let slot = self.slot;
+        let set = e.set;
+        let wrote = match &mut self.save {
+            Some(s) => crate::myset::set_name(s, slot, set, &text),
+            None => false,
+        };
+        if wrote {
+            self.dirty = true;
+            let n = self.refresh_set_warnings();
+            self.message = alloc::format!(
+                "セット名を「{}」にしました（[B] で一覧 → [X] でセーブ保存 / 警告 {} 件）",
+                text,
+                n
+            );
+        } else {
+            self.message = String::from("セット名を書き込めませんでした");
         }
     }
 
@@ -4710,6 +5284,78 @@ impl Editor {
                 push(&mut out, String::from("  B back"), false, false);
             }
             Screen::Sets => {
+                // The editor is a mode of this screen, so it replaces the two
+                // lists while it is open and gives them back on B. Nothing
+                // below it moves, the same shape the item bulk menu uses.
+                if let Some(e) = self.set_edit {
+                    push(
+                        &mut out,
+                        alloc::format!("MY SETS   slot {}   EDIT", self.slot + 1),
+                        false,
+                        false,
+                    );
+                    let name = self.editing_set().map(|r| r.name).unwrap_or_default();
+                    push(
+                        &mut out,
+                        alloc::format!("  SET #{:02}  {}", e.set + 1, clip_text(&name, 24)),
+                        false,
+                        false,
+                    );
+                    for row in 0..SET_EDIT_ROWS {
+                        let (label, value) = if row == SET_ROW_NAME {
+                            (String::from("名前"), clip_text(&name, 24))
+                        } else {
+                            let part = row - 1;
+                            let armed = if self.set_clear_armed == Some(part) {
+                                "  << もう一度 [-] で確定"
+                            } else {
+                                ""
+                            };
+                            (
+                                alloc::format!("{}", crate::myset::PART_NAMES[part]),
+                                alloc::format!(
+                                    "{} 枠 #{:04}{}",
+                                    pad_cells(&self.set_part_label(part), 30),
+                                    self.set_pick(part),
+                                    armed
+                                ),
+                            )
+                        };
+                        push(
+                            &mut out,
+                            alloc::format!("  {:>2} {} {}", row, pad_cells(&label, 6), value),
+                            true,
+                            row == e.field,
+                        );
+                    }
+                    push(
+                        &mut out,
+                        alloc::format!("  警告 {} 件 ([X] で読み直す)", self.set_warnings.len()),
+                        false,
+                        false,
+                    );
+                    if self.set_warnings.is_empty() {
+                        push(&mut out, String::from("    (なし)"), false, false);
+                    } else {
+                        for line in self.set_warnings.iter().take(4) {
+                            push(
+                                &mut out,
+                                alloc::format!("    {}", clip_text(line, 60)),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    push(
+                        &mut out,
+                        String::from(
+                            "  Up/Down 行  Left/Right 装備  A 決定  - 外す×2  X 警告  B 一覧",
+                        ),
+                        false,
+                        false,
+                    );
+                    return out;
+                }
                 push(
                     &mut out,
                     alloc::format!("MY SETS   slot {}", self.slot + 1),
@@ -4744,7 +5390,12 @@ impl Editor {
                         false,
                     );
                 }
-                push(&mut out, String::from("  B back"), false, false);
+                push(
+                    &mut out,
+                    String::from("  A 編集(装備セット)   B back"),
+                    false,
+                    false,
+                );
             }
             Screen::Roster => {
                 let list = self.palicos();

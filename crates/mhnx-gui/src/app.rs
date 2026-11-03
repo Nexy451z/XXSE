@@ -97,6 +97,9 @@ pub enum Confirm {
         /// Records whose count will change.
         changed: usize,
     },
+    /// Empty one saved equipment set. The contents are gone after this, and
+    /// nothing below asks a second time: this dialog is the ask.
+    SetClear(usize),
 }
 
 /// Two-step confirmation for the destructive charm delete.
@@ -206,6 +209,11 @@ pub struct MhnxEditor {
     /// Show the empty slots next to the used ones. Off by default: a save has
     /// 2000 records and only a few hundred of them hold anything.
     pub equip_show_empty: bool,
+    /// Index of the saved equipment set the panel on the right is editing.
+    pub set_selected: Option<usize>,
+    /// Search text of the seven equipment pickers in the set editor, one per
+    /// part: each picker narrows the box on its own.
+    pub set_part_search: [String; mhnx_core::myset::EQUIP_SET_PARTS],
     /// Search text of the three decoration pickers, one per socket.
     pub equip_deco_search: [String; 3],
     /// Type, id and level the "空き枠に作成" row is set to.
@@ -299,6 +307,16 @@ impl Default for MhnxEditor {
             equip_filter: String::new(),
             equip_selected: None,
             equip_show_empty: false,
+            set_selected: None,
+            set_part_search: [
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
             equip_deco_search: [String::new(), String::new(), String::new()],
             equip_new_kind: 7,
             equip_new_id: 1,
@@ -374,6 +392,12 @@ impl MhnxEditor {
         // Keeping them across a slot change let one press of undo write the
         // previous character's 186 items into the new character's box.
         self.item_undo.clear();
+        // The same for the set editor: the selection points into a character's
+        // own forty records, so it cannot survive a slot change.
+        self.set_selected = None;
+        for s in self.set_part_search.iter_mut() {
+            s.clear();
+        }
         let Some(s) = &self.save else { return };
         if let Some(c) = s.read_character(self.slot) {
             self.edit = c;
@@ -1975,6 +1999,30 @@ impl MhnxEditor {
                 ),
                 "丸める",
             ),
+            Confirm::SetClear(n) => {
+                // The name is read now, so the dialog says which set it means
+                // rather than only a number.
+                let name = self
+                    .save
+                    .as_ref()
+                    .and_then(|s| {
+                        mhnx_core::myset::equip_sets(s, self.slot)
+                            .into_iter()
+                            .find(|set| set.index == *n)
+                    })
+                    .map(|set| set.name)
+                    .unwrap_or_default();
+                (
+                    "装備セットを空にします",
+                    format!(
+                        "セット {}「{}」を空にします。\n\
+                         名前は '－－－' になり、7 部位・装飾品の写し・防具の色が消えます。\n\
+                         ゲームが未使用に残す並びに書き換えます。元に戻せません。",
+                        n, name
+                    ),
+                    "空にする",
+                )
+            }
         };
         let mut answer: Option<bool> = None;
         egui::Window::new(title)
@@ -2036,6 +2084,9 @@ impl MhnxEditor {
                     }
                     Confirm::ItemClamp { .. } => {
                         self.item_clamp();
+                    }
+                    Confirm::SetClear(n) => {
+                        self.set_clear(n);
                     }
                     Confirm::None => {}
                 }
@@ -3401,67 +3452,589 @@ impl MhnxEditor {
             .collect()
     }
 
+    /// マイセット: the item sets, then the forty saved equipment sets.
+    ///
+    /// The item sets are a plain list with a name field. The equipment sets get
+    /// a list and an editor, because the core module already knows how to move
+    /// a part: the index at +0x2A and the decoration copy at +0x38 have to
+    /// change together, and writing only the index is what leaves a set
+    /// describing decorations its equipment does not have.
     fn tab_sets(&mut self, ui: &mut egui::Ui) {
         ui.heading("マイセット");
-        let Some(save) = &mut self.save else {
+        if self.save.is_none() {
             ui.label("セーブを開くと、アイテムセットと装備セットを表示します");
             return;
-        };
-        let slot = self.slot;
-        let items = mhnx_core::myset::item_sets(save, slot);
-        let equips = mhnx_core::myset::equip_sets(save, slot);
+        }
+        // The width this tab may use, taken before anything wide is drawn: the
+        // outer scroll area takes its content width from the widest child, and
+        // one long line of items used to stretch it until the equipment list
+        // and its editor were pushed off the right edge.
+        let mut width = ui.available_width();
+        if !width.is_finite() || width <= 0.0 {
+            width = 900.0;
+        }
         ui.label(egui::RichText::new("アイテムセット").strong());
+        // Bounded: twenty-four sets pushed the equipment sets below the fold,
+        // where nothing down there could be reached.
+        egui::ScrollArea::vertical()
+            .id_salt("itemsetlist")
+            .max_height(150.0)
+            .show(ui, |ui| self.item_set_grid(ui, width));
+        ui.separator();
+        ui.label(egui::RichText::new("装備セット").strong());
+        self.equip_set_tab(ui, width);
+    }
+
+    /// The item sets: the name with its box index, the contents under it.
+    ///
+    /// A plain list rather than a Grid: a Grid sizes its columns to the widest
+    /// cell and does not wrap, so one long line of items stretched the whole
+    /// tab sideways and took the editor with it.
+    fn item_set_grid(&mut self, ui: &mut egui::Ui, width: f32) {
+        let slot = self.slot;
+        ui.set_max_width(width);
+        let Some(save) = &mut self.save else {
+            return;
+        };
+        let items = mhnx_core::myset::item_sets(save, slot);
         let mut changed = false;
-        egui::Grid::new("itemsets").num_columns(2).striped(true).show(ui, |ui| {
-            for set in items.iter().filter(|s| !s.is_empty()) {
+        for set in items.iter().filter(|s| !s.is_empty()) {
+            ui.horizontal(|ui| {
                 ui.label(format!("[{}]", set.index));
                 let mut name = set.name.clone();
-                if ui.add(egui::TextEdit::singleline(&mut name).desired_width(180.0)).changed() {
+                if ui
+                    .add(egui::TextEdit::singleline(&mut name).desired_width(180.0))
+                    .changed()
+                {
                     mhnx_core::myset::set_item_set_name(save, slot, set.index, &name);
                     changed = true;
                 }
-                ui.end_row();
-                let body = set
-                    .used_items()
-                    .iter()
-                    .map(|i| format!("{} x{}", mhnx_core::hbedit::item_name_of(i.id), i.count))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                ui.label("");
-                ui.label(body);
-                ui.end_row();
+            });
+            let body = set
+                .used_items()
+                .iter()
+                .map(|i| format!("{} x{}", mhnx_core::hbedit::item_name_of(i.id), i.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if !body.is_empty() {
+                ui.add(egui::Label::new(egui::RichText::new(body).weak().small()).truncate());
             }
-        });
-        ui.separator();
-        ui.label(egui::RichText::new("装備セット").strong());
-        egui::Grid::new("equipsets").num_columns(3).striped(true).show(ui, |ui| {
-            for set in equips.iter().filter(|s| !s.is_empty()) {
-                ui.label(format!("[{}]", set.index));
-                let mut name = set.name.clone();
-                if ui.add(egui::TextEdit::singleline(&mut name).desired_width(180.0)).changed() {
-                    mhnx_core::myset::set_equip_set_name(save, slot, set.index, &name);
-                    changed = true;
-                }
-                let parts = set
-                    .parts
-                    .iter()
-                    .map(|p| {
-                        if *p == mhnx_core::myset::NONE {
-                            String::from("-")
-                        } else {
-                            format!("{}", p)
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                ui.label(parts);
-                ui.end_row();
-            }
-        });
+            ui.add_space(2.0);
+        }
         if changed {
             self.dirty = true;
         }
     }
+
+    /// The forty saved equipment sets: a list on the left, one editor on the
+    /// right. The height is fixed rather than taken from the frame, because
+    /// this tab already sits inside the outer scroll area and an unbounded
+    /// table there would run to the length of the whole list.
+    fn equip_set_tab(&mut self, ui: &mut egui::Ui, width: f32) {
+        let slot = self.slot;
+        let Some(sets) = self
+            .save
+            .as_ref()
+            .map(|s| mhnx_core::myset::equip_sets(s, slot))
+        else {
+            return;
+        };
+        // Copied out once per frame, as the equipment tab does it: the part
+        // pickers read the box by name and the warnings compare the set's
+        // decoration copy against it, and holding &self.save while the editor
+        // writes would lock what it is writing.
+        let boxv: Vec<u8> = self
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_box(slot))
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        let used: Vec<mhnx_core::equip::Equipment> = mhnx_core::equip::decode_box(&boxv)
+            .into_iter()
+            .filter(|e| !e.is_empty())
+            .collect();
+        // One pass over the forty records, so the list itself says which sets
+        // have something to report rather than leaving it to the editor.
+        let warn_counts: Vec<usize> = self
+            .save
+            .as_ref()
+            .map(|s| {
+                sets.iter()
+                    .map(|set| mhnx_core::myset::warnings(s, slot, set.index).len())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The same yellow the editor uses, so the two read as one signal.
+        let warn_colour = egui::Color32::from_rgb(240, 199, 94);
+        // Land on something editable the first time the tab is opened: an empty
+        // panel on the right looks like the tab has no editor at all.
+        if !self.set_selected.is_some_and(|i| i < sets.len()) {
+            self.set_selected = sets
+                .iter()
+                .find(|s| !s.is_empty())
+                .map(|s| s.index)
+                .or(Some(0));
+        }
+        const PANEL_W: f32 = 430.0;
+        const BLOCK_H: f32 = 430.0;
+        let mut pick: Option<usize> = None;
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, BLOCK_H),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.horizontal_top(|ui| {
+                    let table_w = (width - PANEL_W - 16.0).max(260.0);
+                    ui.vertical(|ui| {
+                        ui.set_width(table_w);
+                        ui.set_height(ui.available_height());
+                        TableBuilder::new(ui)
+                            .id_salt("equipsets")
+                            .striped(true)
+                            .sense(egui::Sense::click())
+                            .column(Column::exact(36.0))
+                            .column(Column::remainder())
+                            .column(Column::exact(46.0))
+                            .column(Column::exact(40.0))
+                            .header(22.0, |mut h| {
+                                for t in ["枠", "名前", "部位", "注意"] {
+                                    h.col(|ui| {
+                                        ui.strong(t);
+                                    });
+                                }
+                            })
+                            .body(|body| {
+                                body.rows(20.0, sets.len(), |mut row| {
+                                    let set = &sets[row.index()];
+                                    row.set_selected(pick.or(self.set_selected) == Some(set.index));
+                                    row.col(|ui| {
+                                        ui.label(format!("{}", set.index));
+                                    });
+                                    row.col(|ui| {
+                                        if set.is_empty() {
+                                            ui.label(egui::RichText::new("（未使用）").weak());
+                                        } else if set.name.trim().is_empty() {
+                                            ui.label(egui::RichText::new("（名前なし）").weak());
+                                        } else {
+                                            ui.label(set.name.clone());
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        let filled = set
+                                            .parts
+                                            .iter()
+                                            .filter(|p| **p != mhnx_core::myset::NONE)
+                                            .count();
+                                        let text = format!(
+                                            "{}/{}",
+                                            filled,
+                                            mhnx_core::myset::EQUIP_SET_PARTS
+                                        );
+                                        if filled == 0 {
+                                            ui.label(egui::RichText::new(text).weak());
+                                        } else {
+                                            ui.label(text);
+                                        }
+                                    });
+                                    row.col(|ui| {
+                                        let n = warn_counts.get(set.index).copied().unwrap_or(0);
+                                        if n == 0 {
+                                            ui.label(egui::RichText::new("—").weak());
+                                        } else {
+                                            ui.label(
+                                                egui::RichText::new(format!("{}", n))
+                                                    .color(warn_colour),
+                                            );
+                                        }
+                                    });
+                                    if row.response().clicked() {
+                                        pick = Some(set.index);
+                                    }
+                                });
+                            });
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_min_width(PANEL_W);
+                        ui.set_max_width(PANEL_W + 60.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("setedit")
+                            .max_height(BLOCK_H - 8.0)
+                            .show(ui, |ui| match pick.or(self.set_selected) {
+                                Some(index) => self.set_edit_panel(ui, index, &sets, &used),
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new("行をクリックすると、ここで編集できます")
+                                            .weak(),
+                                    );
+                                }
+                            });
+                    });
+                });
+            },
+        );
+        if let Some(p) = pick {
+            self.set_selected = Some(p);
+        }
+    }
+
+    /// The editor for one saved equipment set.
+    ///
+    /// Every write goes through the myset helpers: a part moves the index and
+    /// the decoration copy in one call, a colour through set_colour, the name
+    /// through set_name, and the whole record through clear_set. Nothing here
+    /// touches the 136 bytes by hand.
+    fn set_edit_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        sets: &[mhnx_core::myset::EquipSet],
+        used: &[mhnx_core::equip::Equipment],
+    ) {
+        let Some(set) = sets.iter().find(|s| s.index == index).cloned() else {
+            ui.label("そのセットは読めません");
+            return;
+        };
+        let slot = self.slot;
+        // Reported, not repaired: the game loads every one of these, and the
+        // real save holds examples of each. See myset::warnings.
+        let warns = self
+            .save
+            .as_ref()
+            .map(|s| mhnx_core::myset::warnings(s, slot, index))
+            .unwrap_or_default();
+        let warn_colour = egui::Color32::from_rgb(240, 199, 94);
+        ui.label(egui::RichText::new(format!("セット {} の編集", index)).strong());
+        ui.horizontal(|ui| {
+            ui.label("名前");
+            let mut name = set.name.clone();
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut name)
+                        .desired_width(250.0)
+                        .hint_text("セット名"),
+                )
+                .changed()
+            {
+                self.set_name_write(index, &name);
+            }
+        });
+        // The warnings sit directly under the name, where they are seen before
+        // the seven pickers rather than after scrolling past them.
+        ui.add_space(4.0);
+        if warns.is_empty() {
+            ui.label(egui::RichText::new("警告はありません").weak().small());
+        } else {
+            ui.label(
+                egui::RichText::new(format!(
+                    "警告 {} 件（保存はできます。直すかどうかは任せます）",
+                    warns.len()
+                ))
+                .color(warn_colour)
+                .strong(),
+            );
+            for w in &warns {
+                ui.label(egui::RichText::new(format!("・{}", w)).color(warn_colour));
+            }
+        }
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("部位").strong())
+            .on_hover_text(
+                "部位と種別が合わなくても書き込めます（実データに頭へ護石が入ったセットがあります）。\n気になる点は下の警告に出ます。",
+            );
+        let mut action: Option<(usize, u16)> = None;
+        for part in 0..mhnx_core::myset::EQUIP_SET_PARTS {
+            let current = set.parts[part];
+            let found = used.iter().find(|e| e.index as u16 == current);
+            let shown = match (found, current) {
+                (Some(e), _) => format!(
+                    "{} {} 枠{}",
+                    mhnx_core::equip::type_name(e.kind),
+                    mhnx_core::equip::name(e),
+                    current
+                ),
+                (None, mhnx_core::myset::NONE) => String::from("（なし）"),
+                (None, idx) => format!("枠 {} （読めません）", idx),
+            };
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [40.0, 20.0],
+                    egui::Label::new(mhnx_core::myset::PART_NAMES[part]),
+                );
+                let mut picked: Option<u16> = None;
+                egui::ComboBox::from_id_salt(("setpart", part))
+                    .selected_text(shown)
+                    .width(250.0)
+                    .show_ui(ui, |ui| {
+                        let search = &mut self.set_part_search[part];
+                        ui.add(
+                            egui::TextEdit::singleline(search)
+                                .hint_text("装備名・種別・枠番号で絞り込み")
+                                .desired_width(250.0),
+                        );
+                        let needle = search.trim().to_lowercase();
+                        egui::ScrollArea::vertical()
+                            .id_salt(("setpartlist", part))
+                            .max_height(260.0)
+                            .show(ui, |ui| {
+                                for e in used.iter() {
+                                    if !needle.is_empty()
+                                        && !mhnx_core::equip::name(e)
+                                            .to_lowercase()
+                                            .contains(&needle)
+                                        && !mhnx_core::equip::type_name(e.kind)
+                                            .to_lowercase()
+                                            .contains(&needle)
+                                        && !format!("{}", e.index).contains(&needle)
+                                    {
+                                        continue;
+                                    }
+                                    let label = format!(
+                                        "枠 {} {} {} Lv{}",
+                                        e.index,
+                                        mhnx_core::equip::type_name(e.kind),
+                                        mhnx_core::equip::name(e),
+                                        e.level
+                                    );
+                                    if ui
+                                        .selectable_label(current == e.index as u16, label)
+                                        .clicked()
+                                    {
+                                        picked = Some(e.index as u16);
+                                    }
+                                }
+                            });
+                    });
+                if ui
+                    .add_enabled(
+                        current != mhnx_core::myset::NONE,
+                        egui::Button::new("解除"),
+                    )
+                    .on_hover_text("この部位を空にします（装飾品の写しも 0 になります）")
+                    .clicked()
+                {
+                    picked = Some(mhnx_core::myset::NONE);
+                }
+                if let Some(p) = picked {
+                    action = Some((part, p));
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(44.0);
+                let detail = match (found, current) {
+                    (Some(e), _) => format!(
+                        "{}（種別 {}）Lv{}",
+                        mhnx_core::equip::name(e),
+                        e.kind,
+                        e.level
+                    ),
+                    (None, mhnx_core::myset::NONE) => String::from("装備なし"),
+                    (None, idx) => format!("枠 {} は装備ボックスにありません", idx),
+                };
+                ui.label(egui::RichText::new(detail).weak().small());
+                // The set's own copy at +0x38, which is what a mismatch in the
+                // warnings below is measured against. Shown only when it holds
+                // something: seven lines of "—・—・—" is noise, and the empty
+                // case is what the 解除 button beside it already says.
+                let d = set.decos_of(part).unwrap_or([0; 3]);
+                if d.iter().any(|x| *x != 0) {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "セット側の装飾品 {}・{}・{}",
+                            deco_label(d[0]),
+                            deco_label(d[1]),
+                            deco_label(d[2])
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            });
+            ui.add_space(1.0);
+        }
+        if let Some((part, box_index)) = action {
+            if box_index == mhnx_core::myset::NONE {
+                self.set_part_clear(index, part);
+            } else {
+                self.set_part_choose(index, part, box_index);
+            }
+            self.set_part_search[part].clear();
+        }
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("防具の色").strong());
+        let mut colour_action: Option<(usize, [u8; 4])> = None;
+        egui::Grid::new(("setcolour", index))
+            .num_columns(2)
+            .spacing([6.0, 3.0])
+            .show(ui, |ui| {
+                for part in 1..=5usize {
+                    ui.label(mhnx_core::myset::PART_NAMES[part]);
+                    // The game writes alpha 255. The swatch is shown at full
+                    // alpha so a colour left at zero is still visible, and the
+                    // write puts the alpha back the way the game leaves it.
+                    let c = set.colours[part - 1];
+                    let mut rgb = [c[0], c[1], c[2]];
+                    if ui.color_edit_button_srgb(&mut rgb).changed() {
+                        colour_action = Some((part, [rgb[0], rgb[1], rgb[2], 0xFF]));
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some((part, colour)) = colour_action {
+            self.set_colour_write(index, part, colour);
+        }
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("スタイル・狩技（読み取り専用）").strong());
+        let arts = set.arts();
+        egui::Grid::new(("settail", index))
+            .num_columns(2)
+            .spacing([6.0, 3.0])
+            .show(ui, |ui| {
+                ui.label("スタイル");
+                ui.label(format!("{}", set.style()));
+                ui.end_row();
+                ui.label("狩技");
+                ui.label(format!("{} / {} / {}", arts[0], arts[1], arts[2]));
+                ui.end_row();
+            });
+        ui.label(
+            egui::RichText::new(
+                "この 4 バイトは読むだけで、書き換えません（対応が確かめられていないため）。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(8.0);
+        ui.separator();
+        let already_empty = set.name == mhnx_core::myset::EMPTY_NAME
+            && set
+                .parts
+                .iter()
+                .all(|p| *p == mhnx_core::myset::NONE);
+        if ui
+            .add_enabled(!already_empty, egui::Button::new("このセットを空にする"))
+            .on_hover_text("名前・部位・色・装飾品を消し、ゲームが未使用に残す並びにします（確認あり）")
+            .clicked()
+        {
+            self.confirm = Confirm::SetClear(index);
+        }
+    }
+
+    /// Rename a saved equipment set.
+    pub fn set_name_write(&mut self, index: usize, name: &str) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        let ok = mhnx_core::myset::set_name(save, slot, index, name);
+        if ok {
+            self.dirty = true;
+        }
+        ok
+    }
+
+    /// Point one part of a saved set at an equipment box record.
+    ///
+    /// Goes through myset::set_part, which writes the index at +0x2A and the
+    /// decoration copy at +0x38 together. The equipment kind is not checked,
+    /// because the real save holds a set with a talisman in the head slot and
+    /// the game loads it; the warnings list says so instead.
+    pub fn set_part_choose(&mut self, set: usize, part: usize, box_index: u16) -> bool {
+        let slot = self.slot;
+        let name = mhnx_core::myset::PART_NAMES
+            .get(part)
+            .copied()
+            .unwrap_or("?");
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if mhnx_core::myset::set_part(save, slot, set, part, box_index) {
+            self.dirty = true;
+            self.message = format!(
+                "セット {} の{}を枠 {} にしました（装飾品の写しも装備側から写しました）",
+                set, name, box_index
+            );
+            true
+        } else {
+            self.message = format!(
+                "セット {} の{}を枠 {} にできませんでした（空の枠か、装備ボックスの外を指しています）",
+                set, name, box_index
+            );
+            false
+        }
+    }
+
+    /// Empty one part of a saved set: the index goes to NONE and its decoration
+    /// copy to zero in the same write.
+    pub fn set_part_clear(&mut self, set: usize, part: usize) -> bool {
+        let slot = self.slot;
+        let name = mhnx_core::myset::PART_NAMES
+            .get(part)
+            .copied()
+            .unwrap_or("?");
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if mhnx_core::myset::clear_part(save, slot, set, part) {
+            self.dirty = true;
+            self.message = format!(
+                "セット {} の{}を解除しました（装飾品の写しも 0 にしました）",
+                set, name
+            );
+            true
+        } else {
+            self.message = format!("セット {} の{}を解除できませんでした", set, name);
+            false
+        }
+    }
+
+    /// Write one armour colour of a saved set. Parts 1..=5 only: the weapon and
+    /// the talisman have no colour of their own.
+    pub fn set_colour_write(&mut self, set: usize, part: usize, colour: [u8; 4]) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if mhnx_core::myset::set_colour(save, slot, set, part, colour) {
+            self.dirty = true;
+            let name = mhnx_core::myset::PART_NAMES
+                .get(part)
+                .copied()
+                .unwrap_or("?");
+            self.message = format!("セット {} の{}の色を変えました", set, name);
+            true
+        } else {
+            self.message = format!(
+                "セット {} の色を書き換えられませんでした（色を持つのは頭・胴・腕・腰・脚だけです）",
+                set
+            );
+            false
+        }
+    }
+
+    /// Empty a saved set, the way the game leaves a record it never used.
+    /// Destructive, and the caller owns the confirmation.
+    pub fn set_clear(&mut self, index: usize) -> bool {
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if mhnx_core::myset::clear_set(save, slot, index) {
+            self.dirty = true;
+            self.message = format!(
+                "セット {} を空にしました（「上書き保存」で書き出します）",
+                index
+            );
+            true
+        } else {
+            self.message = format!("セット {} は空にできませんでした", index);
+            false
+        }
+    }
+
     fn tab_palico_detail(&mut self, ui: &mut egui::Ui) {
         ui.heading("オトモ")
             ;
@@ -6160,6 +6733,162 @@ mod tests {
         assert_eq!(app.item_clamp(), 1);
         assert_eq!(app.items[1], ItemSlot { id: 3, count: 99 });
         assert!(app.dirty);
+    }
+
+    /// Put one equipment record in a box, the way the equipment tab writes one.
+    fn put_record(app: &mut MhnxEditor, index: usize, kind: u8, id: u16, deco0: u16) {
+        let mut rec = [0u8; mhnx_core::equip::EQUIP_RECORD];
+        rec[0] = kind;
+        rec[2..4].copy_from_slice(&id.to_le_bytes());
+        rec[0x06..0x08].copy_from_slice(&deco0.to_le_bytes());
+        let dst = app
+            .save
+            .as_mut()
+            .and_then(|s| s.equipment_record_mut(0, index))
+            .expect("equipment record");
+        dst.copy_from_slice(&rec);
+    }
+
+    /// One saved equipment set, read back out of the open save.
+    fn set_of(app: &MhnxEditor, index: usize) -> mhnx_core::myset::EquipSet {
+        app.save
+            .as_ref()
+            .and_then(|s| {
+                mhnx_core::myset::equip_sets(s, 0)
+                    .into_iter()
+                    .find(|set| set.index == index)
+            })
+            .expect("the set")
+    }
+
+    /// A part goes in through set_part, which moves the index at +0x2A and the
+    /// decoration copy at +0x38 together: writing only the index is what leaves
+    /// a set describing decorations its equipment does not have.
+    #[test]
+    fn a_set_part_is_written_with_its_decoration_copy() {
+        let dir = Scratch::new("setpart");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        put_record(&mut app, 5, 1, 10, 2640);
+
+        // Start from a record in the shape the game leaves an unused one in.
+        // The empty fixture writes zeros here, and a zero part names box slot 0
+        // rather than NONE, which would be a warning before the first write.
+        let set = 2usize;
+        assert!(app.set_clear(set), "{}", app.message);
+        // A record still called '－－－' with a part filled is its own warning,
+        // so the test names the set the way a user would.
+        assert!(app.set_name_write(set, "検証セット"), "{}", app.message);
+        app.dirty = false;
+
+        assert!(app.set_part_choose(set, 1, 5), "{}", app.message);
+        assert!(app.dirty, "a part write has to mark the save dirty");
+        let got = set_of(&app, set);
+        assert_eq!(got.parts[1], 5);
+        assert_eq!(
+            got.decos_of(1),
+            Some([2640, 0, 0]),
+            "the decoration copy follows the equipment record"
+        );
+        let warns = mhnx_core::myset::warnings(app.save.as_ref().expect("save"), 0, set);
+        assert!(
+            warns.is_empty(),
+            "a part written through set_part must not warn: {:?}",
+            warns
+        );
+
+        // 解除 puts the index back to NONE and the copy to zero.
+        assert!(app.set_part_clear(set, 1), "{}", app.message);
+        let got = set_of(&app, set);
+        assert_eq!(got.parts[1], mhnx_core::myset::NONE);
+        assert_eq!(got.decos_of(1), Some([0, 0, 0]));
+        assert!(app.message.contains("解除しました"), "{}", app.message);
+
+        // A box index that holds nothing cannot be named, so the write is
+        // refused and says so rather than writing a dangling index.
+        app.dirty = false;
+        assert!(!app.set_part_choose(set, 1, 1999));
+        assert!(app.message.contains("できませんでした"), "{}", app.message);
+        assert!(!app.dirty, "a refused write must not dirty the save");
+    }
+
+    /// The sample save holds a set with a talisman in the head slot and the game
+    /// loads it, so a kind that does not fit the part is written and reported,
+    /// never refused.
+    #[test]
+    fn a_set_part_of_the_wrong_kind_is_written_and_reported() {
+        let dir = Scratch::new("setwarn");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        // Kind 6 is a talisman, in the head part.
+        put_record(&mut app, 6, 6, 1, 0);
+
+        assert!(app.set_part_choose(1, 1, 6), "{}", app.message);
+        let got = set_of(&app, 1);
+        assert_eq!(got.parts[1], 6, "the mismatch is stored, not refused");
+
+        let warns = mhnx_core::myset::warnings(app.save.as_ref().expect("save"), 0, 1);
+        assert!(
+            warns.iter().any(|w| w.contains("護石") && w.contains("頭")),
+            "{:?}",
+            warns
+        );
+    }
+
+    /// Name, colour and the whole-record clear all go through the myset
+    /// writers, and an emptied record is byte for byte the one the game leaves.
+    #[test]
+    fn a_set_name_colour_and_clear_go_through_the_core_writers() {
+        let dir = Scratch::new("setwrite");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        put_record(&mut app, 3, 2, 7, 0);
+        app.dirty = false;
+
+        assert!(app.set_name_write(0, "テスト"), "{}", app.message);
+        assert_eq!(set_of(&app, 0).name, "テスト");
+        assert!(app.dirty, "a rename has to mark the save dirty");
+
+        assert!(app.set_colour_write(0, 2, [10, 20, 30, 0xFF]), "{}", app.message);
+        assert_eq!(set_of(&app, 0).colours[1], [10, 20, 30, 0xFF]);
+        // The weapon and the talisman carry no colour of their own.
+        assert!(!app.set_colour_write(0, 0, [9, 9, 9, 0xFF]));
+        assert!(!app.set_colour_write(0, 6, [9, 9, 9, 0xFF]));
+        assert!(app.message.contains("色"), "{}", app.message);
+        assert_eq!(
+            set_of(&app, 0).colours[1],
+            [10, 20, 30, 0xFF],
+            "a refused colour must not land in another part"
+        );
+
+        // The part, the name and the colour all go through one clear.
+        assert!(app.set_part_choose(0, 2, 3), "{}", app.message);
+        assert!(app.set_clear(0), "{}", app.message);
+        let got = set_of(&app, 0);
+        assert_eq!(got.name, mhnx_core::myset::EMPTY_NAME);
+        assert_eq!(
+            got.parts,
+            [mhnx_core::myset::NONE; mhnx_core::myset::EQUIP_SET_PARTS]
+        );
+        assert_eq!(got.tail, mhnx_core::myset::EMPTY_TAIL);
+        assert_eq!(got.colours, [[0u8; 4]; 5]);
+        assert!(got.is_empty());
+        assert!(mhnx_core::myset::warnings(app.save.as_ref().expect("save"), 0, 0).is_empty());
+        assert!(app.message.contains("空にしました"), "{}", app.message);
+
+        // The editor's selection points into one character's records and cannot
+        // survive a reload.
+        app.set_selected = Some(7);
+        app.set_part_search[0].push_str("頭");
+        app.reload_from_save();
+        assert_eq!(app.set_selected, None);
+        assert!(app.set_part_search.iter().all(|s| s.is_empty()));
     }
 }
 

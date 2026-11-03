@@ -60,6 +60,7 @@ pub mod equipops;
 pub mod guildcard;
 pub mod myset;
 pub mod palico;
+pub mod palicogear;
 pub mod equipnames;
 pub mod entries;
 pub mod hbedit;
