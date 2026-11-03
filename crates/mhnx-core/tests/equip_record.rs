@@ -88,6 +88,15 @@ fn clearing_returns_a_record_to_empty() {
 }
 
 #[test]
+fn the_palico_kinds_have_labels() {
+    // The hunter's box stops at 21; the palico box uses 22, 23 and 24.
+    assert_eq!(equip::type_name(22), "オトモ武器");
+    assert_eq!(equip::type_name(23), "オトモ防具(頭)");
+    assert_eq!(equip::type_name(24), "オトモ防具(胴)");
+    assert_eq!(equip::type_name(99), "?");
+}
+
+#[test]
 fn a_blank_record_is_all_zero() {
     assert!(equip::record_is_blank(&[0u8; 36]));
     let mut rec = [0u8; 36];

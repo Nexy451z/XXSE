@@ -144,6 +144,13 @@ pub struct MhnxEditor {
     pub hunt_filter: String,
     /// Filter for the equipment tab.
     pub equip_filter: String,
+    /// Box index of the equipment row the editor on the right is showing.
+    pub equip_selected: Option<usize>,
+    /// Show the empty slots next to the used ones. Off by default: a save has
+    /// 2000 records and only a few hundred of them hold anything.
+    pub equip_show_empty: bool,
+    /// Search text of the three decoration pickers, one per socket.
+    pub equip_deco_search: [String; 3],
     pub item_pick_keep_filter: bool,
     /// Row selected inside the .rem / .sup reward table.
     pub entry_item_sel: Option<usize>,
@@ -218,6 +225,9 @@ impl Default for MhnxEditor {
             hunt_size: Vec::new(),
             hunt_filter: String::new(),
             equip_filter: String::new(),
+            equip_selected: None,
+            equip_show_empty: false,
+            equip_deco_search: [String::new(), String::new(), String::new()],
             item_pick_keep_filter: true,
             entry_item_sel: None,
             charm_filter: String::new(),
@@ -3256,39 +3266,65 @@ impl MhnxEditor {
             }
         });
     }
+    /// The equipment box: the list on the left, the editor for the selected
+    /// record on the right.
+    ///
+    /// Only existing records are edited. Deleting one, or replacing its type or
+    /// id, would move a reference onto a different item (worn gear and every
+    /// My Set hold box indices), and nothing here can check or repair that, so
+    /// those two operations are not offered at all.
     fn tab_equip(&mut self, ui: &mut egui::Ui) {
         ui.heading("装備ボックス");
-        let Some(save) = &self.save else {
-            ui.label("セーブを開くと、装備 2000 枠を一覧できます");
+        if self.save.is_none() {
+            ui.label("セーブを開くと、装備 2000 枠を一覧・編集できます");
             return;
-        };
-        let Some(box_) = save.equipment_box(self.slot) else {
+        }
+        // Copied out of the save once per frame, the way the talisman tab does
+        // it: the table and the editor both read these 72,000 bytes, and
+        // holding &self.save across them would lock the fields the editor
+        // writes while it draws.
+        let boxv: Vec<u8> = self
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_box(self.slot))
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        if boxv.len() < mhnx_core::equip::EQUIP_RECORD {
             ui.label("このスロットには装備ボックスがありません");
             return;
-        };
-        let all = mhnx_core::equip::decode_box(&box_);
-        let used: Vec<_> = all.iter().filter(|e| !e.is_empty()).collect();
-        ui.horizontal(|ui| {
-            ui.label(format!("使用中 {} / {} 枠", used.len(), all.len()));
+        }
+        let all = mhnx_core::equip::decode_box(&boxv);
+        let used = all.iter().filter(|e| !e.is_empty()).count();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("使用中 {} / {} 枠", used, all.len()));
             ui.label("絞り込み");
             ui.add(
                 egui::TextEdit::singleline(&mut self.equip_filter)
-                    .hint_text("名前・種類")
-                    .desired_width(180.0),
+                    .hint_text("名前・種類・枠番号")
+                    .desired_width(160.0),
             );
             if ui.small_button("クリア").clicked() {
                 self.equip_filter.clear();
             }
+            ui.checkbox(&mut self.equip_show_empty, "空き枠を表示")
+                .on_hover_text("既定では使用中の枠だけを一覧します");
+            ui.separator();
+            // One line, by design: this tab edits records, and anything that
+            // would move a reference is out of scope until the check exists.
+            ui.label(egui::RichText::new("削除・差し替えは未対応（編集のみ）").weak().small());
         });
         let needle = self.equip_filter.trim().to_lowercase();
-        let rows: Vec<_> = used
+        let show_empty = self.equip_show_empty;
+        let rows: Vec<_> = all
             .iter()
+            .filter(|e| show_empty || !e.is_empty())
             .filter(|e| {
                 needle.is_empty()
                     || mhnx_core::equip::name(e).to_lowercase().contains(&needle)
                     || mhnx_core::equip::type_name(e.kind)
                         .to_lowercase()
                         .contains(&needle)
+                    || format!("{}", e.index).contains(&needle)
             })
             .collect();
         ui.label(
@@ -3296,40 +3332,334 @@ impl MhnxEditor {
                 .weak()
                 .small(),
         );
-        // Only the rows on screen are built: a save can hold seven hundred
-        // entries and a plain grid laid every one of them out each frame.
-        use egui_extras::{Column, TableBuilder};
-        TableBuilder::new(ui)
-            .id_salt("equiplist")
-            .striped(true)
-            .column(Column::exact(60.0))
-            .column(Column::exact(110.0))
-            .column(Column::remainder())
-            .column(Column::exact(60.0))
-            .header(22.0, |mut h| {
-                for t in ["枠", "種類", "名前", "Lv"] {
-                    h.col(|ui| {
-                        ui.strong(t);
+        // Land on something editable the first time the tab is opened: an
+        // empty panel on the right looks like the tab has no editor at all.
+        if self.equip_selected.is_none() {
+            self.equip_selected = rows.iter().find(|e| !e.is_empty()).map(|e| e.index);
+        }
+        // The editor needs about this much; the list gets what is left.
+        const PANEL_W: f32 = 360.0;
+        let mut pick: Option<usize> = None;
+        ui.horizontal_top(|ui| {
+            let table_w = (ui.available_width() - PANEL_W - 14.0).max(420.0);
+            ui.vertical(|ui| {
+                ui.set_width(table_w);
+                ui.set_height(ui.available_height());
+                // Only the rows on screen are built: a save can hold two
+                // thousand entries and a plain grid laid every one of them out
+                // each frame.
+                TableBuilder::new(ui)
+                    .id_salt("equiplist")
+                    .striped(true)
+                    // Clicking anywhere on the row selects it, not just on the
+                    // 46 point box number.
+                    .sense(egui::Sense::click())
+                    .column(Column::exact(46.0))
+                    .column(Column::exact(70.0))
+                    .column(Column::remainder())
+                    .column(Column::exact(40.0))
+                    .column(Column::exact(132.0))
+                    .header(22.0, |mut h| {
+                        for t in ["枠", "種類", "名前", "Lv", "装飾品"] {
+                            h.col(|ui| {
+                                ui.strong(t);
+                            });
+                        }
+                    })
+                    .body(|body| {
+                        body.rows(20.0, rows.len(), |mut row| {
+                            let e = rows[row.index()];
+                            row.set_selected(pick.or(self.equip_selected) == Some(e.index));
+                            row.col(|ui| {
+                                ui.label(format!("{}", e.index));
+                            });
+                            row.col(|ui| {
+                                ui.label(mhnx_core::equip::type_name(e.kind));
+                            });
+                            row.col(|ui| {
+                                ui.label(mhnx_core::equip::name(e));
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{}", e.level));
+                            });
+                            row.col(|ui| {
+                                let d =
+                                    mhnx_core::equip::Equipment::decorations(e.index, &boxv);
+                                let text = format!(
+                                    "{}・{}・{}",
+                                    deco_label(d[0]),
+                                    deco_label(d[1]),
+                                    deco_label(d[2])
+                                );
+                                // The cell is narrower than three decoration
+                                // names, so the full text lives in the tooltip.
+                                ui.label(text.clone()).on_hover_text(text);
+                            });
+                            if row.response().clicked() {
+                                pick = Some(e.index);
+                            }
+                        });
                     });
-                }
-            })
-            .body(|body| {
-                body.rows(20.0, rows.len(), |mut row| {
-                    let e = rows[row.index()];
-                    row.col(|ui| {
-                        ui.label(format!("{}", e.index));
-                    });
-                    row.col(|ui| {
-                        ui.label(mhnx_core::equip::type_name(e.kind));
-                    });
-                    row.col(|ui| {
-                        ui.label(mhnx_core::equip::name(e));
-                    });
-                    row.col(|ui| {
-                        ui.label(format!("{}", e.level));
-                    });
-                });
             });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_min_width(PANEL_W);
+                ui.set_max_width(PANEL_W + 80.0);
+                match pick.or(self.equip_selected) {
+                    Some(index) => self.equip_edit_panel(ui, index, &boxv),
+                    None => {
+                        ui.label(
+                            egui::RichText::new("行をクリックすると、ここで編集できます").weak(),
+                        );
+                    }
+                }
+            });
+        });
+        if let Some(p) = pick {
+            self.equip_selected = Some(p);
+        }
+    }
+
+    /// The editor for one equipment record, drawn to the right of the list.
+    ///
+    /// It works on a copy of the record and hands it back only when a widget
+    /// moved, so a frame with no click writes nothing. Everything it changes
+    /// goes through the helpers in equip, which own the first 12 bytes and
+    /// never touch +0x0C.. - the part the record's type owns.
+    fn equip_edit_panel(&mut self, ui: &mut egui::Ui, index: usize, box_bytes: &[u8]) {
+        let off = index * mhnx_core::equip::EQUIP_RECORD;
+        let Some(rec0) = box_bytes.get(off..off + mhnx_core::equip::EQUIP_RECORD) else {
+            ui.label("その枠は読めません");
+            return;
+        };
+        let mut rec = [0u8; mhnx_core::equip::EQUIP_RECORD];
+        rec.copy_from_slice(rec0);
+        let Some(eq) = mhnx_core::equip::decode_record(index, &rec) else {
+            return;
+        };
+        ui.label(egui::RichText::new(format!("枠 {} の編集", index)).strong());
+        if eq.kind == 0 {
+            // An empty slot is not something this editor creates: a new record
+            // needs a type and an id from a table whose ranges are not verified
+            // yet, so only existing records are offered here.
+            ui.label(
+                egui::RichText::new("空き枠です（新規追加は未対応）")
+                    .weak()
+                    .small(),
+            );
+            return;
+        }
+        egui::Grid::new("equipinfo")
+            .num_columns(2)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                ui.label("種別");
+                ui.label(mhnx_core::equip::type_name(eq.kind));
+                ui.end_row();
+                ui.label("装備名");
+                ui.label(mhnx_core::equip::name(&eq));
+                ui.end_row();
+                ui.label("装備ID");
+                ui.label(format!("{} (0x{:04X})", eq.id, eq.id));
+                ui.end_row();
+            });
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("レベル");
+            let mut level = eq.level;
+            if ui
+                .add(egui::DragValue::new(&mut level).range(1..=32))
+                .changed()
+            {
+                mhnx_core::equip::set_level(&mut rec, level);
+            }
+            ui.label(egui::RichText::new("1〜32").weak().small());
+        });
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("着せ替え").strong());
+        let mut remove = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("ID");
+            let mut id = eq.transmog;
+            if ui
+                .add(egui::DragValue::new(&mut id).range(0..=0xFFFF).speed(1.0))
+                .changed()
+            {
+                let lv = mhnx_core::equip::decode_record(index, &rec)
+                    .map(|e| e.transmog_level)
+                    .unwrap_or(1);
+                mhnx_core::equip::set_transmog(&mut rec, id, lv);
+            }
+            ui.label("元レベル");
+            let mut tl = eq.transmog_level;
+            if ui
+                .add(egui::DragValue::new(&mut tl).range(1..=32))
+                .changed()
+            {
+                let cur = mhnx_core::equip::decode_record(index, &rec)
+                    .map(|e| e.transmog)
+                    .unwrap_or(0);
+                mhnx_core::equip::set_transmog(&mut rec, cur, tl);
+            }
+            remove = ui
+                .small_button("解除")
+                .on_hover_text("着せ替えID を 0 に戻します")
+                .clicked();
+        });
+        if remove {
+            mhnx_core::equip::set_transmog(&mut rec, 0, 1);
+        }
+        // Read back, so the line describes the record as it is now rather than
+        // as it was when the frame started.
+        let now = mhnx_core::equip::decode_record(index, &rec).unwrap_or(eq);
+        let look = if now.transmog == 0 {
+            String::from("なし（ID 0 で解除）")
+        } else {
+            transmog_label(&now)
+        };
+        ui.label(
+            egui::RichText::new(format!("見た目: {}", look))
+                .weak()
+                .small(),
+        );
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new("装飾品").strong());
+        let decos = mhnx_core::equip::Equipment::decorations(index, &rec);
+        for socket in 0..3 {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}枠目", socket + 1));
+                if let Some(id) = Self::deco_combo(
+                    ui,
+                    socket,
+                    decos[socket],
+                    &mut self.equip_deco_search[socket],
+                ) {
+                    mhnx_core::equip::set_decoration(&mut rec, socket, id);
+                }
+            });
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "先頭 12 バイト（種別・Lv・ID・着せ替え・装飾品）だけを書き換えます。+0x0C 以降の持ち物は保持します。",
+            )
+            .weak()
+            .small(),
+        );
+        if rec[..] != rec0[..] {
+            if self.store_equipment_record(index, &rec) {
+                self.message =
+                    format!("装備 {} を編集しました（「上書き保存」で書き出します）", index);
+            } else {
+                self.message = String::from("装備を書き込めませんでした");
+            }
+        }
+    }
+
+    /// Write one edited 36 byte record back into the open save.
+    ///
+    /// The caller is expected to have changed it through the helpers in equip,
+    /// which only own the first 12 bytes; the record is then copied back
+    /// wholesale because it came from the same place.
+    fn store_equipment_record(&mut self, index: usize, rec: &[u8]) -> bool {
+        if rec.len() < mhnx_core::equip::EQUIP_RECORD {
+            return false;
+        }
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        let Some(dst) = save.equipment_record_mut(slot, index) else {
+            return false;
+        };
+        dst[..mhnx_core::equip::EQUIP_RECORD]
+            .copy_from_slice(&rec[..mhnx_core::equip::EQUIP_RECORD]);
+        self.dirty = true;
+        true
+    }
+
+    /// Searchable decoration picker: item ids 2638 + k, named from gamedata.
+    ///
+    /// Returns the id that was picked, Some(0) for "take it out", and None when
+    /// nothing was clicked this frame.
+    #[cfg(feature = "gamedata")]
+    fn deco_combo(
+        ui: &mut egui::Ui,
+        socket: usize,
+        current: u16,
+        search: &mut String,
+    ) -> Option<u16> {
+        let mut picked: Option<u16> = None;
+        let shown = if current == 0 {
+            String::from("なし")
+        } else {
+            format!("{} ({})", deco_name(current), current)
+        };
+        egui::ComboBox::from_id_salt(("deco", socket))
+            .selected_text(shown)
+            .width(230.0)
+            .show_ui(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(search)
+                        .hint_text("装飾品名で検索")
+                        .desired_width(220.0),
+                );
+                if ui.small_button("クリア").clicked() {
+                    search.clear();
+                }
+                if current != 0 && ui.small_button("外す").clicked() {
+                    picked = Some(0);
+                }
+                let needle = search.trim().to_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt(("deco", socket))
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (i, name) in mhnx_core::gamedata::JWL_NAMES.iter().enumerate() {
+                            let id =
+                                mhnx_core::gamedata::JWL_I_DS.get(i).copied().unwrap_or(0) as u16;
+                            if !needle.is_empty()
+                                && !name.to_lowercase().contains(&needle)
+                                && !format!("{}", id).contains(&needle)
+                            {
+                                continue;
+                            }
+                            let label = if id == 0 {
+                                String::from("なし (0)")
+                            } else {
+                                format!("{:<4} {}", id, name)
+                            };
+                            if ui.selectable_label(current == id, label).clicked() {
+                                picked = Some(id);
+                            }
+                        }
+                    });
+            });
+        if picked.is_some() {
+            search.clear();
+        }
+        picked
+    }
+
+    /// Without the name tables there is nothing to search, so the fallback is
+    /// the raw id.
+    #[cfg(not(feature = "gamedata"))]
+    fn deco_combo(
+        ui: &mut egui::Ui,
+        socket: usize,
+        current: u16,
+        _search: &mut String,
+    ) -> Option<u16> {
+        let _ = socket;
+        let mut id = current;
+        if ui
+            .add(egui::DragValue::new(&mut id).range(0..=0xFFFF).speed(1.0))
+            .changed()
+        {
+            Some(id)
+        } else {
+            None
+        }
     }
 
     fn tab_dlc(&mut self, ui: &mut egui::Ui) {
@@ -4596,6 +4926,15 @@ mod tests {
         path
     }
 
+    /// The same, with the three slot bases filled in: without them every
+    /// character-slot accessor returns None and the equipment box is empty.
+    fn write_a_save_with_slots(dir: &std::path::Path, name: &str) -> PathBuf {
+        let save = mhnx_core::save::empty_switch_save();
+        let path = dir.join(name);
+        std::fs::write(&path, save.to_bytes()).expect("write the fixture");
+        path
+    }
+
     #[test]
     fn stamp_and_size_are_read_out_of_the_name() {
         assert_eq!(
@@ -4751,6 +5090,123 @@ mod tests {
         );
         assert!(app.message.contains("照合OK"), "{}", app.message);
     }
+
+    #[test]
+    fn the_equipment_editor_writes_only_the_bytes_it_owns() {
+        let dir = Scratch::new("equip");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // A weapon carrying a talisman-shaped tail. The sample save holds ten
+        // of these and they are worn, so the editor must leave +0x0C.. alone.
+        let mut rec = [0u8; mhnx_core::equip::EQUIP_RECORD];
+        rec[0] = 7; // 大剣
+        rec[2] = 40; // 装備ID
+        for (i, b) in rec[0x0C..].iter_mut().enumerate() {
+            *b = (i as u8) + 1;
+        }
+        let tail: Vec<u8> = rec[0x0C..].to_vec();
+        {
+            let dst = app
+                .save
+                .as_mut()
+                .and_then(|s| s.equipment_record_mut(0, 5))
+                .expect("record 5");
+            dst.copy_from_slice(&rec);
+        }
+
+        // What the panel hands back after a level, a transmog and one socket.
+        let mut edited = rec;
+        assert!(mhnx_core::equip::set_level(&mut edited, 12));
+        assert!(mhnx_core::equip::set_transmog(&mut edited, 300, 4));
+        assert!(mhnx_core::equip::set_decoration(&mut edited, 1, 2640));
+        app.equip_selected = Some(5);
+        assert!(app.store_equipment_record(5, &edited));
+        assert!(app.dirty, "an edit has to mark the save dirty");
+
+        let save = app.save.as_ref().expect("save");
+        let eq = save.equipment_at(0, 5).expect("record");
+        assert_eq!(eq.kind, 7);
+        assert_eq!(eq.id, 40);
+        assert_eq!(eq.level, 12);
+        assert_eq!(eq.transmog, 300);
+        assert_eq!(eq.transmog_level, 4);
+        let box_bytes = save.equipment_box(0).expect("box");
+        let at = 5 * mhnx_core::equip::EQUIP_RECORD;
+        let got = &box_bytes[at..at + mhnx_core::equip::EQUIP_RECORD];
+        assert_eq!(mhnx_core::equip::Equipment::decorations(5, got), [0, 2640, 0]);
+        assert_eq!(&got[0x0C..], &tail[..], "the tail is not the editor's to touch");
+    }
+
+    #[test]
+    fn the_equipment_editor_refuses_what_it_cannot_write() {
+        let mut app = MhnxEditor::default();
+        // Nothing is open yet.
+        assert!(!app.store_equipment_record(0, &[0u8; mhnx_core::equip::EQUIP_RECORD]));
+        assert!(!app.dirty);
+
+        let dir = Scratch::new("equiprefuse");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        // Past the end of the box, and a slice that is not a record.
+        assert!(!app.store_equipment_record(2000, &[0u8; mhnx_core::equip::EQUIP_RECORD]));
+        assert!(!app.store_equipment_record(0, &[0u8; 3]));
+        assert!(!app.dirty, "a refused write must not make the save look edited");
+    }
+
+    #[test]
+    fn a_decoration_is_named_by_its_item_id() {
+        assert_eq!(deco_label(0), "—");
+        #[cfg(feature = "gamedata")]
+        {
+            assert_eq!(deco_name(2638), "Antidote Jwl 1");
+            assert_eq!(deco_name(2640), "Paralysis Jwl 1");
+            // An id the table does not know still reads back as something.
+            assert_eq!(deco_name(65535), "#65535");
+        }
+    }
+}
+
+/// Name shown for a decoration socket: a dash when it is empty.
+fn deco_label(id: u16) -> String {
+    if id == 0 {
+        String::from("—")
+    } else {
+        deco_name(id)
+    }
+}
+
+/// Decoration name looked up in the generated game data tables.
+fn deco_name(id: u16) -> String {
+    #[cfg(feature = "gamedata")]
+    {
+        let ids = mhnx_core::gamedata::JWL_I_DS;
+        let names = mhnx_core::gamedata::JWL_NAMES;
+        match ids.iter().position(|v| *v as u16 == id) {
+            Some(i) => names
+                .get(i)
+                .map(|s| (*s).to_owned())
+                .unwrap_or_else(|| format!("#{}", id)),
+            None => format!("#{}", id),
+        }
+    }
+    #[cfg(not(feature = "gamedata"))]
+    {
+        format!("#{}", id)
+    }
+}
+
+/// Readable "name Lv n" for the piece a record is transmogged from.
+fn transmog_label(e: &mhnx_core::equip::Equipment) -> String {
+    if e.transmog == 0 {
+        return String::from("—");
+    }
+    let mut look = *e;
+    look.id = e.transmog;
+    format!("{} Lv{}", mhnx_core::equip::name(&look), e.transmog_level)
 }
 
 /// Item name looked up in the generated game data tables.

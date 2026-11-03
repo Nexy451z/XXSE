@@ -3291,7 +3291,7 @@ fn the_console_entry_is_labelled_in_the_list() {
 // ===========================================================================
 
 /// Every Screen variant, so the reachability test cannot miss a new one.
-const AUDIT_SCREENS: [Screen; 24] = [
+const AUDIT_SCREENS: [Screen; 26] = [
     Screen::SaveList,
     Screen::Slots,
     Screen::Char,
@@ -3301,6 +3301,8 @@ const AUDIT_SCREENS: [Screen; 24] = [
     Screen::CharmEdit,
     Screen::SkillPick,
     Screen::Equip,
+    Screen::EquipEdit,
+    Screen::JewelPick,
     Screen::QuestEquip,
     Screen::Hunts,
     Screen::Guild,
@@ -3340,6 +3342,8 @@ fn audit_screen_name(s: Screen) -> &'static str {
         Screen::CharmEdit => "CharmEdit",
         Screen::SkillPick => "SkillPick",
         Screen::Equip => "Equip",
+        Screen::EquipEdit => "EquipEdit",
+        Screen::JewelPick => "JewelPick",
         Screen::QuestEquip => "QuestEquip",
         Screen::Hunts => "Hunts",
         Screen::Guild => "Guild",
@@ -3537,6 +3541,24 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Slots);
 
     press!(Key::Minus);
+    assert_eq!(ed.screen, Screen::Equip);
+    // A opens the equipment form, and Y on a decoration row opens the
+    // decoration picker; both are reachable without writing anything.
+    press!(Key::A);
+    assert_eq!(ed.screen, Screen::EquipEdit);
+    for _ in 0..4 {
+        press!(Key::Down);
+    }
+    assert_eq!(
+        ed.equip_edit.map(|e| e.field),
+        Some(5),
+        "the cursor must land on the second decoration row"
+    );
+    press!(Key::Y);
+    assert_eq!(ed.screen, Screen::JewelPick);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::EquipEdit);
+    press!(Key::B);
     assert_eq!(ed.screen, Screen::Equip);
     press!(Key::L);
     assert_eq!(ed.screen, Screen::Guild);
@@ -4268,7 +4290,7 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
         .collect();
     assert_eq!(
         arms.len(),
-        24,
+        26,
         "arms: {:?}",
         arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     );

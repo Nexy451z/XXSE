@@ -185,6 +185,12 @@ pub fn type_name(kind: u8) -> &'static str {
         19 => "狩猟笛",
         20 => "操虫棍",
         21 => "チャージアックス",
+        // The palico equipment box uses three kinds of its own. They never
+        // appear in the hunter's box, which is why the list stopped at 21, but
+        // the same record shape is used there and a "?" helps nobody.
+        22 => "オトモ武器",
+        23 => "オトモ防具(頭)",
+        24 => "オトモ防具(胴)",
         _ => "?",
     }
 }
@@ -216,6 +222,11 @@ pub fn name(eq: &Equipment) -> &'static str {
             .get(eq.id as usize)
             .copied()
             .unwrap_or("-"),
+        // 22..=24 are palico gear. The names exist (PALICO_WEAPON_NAMES and
+        // friends) but they are a different table family with their own id
+        // mapping, and guessing the mapping would print wrong names rather
+        // than none. The palico box is not shown anywhere yet; when it is, the
+        // mapping is the thing to establish first.
         _ => "-",
     }
 }

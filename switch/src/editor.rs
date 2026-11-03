@@ -784,6 +784,8 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         CharmEdit => "お守り編集",
         SkillPick => "スキルを選ぶ",
         Equip => "装備",
+        EquipEdit => "装備編集",
+        JewelPick => "装飾品を選ぶ",
         QuestEquip => "クエスト装備",
         SaveQuests => "クエスト (セーブ内)",
         ArcList => "クエスト (.arc)",
@@ -847,7 +849,22 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Charms => &[("Y", "新規/編集"), ("L", "新規"), ("A", "削除"), ("X", "保存"), ("B", "戻る")],
         CharmEdit => &[("Y", "スキル選択"), ("</>", "値"), ("A", "保存"), ("B", "戻る")],
         SkillPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
-        Equip => &[("Y", "絞る"), ("X", "クリア"), ("L", "ギルド"), ("R", "オトモ"), ("B", "戻る")],
+        Equip => &[
+            ("A", "編集"),
+            ("Y", "絞る"),
+            ("X", "クリア"),
+            ("L", "ギルド"),
+            ("R", "オトモ"),
+            ("B", "戻る"),
+        ],
+        EquipEdit => &[
+            ("A", "BOXへ反映"),
+            ("</>", "値"),
+            ("Y", "装飾品"),
+            ("X", "刻み"),
+            ("B", "戻る"),
+        ],
+        JewelPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
         QuestEquip => &[("A", "中身を開く/変更"), ("B", "戻る")],
         SaveQuests => &[
             ("A", "編集"),
@@ -937,6 +954,8 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
     } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
         ed.equip_filter = s;
         ed.equip_cursor = 0;
+    } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
+        ed.apply_jewel_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
         if let Some(save) = &mut ed.save {
             let slot = ed.slot;
@@ -1132,6 +1151,8 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("書き出すファイル名（拡張子は自動）", 48)
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
             ("装備名か種類で絞り込み", 60)
+        } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
+            ("装飾品名で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
             ("ギルドカードのコメント", 54)
         } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME

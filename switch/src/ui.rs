@@ -27,7 +27,8 @@ use mhnx_core::check::Severity;
 use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
-    item_name_of, monster_name, Editor, Key, Screen, CHAR_FIELDS, CONSOLE_SAVE, STEPS,
+    decoration_name_of, item_name_of, monster_name, Editor, Key, Screen, CHAR_FIELDS,
+    CONSOLE_SAVE, EQUIP_EDIT_ROWS, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -197,9 +198,13 @@ pub fn section_of(screen: Screen) -> MainSection {
         Screen::SaveList | Screen::Convert | Screen::Options => MainSection::File,
         Screen::Slots | Screen::Char => MainSection::Hunter,
         Screen::Items | Screen::ItemPick => MainSection::Items,
-        Screen::Charms | Screen::CharmEdit | Screen::SkillPick | Screen::Equip | Screen::Sets => {
-            MainSection::Gear
-        }
+        Screen::Charms
+        | Screen::CharmEdit
+        | Screen::SkillPick
+        | Screen::Equip
+        | Screen::EquipEdit
+        | Screen::JewelPick
+        | Screen::Sets => MainSection::Gear,
         Screen::Roster | Screen::Palico | Screen::Hunts | Screen::Guild => {
             MainSection::PalicoRecord
         }
@@ -621,7 +626,7 @@ impl GuiState {
                 let active = match ed.screen {
                     Screen::Charms => 0,
                     Screen::CharmEdit | Screen::SkillPick => 1,
-                    Screen::Equip => 2,
+                    Screen::Equip | Screen::EquipEdit | Screen::JewelPick => 2,
                     Screen::Sets => 3,
                     _ => 0,
                 };
@@ -822,6 +827,7 @@ impl GuiState {
                 }
                 2 => {
                     ed.screen = Screen::Equip;
+                    ed.equip_edit = None;
                     ed.equip_cursor = 0;
                 }
                 _ => {
@@ -970,7 +976,10 @@ impl GuiState {
     pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
         // Picker screens use L/R for fast ±10 page jump; EVERY other screen uses L/R for Sub-Tab switching!
         if matches!(key, Key::L | Key::R) {
-            if matches!(ed.screen, Screen::ItemPick | Screen::SkillPick) {
+            if matches!(
+                ed.screen,
+                Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
+            ) {
                 let d = if key == Key::Right || key == Key::R { 10 } else { -10 };
                 scroll_active_cursor(ed, d);
                 return;
@@ -980,7 +989,12 @@ impl GuiState {
         }
 
         // Global X = QuickSave (except on ItemPick / SkillPick where X clears search filter)
-        if key == Key::X && !matches!(ed.screen, Screen::ItemPick | Screen::SkillPick) {
+        if key == Key::X
+            && !matches!(
+                ed.screen,
+                Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
+            )
+        {
             self.apply_action(ed, UiAction::QuickSave);
             return;
         }
@@ -2018,6 +2032,8 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::ItemPick => ed.item_pick_cursor,
         Screen::SkillPick => ed.skill_pick_cursor,
         Screen::Equip => ed.equip_cursor,
+        Screen::EquipEdit => ed.equip_edit.map(|e| e.field).unwrap_or(0),
+        Screen::JewelPick => ed.jewel_pick_cursor,
         Screen::Hunts => ed.hunt_cursor,
         Screen::Guild => ed.guild_field,
         Screen::Roster => ed.roster_cursor,
@@ -2057,6 +2073,8 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::CharmEdit => 7,
         Screen::SkillPick => ed.skill_pick_matches().len(),
         Screen::Equip => ed.equipment().len(),
+        Screen::EquipEdit => EQUIP_EDIT_ROWS,
+        Screen::JewelPick => ed.jewel_pick_matches().len(),
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => 3,
         Screen::Roster => ed.palicos().len(),
@@ -2142,6 +2160,13 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         Screen::ItemPick => ed.item_pick_cursor = clamped,
         Screen::SkillPick => ed.skill_pick_cursor = clamped,
         Screen::Equip => ed.equip_cursor = clamped,
+        Screen::EquipEdit => {
+            if let Some(mut ee) = ed.equip_edit {
+                ee.field = clamped;
+                ed.equip_edit = Some(ee);
+            }
+        }
+        Screen::JewelPick => ed.jewel_pick_cursor = clamped,
         Screen::Hunts => ed.hunt_cursor = clamped,
         Screen::Guild => ed.guild_field = clamped,
         Screen::Roster => ed.roster_cursor = clamped,
@@ -2219,6 +2244,37 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
                     }
                 }
             }
+        }
+        // [MAX] on the equipment form is per row: the level goes to its
+        // ceiling, a decoration is taken out, and the two id rows have no
+        // maximum to jump to.
+        Screen::EquipEdit => {
+            let Some(mut ee) = ed.equip_edit else {
+                return;
+            };
+            match idx {
+                1 => {
+                    ee.level = 32;
+                    ed.message = String::from("レベルを 32 にしました（A で書き込み）");
+                }
+                2 => {
+                    ee.transmog_id = 0;
+                    ed.message = String::from("着せ替えIDを 0（未設定）にしました（A で書き込み）");
+                }
+                3 => {
+                    ee.transmog_level = 32;
+                    ed.message = String::from("着せ替え元Lvを 32 にしました（A で書き込み）");
+                }
+                4..=6 => {
+                    ee.decorations[idx - 4] = 0;
+                    ed.message = format!("装飾品{} を外しました（A で書き込み）", idx - 3);
+                }
+                _ => {
+                    ed.message = String::from("この行に最大値はありません");
+                    return;
+                }
+            }
+            ed.equip_edit = Some(ee);
         }
         Screen::QuestEquip => {
             if !ed.qe_open {
@@ -2350,6 +2406,19 @@ fn trigger_quick_save(ed: &mut Editor) {
                 }
             } else if ed.save.is_some() {
                 ed.install_into_save();
+                let prev_screen = ed.screen;
+                let prev_cursor = ed.cursor;
+                ed.screen = Screen::Char;
+                ed.input(Key::A);
+                ed.screen = prev_screen;
+                ed.cursor = prev_cursor;
+            }
+        }
+        // X on the equipment form applies it first, so the shortcut can never
+        // save a box the form has not been written into yet.
+        Screen::EquipEdit => {
+            ed.input(Key::A);
+            if ed.save.is_some() {
                 let prev_screen = ed.screen;
                 let prev_cursor = ed.cursor;
                 ed.screen = Screen::Char;
@@ -2731,6 +2800,13 @@ impl GuiState {
             Screen::CharmEdit => {
                 "[A] BOXへ反映  [▲/▼] 行  [◀/▶] 値  [Y] スキル選択  [X] 刻み  [B] 戻る"
             }
+            Screen::Equip => "[A] 編集  [▲/▼] 行  [Y] 絞る  [X] クリア  [B] 戻る",
+            Screen::EquipEdit => {
+                "[A] BOXへ反映  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品選択  [X] 保存  [B] 戻る"
+            }
+            Screen::JewelPick => {
+                "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [▲/▼] 行  [B] 戻る"
+            }
             Screen::Options => "[◀/▶] 値変更  [Y] 直近スナップショットへ戻す  [X] 保存  [B] 戻る",
             Screen::Roster => "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [L/R] サブタブ  [X] 保存",
             Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [L/R] サブタブ  [X] 保存",
@@ -2772,6 +2848,8 @@ impl GuiState {
             Screen::Charms => self.draw_charms(c, ed),
             Screen::CharmEdit => self.draw_charm_edit(c, ed),
             Screen::Equip => self.draw_equip(c, ed),
+            Screen::EquipEdit => self.draw_equip_edit(c, ed),
+            Screen::JewelPick => self.draw_jewel_pick(c, ed),
             Screen::Sets => self.draw_sets(c, ed),
             Screen::Roster => self.draw_roster(c, ed),
             Screen::Palico => self.draw_palico(c, ed),
@@ -4039,15 +4117,153 @@ impl GuiState {
                 tname.to_string(),
             ));
         }
-        self.draw_adaptive_rows(
+        // The whole screen edits existing records only. Deleting, swapping and
+        // adding one moves what the worn slots and the saved sets point at, so
+        // those flows are left out and the limit is stated instead of hidden.
+        let notice = alloc::vec![String::from(
+            "削除・差し替え・新規追加は未対応（既存レコードの編集のみ）",
+        )];
+        self.draw_adaptive_rows_warn(
             c,
             ed,
             "装備BOX",
-            "",
             &rows,
             ed.equip_cursor.min(rows.len().saturating_sub(1)),
             false,
-            "選択",
+            "編集",
+            &notice,
+        );
+    }
+
+    /// Seven-row form for one equipment record, the same shape as the talisman
+    /// form: one row per field, the value on the right, the hint in the meta
+    /// column, so no row needs two lines and nothing can overlap.
+    fn draw_equip_edit(&mut self, c: &mut Canvas, ed: &Editor) {
+        let Some(ee) = ed.equip_edit else {
+            return;
+        };
+        let eq = ed
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_at(ed.slot, ee.index));
+        let kind = eq.map(|q| q.kind).unwrap_or(0);
+        let ename = eq
+            .as_ref()
+            .map(|q| mhnx_core::equip::name(q).to_string())
+            .unwrap_or_default();
+        let deco = |sock: usize| -> alloc::string::String {
+            let id = ee.decorations[sock];
+            if id == 0 {
+                String::from("なし")
+            } else {
+                decoration_name_of(id)
+            }
+        };
+        let deco_id = |sock: usize| -> alloc::string::String {
+            format!("◀ ▶ で切替 / ID {}", ee.decorations[sock])
+        };
+
+        let rows = alloc::vec![
+            (
+                0,
+                String::from("装備枠"),
+                format!("◀ ▶ で移動 / {} {}", mhnx_core::equip::type_name(kind), ename),
+                format!("#{:04}", ee.index),
+                String::from("#01"),
+            ),
+            (
+                1,
+                String::from("レベル"),
+                String::from("1 〜 32"),
+                format!("{}", ee.level),
+                String::from("#02"),
+            ),
+            (
+                2,
+                String::from("着せ替えID"),
+                String::from("0 = 着せ替えなし"),
+                format!("{}", ee.transmog_id),
+                String::from("#03"),
+            ),
+            (
+                3,
+                String::from("着せ替え元レベル"),
+                String::from("1 〜 32"),
+                format!("{}", ee.transmog_level),
+                String::from("#04"),
+            ),
+            (
+                4,
+                String::from("装飾品1"),
+                deco_id(0),
+                deco(0),
+                String::from("#05"),
+            ),
+            (
+                5,
+                String::from("装飾品2"),
+                deco_id(1),
+                deco(1),
+                String::from("#06"),
+            ),
+            (
+                6,
+                String::from("装飾品3"),
+                deco_id(2),
+                deco(2),
+                String::from("#07"),
+            ),
+        ];
+
+        let notice = alloc::vec![String::from(
+            "削除・差し替え・新規追加は未対応（既存レコードの編集のみ）",
+        )];
+
+        // [A] writes the form into the box; the save file is written with X,
+        // the same split the talisman form uses.
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            "装備編集",
+            &rows,
+            ee.field.min(EQUIP_EDIT_ROWS - 1),
+            true,
+            "BOXへ反映",
+            &notice,
+        );
+    }
+
+    /// Decoration name picker, opened from the equipment form with [Y].
+    fn draw_jewel_pick(&mut self, c: &mut Canvas, ed: &Editor) {
+        let matches = ed.jewel_pick_matches();
+        let mut rows = Vec::with_capacity(matches.len());
+        for (i, &id) in matches.iter().enumerate() {
+            rows.push((
+                i,
+                decoration_name_of(id),
+                if id == 0 {
+                    String::from("空きスロットに戻す")
+                } else {
+                    format!("Decoration ID: {}", id)
+                },
+                String::new(),
+                format!("{:04}", id),
+            ));
+        }
+        let hdr = if ed.jewel_pick_filter.is_empty() {
+            String::from("装飾品選択")
+        } else {
+            format!("装飾品選択 (検索: {})", ed.jewel_pick_filter)
+        };
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            &hdr,
+            "",
+            &rows,
+            ed.jewel_pick_cursor.min(rows.len().saturating_sub(1)),
+            false,
+            "決定",
         );
     }
 
