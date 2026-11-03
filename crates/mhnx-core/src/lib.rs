@@ -58,7 +58,15 @@ pub mod equip;
 pub mod equiprefs;
 /// Adding, replacing and clearing equipment records.
 pub mod equipops;
+/// Guild card awards.
+pub mod awards;
 pub mod guildcard;
+/// Quest progress bit maps.
+pub mod questprogress;
+/// Village requests.
+pub mod requests;
+/// Names that live in the user's romfs, not in this repository.
+pub mod romfstables;
 pub mod myset;
 pub mod palico;
 pub mod palicogear;
