@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 
 use crate::crc::name_hash;
 use crate::charm;
+use crate::equip;
 use crate::dlcats;
 use crate::itembox::{self, ItemSlot, ITEM_BOX_SIZE};
 use crate::Error;
@@ -795,6 +796,25 @@ impl Save {
         let r = self.slot_field(slot, OFF_EQUIPMENT_BOX, EQUIPMENT_BOX_SIZE)?;
         self.body.get(r)
     }
+    /// One decoded equipment record.
+    pub fn equipment_at(&self, slot: usize, index: usize) -> Option<equip::Equipment> {
+        let b = self.equipment_box(slot)?;
+        let o = index.checked_mul(equip::EQUIP_RECORD)?;
+        let rec = b.get(o..o + equip::EQUIP_RECORD)?;
+        equip::decode_record(index, rec)
+    }
+
+    /// One equipment record, mutable, for the editing helpers in equip.
+    pub fn equipment_record_mut(
+        &mut self,
+        slot: usize,
+        index: usize,
+    ) -> Option<&mut [u8]> {
+        let b = self.equipment_box_mut(slot)?;
+        let o = index.checked_mul(equip::EQUIP_RECORD)?;
+        b.get_mut(o..o + equip::EQUIP_RECORD)
+    }
+
     /// Mutable raw equipment box.
     pub fn equipment_box_mut(&mut self, slot: usize) -> Option<&mut [u8]> {
         let r = self.slot_field_mut(slot, OFF_EQUIPMENT_BOX, EQUIPMENT_BOX_SIZE)?;

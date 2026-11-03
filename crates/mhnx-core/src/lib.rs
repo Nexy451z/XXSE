@@ -53,6 +53,8 @@ pub mod dlc_bundle;
 pub mod dlc_bundle;
 pub mod dlcats;
 pub mod equip;
+/// Who points at an equipment record, before anything clears it.
+pub mod equiprefs;
 pub mod guildcard;
 pub mod myset;
 pub mod palico;

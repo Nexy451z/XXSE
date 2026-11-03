@@ -99,6 +99,67 @@ pub fn decode_record(index: usize, rec: &[u8]) -> Option<Equipment> {
     })
 }
 
+
+/// Rewrite the level field, keeping the type and the transmog level.
+///
+/// The level is stored minus one in five bits, so it runs 1..=32. A level of
+/// zero is not a value the game writes; the caller is clamped to 1.
+pub fn set_level(rec: &mut [u8], level: u16) -> bool {
+    if rec.len() < EQUIP_RECORD {
+        return false;
+    }
+    let level = level.clamp(1, 32);
+    let mut head = u16::from_le_bytes([rec[0], rec[1]]);
+    head &= !(0x1F << 5);
+    head |= (level - 1) << 5;
+    rec[..2].copy_from_slice(&head.to_le_bytes());
+    true
+}
+
+/// Rewrite the transmog id and its source level.
+pub fn set_transmog(rec: &mut [u8], id: u16, source_level: u16) -> bool {
+    if rec.len() < EQUIP_RECORD {
+        return false;
+    }
+    let mut head = u16::from_le_bytes([rec[0], rec[1]]);
+    head &= !(0x1F << 10);
+    head |= (source_level.clamp(1, 32) - 1) << 10;
+    rec[..2].copy_from_slice(&head.to_le_bytes());
+    rec[0x04..0x06].copy_from_slice(&id.to_le_bytes());
+    true
+}
+
+/// Rewrite one of the three decoration sockets. Zero empties it.
+pub fn set_decoration(rec: &mut [u8], socket: usize, id: u16) -> bool {
+    if rec.len() < EQUIP_RECORD || socket >= 3 {
+        return false;
+    }
+    let at = 0x06 + socket * 2;
+    rec[at..at + 2].copy_from_slice(&id.to_le_bytes());
+    true
+}
+
+/// Number of decoration sockets that hold something.
+pub fn socketed(rec: &[u8]) -> usize {
+    Equipment::decorations(0, rec)
+        .iter()
+        .filter(|d| **d != 0)
+        .count()
+}
+
+/// Zero a whole record, returning it to the empty state.
+///
+/// The caller is responsible for making sure nothing points at it: an
+/// equipped item and a saved set both hold box indices, and a dangling one is
+/// not something this library can repair.
+pub fn clear(rec: &mut [u8]) -> bool {
+    if rec.len() < EQUIP_RECORD {
+        return false;
+    }
+    rec[..EQUIP_RECORD].fill(0);
+    true
+}
+
 /// Name of the equipment type, in Japanese.
 pub fn type_name(kind: u8) -> &'static str {
     match kind {

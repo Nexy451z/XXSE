@@ -47,6 +47,47 @@ fn decorations_are_three_u16s_and_zero_means_empty() {
 }
 
 #[test]
+fn setting_the_level_leaves_the_type_and_the_transmog_alone() {
+    let mut rec = record(4, 3, 6);
+    assert!(equip::set_level(&mut rec, 9));
+    let e = equip::decode_record(0, &rec).unwrap();
+    assert_eq!(e.kind, 4, "the type must not move");
+    assert_eq!(e.level, 9);
+    assert_eq!(e.transmog_level, 7, "the transmog level must not move");
+}
+
+#[test]
+fn the_level_is_clamped_to_the_range_the_field_holds() {
+    let mut rec = record(1, 0, 0);
+    assert!(equip::set_level(&mut rec, 0));
+    assert_eq!(equip::decode_record(0, &rec).unwrap().level, 1, "zero clamps up");
+    assert!(equip::set_level(&mut rec, 99));
+    assert_eq!(equip::decode_record(0, &rec).unwrap().level, 32, "and the top clamps down");
+}
+
+#[test]
+fn decorations_can_be_written_one_socket_at_a_time() {
+    let mut rec = record(1, 1, 0);
+    assert!(equip::set_decoration(&mut rec, 0, 2638));
+    assert!(equip::set_decoration(&mut rec, 2, 2640));
+    assert_eq!(equip::Equipment::decorations(0, &rec), [2638, 0, 2640]);
+    assert_eq!(equip::socketed(&rec), 2);
+    // Emptying one leaves the others alone.
+    assert!(equip::set_decoration(&mut rec, 0, 0));
+    assert_eq!(equip::Equipment::decorations(0, &rec), [0, 0, 2640]);
+    // A fourth socket does not exist.
+    assert!(!equip::set_decoration(&mut rec, 3, 1));
+}
+
+#[test]
+fn clearing_returns_a_record_to_empty() {
+    let mut rec = record(2, 5, 0);
+    rec[0x06..0x08].copy_from_slice(&2639u16.to_le_bytes());
+    assert!(equip::clear(&mut rec));
+    assert!(equip::record_is_blank(&rec));
+}
+
+#[test]
 fn a_blank_record_is_all_zero() {
     assert!(equip::record_is_blank(&[0u8; 36]));
     let mut rec = [0u8; 36];
