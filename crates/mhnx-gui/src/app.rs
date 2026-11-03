@@ -237,6 +237,78 @@ pub struct SnapshotEntry {
     pub size: u64,
 }
 
+/// What a snapshot is compared with.
+///
+/// The reference editor can compare two snapshots; this one always starts from
+/// a snapshot, and the other side is either the save the editor holds now or
+/// another snapshot in the same folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareSide {
+    /// The save held now, with the edits that have not been written yet: what
+    /// 上書き保存 would put on disk.
+    Current,
+    /// Another file in the same `snapshots` folder.
+    Snapshot(String),
+}
+
+impl CompareSide {
+    /// What the comparison window calls it.
+    pub fn label(&self) -> String {
+        match self {
+            CompareSide::Current => String::from("現在のセーブ（未保存の編集を含む）"),
+            CompareSide::Snapshot(name) => format!("スナップショット {}", name),
+        }
+    }
+}
+
+/// A read-only comparison of one snapshot with the save held now, or with
+/// another snapshot.
+///
+/// Nothing here is written: the two files are read, diffed with the same
+/// [diff_ranges] the pre-save review uses, and shown in the same wording.
+pub struct SnapshotCompare {
+    /// Snapshot the comparison starts from, by file name.
+    pub left: String,
+    /// What it is compared with.
+    pub right: CompareSide,
+    /// Size of the snapshot file.
+    pub left_len: usize,
+    /// Size of the other side.
+    pub right_len: usize,
+    /// What differs.
+    pub diff: WriteDiff,
+}
+
+impl SnapshotCompare {
+    /// The body of the comparison window.
+    ///
+    /// Same sections as [MhnxEditor::review_text]: the feature level summary
+    /// first, then the byte ranges, so a comparison reads like a review of the
+    /// write that would take one side to the other.
+    pub fn text(&self) -> String {
+        // A save that differs in hundreds of places would push everything else
+        // out of the window.
+        const SHOWN: usize = 12;
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("比較元: スナップショット {}", self.left));
+        lines.push(format!("比較先: {}", self.right.label()));
+        lines.push(String::new());
+        let size = if self.left_len == self.right_len {
+            format!("（サイズは {} バイトのまま）", self.left_len)
+        } else {
+            format!("（サイズ {} → {} バイト）", self.left_len, self.right_len)
+        };
+        lines.push(format!("{} バイトが違います{}。", self.diff.changed, size));
+        lines.push(String::from("+0x… はその機能の先頭からの位置です。"));
+        lines.extend(diff_sections(&self.diff, SHOWN));
+        lines.push(String::new());
+        lines.push(String::from(
+            "この比較は読み取り専用です（どちらのファイルも書き換えません）。",
+        ));
+        lines.join("\n")
+    }
+}
+
 /// What a file looked like the last time this editor read or wrote it.
 ///
 /// The path is kept with the fingerprint on purpose: a save can be written
@@ -860,6 +932,35 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
     out
 }
 
+/// The two sections a difference is printed as.
+///
+/// Shared by the pre-save review and the snapshot comparison so the two read
+/// the same: the feature level summary first, then the named byte ranges.
+/// `shown` caps the ranges so a difference in hundreds of places cannot push
+/// the rest of a dialog out of the window.
+pub fn diff_sections(diff: &WriteDiff, shown: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    if !diff.summary.is_empty() {
+        lines.push(String::new());
+        lines.push(String::from("■ 変更される内容"));
+        for line in &diff.summary {
+            lines.push(format!("・{}", line));
+        }
+    }
+    lines.push(String::new());
+    lines.push(String::from("■ 変更される範囲"));
+    if diff.ranges.is_empty() {
+        lines.push(String::from("・特定できる違いはありません"));
+    }
+    for range in diff.ranges.iter().take(shown) {
+        lines.push(format!("・{}", range.line()));
+    }
+    if diff.ranges.len() > shown {
+        lines.push(format!("・ほか {} 件", diff.ranges.len() - shown));
+    }
+    lines
+}
+
 /// One received guild card, as the ギルド tab lists it.
 ///
 /// The card itself stays compressed in the save; this is only what the list
@@ -1174,6 +1275,13 @@ pub struct MhnxEditor {
     // ---- snapshots ----
     /// Snapshots next to the open save, newest first.
     pub snapshots: Vec<SnapshotEntry>,
+    /// A snapshot comparison that is open. Read-only: both files are only
+    /// read, and nothing in it is ever written back.
+    pub compare: Option<SnapshotCompare>,
+    /// Set by Ctrl+F and consumed by the current tab's filter box on the same
+    /// frame, so the cursor lands there once and a later frame does not take
+    /// the focus back from wherever the user clicked.
+    pub focus_filter: bool,
 
     // ---- progress (進行状況) ----
     /// romfs folder the user typed or picked. Nothing is read from it until
@@ -1312,6 +1420,8 @@ impl Default for MhnxEditor {
             card_selected: None,
             scroll_to_cards: 0,
             snapshots: Vec::new(),
+            compare: None,
+            focus_filter: false,
             romfs_path: String::new(),
             romfs_status: String::new(),
             romfs_dir: None,
@@ -1362,6 +1472,9 @@ impl MhnxEditor {
                 // before this one; putting one back would replace this save with
                 // another character's data.
                 self.undo.clear();
+                // A comparison names snapshots of the file that was open, so it
+                // means nothing against this one.
+                self.compare = None;
                 self.message = if mhgu {
                     format!(
                         "読み込みましたが MHGU のセーブです: {}（このツールは MHXX 用なので保存できません）",
@@ -1590,6 +1703,86 @@ impl MhnxEditor {
         // is newest first.
         found.sort_by(|a, b| b.name.cmp(&a.name));
         self.snapshots = found;
+    }
+
+    /// Compare a snapshot with the save held now, or with another snapshot.
+    ///
+    /// The audit asked for the comparison the reference editor has: what a
+    /// snapshot differs in, named the same way the pre-save review names a
+    /// write. `right` is None for 「現在のセーブ」 (the working copies folded in,
+    /// i.e. what 上書き保存 would write) and Some(name) for a second snapshot.
+    ///
+    /// Only reads both files: the snapshot folder and the save on disk are
+    /// left exactly as they are, so a comparison can never damage either side.
+    pub fn compare_snapshot(&mut self, left: String, right: Option<String>) {
+        let Some(path) = self.save_path.clone() else {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        };
+        let dir = Self::snapshot_dir(&path);
+        let left_bytes = match std::fs::read(dir.join(&left)) {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = format!("スナップショットを読めません: {}: {}", left, e);
+                return;
+            }
+        };
+        // The layout names offsets of a parsed save; without one the ranges
+        // could not be worded at all.
+        let left_save = match Save::from_bytes(&left_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                self.message = format!("スナップショット {} はセーブとして読めません: {}", left, e);
+                return;
+            }
+        };
+        let (side, right_bytes) = match right {
+            None => match self.planned_save() {
+                Some(save) => (CompareSide::Current, save.to_bytes()),
+                None => {
+                    self.message = String::from("比較するセーブがありません");
+                    return;
+                }
+            },
+            Some(name) => {
+                let bytes = match std::fs::read(dir.join(&name)) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.message = format!("スナップショットを読めません: {}: {}", name, e);
+                        return;
+                    }
+                };
+                (CompareSide::Snapshot(name), bytes)
+            }
+        };
+        let header = if left_save.kind().has_header() {
+            mhnx_core::save::SWITCH_HEADER_SIZE
+        } else {
+            0
+        };
+        let (changed, ranges) = diff_ranges(&left_bytes, &right_bytes, header, &left_save);
+        // The summary needs both sides to be saves of the same kind: a 3DS
+        // snapshot against a Switch save has no character slots to compare, so
+        // the ranges stand alone, exactly as they do in the review.
+        let summary = match Save::from_bytes(&right_bytes) {
+            Ok(other) if other.kind() == left_save.kind() => {
+                diff_summary(&ranges, &left_save, &other)
+            }
+            _ => Vec::new(),
+        };
+        self.compare = Some(SnapshotCompare {
+            left_len: left_bytes.len(),
+            right_len: right_bytes.len(),
+            left,
+            right: side,
+            diff: WriteDiff {
+                changed,
+                summary,
+                ranges,
+            },
+        });
+        let changed = self.compare.as_ref().map(|c| c.diff.changed).unwrap_or(0);
+        self.message = format!("スナップショットと比べました: {} バイトの違い", changed);
     }
 
     // ---------------------------------------------------- writing, verified
@@ -2016,21 +2209,7 @@ impl MhnxEditor {
             review.diff.changed, size
         ));
         lines.push(String::from("+0x… はその機能の先頭からの位置です。"));
-        if !review.diff.summary.is_empty() {
-            lines.push(String::new());
-            lines.push(String::from("■ 変更される内容"));
-            for line in &review.diff.summary {
-                lines.push(format!("・{}", line));
-            }
-        }
-        lines.push(String::new());
-        lines.push(String::from("■ 変更される範囲"));
-        for range in review.diff.ranges.iter().take(SHOWN) {
-            lines.push(format!("・{}", range.line()));
-        }
-        if review.diff.ranges.len() > SHOWN {
-            lines.push(format!("・ほか {} 件", review.diff.ranges.len() - SHOWN));
-        }
+        lines.extend(diff_sections(&review.diff, SHOWN));
         lines.push(String::new());
         lines.push(String::from("この内容で保存しますか？"));
         lines.push(String::from(
@@ -2663,17 +2842,10 @@ impl eframe::App for MhnxEditor {
         // The hooks main.rs does not know about are resolved here; see
         // apply_launch_env.
         self.apply_launch_env();
-        // Ctrl+Z takes back the last edit of whichever tab made it. A text
-        // field keeps its own Ctrl+Z while it has focus, and a dialog is
-        // answering a question that undo must not race, so both are skipped.
-        if matches!(self.confirm, Confirm::None)
-            && !ctx.wants_keyboard_input()
-            && ctx.input(|i| {
-                i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z)
-            })
-        {
-            self.undo_last();
-        }
+        // The keyboard shortcuts, in one place: Ctrl+S / Ctrl+O / Ctrl+Z /
+        // Ctrl+F. A text field keeps its own keys while it has focus, and a
+        // dialog is answering a question the shortcuts must not race.
+        self.keyboard_shortcuts(ctx);
         // Closing the window with unwritten edits used to lose them silently.
         if ctx.input(|i| i.viewport().close_requested()) && self.dirty && !self.discard_ok {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -2687,6 +2859,9 @@ impl eframe::App for MhnxEditor {
         self.tab_bar(ctx);
         self.side_panel(ctx);
         self.bottom_bar(ctx);
+        // A window rather than a dialog: it stays open while the editor behind
+        // it is looked at, and the side panel can switch what it compares.
+        self.compare_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // These tabs stack several sections and could grow past the
@@ -2712,6 +2887,9 @@ impl eframe::App for MhnxEditor {
             }
         });
 
+        // A Ctrl+F request the tab did not consume (an empty list draws no
+        // filter at all) must not take the focus on some later frame.
+        self.focus_filter = false;
         self.drive_screenshot(ctx);
     }
 }
@@ -2775,19 +2953,133 @@ impl MhnxEditor {
 }
 
 impl MhnxEditor {
+    /// The shortcuts the window answers, in the order the top bar lists them.
+    ///
+    /// One table so the line on screen and the test that reads it cannot drift
+    /// apart: a key added here is listed and tested without a second edit.
+    const SHORTCUTS: &'static [(&'static str, &'static str)] = &[
+        ("Ctrl+S", "上書き保存"),
+        ("Ctrl+O", "セーブを開く"),
+        ("Ctrl+Z", "元に戻す"),
+        ("Ctrl+F", "現在のタブの絞り込みへ"),
+    ];
+
+    /// The one-line list of shortcuts drawn at the top of the window.
+    fn shortcut_line() -> String {
+        let parts: Vec<String> = Self::SHORTCUTS
+            .iter()
+            .map(|(key, what)| format!("{} {}", key, what))
+            .collect();
+        format!("ショートカット: {}", parts.join(" / "))
+    }
+
+    /// Whether the tab on screen has a filter box for Ctrl+F to reach.
+    fn tab_has_filter(&self) -> bool {
+        matches!(
+            self.tab,
+            Tab::Items
+                | Tab::Quest
+                | Tab::Dlc
+                | Tab::Charm
+                | Tab::Equip
+                | Tab::Hunts
+                | Tab::Progress
+                | Tab::Palico
+        )
+    }
+
+    /// Every keyboard shortcut the window answers, fired once per press.
+    ///
+    /// Skipped while a text field has the keyboard (Ctrl+S halfway through
+    /// typing a name must not save) and while a dialog waits for an answer.
+    fn keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        if !matches!(self.confirm, Confirm::None) || ctx.wants_keyboard_input() {
+            return;
+        }
+        let (save, open, undo, find) = ctx.input(|i| {
+            let command = i.modifiers.command && !i.modifiers.shift;
+            (
+                command && i.key_pressed(egui::Key::S),
+                command && i.key_pressed(egui::Key::O),
+                command && i.key_pressed(egui::Key::Z),
+                command && i.key_pressed(egui::Key::F),
+            )
+        });
+        if save {
+            // The very path the button takes: the safety check and the review
+            // both run, so the keyboard cannot be a way around them.
+            match self.save_path.clone() {
+                Some(p) => self.write_current(p),
+                None => self.message = String::from("先にセーブを開いてください"),
+            }
+        }
+        if open {
+            self.pick_and_open_save();
+        }
+        if undo {
+            self.undo_last();
+        }
+        if find {
+            self.focus_current_filter();
+        }
+    }
+
+    /// The セーブを開く dialog, shared by the button and Ctrl+O.
+    fn pick_and_open_save(&mut self) {
+        if let Some(p) = rfd::FileDialog::new()
+            .add_filter("MHXX save (system)", &["system", "sav", "*"])
+            .set_title("system ファイルを選択")
+            .pick_file()
+        {
+            self.open_save(p);
+        }
+    }
+
+    /// Ctrl+F: put the cursor in the current tab's filter box.
+    fn focus_current_filter(&mut self) {
+        if !self.tab_has_filter() {
+            self.message = String::from(
+                "このタブに絞り込み欄はありません（Ctrl+F は一覧のあるタブで効きます）",
+            );
+            return;
+        }
+        self.focus_filter = true;
+        self.message = String::from("絞り込み欄へ移動しました（Ctrl+F）");
+    }
+
+    /// One tab's filter box, with the Ctrl+F request applied when it is set.
+    ///
+    /// The flag is consumed here, so the focus is taken once: a later frame
+    /// must not pull the cursor back from wherever the user clicked.
+    fn filter_edit(
+        ui: &mut egui::Ui,
+        text: &mut String,
+        width: f32,
+        hint: &str,
+        focus: &mut bool,
+    ) {
+        let mut edit = egui::TextEdit::singleline(text).desired_width(width);
+        if !hint.is_empty() {
+            edit = edit.hint_text(hint);
+        }
+        let response = ui.add(edit);
+        if *focus {
+            response.request_focus();
+            *focus = false;
+        }
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("XXSE");
                 ui.separator();
-                if ui.button("セーブを開く").clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .add_filter("MHXX save (system)", &["system", "sav", "*"])
-                        .set_title("system ファイルを選択")
-                        .pick_file()
-                    {
-                        self.open_save(p);
-                    }
+                if ui
+                    .button("セーブを開く")
+                    .on_hover_text("Ctrl+O")
+                    .clicked()
+                {
+                    self.pick_and_open_save();
                 }
                 let has_save = self.save.is_some();
                 if ui.add_enabled(has_save, egui::Button::new("上書き保存")).clicked() {
@@ -2893,6 +3185,12 @@ impl MhnxEditor {
                         .weak()
                         .small(),
                 );
+            });
+
+            // The shortcuts, one line, so they can be found without a manual:
+            // the reference editor has the same set.
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(Self::shortcut_line()).weak().small());
             });
         });
     }
@@ -3098,11 +3396,23 @@ impl MhnxEditor {
             .map(|s| (s.name.clone(), s.size))
             .collect();
         let mut restore: Option<String> = None;
+        let mut compare: Option<String> = None;
         for (name, size) in &list {
-            ui.horizontal(|ui| {
+            // Wrapped: the stamp, the size and two buttons do not fit the
+            // default panel width on one line.
+            ui.horizontal_wrapped(|ui| {
                 ui.label(Self::snapshot_stamp(name))
                     .on_hover_text(name.as_str());
                 ui.label(egui::RichText::new(Self::human_size(*size)).weak().small());
+                if ui
+                    .small_button("比較")
+                    .on_hover_text(
+                        "この時点と、いまのセーブ（未保存の編集を含む）との違いを表示します。読み取り専用です",
+                    )
+                    .clicked()
+                {
+                    compare = Some(name.clone());
+                }
                 if ui
                     .small_button("この時点に戻す")
                     .on_hover_text("いまの内容は自動でスナップショットに退避してから戻します")
@@ -3112,8 +3422,82 @@ impl MhnxEditor {
                 }
             });
         }
+        if let Some(n) = compare {
+            self.compare_snapshot(n, None);
+        }
         if let Some(n) = restore {
             self.restore_snapshot(n);
+        }
+    }
+
+    /// The comparison a 比較 button opened: one snapshot against the save held
+    /// now, or against another snapshot picked from the list.
+    ///
+    /// Read-only by construction: the two files are read by compare_snapshot
+    /// and only text is drawn here. A window rather than a dialog on purpose:
+    /// it stays open while the editor behind it is looked at, and the side
+    /// panel's 比較 buttons can switch what it compares.
+    fn compare_window(&mut self, ctx: &egui::Context) {
+        let Some((left, right, text)) = self
+            .compare
+            .as_ref()
+            .map(|c| (c.left.clone(), c.right.clone(), c.text()))
+        else {
+            return;
+        };
+        // What the right side may be: the save held now, then every snapshot
+        // in the folder.
+        let names: Vec<String> = self.snapshots.iter().map(|s| s.name.clone()).collect();
+        let mut pick: Option<Option<String>> = None;
+        let mut close = false;
+        egui::Window::new("スナップショットの比較")
+            .id(egui::Id::new("snapshot_compare"))
+            .collapsible(false)
+            .resizable(true)
+            .default_width(640.0)
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    // The body repeats what is being compared; this row is
+                    // only the control that changes the right hand side.
+                    ui.label("比較先");
+                    egui::ComboBox::from_id_salt("compare_right")
+                        .selected_text(right.label())
+                        .width(320.0)
+                        .show_ui(ui, |ui| {
+                            if ui
+                                .selectable_label(
+                                    matches!(right, CompareSide::Current),
+                                    "現在のセーブ（未保存の編集を含む）",
+                                )
+                                .clicked()
+                            {
+                                pick = Some(None);
+                            }
+                            for name in &names {
+                                let selected =
+                                    matches!(&right, CompareSide::Snapshot(n) if *n == *name);
+                                if ui.selectable_label(selected, name.as_str()).clicked() {
+                                    pick = Some(Some(name.clone()));
+                                }
+                            }
+                        });
+                    if ui.button("閉じる").clicked() {
+                        close = true;
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("compare_body")
+                    .max_height(420.0)
+                    .show(ui, |ui| {
+                        // Monospace: the ranges line up as a list of offsets.
+                        ui.label(egui::RichText::new(text.as_str()).monospace());
+                    });
+            });
+        if let Some(right) = pick {
+            self.compare_snapshot(left, right);
+        } else if close {
+            self.compare = None;
         }
     }
 
@@ -3858,7 +4242,7 @@ impl MhnxEditor {
         // default window size and the last buttons fell off the right edge.
         ui.horizontal_wrapped(|ui| {
             ui.label("絞り込み");
-            ui.text_edit_singleline(&mut self.item_filter);
+            Self::filter_edit(ui, &mut self.item_filter, 160.0, "", &mut self.focus_filter);
             ui.checkbox(&mut self.item_show_empty, "空きスロットも表示");
             if ui
                 .add_enabled(!self.item_undo.is_empty(), egui::Button::new("元に戻す"))
@@ -4555,7 +4939,7 @@ impl MhnxEditor {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("絞り込み");
-            ui.text_edit_singleline(&mut self.arc_filter);
+            Self::filter_edit(ui, &mut self.arc_filter, 160.0, "", &mut self.focus_filter);
             if ui.button("選択中の .arc を名前を付けて保存").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("quest archive", &["arc"])
@@ -7295,10 +7679,12 @@ impl MhnxEditor {
         ui.set_height(ui.available_height());
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("オトモ装備ボックス").strong());
-            ui.add(
-                egui::TextEdit::singleline(&mut self.palico_gear_filter)
-                    .hint_text("種類・ID・枠番号")
-                    .desired_width(140.0),
+            Self::filter_edit(
+                ui,
+                &mut self.palico_gear_filter,
+                140.0,
+                "種類・ID・枠番号",
+                &mut self.focus_filter,
             );
             if ui.small_button("クリア").clicked() {
                 self.palico_gear_filter.clear();
@@ -7650,11 +8036,7 @@ impl MhnxEditor {
             let recorded = self.hunt_slay.iter().filter(|v| **v > 0).count();
             ui.label(format!("{} 体 / {} 体中記録あり", recorded, self.hunt_slay.len()));
             ui.label("絞り込み");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.hunt_filter)
-                    .hint_text("モンスター名")
-                    .desired_width(160.0),
-            );
+            Self::filter_edit(ui, &mut self.hunt_filter, 160.0, "モンスター名", &mut self.focus_filter);
             if ui.small_button("クリア").clicked() {
                 self.hunt_filter.clear();
             }
@@ -8639,10 +9021,12 @@ impl MhnxEditor {
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("使用中 {} / {} 枠", used, all.len()));
             ui.label("絞り込み");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.equip_filter)
-                    .hint_text("名前・種類・枠番号")
-                    .desired_width(160.0),
+            Self::filter_edit(
+                ui,
+                &mut self.equip_filter,
+                160.0,
+                "名前・種類・枠番号",
+                &mut self.focus_filter,
             );
             if ui.small_button("クリア").clicked() {
                 self.equip_filter.clear();
@@ -9254,7 +9638,7 @@ impl MhnxEditor {
         ui.horizontal(|ui| {
             ui.label(format!("導入済み {} 件", quests.len()));
             ui.label("絞り込み");
-            ui.text_edit_singleline(&mut self.dlc_filter);
+            Self::filter_edit(ui, &mut self.dlc_filter, 160.0, "", &mut self.focus_filter);
             // Adding a quest needs an archive, so the button only appears when
             // one is open; the id is read from its .mib rather than its name.
             let can_add = self.arc.is_some();
@@ -9658,10 +10042,12 @@ impl MhnxEditor {
                 total
             ));
             ui.label("絞り込み");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.charm_filter)
-                    .hint_text("スキル名・番号")
-                    .desired_width(180.0),
+            Self::filter_edit(
+                ui,
+                &mut self.charm_filter,
+                180.0,
+                "スキル名・番号",
+                &mut self.focus_filter,
             );
         });
 
@@ -10608,6 +10994,15 @@ impl MhnxEditor {
                 self.scroll_to_cards = 6;
             }
         }
+        // The comparison window is opened by the 比較 button in the side
+        // panel; the harness has no way to click, so the same call is behind
+        // this hook.
+        if std::env::var("MHNXEDITOR_COMPARE").is_ok() {
+            self.refresh_snapshots();
+            if let Some(name) = self.snapshots.first().map(|s| s.name.clone()) {
+                self.compare_snapshot(name, None);
+            }
+        }
         if let Ok(p) = std::env::var("MHNXEDITOR_ROMFS") {
             // The line the window opened with (the font, or the file that was
             // opened) says more than this report until the user asks for it.
@@ -11379,11 +11774,7 @@ impl MhnxEditor {
             );
             ui.separator();
             ui.label("絞り込み");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.request_filter)
-                    .hint_text("依頼名")
-                    .desired_width(160.0),
-            );
+            Self::filter_edit(ui, &mut self.request_filter, 160.0, "依頼名", &mut self.focus_filter);
             if ui.small_button("クリア").clicked() {
                 self.request_filter.clear();
             }
@@ -11597,11 +11988,7 @@ impl MhnxEditor {
         }
         ui.horizontal_wrapped(|ui| {
             ui.label("絞り込み");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.quest_filter)
-                    .hint_text("索引")
-                    .desired_width(80.0),
-            );
+            Self::filter_edit(ui, &mut self.quest_filter, 80.0, "索引", &mut self.focus_filter);
             ui.checkbox(&mut self.quest_missing_only, "未クリアのみ");
             if ui.small_button("クリア").clicked() {
                 self.quest_filter.clear();
@@ -14115,6 +14502,283 @@ xjksv_readysystem");
         assert_eq!(ranges[0].name, "DLC セクション");
     }
 
+    /// The bytes the editor would write right now, without writing them.
+    ///
+    /// Used as the snapshot in the comparison tests: then the only difference
+    /// between the two sides is the edit a test makes, not whatever the
+    /// parse / write round trip costs.
+    fn planned_bytes(app: &MhnxEditor) -> Vec<u8> {
+        app.planned_save().expect("a planned save").to_bytes()
+    }
+
+    /// The audit's 「スナップショット同士の比較」: one snapshot against the save
+    /// held now, read-only, in the same wording as the pre-save review.
+    #[test]
+    fn a_snapshot_is_compared_with_the_save_held_now() {
+        let dir = Scratch::new("compare");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let on_disk = std::fs::read(&path).expect("read the fixture");
+        // The snapshot is exactly what the editor would write before any edit,
+        // so the first comparison has to find nothing at all.
+        let baseline = planned_bytes(&app);
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = String::from("system-20261104-012812.sav");
+        std::fs::write(snaps.join(&name), &baseline).expect("snapshot");
+        app.refresh_snapshots();
+        assert_eq!(app.snapshots.len(), 1);
+
+        app.compare_snapshot(name.clone(), None);
+        let compare = app.compare.as_ref().expect("a comparison");
+        assert_eq!(compare.diff.changed, 0, "{}", compare.text());
+        assert_eq!(compare.left_len, baseline.len());
+        assert_eq!(compare.right_len, baseline.len());
+        assert!(matches!(compare.right, CompareSide::Current));
+        let text = compare.text();
+        assert!(
+            text.contains(&format!("比較元: スナップショット {}", name)),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains("比較先: 現在のセーブ（未保存の編集を含む）"),
+            "{}",
+            text
+        );
+        assert!(text.contains("0 バイトが違います"), "{}", text);
+        assert!(text.contains("この比較は読み取り専用です"), "{}", text);
+
+        // One arena time: the change is named by the layout, the same way the
+        // review names it.
+        assert!(app.set_arena_time(0, 0, 1234));
+        app.compare_snapshot(name.clone(), None);
+        let compare = app.compare.as_ref().expect("a comparison");
+        assert!(compare.diff.changed > 0, "{}", compare.text());
+        let text = compare.text();
+        assert!(text.contains("■ 変更される内容"), "{}", text);
+        assert!(text.contains("■ 変更される範囲"), "{}", text);
+        assert!(text.contains("闘技大会の記録"), "{}", text);
+        assert!(
+            !text.contains("0 バイトが違います"),
+            "the edit is visible: {}",
+            text
+        );
+
+        // Read-only: the save on disk and the snapshot are both untouched.
+        assert_eq!(std::fs::read(&path).expect("save"), on_disk);
+        assert_eq!(std::fs::read(snaps.join(&name)).expect("snapshot"), baseline);
+        assert!(app.dirty, "the edit is still only in memory");
+    }
+
+    /// Two snapshots against each other, and the right side can be switched
+    /// back to the save held now from the same comparison.
+    #[test]
+    fn two_snapshots_are_compared_with_each_other() {
+        let dir = Scratch::new("compare2");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let baseline = planned_bytes(&app);
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let a = String::from("system-20261104-012812.sav");
+        let b = String::from("system-20261104-012813.sav");
+        std::fs::write(snaps.join(&a), &baseline).expect("snapshot a");
+        // The second snapshot is the same save with one arena record set.
+        let mut changed = Save::from_bytes(&baseline).expect("parse the baseline");
+        assert!(mhnx_core::guildcard::set_arena_time(
+            &mut changed,
+            0,
+            0,
+            0,
+            1234
+        ));
+        std::fs::write(snaps.join(&b), changed.to_bytes()).expect("snapshot b");
+        app.refresh_snapshots();
+        assert_eq!(app.snapshots.len(), 2);
+
+        app.compare_snapshot(a.clone(), Some(b.clone()));
+        let compare = app.compare.as_ref().expect("a comparison");
+        assert!(compare.diff.changed > 0, "{}", compare.text());
+        assert_eq!(compare.left_len, compare.right_len);
+        assert!(
+            matches!(&compare.right, CompareSide::Snapshot(n) if *n == b),
+            "{:?}",
+            compare.right
+        );
+        let text = compare.text();
+        assert!(
+            text.contains(&format!("比較先: スナップショット {}", b)),
+            "{}",
+            text
+        );
+        assert!(text.contains("闘技大会の記録"), "{}", text);
+
+        let snapshot_vs_snapshot = compare.diff.changed;
+        // The same comparison can be pointed back at the save held now: with
+        // the same arena time applied in the editor, the same bytes differ.
+        assert!(app.set_arena_time(0, 0, 1234));
+        app.compare_snapshot(a.clone(), None);
+        let compare = app.compare.as_ref().expect("a comparison");
+        assert!(matches!(compare.right, CompareSide::Current));
+        assert_eq!(
+            compare.diff.changed,
+            snapshot_vs_snapshot,
+            "the same record, whichever side the comparison ends on"
+        );
+
+        // Neither snapshot was rewritten by being compared.
+        assert_eq!(std::fs::read(snaps.join(&a)).expect("a"), baseline);
+        assert_eq!(
+            std::fs::read(snaps.join(&b)).expect("b"),
+            changed.to_bytes()
+        );
+    }
+
+    /// A file in snapshots/ that is not a save is refused, not compared: the
+    /// layout cannot name offsets in something the parser does not know.
+    #[test]
+    fn a_snapshot_that_is_not_a_save_is_refused_instead_of_compared() {
+        let dir = Scratch::new("comparebad");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = String::from("system-20261104-012812.sav");
+        std::fs::write(snaps.join(&name), b"not a save").expect("junk");
+        app.refresh_snapshots();
+        app.compare_snapshot(name, None);
+        assert!(app.compare.is_none(), "nothing to show: {}", app.message);
+        assert!(
+            app.message.contains("セーブとして読めません"),
+            "{}",
+            app.message
+        );
+    }
+
+    /// The shortcut list is one line and names every key the editor answers.
+    #[test]
+    fn the_shortcut_line_lists_every_key_the_editor_answers() {
+        let line = MhnxEditor::shortcut_line();
+        assert!(line.starts_with("ショートカット: "), "{}", line);
+        assert!(!line.contains('\n'), "one line only: {}", line);
+        for (key, what) in MhnxEditor::SHORTCUTS.iter().copied() {
+            assert!(line.contains(key), "{} missing from {}", key, line);
+            assert!(line.contains(what), "{} missing from {}", what, line);
+        }
+        // The four the reference editor has, and the ones the task named.
+        for key in ["Ctrl+S", "Ctrl+O", "Ctrl+Z", "Ctrl+F"] {
+            assert!(line.contains(key), "{} missing from {}", key, line);
+        }
+        assert!(line.contains("上書き保存"), "{}", line);
+        assert!(line.contains("現在のタブの絞り込みへ"), "{}", line);
+    }
+
+    /// Ctrl+F only claims to have moved the cursor where a filter exists, and
+    /// the request it leaves behind is what the filter box consumes.
+    #[test]
+    fn ctrl_f_only_reaches_a_tab_that_has_a_filter() {
+        let mut app = MhnxEditor::default();
+        app.tab = Tab::Items;
+        assert!(app.tab_has_filter());
+        app.focus_current_filter();
+        assert!(app.focus_filter, "the request waits for the tab to draw");
+        assert!(app.message.contains("Ctrl+F"), "{}", app.message);
+
+        // A tab with no list filter says so instead of doing nothing.
+        app.focus_filter = false;
+        app.tab = Tab::About;
+        assert!(!app.tab_has_filter());
+        app.focus_current_filter();
+        assert!(!app.focus_filter);
+        assert!(
+            app.message.contains("絞り込み欄はありません"),
+            "{}",
+            app.message
+        );
+    }
+
+    /// The keys run the same paths the buttons do: Ctrl+Z is the 元に戻す
+    /// button, Ctrl+S is 上書き保存 including its review, and a dialog being
+    /// open holds all of them until it is answered.
+    #[test]
+    fn the_shortcut_keys_run_the_same_paths_as_the_buttons() {
+        let dir = Scratch::new("keys");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+
+        let key = |key: egui::Key| {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1180.0, 740.0),
+            ));
+            input.modifiers = egui::Modifiers::COMMAND;
+            input.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            });
+            input
+        };
+        let ctx = egui::Context::default();
+
+        // Ctrl+Z takes back the edit, through the same stack the button uses.
+        assert!(app.set_arena_time(0, 0, 1234));
+        assert_eq!(app.undo.len(), 1);
+        let _ = ctx.run(key(egui::Key::Z), |ctx| app.keyboard_shortcuts(ctx));
+        assert_eq!(app.undo.len(), 0, "{}", app.message);
+        assert!(app.message.contains("元に戻しました"), "{}", app.message);
+
+        // Ctrl+S is 上書き保存: the safety check and the review still run, so
+        // the keyboard cannot write without the dialog.
+        assert!(app.set_arena_time(0, 0, 1234));
+        app.write_force = true;
+        let _ = ctx.run(key(egui::Key::S), |ctx| app.keyboard_shortcuts(ctx));
+        assert!(matches!(app.confirm, Confirm::ReviewWrite), "{}", app.message);
+
+        // A dialog holds the keys until it is answered.
+        app.focus_filter = false;
+        let _ = ctx.run(key(egui::Key::F), |ctx| app.keyboard_shortcuts(ctx));
+        assert!(!app.focus_filter, "the dialog holds the keyboard");
+        app.confirm = Confirm::None;
+
+        // Ctrl+F asks the current tab for its filter box.
+        app.tab = Tab::Items;
+        let _ = ctx.run(key(egui::Key::F), |ctx| app.keyboard_shortcuts(ctx));
+        assert!(app.focus_filter, "{}", app.message);
+        assert!(app.message.contains("Ctrl+F"), "{}", app.message);
+
+        // A text field holding the keyboard keeps its own keys: the rule the
+        // old Ctrl+Z had, which every shortcut here shares.
+        let typing = egui::Context::default();
+        let mut text = String::new();
+        let field = egui::Id::new("filter-probe");
+        let mut draw_field = |ctx: &egui::Context| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut text).id(field));
+            });
+        };
+        let _ = typing.run(key(egui::Key::F), |ctx| {
+            draw_field(ctx);
+            ctx.memory_mut(|m| m.request_focus(field));
+        });
+        assert!(typing.wants_keyboard_input(), "the field took the keyboard");
+        app.focus_filter = false;
+        let _ = typing.run(key(egui::Key::F), |ctx| app.keyboard_shortcuts(ctx));
+        assert!(!app.focus_filter, "typing keeps Ctrl+F away");
+    }
+
     /// A write that passes the safety check but changes nothing on disk skips
     /// the dialog, the way it always did.
     #[test]
@@ -14342,6 +15006,42 @@ xjksv_readysystem");
             app.confirm_dialog(ctx);
         });
         assert!(!output.shapes.is_empty(), "the top bar and dialog drew nothing");
+    }
+
+    /// The comparison window and the snapshot list that opens it draw a frame:
+    /// a duplicate egui id or a window the layout cannot fit would panic here,
+    /// and this is the only place the new section is rendered at all.
+    #[test]
+    fn the_comparison_window_draws_a_frame() {
+        let dir = Scratch::new("comparedraw");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let baseline = planned_bytes(&app);
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = String::from("system-20261104-012812.sav");
+        std::fs::write(snaps.join(&name), &baseline).expect("snapshot");
+        app.refresh_snapshots();
+        assert!(app.set_arena_time(0, 0, 1234));
+        app.compare_snapshot(name, None);
+        assert!(app.compare.is_some(), "{}", app.message);
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.snapshots_panel(ui));
+            app.compare_window(ctx);
+        });
+        assert!(
+            !output.shapes.is_empty(),
+            "the snapshot list and the comparison window drew nothing"
+        );
     }
 }
 
