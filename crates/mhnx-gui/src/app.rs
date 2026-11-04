@@ -177,6 +177,69 @@ fn with_commas(n: usize) -> String {
     out
 }
 
+/// One value the game keeps twice, as the character tab shows it.
+///
+/// The pair is read out of the save, not out of the working copy: it answers
+/// "does this save agree with itself", which is a question about the file.
+struct CharacterCopy {
+    /// What the field is called.
+    label: &'static str,
+    /// The value the game loads.
+    live: String,
+    /// The value the save screen reads.
+    copy: String,
+}
+
+impl CharacterCopy {
+    /// Do the two copies say the same thing?
+    fn agrees(&self) -> bool {
+        self.live == self.copy
+    }
+}
+
+/// The character options the reference editor edits and this build cannot.
+///
+/// Provenance: Scrimas/MHGU-Save-editor, app/core/src/options.rs (the 28
+/// entries of OPTIONS) and app/gui/src/views/options_ui.rs (option_name). The
+/// ids are that crate's own; the Japanese labels are this window's reading.
+///
+/// **Nothing here is a byte this crate can reach.** The reference reads them at
+/// character-relative positions that mhnx_core has no constant for, and this
+/// build does not invent offsets (an unverified offset in a save editor is a
+/// silent corruption). The list is kept so the gap is counted on screen instead
+/// of being absent from it, and so the next reader does not have to go looking
+/// for options that were never wired up.
+const UNREACHABLE_OPTIONS: [(&str, &str); 28] = [
+    ("music", "音楽の音量"),
+    ("sfx", "効果音の音量"),
+    ("hud", "HUD"),
+    ("map", "マップ"),
+    ("camera-angle", "カメラの角度"),
+    ("camera-controls", "カメラ操作"),
+    ("camera-speed", "カメラ速度"),
+    ("scope", "スコープ操作"),
+    ("bowgun", "ボウガン操作"),
+    ("quick-aim", "クイックエイム操作"),
+    ("quick-aim-camera", "クイックエイムカメラ"),
+    ("reticle", "照準速度"),
+    ("orientation", "向き"),
+    ("bow", "弓操作"),
+    ("bow-cancel", "弓のエイム解除"),
+    ("melody", "旋律エフェクト表示"),
+    ("target-controls", "ターゲットカメラ操作"),
+    ("target-behavior", "ターゲットカメラの挙動"),
+    ("terrain-camera", "地形対応カメラ"),
+    ("lens-flares", "レンズフレア"),
+    ("control-type", "操作タイプ"),
+    ("plus-button", "＋ボタン操作"),
+    ("lr-buttons", "L/R ボタン操作"),
+    ("r-stick", "R スティック操作"),
+    ("net-cards", "ギルドカード/オトモ"),
+    ("net-chat", "チャット"),
+    ("net-invites", "招待"),
+    ("net-palico-chat", "オトモチャット"),
+];
+
 /// The whole application.
 /// Destructive actions that have to be confirmed before they happen.
 #[derive(Default, PartialEq)]
@@ -4185,6 +4248,73 @@ impl MhnxEditor {
         )
     }
 
+    /// The four values the game keeps twice: the live field and the copy the
+    /// save screen reads.
+    ///
+    /// [Save::write_character] writes both, so a save edited here agrees with
+    /// itself. A save edited by another tool can disagree, and the tab says so
+    /// rather than showing only the live value. The bytes are read at the
+    /// crate's own offsets, the way the save map reads them.
+    fn character_copies(save: &Save, slot: usize) -> Option<Vec<CharacterCopy>> {
+        let base = save.slot_base(slot)? as usize;
+        let body = save.body();
+        let with = |off: usize| base.checked_add(off);
+        let u32_at = |off: usize| -> u32 {
+            match with(off).and_then(|o| body.get(o..o + 4)) {
+                Some(b) => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                None => 0,
+            }
+        };
+        let byte_at =
+            |off: usize| -> u8 { with(off).and_then(|o| body.get(o)).copied().unwrap_or(0) };
+        let name_at = |off: usize| -> String {
+            let raw = with(off).and_then(|o| body.get(o..o + 32)).unwrap_or(&[]);
+            let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+            String::from_utf8_lossy(&raw[..end]).into_owned()
+        };
+        let clock = |secs: u32| {
+            format!(
+                "{}:{:02}:{:02}",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            )
+        };
+        let zenny = |v: u32| format!("{} z", with_commas(v as usize));
+        Some(vec![
+            CharacterCopy {
+                label: "名前",
+                live: name_at(mhnx_core::save::OFF_NAME),
+                copy: name_at(mhnx_core::save::OFF_NAME_PREVIEW),
+            },
+            CharacterCopy {
+                label: "プレイ時間",
+                live: clock(u32_at(mhnx_core::save::OFF_PLAY_TIME)),
+                copy: clock(u32_at(mhnx_core::save::OFF_PLAY_TIME_PREVIEW)),
+            },
+            CharacterCopy {
+                label: "所持金",
+                live: zenny(u32_at(mhnx_core::save::OFF_FUNDS)),
+                copy: zenny(u32_at(mhnx_core::save::OFF_FUNDS_PREVIEW)),
+            },
+            CharacterCopy {
+                label: "性別",
+                live: Self::gender_text(byte_at(mhnx_core::save::OFF_GENDER)),
+                copy: Self::gender_text(byte_at(mhnx_core::save::OFF_GENDER_PREVIEW)),
+            },
+        ])
+    }
+
+    /// 0 and 1 as the game's two body types; any other byte is shown as the
+    /// number it is rather than being called male.
+    pub fn gender_text(v: u8) -> String {
+        match v {
+            0 => String::from("男性"),
+            1 => String::from("女性"),
+            other => format!("その他 ({})", other),
+        }
+    }
+
     fn tab_save(&mut self, ui: &mut egui::Ui) {
         if self.save.is_none() {
             ui.centered_and_justified(|ui| ui.label("左上の「セーブを開く」から system ファイルを選んでください"));
@@ -4196,6 +4326,14 @@ impl MhnxEditor {
         // the save by apply_to_save. Nothing here used to mark the save dirty,
         // so the window said "no changes", a slot switch rebuilt self.edit from
         // the save and the edits disappeared without a word.
+        // The four values the game keeps twice, read out of the save itself
+        // (not out of self.edit): they are what the save screen shows, and
+        // comparing them with the live value is how a save whose copies were
+        // left behind becomes visible at all.
+        let copies = self
+            .save
+            .as_ref()
+            .and_then(|s| Self::character_copies(s, self.slot));
         let before = self.edit.clone();
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("char").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -4239,26 +4377,53 @@ impl MhnxEditor {
             ui.label(egui::RichText::new("外見").strong());
             egui::Grid::new("look").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("性別");
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.edit.gender, 0, "男性");
-                    ui.selectable_value(&mut self.edit.gender, 1, "女性");
-                });
+                // A choice, so a combo box rather than two radio buttons: the
+                // value the save holds is 0 or 1, and a byte from a damaged
+                // save is shown as the byte instead of being called male.
+                egui::ComboBox::from_id_salt("chargender")
+                    .selected_text(Self::gender_text(self.edit.gender))
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [(0u8, "男性"), (1, "女性")] {
+                            ui.selectable_value(&mut self.edit.gender, value, label);
+                        }
+                    });
                 ui.end_row();
-                for (label, v, max) in [
-                    ("ボイス", &mut self.edit.voice, 40u8),
-                    ("瞳の色", &mut self.edit.eye_color, 40),
-                    ("服", &mut self.edit.clothing, 40),
-                    ("髪型", &mut self.edit.hairstyle, 60),
-                    ("顔", &mut self.edit.face, 40),
-                    ("特徴", &mut self.edit.features, 40),
+                // One byte each, so the widget takes the whole byte. The old
+                // ceilings (40 for four of them, 60 for the hair) were numbers
+                // nothing in this crate supports: it has no table of the ids,
+                // so a save holding 200 was quietly forced down on the next
+                // nudge of the arrow keys.
+                for (label, v) in [
+                    ("ボイス", &mut self.edit.voice),
+                    ("瞳の色", &mut self.edit.eye_color),
+                    ("服", &mut self.edit.clothing),
+                    ("髪型", &mut self.edit.hairstyle),
+                    ("顔", &mut self.edit.face),
+                    ("特徴", &mut self.edit.features),
                 ] {
                     ui.label(label);
-                    ui.add(egui::DragValue::new(v).speed(1).range(0..=max));
+                    ui.add(egui::DragValue::new(v).speed(1).range(0..=255));
                     ui.end_row();
                 }
             });
+            ui.label(
+                egui::RichText::new(
+                    "外見の ID はセーブのバイトそのものです。名前の表を持っていないので、\
+                     数値のまま出しています（0〜255）。",
+                )
+                .weak()
+                .small(),
+            );
 
             ui.separator();
+            // The four colours below are slots 5-8 of the game's nine colour
+            // block: 0-4 are the worn pieces' pigment, then skin, hair,
+            // features, clothing. Only the four the crate has constants for are
+            // shown. The five pigments sit 20 bytes in front of
+            // mhnx_core::save::OFF_SKIN_COLOR and are plain RGBA (the sample
+            // save holds 3D 36 3E FF four times and 38 62 CD FF for them), but
+            // no existing constant addresses them and this build does not mint
+            // offsets, so they are left out rather than guessed at.
             ui.label(egui::RichText::new("カラー (RGBA)").strong());
             for (label, color) in [
                 ("肌", &mut self.edit.skin_color),
@@ -4277,6 +4442,47 @@ impl MhnxEditor {
                         color[0], color[1], color[2], color[3]
                     ));
                 });
+            }
+
+            ui.separator();
+            ui.label(egui::RichText::new("セーブ画面の写し").strong());
+            ui.label(
+                egui::RichText::new(
+                    "名前・プレイ時間・所持金・性別は、ゲームが同じ値を 2 か所に持ちます。\
+                     下はセーブ画面が読む側で、「編集内容を反映」は本体と写しの両方に同じ値を書きます。\
+                     ここが「不一致」なら、そのセーブは別の道具で片方だけ書き換えられています。",
+                )
+                .weak()
+                .small(),
+            );
+            match &copies {
+                Some(list) => {
+                    egui::Grid::new("charcopies")
+                        .num_columns(3)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.strong("項目");
+                            ui.strong("本体");
+                            ui.strong("写し");
+                            ui.end_row();
+                            for c in list {
+                                ui.label(c.label);
+                                ui.label(&c.live);
+                                ui.horizontal(|ui| {
+                                    ui.label(&c.copy);
+                                    if c.agrees() {
+                                        ui.weak("一致");
+                                    } else {
+                                        ui.colored_label(warning_color(), "不一致");
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                }
+                None => {
+                    ui.label(egui::RichText::new("このスロットは読めません").weak());
+                }
             }
 
             ui.add_space(10.0);
@@ -4330,6 +4536,40 @@ impl MhnxEditor {
                 self.message = format!("お守り {} を削除しました", index);
             }
         }
+    }
+
+    /// The options the reference edits and this build cannot reach: named,
+    /// counted, and marked 未対応.
+    ///
+    /// Split out of the tab so a test can draw it: a collapsed header draws no
+    /// row at all, and a list nothing ever draws is a list nobody can check.
+    fn unreachable_options_panel(ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new(
+                "参考（MHGU 版）はキャラクターごとの Start メニュー設定を 28 項目\
+                 編集できます。上の 4 項目は Switch / 3DS の本体設定で、参考の 28 項目とは\
+                 別の場所です。このクレートにはその位置の定数が無いため、値は読まず、\
+                 位置も推測しません。下は名前だけの一覧です。",
+            )
+            .weak()
+            .small(),
+        );
+        egui::Grid::new("optiongapgrid")
+            .num_columns(3)
+            .striped(true)
+            .spacing([8.0, 3.0])
+            .show(ui, |ui| {
+                ui.strong("参考の ID");
+                ui.strong("参考の名前");
+                ui.strong("状態");
+                ui.end_row();
+                for (id, label) in UNREACHABLE_OPTIONS {
+                    ui.label(id);
+                    ui.label(label);
+                    ui.weak("未対応");
+                    ui.end_row();
+                }
+            });
     }
 
     /// Store the four global options and mark the save dirty.
@@ -7750,6 +7990,27 @@ impl MhnxEditor {
         ok
     }
 
+    /// Rewrite one palico's experience.
+    ///
+    /// The number is the u32 at palico::EXP, where palico::roster reads it.
+    /// The range shown is the whole u32: the level is a separate byte the game
+    /// writes beside it, so clamping the experience to a level table this
+    /// crate does not have would be a guess. The roster row calls this.
+    pub fn set_palico_exp(&mut self, index: usize, exp: u32) -> bool {
+        self.push_undo(format!("オトモ {} の経験値", index));
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if !mhnx_core::palico::set_exp(save, self.slot, index, exp) {
+            self.message = format!("オトモ {} の経験値を書き換えられませんでした", index);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!("オトモ {} の経験値を {} にしました", index, exp);
+        true
+    }
+
     fn tab_palico_detail(&mut self, ui: &mut egui::Ui) {
         ui.heading("オトモ");
         let Some(save) = &self.save else {
@@ -7809,7 +8070,7 @@ impl MhnxEditor {
                     .striped(true)
                     .spacing([10.0, 4.0])
                     .show(ui, |ui| {
-                        for h in ["枠", "名前", "レベル", "なつき", "系統", "修得スキル"] {
+                        for h in ["枠", "名前", "レベル / 経験値", "なつき", "系統", "修得スキル"] {
                             ui.strong(h);
                         }
                         ui.end_row();
@@ -7838,20 +8099,39 @@ impl MhnxEditor {
                                 }
                                 changed = true;
                             }
-                            let mut lvl = p.level as i32;
-                            let level_edit = ui.add(egui::DragValue::new(&mut lvl).range(1..=99));
-                            if level_edit.changed() {
-                                self.push_undo(format!("オトモ {} のレベル", p.index));
-                                if let Some(s) = &mut self.save {
-                                    mhnx_core::palico::set_level(
-                                        s,
-                                        self.slot,
-                                        p.index,
-                                        lvl as u16,
-                                    );
+                            ui.horizontal(|ui| {
+                                let mut lvl = p.level as i32;
+                                let level_edit =
+                                    ui.add(egui::DragValue::new(&mut lvl).range(1..=99));
+                                if level_edit.changed() {
+                                    self.push_undo(format!("オトモ {} のレベル", p.index));
+                                    if let Some(s) = &mut self.save {
+                                        mhnx_core::palico::set_level(
+                                            s,
+                                            self.slot,
+                                            p.index,
+                                            lvl as u16,
+                                        );
+                                    }
+                                    changed = true;
                                 }
-                                changed = true;
-                            }
+                                // The experience is the one number of the
+                                // record the core has always been able to
+                                // write (palico::set_exp) and that no screen
+                                // ever reached: the row showed the level and
+                                // nothing said what the level was made of.
+                                let mut exp = p.exp;
+                                let exp_edit = ui.add(
+                                    egui::DragValue::new(&mut exp)
+                                        .speed(100)
+                                        .range(0..=u32::MAX)
+                                        .prefix("exp "),
+                                );
+                                if exp_edit.changed() {
+                                    self.set_palico_exp(p.index, exp);
+                                    changed = true;
+                                }
+                            });
                             let mut ent = p.enthusiasm as i32;
                             let ent_edit = ui.add(egui::DragValue::new(&mut ent).range(0..=100));
                             if ent_edit.changed() {
@@ -9336,11 +9616,9 @@ impl MhnxEditor {
         let Some(save) = &self.save else { return };
         let slot = self.slot;
         let history = mhnx_core::guildcard::history(save, slot);
+        // The card shows the sum capped at 99,999; the counters themselves are
+        // not capped, so the grid below prints both.
         let counts = mhnx_core::guildcard::quest_counts(save, slot);
-        // The card shows the sum capped at 99,999; both numbers are worth
-        // seeing, because the counters themselves are not capped.
-        let shown_total = mhnx_core::guildcard::quest_total(save, slot);
-        let raw_total: u32 = counts.iter().sum();
         if history.is_empty() {
             ui.label("記録はありません");
         } else {
@@ -9367,7 +9645,15 @@ impl MhnxEditor {
                 });
         }
         ui.separator();
-        ui.label(egui::RichText::new("クエスト回数").strong());
+        ui.label(egui::RichText::new("クエスト回数（カードの 7 つの欄）").strong());
+        ui.label(
+            egui::RichText::new(
+                "7 つの欄はそれぞれ u16 です。カードはその合計を 99,999 で切って表示し、\
+                 合計そのものはセーブに入りません。",
+            )
+            .weak()
+            .small(),
+        );
         let labels = [
             "村（下位）",
             "村（上位）",
@@ -9377,21 +9663,44 @@ impl MhnxEditor {
             "特別許可",
             "闘技大会",
         ];
+        // New values are collected while the grid draws and written after it,
+        // the way the weapon usage grid above does it: the fields borrow the
+        // numbers, and the save cannot be borrowed mutably at the same time.
+        let mut new_counts: Vec<u32> = (0..labels.len())
+            .map(|i| counts.get(i).copied().unwrap_or(0))
+            .collect();
+        let mut edits: Vec<(usize, u32)> = Vec::new();
         egui::Grid::new("questcountgrid")
             .num_columns(2)
             .spacing([8.0, 3.0])
             .show(ui, |ui| {
                 for (i, label) in labels.iter().enumerate() {
                     ui.label(*label);
-                    ui.label(format!("{}", counts.get(i).copied().unwrap_or(0)));
+                    let mut v = new_counts[i] as i32;
+                    if ui
+                        .add(egui::DragValue::new(&mut v).range(0..=u16::MAX as i32))
+                        .changed()
+                    {
+                        new_counts[i] = v as u32;
+                        if counts.get(i).copied().unwrap_or(0) != new_counts[i] {
+                            edits.push((i, new_counts[i]));
+                        }
+                    }
                     ui.end_row();
                 }
+                let total: u32 = new_counts.iter().sum();
                 ui.label(egui::RichText::new("合計").strong());
-                ui.label(egui::RichText::new(format!("{}", raw_total)).strong());
+                ui.label(egui::RichText::new(format!("{}", total)).strong());
                 ui.end_row();
                 ui.label("カードの表示");
-                ui.label(format!("{}（99,999 で頭打ち）", shown_total));
+                ui.label(format!(
+                    "{}（99,999 で頭打ち）",
+                    total.min(mhnx_core::guildcard::QUEST_TOTAL_CAP)
+                ));
             });
+        for (kind, value) in edits {
+            self.set_quest_count(kind, value);
+        }
     }
 
     /// What one history record is about; the numbers are documented on
@@ -9722,6 +10031,38 @@ impl MhnxEditor {
         self.message = format!(
             "武器使用数を {} にしました（まだファイルには書いていません）",
             count
+        );
+        true
+    }
+
+    /// Rewrite one of the card's seven quest counters.
+    ///
+    /// The counters are the u16s the card adds up when it draws, so they are
+    /// written where mhnx_core::guildcard::quest_counts reads them; nothing
+    /// else in the save moves. A value past u16::MAX is clamped by the core,
+    /// not wrapped, and a kind past the seven is refused.
+    pub fn set_quest_count(&mut self, kind: usize, value: u32) -> bool {
+        // Refused before the undo step: a step that puts back a save nothing
+        // touched is a step the user has to press 元に戻す twice to get past.
+        if kind >= mhnx_core::guildcard::QUEST_COUNTS {
+            self.message = format!("クエスト回数 {} 番はありません", kind + 1);
+            return false;
+        }
+        let slot = self.slot;
+        self.push_undo(format!("クエスト回数 {} 番", kind + 1));
+        let Some(save) = &mut self.save else {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        };
+        if !mhnx_core::guildcard::set_quest_count(save, slot, kind, value) {
+            self.message = format!("クエスト回数 {} 番を書き換えられませんでした", kind + 1);
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!(
+            "クエスト回数 {} 番を {} にしました（まだファイルには書いていません）",
+            kind + 1,
+            value.min(u16::MAX as u32)
         );
         true
     }
@@ -11382,12 +11723,21 @@ impl MhnxEditor {
             });
         ui.label(
             egui::RichText::new(
-                "Switch / 3DS の本体設定と同じ 4 項目です。値はセーブの同じ位置に入り、\
-                 書き出すまでファイルは変わりません。",
+                "Switch / 3DS の本体設定と同じ 4 項目です（このビルドが読めるのはこの 4 つだけ）。\
+                 値はセーブの同じ位置に入り、書き出すまでファイルは変わりません。",
             )
             .weak()
             .small(),
         );
+        ui.add_space(4.0);
+        // What the reference edits and this build cannot. The list is named,
+        // the positions are not: see UNREACHABLE_OPTIONS.
+        egui::CollapsingHeader::new(format!(
+            "未対応: 参考の Start メニュー設定 {} 項目",
+            UNREACHABLE_OPTIONS.len()
+        ))
+        .id_salt("optiongaps")
+        .show(ui, |ui| Self::unreachable_options_panel(ui));
         if opts_changed {
             set_opts = Some(edit_o);
         }
@@ -18719,6 +19069,296 @@ mod tests {
         assert_eq!(load.tables.len(), 1, "{}", load.report);
         assert_eq!(load.tables[0].file, "GC_Medal_jpn.gmd");
         assert_eq!(load.tables[0].rows, ["ja one", "ja two"]);
+    }
+
+    /// The four values the game keeps twice: the character tab reads them out
+    /// of the save, so a save whose copies were left behind says so instead of
+    /// showing only the live value. Writing the character writes both, so a
+    /// save edited here agrees with itself.
+    #[test]
+    fn the_character_copies_are_shown_and_kept_in_step() {
+        let dir = Scratch::new("charcopies");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        app.edit.name = String::from("テスト");
+        app.edit.play_time = 3723;
+        app.edit.funds = 1_234_567;
+        app.edit.gender = 1;
+        app.apply_to_save();
+
+        let copies = MhnxEditor::character_copies(app.save.as_ref().expect("save"), 0)
+            .expect("a slot");
+        assert_eq!(
+            copies.iter().map(|c| c.label).collect::<Vec<_>>(),
+            ["名前", "プレイ時間", "所持金", "性別"]
+        );
+        for c in &copies {
+            assert!(c.agrees(), "{} reads {} / {}", c.label, c.live, c.copy);
+        }
+        assert_eq!(copies[0].live, "テスト");
+        assert_eq!(copies[1].live, "1:02:03");
+        assert_eq!(copies[2].live, "1,234,567 z");
+        assert_eq!(copies[3].live, "女性");
+
+        // The badge the tab prints for a pair that agrees.
+        let ctx = egui::Context::default();
+        let output = ctx.run(frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("セーブ画面の写し"), "{}", text);
+        // The badges are their own labels, so a line that says exactly 一致 is
+        // one badge (the note above it also carries the word 不一致, which is
+        // why the count is taken per line and not per substring).
+        let agree = |text: &str| {
+            (
+                text.lines().filter(|l| *l == "一致").count(),
+                text.lines().filter(|l| *l == "不一致").count(),
+            )
+        };
+        assert_eq!(agree(&text), (4, 0), "{}", text);
+
+        // A copy another tool left behind is reported, not smoothed over: the
+        // byte is poked directly, which is what such a save looks like.
+        let base = app
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        app.save.as_mut().expect("save").body_mut()[base + mhnx_core::save::OFF_NAME_PREVIEW] =
+            b'X';
+        let copies = MhnxEditor::character_copies(app.save.as_ref().expect("save"), 0)
+            .expect("a slot");
+        assert!(!copies[0].agrees(), "a stale copy has to be visible");
+        assert!(copies[1..].iter().all(|c| c.agrees()));
+        let output = ctx.run(frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
+        });
+        let text = drawn_text(&output);
+        assert_eq!(agree(&text), (3, 1), "{}", text);
+
+        // The appearance id is one byte, so nothing is clamped on the way in:
+        // 200 used to be forced down to the 40/60 ceilings the old widgets had,
+        // numbers nothing in the crate supported.
+        app.edit.voice = 200;
+        app.edit.hairstyle = 201;
+        app.apply_to_save();
+        let stored = app.save.as_ref().expect("save").read_character(0).expect("a slot");
+        assert_eq!((stored.voice, stored.hairstyle), (200, 201));
+    }
+
+    /// The card's seven quest counters are the u16s the card adds up, written
+    /// where they are read. A value past 65,535 is clamped rather than wrapped
+    /// into the counter beside it, and a kind past the seven is refused without
+    /// leaving an undo step that puts back a save nothing touched.
+    #[test]
+    fn a_quest_counter_is_written_capped_and_refused() {
+        let dir = Scratch::new("questcounts");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let before = app.save.as_ref().expect("save").body().to_vec();
+        let base = app
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+
+        assert!(app.set_quest_count(0, 1234));
+        assert!(app.dirty);
+        let at = base
+            + mhnx_core::guildcard::OFF_GUILD_CARD
+            + mhnx_core::guildcard::GC_QUESTS;
+        assert_eq!(&app.save.as_ref().expect("save").body()[at..at + 2], &1234u16.to_le_bytes());
+        assert_eq!(
+            mhnx_core::guildcard::quest_counts(app.save.as_ref().expect("save"), 0)[0],
+            1234
+        );
+
+        assert!(app.set_quest_count(1, 70_000));
+        let save = app.save.as_ref().expect("save");
+        assert_eq!(
+            mhnx_core::guildcard::quest_counts(save, 0)[1],
+            u16::MAX as u32
+        );
+        assert_eq!(
+            mhnx_core::guildcard::quest_counts(save, 0)[0],
+            1234,
+            "the neighbour did not move"
+        );
+
+        let steps = app.undo.len();
+        assert!(!app.set_quest_count(7, 5));
+        assert_eq!(app.undo.len(), steps, "a refusal is not an undo step");
+        assert_eq!(
+            app.save.as_ref().expect("save").body().len(),
+            before.len()
+        );
+
+        app.undo_last();
+        app.undo_last();
+        assert_eq!(app.save.as_ref().expect("save").body(), &before[..]);
+    }
+
+    /// A palico's experience is the number the core has always been able to
+    /// write and no screen ever reached. The roster row writes it now, through
+    /// the same method this test calls.
+    #[test]
+    fn a_palicos_experience_is_written_and_taken_back() {
+        let dir = Scratch::new("palicoexp");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(mhnx_core::palico::set_name(
+            app.save.as_mut().expect("save"),
+            0,
+            0,
+            "テスト"
+        ));
+        let before = app.save.as_ref().expect("save").body().to_vec();
+        let level = mhnx_core::palico::used(app.save.as_ref().expect("save"), 0)[0].level;
+
+        assert!(app.set_palico_exp(0, 123_456));
+        assert!(app.dirty);
+        let p = mhnx_core::palico::used(app.save.as_ref().expect("save"), 0)[0].clone();
+        assert_eq!(p.exp, 123_456);
+        assert_eq!(p.level, level, "the level is a separate byte");
+
+        app.undo_last();
+        assert_eq!(app.save.as_ref().expect("save").body(), &before[..]);
+    }
+
+    /// The options this build cannot reach are counted and named on screen as
+    /// 未対応, and the four it can reach stay editable. The list is the
+    /// reference editor's own ids, so the gap can be checked against it.
+    #[test]
+    fn the_options_panel_names_what_it_cannot_reach() {
+        assert_eq!(UNREACHABLE_OPTIONS.len(), 28);
+        let mut ids: Vec<&str> = UNREACHABLE_OPTIONS.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 28, "an id is listed twice");
+        assert!(UNREACHABLE_OPTIONS.iter().all(|(_, label)| !label.is_empty()));
+        // The four the window does edit are not in the list: nothing is both.
+        for id in ["brightness", "rumble", "disable-3d", "circle-pad-pro"] {
+            assert!(!ids.contains(&id), "{} is listed as reachable and not", id);
+        }
+
+        // A collapsed header draws no row, so the panel itself is drawn here
+        // the way the header draws it when it is open.
+        let ctx = egui::Context::default();
+        let output = ctx.run(frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                MhnxEditor::unreachable_options_panel(ui)
+            });
+        });
+        let text = drawn_text(&output);
+        for (id, label) in UNREACHABLE_OPTIONS {
+            assert!(text.contains(id), "{} is not on screen", id);
+            assert!(text.contains(label), "{} is not on screen", label);
+        }
+        assert_eq!(text.matches("未対応").count(), 28, "{}", text);
+
+        // And the four it can reach are still written to the save.
+        let dir = Scratch::new("four-options-again");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let want = mhnx_core::save::Options {
+            brightness: 40,
+            rumble: 1,
+            disable_3d: 1,
+            circle_pad_pro: 1,
+        };
+        assert!(app.apply_options(&want));
+        assert_eq!(app.save.as_ref().expect("save").options(), want);
+    }
+
+    /// コレクション: the save map names ten bit maps. Three are the award list,
+    /// which is the only collection this build has; the other seven are flags
+    /// the 進行状況 and DLC tabs already read, or (アイテムボックス / ポーチ)
+    /// bit-packed records of the item tabs. Nothing is left unshown, and there
+    /// is no fourth collection hiding in the map.
+    #[test]
+    fn the_only_collection_bitmap_in_the_save_map_is_the_award_list() {
+        let dir = Scratch::new("bitmaps");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.save.as_mut().expect("save").set_slot_used(0, true);
+
+        let mut bitmaps: Vec<&str> = mhnx_core::savemap::fields()
+            .iter()
+            .filter(|f| f.kind == mhnx_core::savemap::FieldKind::BitMap)
+            .map(|f| f.name)
+            .collect();
+        bitmaps.sort_unstable();
+        bitmaps.dedup();
+        assert_eq!(
+            bitmaps,
+            [
+                "DLC 導入済みのビット",
+                "アイテムボックス",
+                "クエスト（クリア）",
+                "クエスト（失敗）",
+                "クエスト（発見）",
+                "ポーチ",
+                "依頼フラグ",
+                "勲章（カード側）",
+                "勲章（解禁マップ）",
+                "勲章（通知）",
+            ]
+        );
+
+        // Each flag map is reached by a screen: the awards by set_award, the
+        // quest bits by set_quest, the download flags by the DLC list. A list
+        // with no screen would be a collection nobody can see.
+        let save = app.save.as_ref().expect("save");
+        assert_eq!(awards::count(save, 0), 0);
+        assert_eq!(
+            mhnx_core::questprogress::count(save, 0, Progress::Cleared),
+            0
+        );
+        assert!(dlc::list_quests(save).is_empty());
+        assert_eq!(
+            mhnx_core::guildcard::quest_counts(save, 0).len(),
+            7,
+            "the card counters are not a bit map; they are seven u16s"
+        );
+    }
+
+    /// On the real save the four pairs agree, for every slot: the offsets the
+    /// panel reads are the ones the game writes, not four numbers picked to
+    /// make the panel look right.
+    #[test]
+    fn the_sample_saves_four_copies_agree() {
+        let Some(path) = sample_save() else { return };
+        let save = Save::from_bytes(&std::fs::read(path).expect("read")).expect("a save");
+        for slot in 0..mhnx_core::save::MAX_SLOTS {
+            let Some(copies) = MhnxEditor::character_copies(&save, slot) else {
+                continue;
+            };
+            for c in &copies {
+                assert!(
+                    c.agrees(),
+                    "slot {} {} reads {} / {}",
+                    slot,
+                    c.label,
+                    c.live,
+                    c.copy
+                );
+            }
+            // A read that landed on the wrong bytes would show up as an empty
+            // name rather than a matching pair of blanks.
+            assert!(!copies[0].live.is_empty(), "slot {} has no name", slot);
+        }
     }
 }
 

@@ -823,6 +823,27 @@ pub fn quest_total(save: &Save, slot: usize) -> u32 {
     total.min(QUEST_TOTAL_CAP)
 }
 
+/// Rewrite one of the card's seven quest counters.
+///
+/// The field is the u16 [quest_counts_in] reads, so a value above 65,535 is
+/// clamped rather than wrapped and a kind past the seven counters is refused.
+/// The card's own total is not stored: the game adds the seven up when it
+/// draws the card and caps that sum, which [quest_total] repeats.
+pub fn set_quest_count(save: &mut Save, slot: usize, kind: usize, value: u32) -> bool {
+    if kind >= QUEST_COUNTS {
+        return false;
+    }
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return false;
+    };
+    let o = base + OFF_GUILD_CARD + GC_QUESTS + kind * 2;
+    let Some(dst) = save.body_mut().get_mut(o..o + 2) else {
+        return false;
+    };
+    dst.copy_from_slice(&(value.min(u16::MAX as u32) as u16).to_le_bytes());
+    true
+}
+
 // ---- quest history ---------------------------------------------------------
 
 fn history_records(card: &[u8]) -> Vec<HistoryRecord> {
