@@ -309,6 +309,12 @@ static SLOT_SPECS: &[Spec] = &[
     Spec { offset: save::OFF_HAIRSTYLE, len: 1, name: "髪型", kind: FieldKind::Byte },
     Spec { offset: save::OFF_FACE, len: 1, name: "顔", kind: FieldKind::Byte },
     Spec { offset: save::OFF_FEATURES, len: 1, name: "特徴", kind: FieldKind::Byte },
+    // The five pigments come first, in the same order the game lists them.
+    Spec { offset: save::OFF_ARMOR_COLORS, len: 4, name: "装備の色1（RGBA）", kind: FieldKind::Byte },
+    Spec { offset: save::OFF_ARMOR_COLORS + save::COLOR_BYTES, len: 4, name: "装備の色2（RGBA）", kind: FieldKind::Byte },
+    Spec { offset: save::OFF_ARMOR_COLORS + 2 * save::COLOR_BYTES, len: 4, name: "装備の色3（RGBA）", kind: FieldKind::Byte },
+    Spec { offset: save::OFF_ARMOR_COLORS + 3 * save::COLOR_BYTES, len: 4, name: "装備の色4（RGBA）", kind: FieldKind::Byte },
+    Spec { offset: save::OFF_ARMOR_COLORS + 4 * save::COLOR_BYTES, len: 4, name: "装備の色5（RGBA）", kind: FieldKind::Byte },
     Spec { offset: save::OFF_SKIN_COLOR, len: 4, name: "肌の色（RGBA）", kind: FieldKind::Byte },
     Spec { offset: save::OFF_HAIR_COLOR, len: 4, name: "髪の色（RGBA）", kind: FieldKind::Byte },
     Spec { offset: save::OFF_FEATURES_COLOR, len: 4, name: "特徴の色（RGBA）", kind: FieldKind::Byte },
@@ -380,6 +386,13 @@ static SLOT_SPECS: &[Spec] = &[
     },
     // ---- guild card ----
     Spec { offset: save::OFF_GUILD_CARD, len: save::GUILD_CARD_SIZE, name: "ギルドカード", kind: FieldKind::Byte },
+    // UTF-16, eleven units, so the value column shows the bytes.
+    Spec {
+        offset: save::OFF_GUILD_CARD + guildcard::GC_NAME,
+        len: guildcard::GC_NAME_UNITS * 2,
+        name: "ギルドカード（名前・UTF-16）",
+        kind: FieldKind::Byte,
+    },
     Spec {
         offset: save::OFF_GUILD_CARD + guildcard::GC_HR,
         len: 2,

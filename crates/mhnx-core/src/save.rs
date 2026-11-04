@@ -94,6 +94,34 @@ pub const OFF_GENDER_PREVIEW: usize = 0x2A;
 pub const OFF_HAIRSTYLE: usize = 0x23B4D;
 pub const OFF_FACE: usize = 0x23B4E;
 pub const OFF_FEATURES: usize = 0x23B4F;
+/// The five armour pigments, one RGBA each, at the front of the colour block.
+///
+/// The game's colour block has nine slots: 0..4 are the pigment of each worn
+/// piece, then skin (5), hair (6), features (7) and clothing (8). The four
+/// constants below sit at 5, 6, 7 and 8 with no gap between them, so the five
+/// four-byte RGBA values directly in front of slot 5 are slots 0..4.
+///
+/// Evidence, read out of the sample save (C:\anyWorkspace\nx\jksv_ready\system;
+/// all three slots hold the same bytes): slot + 0x23B53 reads
+///
+/// ```text
+/// 3D 36 3E FF  3D 36 3E FF  3D 36 3E FF  3D 36 3E FF  38 62 CD FF
+/// ```
+///
+/// - five RGBA values, 20 bytes in all - and 0x23B53 + 20 = 0x23B67 is exactly
+/// OFF_SKIN_COLOR, which the assertion below pins down. The guild card carries
+/// the same five values in the same order at card + 0x24, twenty bytes in front
+/// of its own copy of the colours at guildcard::GC_COLOURS (+0x38, = skin).
+pub const OFF_ARMOR_COLORS: usize = 0x23B53;
+/// How many pigments the block holds: one per worn piece.
+pub const ARMOR_COLOR_SLOTS: usize = 5;
+/// Bytes one RGBA colour occupies.
+pub const COLOR_BYTES: usize = 4;
+/// Bytes the whole pigment block occupies: 5 x 4 = 20.
+pub const ARMOR_COLORS_SIZE: usize = ARMOR_COLOR_SLOTS * COLOR_BYTES;
+// The block has to end exactly where the skin colour starts, or the twenty
+// bytes are not the whole story and OFF_ARMOR_COLORS is the wrong offset.
+const _: () = assert!(OFF_ARMOR_COLORS + ARMOR_COLORS_SIZE == OFF_SKIN_COLOR);
 /// RGBA colours.
 pub const OFF_SKIN_COLOR: usize = 0x23B67;
 pub const OFF_HAIR_COLOR: usize = 0x23B6B;
@@ -397,6 +425,13 @@ impl Save {
             hairstyle: self.body[base + OFF_HAIRSTYLE],
             face: self.body[base + OFF_FACE],
             features: self.body[base + OFF_FEATURES],
+            armor_colors: {
+                let mut a = [[0u8; 4]; ARMOR_COLOR_SLOTS];
+                for (i, v) in a.iter_mut().enumerate() {
+                    *v = col(OFF_ARMOR_COLORS + i * COLOR_BYTES);
+                }
+                a
+            },
             skin_color: col(OFF_SKIN_COLOR),
             hair_color: col(OFF_HAIR_COLOR),
             features_color: col(OFF_FEATURES_COLOR),
@@ -441,6 +476,10 @@ impl Save {
         self.body[base + OFF_HAIRSTYLE] = c.hairstyle;
         self.body[base + OFF_FACE] = c.face;
         self.body[base + OFF_FEATURES] = c.features;
+        for (i, v) in c.armor_colors.iter().enumerate() {
+            let off = base + OFF_ARMOR_COLORS + i * COLOR_BYTES;
+            self.body[off..off + COLOR_BYTES].copy_from_slice(v);
+        }
         for (off, v) in [
             (OFF_SKIN_COLOR, c.skin_color),
             (OFF_HAIR_COLOR, c.hair_color),
@@ -455,27 +494,43 @@ impl Save {
 
     /// Copy the appearance bytes into the guild card's own copy.
     ///
-    /// The card carries a second copy of the same eight bytes at
-    /// OFF_GUILD_CARD + 0x19 and of the four colours at +0x38. In the sample
-    /// save both copies are byte for byte identical for every character, so
-    /// changing only the live one would leave the card describing the old
-    /// hunter.
+    /// The card carries a second copy of the character's colour block: the same
+    /// eight look bytes at card + GC_APPEARANCE (+0x19), the same five pigments
+    /// at card + GC_PIGMENTS (+0x24) and the same four colours at
+    /// card + GC_COLOURS (+0x38). In the sample save every one of those copies
+    /// is byte for byte identical to the character's, for all three slots (the
+    /// card's 0x24..0x38 holds 3D 36 3E FF four times and 38 62 CD FF, exactly
+    /// as slot + 0x23B53 does), so changing only the live one would leave the
+    /// card describing the old hunter.
     pub fn sync_guild_card_appearance(&mut self, slot: usize) -> bool {
+        use crate::guildcard::{GC_APPEARANCE, GC_COLOURS, GC_PIGMENTS};
         let Some(base) = self.slot_base(slot).map(|b| b as usize) else {
             return false;
         };
         let gc = base + OFF_GUILD_CARD;
-        let src = base + OFF_VOICE;
-        let (Some(dst), Some(from)) = (
-            self.body.get(gc + 0x19..gc + 0x21),
-            self.body.get(src..src + 8).map(|s| s.to_vec()),
-        ) else {
+        // Read every source first: a truncated save must not be half-mirrored.
+        let look = self.body.get(base + OFF_VOICE..base + OFF_VOICE + 8).map(|s| s.to_vec());
+        let pigs = self
+            .body
+            .get(base + OFF_ARMOR_COLORS..base + OFF_ARMOR_COLORS + ARMOR_COLORS_SIZE)
+            .map(|s| s.to_vec());
+        let cols = self
+            .body
+            .get(base + OFF_SKIN_COLOR..base + OFF_SKIN_COLOR + 4 * COLOR_BYTES)
+            .map(|s| s.to_vec());
+        let (Some(look), Some(pigs), Some(cols)) = (look, pigs, cols) else {
             return false;
         };
-        let _ = dst;
-        self.body[gc + 0x19..gc + 0x21].copy_from_slice(&from);
-        let colors = self.body[base + OFF_SKIN_COLOR..base + OFF_SKIN_COLOR + 16].to_vec();
-        self.body[gc + 0x38..gc + 0x48].copy_from_slice(&colors);
+        let fits = |o: usize, n: usize| o.checked_add(n).is_some_and(|e| e <= self.body.len());
+        if !fits(gc + GC_APPEARANCE, look.len())
+            || !fits(gc + GC_PIGMENTS, pigs.len())
+            || !fits(gc + GC_COLOURS, cols.len())
+        {
+            return false;
+        }
+        self.body[gc + GC_APPEARANCE..gc + GC_APPEARANCE + look.len()].copy_from_slice(&look);
+        self.body[gc + GC_PIGMENTS..gc + GC_PIGMENTS + pigs.len()].copy_from_slice(&pigs);
+        self.body[gc + GC_COLOURS..gc + GC_COLOURS + cols.len()].copy_from_slice(&cols);
         true
     }
 
@@ -998,6 +1053,8 @@ pub struct Character {
     pub face: u8,
     /// Features id.
     pub features: u8,
+    /// Armour pigments RGBA, one per worn piece (colour slots 0..4).
+    pub armor_colors: [[u8; 4]; ARMOR_COLOR_SLOTS],
     /// Skin colour RGBA.
     pub skin_color: [u8; 4],
     /// Hair colour RGBA.
@@ -1028,6 +1085,7 @@ impl Default for Character {
             hairstyle: 0,
             face: 0,
             features: 0,
+            armor_colors: [[0; 4]; ARMOR_COLOR_SLOTS],
             skin_color: [0; 4],
             hair_color: [0; 4],
             features_color: [0; 4],

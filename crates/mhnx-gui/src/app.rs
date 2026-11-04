@@ -4416,21 +4416,25 @@ impl MhnxEditor {
             );
 
             ui.separator();
-            // The four colours below are slots 5-8 of the game's nine colour
-            // block: 0-4 are the worn pieces' pigment, then skin, hair,
-            // features, clothing. Only the four the crate has constants for are
-            // shown. The five pigments sit 20 bytes in front of
-            // mhnx_core::save::OFF_SKIN_COLOR and are plain RGBA (the sample
-            // save holds 3D 36 3E FF four times and 38 62 CD FF for them), but
-            // no existing constant addresses them and this build does not mint
-            // offsets, so they are left out rather than guessed at.
+            // The nine colours the game keeps, in the order it stores them:
+            // slots 0-4 are the pigment of each worn piece, then skin, hair,
+            // features, clothing. The five pigments start at
+            // mhnx_core::save::OFF_ARMOR_COLORS, twenty bytes in front of
+            // OFF_SKIN_COLOR, and are plain RGBA (the sample save holds
+            // 3D 36 3E FF four times and 38 62 CD FF for them).
             ui.label(egui::RichText::new("カラー (RGBA)").strong());
-            for (label, color) in [
-                ("肌", &mut self.edit.skin_color),
-                ("髪", &mut self.edit.hair_color),
-                ("特徴", &mut self.edit.features_color),
-                ("服", &mut self.edit.clothing_color),
-            ] {
+            // The five pigments are borrowed slot by slot, so the row list is
+            // built first: an array literal of `&mut self.edit.armor_colors[i]`
+            // would borrow the whole array once per element.
+            let mut rows: Vec<(String, &mut [u8; 4])> = Vec::new();
+            for (i, color) in self.edit.armor_colors.iter_mut().enumerate() {
+                rows.push((format!("色素{}", i + 1), color));
+            }
+            rows.push((String::from("肌"), &mut self.edit.skin_color));
+            rows.push((String::from("髪"), &mut self.edit.hair_color));
+            rows.push((String::from("特徴"), &mut self.edit.features_color));
+            rows.push((String::from("服"), &mut self.edit.clothing_color));
+            for (label, color) in rows {
                 ui.horizontal(|ui| {
                     ui.label(format!("{:<4}", label));
                     let mut c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
@@ -9215,13 +9219,14 @@ impl MhnxEditor {
         ui.heading("ギルドカード");
         // Everything below is copied out first: the edit controls need a
         // mutable borrow of the save, which cannot coexist with reading it.
-        let (hr, time, id, comment, log) = {
+        let (name, hr, time, id, comment, log) = {
             let Some(save) = &self.save else {
                 ui.label("セーブを開くと、ギルドカードと闘技大会の記録を表示します");
                 return;
             };
             let slot = self.slot;
             (
+                mhnx_core::guildcard::card_name(save, slot).unwrap_or_default(),
                 mhnx_core::guildcard::hunter_rank(save, slot).unwrap_or(0),
                 mhnx_core::guildcard::play_time(save, slot).unwrap_or(0),
                 mhnx_core::guildcard::card_id(save, slot).unwrap_or([0; 8]),
@@ -9230,13 +9235,27 @@ impl MhnxEditor {
             )
         };
         let slot = self.slot;
-        // The card is editable: rank, its own clock and the comment are all
-        // plain fields, so they can be nudged here like any other number.
+        // The card is editable: the name, rank, its own clock and the comment
+        // are all plain fields, so they can be nudged here like any other
+        // number.
+        let mut new_name = name.clone();
         let mut new_hr = hr;
         let mut new_time = time;
         let mut new_comment = comment.clone();
         let mut changed = false;
         egui::Grid::new("gcinfo").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+            ui.label("名前");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut new_name)
+                        .desired_width(360.0)
+                        .char_limit(mhnx_core::guildcard::GC_NAME_UNITS),
+                )
+                .changed()
+            {
+                changed = true;
+            }
+            ui.end_row();
             ui.label("ハンターランク");
             if ui
                 .add(egui::DragValue::new(&mut new_hr).range(0..=999))
@@ -9281,9 +9300,20 @@ impl MhnxEditor {
             }
             ui.end_row();
         });
+        ui.label(
+            egui::RichText::new(
+                "名前はカード側の写しを書き換えます（キャラクター本体の名前はキャラクタータブ）。\
+                 欄は 11 文字までで、終端より後ろの残りバイトには触れません。",
+            )
+            .weak()
+            .small(),
+        );
         if changed {
             self.push_undo(String::from("ギルドカードの基本情報"));
             if let Some(save) = &mut self.save {
+                if new_name != name {
+                    mhnx_core::guildcard::set_card_name(save, slot, &new_name);
+                }
                 if new_hr != hr {
                     mhnx_core::guildcard::set_hunter_rank(save, slot, new_hr);
                 }
@@ -18832,6 +18862,22 @@ mod tests {
         out
     }
 
+    /// A frame tall enough to show the whole セーブ tab without scrolling.
+    ///
+    /// The tab grew by the five armour-pigment rows, and the copy section at
+    /// the bottom of it no longer fits a 740 px viewport. egui culls text that
+    /// falls outside the scroll area's clip rectangle, so a test that reads the
+    /// badges back must give the frame the height of the whole tab; the tab
+    /// still scrolls in a smaller window, which is what a person does.
+    fn tall_frame_input() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 1300.0),
+        ));
+        input
+    }
+
     /// A window-sized frame input for the drawing tests below.
     fn frame_input() -> egui::RawInput {
         let mut input = egui::RawInput::default();
@@ -19105,7 +19151,7 @@ mod tests {
 
         // The badge the tab prints for a pair that agrees.
         let ctx = egui::Context::default();
-        let output = ctx.run(frame_input(), |ctx| {
+        let output = ctx.run(tall_frame_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
         });
         let text = drawn_text(&output);
@@ -19134,7 +19180,7 @@ mod tests {
             .expect("a slot");
         assert!(!copies[0].agrees(), "a stale copy has to be visible");
         assert!(copies[1..].iter().all(|c| c.agrees()));
-        let output = ctx.run(frame_input(), |ctx| {
+        let output = ctx.run(tall_frame_input(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
         });
         let text = drawn_text(&output);
@@ -19148,6 +19194,78 @@ mod tests {
         app.apply_to_save();
         let stored = app.save.as_ref().expect("save").read_character(0).expect("a slot");
         assert_eq!((stored.voice, stored.hairstyle), (200, 201));
+    }
+
+    /// The five armour pigments are on the character tab, drawn with the same
+    /// widget as the four colours that were already there, and applying the tab
+    /// writes them where the crate reads them.
+    #[test]
+    fn the_five_pigment_pickers_are_drawn_and_written() {
+        let dir = Scratch::new("pigments");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
+        });
+        let text = drawn_text(&output);
+        for label in ["色素1", "色素2", "色素3", "色素4", "色素5"] {
+            assert!(text.contains(label), "{}", text);
+        }
+        // Nine colour rows, all with the same R/G/B/A readout: the five new ones
+        // are the same widget as the four that were already there.
+        assert_eq!(text.matches("R0 G0 B0 A0").count(), 9, "{}", text);
+
+        app.edit.armor_colors[0] = [1, 2, 3, 255];
+        app.edit.armor_colors[4] = [9, 8, 7, 6];
+        app.apply_to_save();
+        let stored = app.save.as_ref().expect("save").read_character(0).expect("a slot");
+        assert_eq!(stored.armor_colors[0], [1, 2, 3, 255]);
+        assert_eq!(stored.armor_colors[4], [9, 8, 7, 6]);
+        let base = app
+            .save
+            .as_ref()
+            .and_then(|s| s.slot_base(0))
+            .expect("slot base") as usize;
+        assert_eq!(
+            &app.save.as_ref().expect("save").body()
+                [base + mhnx_core::save::OFF_ARMOR_COLORS..base + mhnx_core::save::OFF_ARMOR_COLORS + 4],
+            &[1, 2, 3, 255]
+        );
+    }
+
+    /// The guild tab edits the name the card carries, and the field is the
+    /// eleven units in front of the card's rank - not the character's own name.
+    #[test]
+    fn the_guild_tab_edits_the_card_name() {
+        let dir = Scratch::new("cardname");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_guild(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("名前"), "{}", text);
+        assert!(text.contains("カード側の写し"), "{}", text);
+
+        // The write the field performs, through the crate function the tab uses.
+        let mut save = app.save.take().expect("save");
+        assert!(mhnx_core::guildcard::set_card_name(&mut save, 0, "ナナ"));
+        assert_eq!(
+            mhnx_core::guildcard::card_name(&save, 0).as_deref(),
+            Some("ナナ")
+        );
+        app.save = Some(save);
+        // The character's own name field is a different field and is untouched.
+        let stored = app.save.as_ref().expect("save").read_character(0).expect("a slot");
+        assert_eq!(stored.name, "");
     }
 
     /// The card's seven quest counters are the u16s the card adds up, written

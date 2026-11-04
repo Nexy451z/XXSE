@@ -1866,6 +1866,7 @@ fn character_fields_changed(old: &Save, new: &Save, slot: usize) -> Vec<&'static
         || a.hairstyle != b.hairstyle
         || a.face != b.face
         || a.features != b.features
+        || a.armor_colors != b.armor_colors
         || a.skin_color != b.skin_color
         || a.hair_color != b.hair_color
         || a.features_color != b.features_color

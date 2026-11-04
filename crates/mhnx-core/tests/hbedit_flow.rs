@@ -2814,6 +2814,92 @@ fn editing_the_appearance_updates_the_guild_card_too() {
 }
 
 // ---------------------------------------------------------------------------
+// The five armour pigments (the game's colour slots 0-4).
+// ---------------------------------------------------------------------------
+
+/// The measured pigments: 3D 36 3E FF four times, then 38 62 CD FF.
+///
+/// These are the bytes the sample save holds at slot + 0x23B53, verified while
+/// the offset was being pinned down; OFF_SKIN_COLOR follows twenty bytes later
+/// (0x23B67). All three slots carry them, both through the slot bases the save
+/// stores in its header and at the fixed stride.
+#[test]
+fn the_five_armour_pigments_read_back_as_measured() {
+    if !real_save().exists() {
+        return;
+    }
+    use mhnx_core::save::*;
+    let s = Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let want: [[u8; 4]; ARMOR_COLOR_SLOTS] = [
+        [0x3D, 0x36, 0x3E, 0xFF],
+        [0x3D, 0x36, 0x3E, 0xFF],
+        [0x3D, 0x36, 0x3E, 0xFF],
+        [0x3D, 0x36, 0x3E, 0xFF],
+        [0x38, 0x62, 0xCD, 0xFF],
+    ];
+    let mut flat = Vec::new();
+    for p in want {
+        flat.extend_from_slice(&p);
+    }
+    // The block is twenty bytes and ends exactly on the skin colour, which is
+    // the whole reason 0x23B53 is the offset rather than a guess.
+    assert_eq!(ARMOR_COLORS_SIZE, 20);
+    assert_eq!(OFF_ARMOR_COLORS + ARMOR_COLORS_SIZE, OFF_SKIN_COLOR);
+    for slot in 0..3 {
+        // The stride-placed copy of the body and the slot base the header
+        // names are the same address for this save, so both readings have to
+        // agree with the measured bytes.
+        let at = FIRST_SLOT_BASE as usize + slot * SLOT_STRIDE + OFF_ARMOR_COLORS;
+        assert_eq!(&s.body()[at..at + 20], &flat[..], "slot copy {}", slot + 1);
+        let c = s.read_character(slot).expect("a character");
+        assert_eq!(c.armor_colors, want, "slot {}", slot + 1);
+    }
+    // The five pigments are followed by the four colours the crate already
+    // knew, in slot order, with no gap.
+    assert_eq!(OFF_HAIR_COLOR, OFF_SKIN_COLOR + COLOR_BYTES);
+    assert_eq!(OFF_FEATURES_COLOR, OFF_HAIR_COLOR + COLOR_BYTES);
+    assert_eq!(OFF_CLOTHING_COLOR, OFF_FEATURES_COLOR + COLOR_BYTES);
+}
+
+/// Writing one pigment moves those four bytes and the card's copy of them -
+/// nothing else. The identity write first means the assertion is about the
+/// change, not about how the rest of the record re-encodes.
+#[test]
+fn writing_a_pigment_touches_that_pigment_and_its_card_copy() {
+    if !real_save().exists() {
+        return;
+    }
+    use mhnx_core::guildcard::GC_PIGMENTS;
+    use mhnx_core::save::*;
+    let mut s = Save::from_bytes(&std::fs::read(real_save()).unwrap()).unwrap();
+    let mut c = s.read_character(0).expect("a character");
+    s.write_character(&c).expect("the character writes");
+    let before = s.to_bytes();
+
+    c.armor_colors[1] = [0x11, 0x22, 0x33, 0x44];
+    s.write_character(&c).expect("the character writes again");
+    let after = s.to_bytes();
+    let base = SWITCH_HEADER_SIZE + FIRST_SLOT_BASE as usize;
+    let live = base + OFF_ARMOR_COLORS + COLOR_BYTES;
+    let card = base + OFF_GUILD_CARD + GC_PIGMENTS + COLOR_BYTES;
+    let diff: Vec<usize> = (0..after.len()).filter(|i| after[*i] != before[*i]).collect();
+    assert_eq!(diff.len(), 8, "diff {:?}", diff);
+    assert!(
+        diff.iter()
+            .all(|d| (*d >= live && *d < live + COLOR_BYTES)
+                || (*d >= card && *d < card + COLOR_BYTES)),
+        "diff {:?}",
+        diff
+    );
+    let back = s.read_character(0).expect("a character");
+    assert_eq!(back.armor_colors[1], [0x11, 0x22, 0x33, 0x44]);
+    // The other four pigments are still the measured ones.
+    assert_eq!(back.armor_colors[0], [0x3D, 0x36, 0x3E, 0xFF]);
+    assert_eq!(back.armor_colors[4], [0x38, 0x62, 0xCD, 0xFF]);
+    assert_eq!(back.skin_color, c.skin_color);
+}
+
+// ---------------------------------------------------------------------------
 // Guild card and arena log.
 // ---------------------------------------------------------------------------
 

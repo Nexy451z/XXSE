@@ -399,6 +399,9 @@ fn character_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChan
     ] {
         differing(out, at, field, x.to_string(), y.to_string());
     }
+    for (i, (x, y)) in a.armor_colors.iter().zip(b.armor_colors.iter()).enumerate() {
+        differing(out, at, format!("装備の色{}", i + 1), rgba(*x), rgba(*y));
+    }
     for (field, x, y) in [
         ("肌の色", a.skin_color, b.skin_color),
         ("髪の色", a.hair_color, b.hair_color),
@@ -418,6 +421,13 @@ fn card_values(
     out: &mut Vec<ValueChange>,
 ) {
     let at = Some(slot);
+    differing(
+        out,
+        at,
+        "ギルドカードの名前",
+        guildcard::card_name(old, slot).unwrap_or_default(),
+        guildcard::card_name(new, slot).unwrap_or_default(),
+    );
     differing(
         out,
         at,

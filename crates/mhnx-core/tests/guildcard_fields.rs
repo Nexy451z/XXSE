@@ -500,6 +500,130 @@ fn the_title_table_writes_word_connector_word() {
     assert_eq!(t.word(TITLE_WORDS - 1), None);
 }
 
+// ---------------------------------------------------------------------------
+// The hunter name on the card (card + 0, eleven UTF-16 units).
+// ---------------------------------------------------------------------------
+
+/// The sample save holds "ナナ" in all three slots, and the eleven units in
+/// front of GC_HR are the field: 0x16 / 2 = 11. The bytes behind the
+/// terminator are leftovers, not part of the name.
+#[test]
+fn the_card_name_reads_back_as_measured() {
+    let Some(s) = real_save() else { return };
+    assert_eq!(guildcard::GC_NAME, 0);
+    assert_eq!(guildcard::GC_NAME_UNITS, 11);
+    assert_eq!(
+        guildcard::GC_HR,
+        guildcard::GC_NAME + guildcard::GC_NAME_UNITS * 2,
+        "the name field ends where the rank starts"
+    );
+    for slot in 0..3 {
+        assert_eq!(
+            guildcard::card_name(&s, slot).as_deref(),
+            Some("ナナ"),
+            "slot {slot}"
+        );
+        let card = guildcard::full_card(&s, slot).expect("card block");
+        // CA 30 CA 30 00 00 - "ナナ" and its terminator - and then residue.
+        assert_eq!(&card[0..6], &[0xCA, 0x30, 0xCA, 0x30, 0x00, 0x00], "slot {slot}");
+        assert!(
+            card[6..22].iter().any(|b| *b != 0),
+            "slot {slot}: the leftovers are the evidence for the field width"
+        );
+    }
+}
+
+/// Writing the name touches the characters and the terminator, and nothing
+/// behind them: the sample save really does keep leftovers there, so zeroing
+/// the tail would rewrite bytes nobody asked to change.
+#[test]
+fn set_card_name_writes_the_text_and_the_terminator_only() {
+    let Some(mut s) = real_save() else { return };
+    // to_bytes() carries the Switch header while a slot base is a body offset,
+    // so the byte indices into the serialised save need both.
+    let hdr = if s.kind().has_header() {
+        mhnx_core::save::SWITCH_HEADER_SIZE
+    } else {
+        0
+    };
+    let base = s.slot_base(0).expect("slot base") as usize;
+    let in_body = base + guildcard::OFF_GUILD_CARD + guildcard::GC_NAME;
+    let at = hdr + in_body;
+    let before = s.to_bytes();
+    let residue = s.body()[in_body + 6..in_body + 22].to_vec();
+    assert!(residue.iter().any(|b| *b != 0), "nothing to preserve");
+
+    // Three units plus a terminator: eight bytes.
+    assert!(guildcard::set_card_name(&mut s, 0, "アイル"));
+    assert_eq!(guildcard::card_name(&s, 0).as_deref(), Some("アイル"));
+    let after = s.to_bytes();
+    let diff: Vec<usize> = (0..after.len()).filter(|i| after[*i] != before[*i]).collect();
+    assert!(!diff.is_empty());
+    assert!(diff.iter().all(|d| *d >= at && *d < at + 8), "diff {:?}", diff);
+    // The field now holds three units and a terminator, and nothing more.
+    let mut want = utf16le("アイル");
+    want.extend_from_slice(&[0, 0]);
+    assert_eq!(&after[at..at + 8], &want[..]);
+    // The leftovers behind the terminator are still the bytes they were.
+    assert_eq!(&s.body()[in_body + 8..in_body + 22], &residue[2..]);
+
+    // A name that fills the field gets no terminator and still stops at GC_HR.
+    let hr = guildcard::hunter_rank(&s, 0);
+    assert!(guildcard::set_card_name(&mut s, 0, "一二三四五六七八九十十一"));
+    assert_eq!(
+        guildcard::card_name(&s, 0).as_deref(),
+        Some("一二三四五六七八九十十"),
+        "twelve characters do not fit in eleven units"
+    );
+    assert_eq!(guildcard::hunter_rank(&s, 0), hr, "the rank moved");
+}
+
+/// A blank save has no leftovers, so the short-name and astral cases can be
+/// checked without the sample file.
+#[test]
+fn card_name_is_trimmed_to_eleven_units() {
+    let (mut s, base) = blank();
+    let at = base + guildcard::OFF_GUILD_CARD + guildcard::GC_NAME;
+    assert_eq!(guildcard::card_name(&s, 0).as_deref(), Some(""));
+    assert!(guildcard::set_card_name(&mut s, 0, "ナナ"));
+    assert_eq!(guildcard::card_name(&s, 0).as_deref(), Some("ナナ"));
+    assert_eq!(&s.body()[at..at + 6], &[0xCA, 0x30, 0xCA, 0x30, 0x00, 0x00]);
+    // An astral character cannot fit one unit and becomes the same placeholder
+    // set_comment writes.
+    assert!(guildcard::set_card_name(&mut s, 0, "a\u{1F600}b"));
+    assert_eq!(guildcard::card_name(&s, 0).as_deref(), Some("a\u{30FB}b"));
+    // Out-of-range slots are refused, not written elsewhere.
+    assert!(!guildcard::set_card_name(&mut s, 3, "x"));
+}
+
+/// The card carries the same five pigments as the character, twenty bytes in
+/// front of its own colours.
+#[test]
+fn the_card_copies_the_five_pigments_of_the_hunter() {
+    let Some(s) = real_save() else { return };
+    assert_eq!(
+        guildcard::GC_PIGMENTS + mhnx_core::save::ARMOR_COLORS_SIZE,
+        guildcard::GC_COLOURS,
+        "the card's pigments end where its colours start"
+    );
+    for slot in 0..3 {
+        let card = guildcard::full_card(&s, slot).expect("card block");
+        let c = s.read_character(slot).expect("character");
+        let mut want = Vec::new();
+        for p in c.armor_colors {
+            want.extend_from_slice(&p);
+        }
+        assert_eq!(
+            &card[guildcard::GC_PIGMENTS..guildcard::GC_PIGMENTS + 20],
+            &want[..],
+            "slot {slot}"
+        );
+        // And the measured value itself, not just agreement between two copies.
+        assert_eq!(&card[0x24..0x28], &[0x3D, 0x36, 0x3E, 0xFF], "slot {slot}");
+        assert_eq!(&card[0x34..0x38], &[0x38, 0x62, 0xCD, 0xFF], "slot {slot}");
+    }
+}
+
 #[test]
 fn comment_decodes_utf16_including_astral_characters() {
     let (mut s, _) = blank();

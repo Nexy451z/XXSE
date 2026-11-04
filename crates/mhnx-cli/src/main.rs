@@ -150,6 +150,22 @@ fn cmd_save_info(path: &str) -> Result<(), String> {
         println!("  academy     {}", c.academy_points);
         println!("  villages    {:?}", c.village_points);
         println!("  look        voice {} eye {} cloth {} gender {} hair {} face {} feature {}", c.voice, c.eye_color, c.clothing, c.gender, c.hairstyle, c.face, c.features);
+        // The nine colour slots in the order the save keeps them: 0..4 are the
+        // pigment of each worn piece, then skin, hair, features, clothing.
+        for (n, p) in c.armor_colors.iter().enumerate() {
+            println!("  pigment {}       {:02X} {:02X} {:02X} {:02X}", n + 1, p[0], p[1], p[2], p[3]);
+        }
+        for (label, v) in [
+            ("skin", c.skin_color),
+            ("hair", c.hair_color),
+            ("feature", c.features_color),
+            ("cloth", c.clothing_color),
+        ] {
+            println!("  colour {:<7} {:02X} {:02X} {:02X} {:02X}", label, v[0], v[1], v[2], v[3]);
+        }
+        if let Some(name) = mhnx_core::guildcard::card_name(&s, i) {
+            println!("  card name   {}", name);
+        }
         let items = s.read_item_box(i).ok_or("no item box")?;
         let used_items = items.iter().filter(|x| x.id != 0).count();
         println!("  item box    {} non-empty slots", used_items);

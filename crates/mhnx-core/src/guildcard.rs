@@ -61,10 +61,33 @@ pub const GUILD_CARD_SIZE: usize = 4986;
 pub const GC_SIZE: usize = 0x18B8;
 /// Hunter rank as the card records it.
 pub const GC_HR: usize = 0x16;
+/// The hunter's name on the card: UTF-16LE units, no length field.
+///
+/// The field is the eleven units in front of GC_HR, because 0x16 / 2 = 11. The
+/// sample save (C:\anyWorkspace\nx\jksv_ready\system) agrees: card + 0 holds
+/// CA 30 CA 30 00 00 CA C1 00 00 00 00 60 97 0D 30 A8 96 36 08 00 00 - the
+/// units CA 30 CA 30 are "ナナ", 00 00 is its terminator, the eight units from
+/// byte 6 on (CA C1 00 00 00 00 60 97 ...) are leftovers from a longer earlier
+/// name, and byte 0x16 (C7 03) is where GC_HR starts. So the name is written up
+/// to and including the terminator only; the leftovers stay as they are.
+/// Eleven units is also the longest the game's name entry accepts.
+pub const GC_NAME: usize = 0x00;
+/// Units of the name field: MHXX stores eleven (GC_HR / 2).
+pub const GC_NAME_UNITS: usize = GC_HR / 2;
 /// The card's copy of the appearance, eight bytes.
 pub const GC_APPEARANCE: usize = 0x19;
+/// The card's copy of the five armour pigments, 20 bytes.
+///
+/// It is the same nine-slot colour block the character keeps: card + 0x24 reads
+/// 3D 36 3E FF four times and 38 62 CD FF, and 0x24 + 20 = 0x38 is GC_COLOURS,
+/// i.e. the card's skin colour - the same relationship
+/// save::OFF_ARMOR_COLORS has to save::OFF_SKIN_COLOR.
+pub const GC_PIGMENTS: usize = 0x24;
 /// The card's copy of the four colours.
 pub const GC_COLOURS: usize = 0x38;
+// The card blocks line up with the character's: pigments take the twenty bytes
+// in front of the colours, wherever the colours are.
+const _: () = assert!(GC_PIGMENTS + crate::save::ARMOR_COLORS_SIZE == GC_COLOURS);
 /// Card play time, in seconds.
 pub const GC_PLAY_TIME: usize = 0x914;
 /// Card ID, eight bytes.
@@ -545,6 +568,19 @@ pub fn full_card(save: &Save, slot: usize) -> Option<&[u8]> {
     let base = save.slot_base(slot)? as usize;
     let start = base.checked_add(OFF_GUILD_CARD)?;
     save.body().get(start..start.checked_add(GC_SIZE)?)
+}
+
+/// The hunter name a card block carries, decoded from UTF-16.
+pub fn name_in(card: &[u8]) -> String {
+    match card.get(GC_NAME..GC_NAME + GC_NAME_UNITS * 2) {
+        Some(b) => utf16(b, GC_NAME_UNITS),
+        None => String::new(),
+    }
+}
+
+/// The hunter name the card carries.
+pub fn card_name(save: &Save, slot: usize) -> Option<String> {
+    Some(name_in(full_card(save, slot)?))
 }
 
 /// The hunter rank stored on the card.
@@ -1094,6 +1130,40 @@ pub fn set_comment(save: &mut Save, slot: usize, text: &str) -> bool {
         // Anything outside the basic plane cannot fit in a single unit.
         let unit = if v <= 0xFFFF { v as u16 } else { 0x30FB };
         dst[i * 2..i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+    }
+    true
+}
+
+/// Rewrite the hunter name on the card.
+///
+/// Only the characters and the terminator are written. The field is eleven
+/// units wide and the sample save really does keep leftover bytes behind the
+/// terminator (GC_NAME lists them), so zeroing the rest would rewrite bytes
+/// nobody asked to change. Text shorter than eleven units gets a NUL behind it;
+/// text that fills the field gets none, and longer text is truncated.
+pub fn set_card_name(save: &mut Save, slot: usize, text: &str) -> bool {
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return false;
+    };
+    let o = base + OFF_GUILD_CARD + GC_NAME;
+    let Some(dst) = save.body_mut().get_mut(o..o + GC_NAME_UNITS * 2) else {
+        return false;
+    };
+    let mut written = 0usize;
+    for ch in text.chars() {
+        if written >= GC_NAME_UNITS {
+            break;
+        }
+        let v = ch as u32;
+        // The game's name entry is BMP only; anything outside it cannot fit in
+        // one unit, so it becomes the same placeholder set_comment uses.
+        let unit = if v <= 0xFFFF { v as u16 } else { 0x30FB };
+        dst[written * 2..written * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+        written += 1;
+    }
+    // The terminator, and nothing behind it.
+    if written < GC_NAME_UNITS {
+        dst[written * 2..written * 2 + 2].copy_from_slice(&0u16.to_le_bytes());
     }
     true
 }
