@@ -3412,6 +3412,38 @@ impl Editor {
         true
     }
 
+    /// The console's "全オトモ Lv99・なつき100・EXP最大", as one undo step.
+    ///
+    /// The touch button used to write every palico straight into the save with
+    /// no [Editor::push_undo] behind it, so the one bulk edit on the roster was
+    /// also the one that could not be taken back. It is one writer now: the
+    /// button asks twice and this is what the second press runs.
+    ///
+    /// Returns how many palicos were written (0 when the roster is empty).
+    pub fn maximize_all_palicos(&mut self) -> usize {
+        let list = self.palicos();
+        if list.is_empty() {
+            self.message = String::from("オトモがいません（オトモを雇ってから実行してください）");
+            return 0;
+        }
+        let slot = self.slot;
+        self.push_undo("オトモ一括MAX");
+        let mut cnt = 0usize;
+        if let Some(save) = &mut self.save {
+            for p in &list {
+                let _ = crate::palico::set_level(save, slot, p.index, 99);
+                let _ = crate::palico::set_enthusiasm(save, slot, p.index, 100);
+                let _ = crate::palico::set_exp(save, slot, p.index, 999_999);
+                cnt += 1;
+            }
+        }
+        if cnt > 0 {
+            self.dirty = true;
+            self.message = alloc::format!("オトモ {} 匹を Lv99・最大に設定しました", cnt);
+        }
+        cnt
+    }
+
     /// Indices of the item slots currently visible.
     pub fn visible_items(&self) -> Vec<usize> {
         let Some(items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
@@ -3509,7 +3541,10 @@ impl Editor {
         self.screen = Screen::Charms;
         self.cursor = 0;
         if self.charms().is_empty() {
-            self.message = String::from("お守りがありません（Y で作成）");
+            // Y is the delete key on this screen, so pointing at it for "create"
+        // sent the user straight at the button that removes a talisman. Minus
+        // is what makes a new one.
+        self.message = String::from("お守りがありません（[-] で作成）");
         }
     }
 
@@ -10113,7 +10148,7 @@ impl Editor {
                     }
                     push(
                         &mut out,
-                        alloc::format!("  警告 {} 件 ([X] で読み直す)", self.set_warnings.len()),
+                        alloc::format!("  警告 {} 件 ([Y] で読み直す)", self.set_warnings.len()),
                         false,
                         false,
                     );
@@ -10132,7 +10167,7 @@ impl Editor {
                     push(
                         &mut out,
                         String::from(
-                            "  Up/Down 行  Left/Right 装備  A 決定  - 外す×2  X 警告  B 一覧",
+                            "  Up/Down 行  Left/Right 装備  A 決定  - 外す×2  Y 警告  B 一覧",
                         ),
                         false,
                         false,

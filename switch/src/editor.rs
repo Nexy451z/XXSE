@@ -85,13 +85,6 @@ pub const OUT_QUEST_DIR: &str = "/switch/XXSE/mhxx/quest/arc";
 /// simple and predictable. This many frames must pass before a repeat.
 const REPEAT_DELAY: u32 = 12;
 
-/// How long L has to be held before it means "元に戻す" instead of the sub-tab.
-///
-/// L is the sub-tab key on every screen, so the undo cannot be a plain L press.
-/// About half a second is the usual long-press threshold, and the footer pill
-/// names the key next to the count and the memory it costs.
-const L_UNDO_FRAMES: u32 = 30;
-
 // ---------------------------------------------------------------------------
 // file helpers
 // ---------------------------------------------------------------------------
@@ -569,11 +562,20 @@ fn finish_console_write(ed: &mut Editor, bytes: &[u8], pre_read: Option<&[u8]>) 
     }
 }
 
-/// The A press of the save review: write what the review just showed.
+/// The A press of the review dialog: do what the dialog just showed.
 ///
 /// The UI layer calls this from a tap on the dialog's button, so the key path
-/// and the touch path run the same code.
-pub(crate) fn finish_reviewed_write(ed: &mut Editor) {
+/// and the touch path run the same code. A snapshot restore is a write from a
+/// different source, so it waits on the same press and is spent here.
+pub(crate) fn finish_reviewed_write(ed: &mut Editor, gui: &mut crate::ui::GuiState) {
+    if let Some(plan) = gui.pending_snapshot.take() {
+        // The dialog has been answered, so the review it was built from is
+        // done; the write below is the snapshot's, not the open save's, which
+        // is why confirm_save_review must not be the one that runs it.
+        ed.review = None;
+        commit_snapshot_restore(ed, &plan);
+        return;
+    }
     if let Some(Write::File { bytes, .. }) = ed.confirm_save_review() {
         // No pre-read: the console may have changed between the review and this
         // press, and the copy write_console_save keeps has to be what is there.
@@ -718,45 +720,70 @@ fn snapshot_note(snapshot: &Result<String, String>) -> String {
     }
 }
 
-/// Put the newest snapshot back on the console and reload it into the editor.
+/// The snapshot a review is waiting on.
 ///
-/// The save currently on the console is copied into `SAFETY_DIR` first:
-/// restoring is a write like any other and can itself go wrong, and a restore
-/// that fails must not cost the save it replaced.
-pub fn restore_latest_snapshot(ed: &mut Editor) {
+/// Restoring used to write the console on the press that asked for it, which
+/// made it the one write in the editor that skipped the review every other
+/// write goes through. It is a write like any other now, and this is what the
+/// dialog holds between the first [Y] and the second [A].
+pub struct SnapshotRestore {
+    /// The file in `SNAPSHOT_DIR` that goes back.
+    pub name: String,
+    /// The copy of the save it replaces, made before the dialog opened.
+    pub backup: String,
+}
+
+/// The newest snapshot, read and checked, ready to be offered.
+///
+/// Split out of the restore so the review can be built from the same bytes the
+/// write will use, and so every reason a snapshot cannot be used is one message
+/// instead of four returns.
+fn newest_snapshot() -> Result<(String, Vec<u8>), String> {
     let mut names = snapshot_names();
     if names.is_empty() {
-        ed.message = alloc::format!(
+        return Err(alloc::format!(
             "スナップショットがありません（本体セーブを保存すると {} に作られます）",
             SNAPSHOT_DIR
-        );
-        return;
+        ));
     }
     names.sort();
-    let Some(name) = names.pop() else { return };
+    let Some(name) = names.pop() else {
+        return Err(String::from("スナップショットがありません"));
+    };
     let path = format!("{}/{}", SNAPSHOT_DIR, name);
-    let bytes = match read_file(&path) {
-        Some(b) => b,
-        None => {
-            ed.message = alloc::format!("スナップショットを読み込めません: {}", path);
+    let Some(bytes) = read_file(&path) else {
+        return Err(alloc::format!("スナップショットを読み込めません: {}", path));
+    };
+    if !crate::savedata::looks_like_save(&bytes) {
+        return Err(alloc::format!(
+            "スナップショットのサイズが想定と違います（{} バイト）",
+            bytes.len()
+        ));
+    }
+    if let Some(finding) = mhnx_core::verify::check_shape(&bytes).first().copied() {
+        return Err(alloc::format!(
+            "スナップショットの形が不正なため戻しません: {}",
+            finding.text()
+        ));
+    }
+    Ok((name, bytes))
+}
+
+/// The [Y] press: keep what is about to be replaced, then ask.
+///
+/// Nothing is written to the console here. The save is copied into `SAFETY_DIR`
+/// first - the dialog names that copy, so the user knows where the save being
+/// replaced went - and the restore is then put through the very review dialog
+/// the save key uses. Only the second [A] reaches [commit_snapshot_restore].
+pub(crate) fn begin_snapshot_restore(ed: &mut Editor, gui: &mut crate::ui::GuiState) {
+    gui.pending_snapshot = None;
+    let (name, bytes) = match newest_snapshot() {
+        Ok(v) => v,
+        Err(msg) => {
+            ed.message = msg;
             return;
         }
     };
-    if !crate::savedata::looks_like_save(&bytes) {
-        ed.message = alloc::format!(
-            "スナップショットのサイズが想定と違います（{} バイト）",
-            bytes.len()
-        );
-        return;
-    }
-    let findings = mhnx_core::verify::check_shape(&bytes);
-    if let Some(finding) = findings.first().copied() {
-        ed.message = alloc::format!(
-            "スナップショットの形が不正なため戻しません: {}",
-            finding.text()
-        );
-        return;
-    }
     let mount = match crate::savedata::Mount::open() {
         Ok(m) => m,
         Err(e) => {
@@ -775,18 +802,72 @@ pub fn restore_latest_snapshot(ed: &mut Editor) {
         }
     };
     make_dirs(SAFETY_DIR);
-    let backup_path = format!("{}/system_{}.bak", SAFETY_DIR, crate::savedata::stamp());
-    if !write_file(&backup_path, &current) {
-        ed.message = alloc::format!("控えを書けないため戻しませんでした（{}）", backup_path);
+    let backup = format!("{}/system_{}.bak", SAFETY_DIR, crate::savedata::stamp());
+    if !write_file(&backup, &current) {
+        ed.message = alloc::format!("控えを書けないため戻しませんでした（{}）", backup);
         return;
     }
     prune_old_backups(10);
-    match mount.write_diff(&bytes, Some(&current)) {
+    // A snapshot that is byte for byte what the console already holds is not a
+    // write; saying so is friendlier than a dialog with nothing in it.
+    if !ed.stage_save_review(mhnx_core::hbedit::CONSOLE_SAVE, &current, &bytes) {
+        ed.message = alloc::format!(
+            "スナップショット {} は今のセーブと同じ内容です（書き込みません）",
+            name
+        );
+        return;
+    }
+    ed.message = mhnx_core::snapshot::restore_review_message(&name, &backup);
+    // The dialog's body has to say what is being put back: the one-line
+    // message below it is clipped to the footer, and the diff alone would not
+    // name the file or the copy the current save went to.
+    let headline_line = ed.message.clone();
+    if let Some(review) = ed.review.as_mut() {
+        review.lines.insert(0, String::new());
+        review.lines.insert(0, headline_line);
+    }
+    gui.pending_snapshot = Some(SnapshotRestore { name, backup });
+}
+
+/// The second [A]: put the snapshot back and prove it landed.
+///
+/// Read from the card again rather than hold 4.5MB across the dialog: nothing
+/// prunes the snapshot folder while the dialog is up, so the name still points
+/// at the same bytes, and the shape is checked a second time because a file the
+/// user can reach with a card reader is not a file this code can trust twice.
+pub(crate) fn commit_snapshot_restore(ed: &mut Editor, plan: &SnapshotRestore) {
+    let path = format!("{}/{}", SNAPSHOT_DIR, plan.name);
+    let bytes = match read_file(&path) {
+        Some(b) => b,
+        None => {
+            ed.message = alloc::format!("スナップショットを読み込めません: {}", path);
+            return;
+        }
+    };
+    if !crate::savedata::looks_like_save(&bytes) {
+        ed.message = alloc::format!(
+            "スナップショットのサイズが想定と違います（{} バイト）",
+            bytes.len()
+        );
+        return;
+    }
+    let mount = match crate::savedata::Mount::open() {
+        Ok(m) => m,
+        Err(e) => {
+            ed.message = e.describe();
+            return;
+        }
+    };
+    // The copy kept before the dialog opened is what the console still holds,
+    // so it is the side of the diff. It is also the file the failure message
+    // tells the user to fall back on.
+    let current = read_file(&plan.backup);
+    match mount.write_diff(&bytes, current.as_deref()) {
         Err(e) => {
             ed.message = alloc::format!(
                 "スナップショットの書き込みに失敗しました（{}）。控え {} を SD カードから戻してください",
                 e.describe(),
-                backup_path
+                plan.backup
             );
         }
         Ok(trip) if trip.is_identical() => {
@@ -799,13 +880,23 @@ pub fn restore_latest_snapshot(ed: &mut Editor) {
             ed.cursor = cursor;
             ed.message = alloc::format!(
                 "スナップショット {} を本体セーブに戻しました（書き込みと照合が完了しました / 控え: {}）",
-                name,
-                backup_path
+                plan.name,
+                plan.backup
             );
         }
         Ok(trip) => {
             let detail = round_trip_detail(&trip);
-            match restore_save(&mount, &backup_path, &current) {
+            let Some(old) = current else {
+                // Without the copy there is nothing safe to roll back to, and
+                // writing the snapshot again would fail the same way.
+                ed.message = alloc::format!(
+                    "スナップショットの照合に失敗し、控えも読めないため戻せませんでした（{}）。控え {} を SD カードから手動で戻してください",
+                    detail,
+                    plan.backup
+                );
+                return;
+            };
+            match restore_save(&mount, &plan.backup, &old) {
                 Ok(()) => {
                     ed.message = alloc::format!(
                         "スナップショットの照合に失敗したので、戻す前のセーブに戻しました（{}）",
@@ -817,7 +908,7 @@ pub fn restore_latest_snapshot(ed: &mut Editor) {
                         "スナップショットの照合に失敗し、戻しにも失敗しました（{} / {}）。控え {} を SD カードから手動で戻してください",
                         detail,
                         why,
-                        backup_path
+                        plan.backup
                     );
                 }
             }
@@ -1251,7 +1342,9 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
     }
     if gui.wants_restore_snapshot {
         gui.wants_restore_snapshot = false;
-        restore_latest_snapshot(ed);
+        // Only the first half: the review dialog decides whether the write
+        // happens, the same way the save key's write does.
+        begin_snapshot_restore(ed, gui);
         force_redraw = true;
     }
 
@@ -1456,11 +1549,18 @@ pub fn run() -> i32 {
 
     let mut held: u64 = 0;
     let mut hold_frames: u32 = 0;
-    // L: held for the undo, tapped for the sub-tab (see L_UNDO_FRAMES).
+    // L: held for the undo, tapped for the sub-tab.
+    //
+    // L is the sub-tab key on every screen, so the undo cannot be a plain L
+    // press. It used to be half a second and it fired on the frame the
+    // threshold was crossed, which turned a press that lingered into a
+    // whole-save undo with no way back: undo_last pops the step, so nothing
+    // puts it on again. It is one second now, and the first hold only offers
+    // the undo - the second one runs it (confirm::HoldConfirm).
     let mut l_pending = false;
     let mut l_fired = false;
     let mut l_clean = true;
-    let mut l_frames: u32 = 0;
+    let mut l_hold = mhnx_core::confirm::HoldConfirm::new();
 
     unsafe {
         sys::padConfigureInput(1, HID_NPAD_STYLE_SET_NPAD_STANDARD);
@@ -1532,11 +1632,15 @@ pub fn run() -> i32 {
                 if let Some(k) = key {
                     match k {
                         Key::A => {
-                            finish_reviewed_write(&mut ed);
+                            finish_reviewed_write(&mut ed, &mut painter.gui);
                             need_draw = true;
                         }
                         Key::B => {
                             ed.cancel_save_review();
+                            // A restore's offer dies with its dialog: the save
+                            // it kept a copy of is still what the console
+                            // holds, so there is nothing else to undo.
+                            painter.gui.pending_snapshot = None;
                             need_draw = true;
                         }
                         _ => {}
@@ -1593,7 +1697,7 @@ pub fn run() -> i32 {
                     l_pending = true;
                     l_fired = false;
                     l_clean = true;
-                    l_frames = 0;
+                    l_hold.press();
                 }
                 if l_pending {
                     if cur & BTN_L == 0 {
@@ -1606,13 +1710,25 @@ pub fn run() -> i32 {
                             need_draw = true;
                         }
                         l_fired = false;
+                        let _ = l_hold.release();
                     } else if !l_fired {
-                        l_frames += 1;
-                        if l_frames >= L_UNDO_FRAMES {
-                            l_fired = true;
-                            if ed.undo_last() {
+                        match l_hold.tick() {
+                            mhnx_core::confirm::HoldAction::Arm => {
+                                l_fired = true;
+                                ed.message = alloc::format!(
+                                    "もう一度 [L] を {} 秒長押しすると元に戻します（取り消す操作: {}）",
+                                    mhnx_core::confirm::HOLD_CONFIRM_FRAMES / 60,
+                                    ed.undo_label().unwrap_or("-")
+                                );
                                 need_draw = true;
                             }
+                            mhnx_core::confirm::HoldAction::Run => {
+                                l_fired = true;
+                                if ed.undo_last() {
+                                    need_draw = true;
+                                }
+                            }
+                            mhnx_core::confirm::HoldAction::None => {}
                         }
                     }
                 }
@@ -1622,6 +1738,10 @@ pub fn run() -> i32 {
                     // and Key::L is answered above (tap on release, hold for undo).
                     if k != Key::Z && k != Key::L {
                         l_clean = false;
+                        // Some other key means the offer is gone: it has to be
+                        // asked for again rather than waiting for the next
+                        // hold however long later.
+                        l_hold.clear_arm();
                         painter.gui.handle_pad_key(&mut ed, k, cur);
                         need_draw = true;
                     }

@@ -248,6 +248,11 @@ fn is_quest_inner(screen: Screen) -> bool {
 #[derive(Clone, Copy)]
 pub enum UiAction {
     Key(Key),
+    /// A tap that lands outside a modal panel. It covers the whole frame while
+    /// the keyboard or the MIB picker is up, so a tap that misses the panel
+    /// stops here instead of reaching the list - or the footer's undo pill -
+    /// underneath it.
+    ModalBlank,
     SelectSlot(usize),
     GotoSection(MainSection),
     SelectSubTab(usize),
@@ -369,6 +374,15 @@ pub struct GuiState {
     pub pending_delete_charm: Option<usize>,
     pub sets_cursor: usize,
     pub sets_tab: usize,
+    /// The snapshot a review is waiting on. Set by the [Y] press on the options
+    /// screen through the same dialog a save write uses, and taken by the
+    /// second press: restoring is a write like any other and must not happen
+    /// on the press that asked for it.
+    pub pending_snapshot: Option<crate::editor::SnapshotRestore>,
+    /// The whole-save undo asked for once, waiting for the second answer.
+    undo_press: mhnx_core::confirm::ConfirmPress,
+    /// The roster's bulk MAX asked for once, waiting for the second answer.
+    roster_max: mhnx_core::confirm::ConfirmPress,
 }
 
 impl GuiState {
@@ -395,6 +409,9 @@ impl GuiState {
             pending_delete_charm: None,
             sets_cursor: 0,
             sets_tab: 0,
+            pending_snapshot: None,
+            undo_press: mhnx_core::confirm::ConfirmPress::new(),
+            roster_max: mhnx_core::confirm::ConfirmPress::new(),
         }
     }
 
@@ -1604,7 +1621,9 @@ impl GuiState {
                     self.scroll_mib_picker(rows);
                     changed = true;
                 }
-            } else if ty >= CONTENT_Y && ty < FOOTER_Y {
+            // The keyboard is modal too: a finger dragged over the band it
+            // leaves open must not page the list underneath.
+            } else if self.osk.is_none() && ty >= CONTENT_Y && ty < FOOTER_Y {
                 let dy = ty - self.last_drag_y;
                 if (ty - self.drag_start_y).abs() > 18 {
                     self.dragged = true;
@@ -1636,8 +1655,21 @@ impl GuiState {
     // Action Execution & One-Tap Bulk Cheat Implementations
     // -----------------------------------------------------------------------
     fn apply_action(&mut self, ed: &mut Editor, action: UiAction) {
+        // Any other input takes back the offer a two-press action made: the
+        // second press has to be the next thing the user does, not something
+        // they come back to a minute later.
+        if !matches!(
+            action,
+            UiAction::Undo | UiAction::RosterMaxAll | UiAction::CommitReview | UiAction::CancelReview
+        ) {
+            self.undo_press.clear();
+            self.roster_max.clear();
+        }
         match action {
             UiAction::Key(k) => self.handle_pad_key(ed, k, 0),
+            // A tap outside a modal panel: it is here to stop, and stopping is
+            // all it does.
+            UiAction::ModalBlank => {}
             UiAction::SelectSlot(s) => {
                 if s < 3 {
                     ed.slot = s;
@@ -1729,12 +1761,29 @@ impl GuiState {
             UiAction::Rescan => self.wants_rescan = true,
             UiAction::QuickSave => trigger_quick_save(ed),
             // The whole-save undo, reachable from the footer pill as well as
-            // from holding L on the pad.
+            // from holding L on the pad. Both ask twice: undo_last pops the
+            // step, so a tap that was not meant as one cannot be taken back
+            // afterwards.
             UiAction::Undo => {
-                ed.undo_last();
+                if ed.undo_depth() == 0 {
+                    self.undo_press.clear();
+                    ed.message = String::from("戻せる操作がありません");
+                } else if self.undo_press.press() {
+                    ed.undo_last();
+                } else {
+                    ed.message = format!(
+                        "もう一度タップで元に戻します（取り消す操作: {}）",
+                        ed.undo_label().unwrap_or("-")
+                    );
+                }
             }
-            UiAction::CommitReview => crate::editor::finish_reviewed_write(ed),
-            UiAction::CancelReview => ed.cancel_save_review(),
+            // The review dialog's own two answers. A restore is on the second
+            // press of [A] the same way a save write is.
+            UiAction::CommitReview => crate::editor::finish_reviewed_write(ed, self),
+            UiAction::CancelReview => {
+                ed.cancel_save_review();
+                self.pending_snapshot = None;
+            }
             // One press is one undo step, so the bulk MAX goes through the
             // editor instead of calling the field writer eleven times.
             UiAction::CharMaxAll => {
@@ -1773,21 +1822,21 @@ impl GuiState {
                     }
                 }
             }
+            // One tap used to write every palico with no undo step behind it.
+            // It asks twice now, and the write itself is one undo step
+            // (Editor::maximize_all_palicos), so the bulk MAX can be taken back.
             UiAction::RosterMaxAll => {
-                let list = ed.palicos();
-                let slot = ed.slot;
-                if let Some(save) = &mut ed.save {
-                    let mut cnt = 0usize;
-                    for p in &list {
-                        let _ = mhnx_core::palico::set_level(save, slot, p.index, 99);
-                        let _ = mhnx_core::palico::set_enthusiasm(save, slot, p.index, 100);
-                        let _ = mhnx_core::palico::set_exp(save, slot, p.index, 999_999);
-                        cnt += 1;
-                    }
-                    if cnt > 0 {
-                        ed.dirty = true;
-                        ed.message = format!("オトモ {} 匹を Lv99・最大に設定しました", cnt);
-                    }
+                let n = ed.palicos().len();
+                if n == 0 {
+                    self.roster_max.clear();
+                    ed.message = String::from("オトモがいません（オトモを雇ってから実行してください）");
+                } else if self.roster_max.press() {
+                    ed.maximize_all_palicos();
+                } else {
+                    ed.message = format!(
+                        "オトモ {} 匹を Lv99・なつき100・EXP最大にします。もう一度タップで実行",
+                        n
+                    );
                 }
             }
             UiAction::InstallOfficialDlc => ed.install_official_dlc(),
@@ -2931,6 +2980,21 @@ impl GuiState {
         self.draw_footer(c, ed);
 
         // 4. Modal Overlays (MIB Picker / Built-in OSK)
+        //
+        // The two panels cover most of the frame but not all of it, and the
+        // screen under them still has live tap targets - including the footer's
+        // undo pill at y670..700, which ran a whole-save undo from a tap on the
+        // band the keyboard leaves open. This hit covers the whole frame and is
+        // pushed before the panel's own targets, so a tap that lands on the
+        // panel still reaches it (the search runs newest first) and a tap that
+        // misses it stops here.
+        if mhnx_core::confirm::needs_modal_guard(
+            self.mib_picker.is_some(),
+            self.osk.is_some(),
+            ed.review_open(),
+        ) {
+            self.add_hit(0, 0, 1280, 720, UiAction::ModalBlank);
+        }
         if self.mib_picker.is_some() {
             self.draw_mib_picker(c);
         }
@@ -3257,7 +3321,9 @@ impl GuiState {
             Screen::Csv => {
                 "[A] 適用(2回)  [Y] 書き出し  [-] 再読込  [▲/▼] 行  [L/R] タブ"
             }
-            Screen::Options => "[◀/▶] 値変更  [Y] 直近スナップショットへ戻す  [X] 保存  [B] 戻る",
+            // Y opens the same review dialog a save write uses and only the
+            // second [A] puts the snapshot back, so the chip says so.
+            Screen::Options => "[◀/▶] 値変更  [Y] スナップショットへ戻す(確認)  [X] 保存  [B] 戻る",
             // The equipment panel is a mode of both palico screens: its chips
             // replace theirs while it is open.
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
@@ -3352,11 +3418,19 @@ impl GuiState {
         c.round_rect(mx, my, mw, mh, 12, t.bg_panel);
         c.round_rect_border(mx, my, mw, mh, 12, 2, t.border_focus);
 
+        // The dialog answers two different writes now: the save key's, and the
+        // snapshot restore the options screen starts. The title, the rule line
+        // and the button all say which one is waiting.
+        let restoring = self.pending_snapshot.is_some();
         c.text_clipped(
             mx + 26,
             my + 14,
             mw - 500,
-            "保存前レビュー: 変更内容",
+            if restoring {
+                "スナップショット復元の確認: 変更内容"
+            } else {
+                "保存前レビュー: 変更内容"
+            },
             t.text_primary,
             FontSize::Large,
         );
@@ -3423,7 +3497,11 @@ impl GuiState {
         c.text_sized(
             mx + 30,
             foot_y + 12,
-            "1回目は確認だけです。2回目で本体セーブに書き込みます",
+            if restoring {
+                "1回目は確認だけです。2回目でスナップショットを本体セーブに戻します"
+            } else {
+                "1回目は確認だけです。2回目で本体セーブに書き込みます"
+            },
             t.text_secondary,
             FontSize::Small,
         );
@@ -3437,7 +3515,11 @@ impl GuiState {
             foot_y,
             a_w,
             42,
-            "[A] この内容で保存",
+            if restoring {
+                "[A] この内容で戻す"
+            } else {
+                "[A] この内容で保存"
+            },
             white_or_dark(t.accent_primary),
             FontSize::Small,
         );
@@ -4303,8 +4385,11 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
+                        // This sent X, and X is the save key (QuickSave): a
+                        // tap on "re-read the warnings" opened the save review
+                        // instead. The state machine answers Y on this screen.
                         "[Y] 警告を読み直す",
-                        UiAction::Key(Key::X),
+                        UiAction::Key(Key::Y),
                     );
                     cur_y += 44;
                     let clear_label = if ed.set_clear_armed.is_some() {

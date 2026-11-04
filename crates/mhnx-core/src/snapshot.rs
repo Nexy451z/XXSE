@@ -44,6 +44,20 @@ pub fn name(stem: &str, unix: u64) -> String {
     format!("{}-{}.sav", stem, stamp(unix))
 }
 
+/// What the restore dialog says before the newest snapshot is put back.
+///
+/// Restoring used to write the console the moment the key was pressed, which
+/// made it the one write in the editor that skipped the review every other
+/// write goes through. The line names both halves the user has to agree to: the
+/// snapshot that comes back and the copy the save being replaced went to.
+pub fn restore_review_message(name: &str, backup: &str) -> String {
+    use alloc::format;
+    format!(
+        "スナップショット {} に戻します。いまのセーブは {} に退避済みです。[A] でもう一度押すと戻します（[B] 中止）",
+        name, backup
+    )
+}
+
 /// Which names to delete so that at most `keep` remain.
 ///
 /// `existing` is the snapshot names in any order and `prefix` is the stem they

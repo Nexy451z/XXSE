@@ -40,6 +40,8 @@ pub fn write_name_field(dst: &mut [u8], name: &str) {
 
 pub mod arc;
 pub mod charm;
+/// The two-press / long-hold guards a destructive action goes through.
+pub mod confirm;
 pub mod check;
 pub mod crc;
 pub mod csvout;
