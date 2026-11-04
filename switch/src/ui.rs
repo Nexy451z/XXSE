@@ -317,6 +317,8 @@ pub enum UiAction {
     OskClear,
     OskModify,
     OskSpace,
+    /// Insert the line break a multiline field holds (U+000A).
+    OskNewline,
     OskConfirm,
     OskCancel,
 }
@@ -334,10 +336,14 @@ pub struct OskState {
     pub req_idx: usize,
     pub header: String,
     pub buffer: String,
-    pub max_bytes: usize,
+    /// What the field accepts: the bytes it counts and whether it holds a
+    /// line break. A name does; every other text request does not.
+    pub spec: mhnx_core::hbedit::NameSpec,
     pub tab: usize,
     pub row: usize,
     pub col: usize,
+    /// The last character the field refused, so the modal can name it.
+    pub refused: Option<char>,
 }
 
 #[derive(Clone, Copy)]
@@ -417,15 +423,26 @@ impl GuiState {
         }
     }
 
-    pub fn open_osk(&mut self, req_idx: usize, header: &str, initial: &str, max_bytes: usize) {
+    pub fn open_osk(
+        &mut self,
+        req_idx: usize,
+        header: &str,
+        initial: &str,
+        spec: mhnx_core::hbedit::NameSpec,
+    ) {
+        // Whatever an old keyboard or an old save left in the text goes
+        // through the field filter before it can be edited: a tab has no glyph
+        // in a name and the writers refuse it, so it never reaches the box.
+        let (initial, refused) = spec.filter(initial);
         self.osk = Some(OskState {
             req_idx,
             header: String::from(header),
-            buffer: String::from(initial),
-            max_bytes: max_bytes.max(8),
+            buffer: initial,
+            spec,
             tab: 0,
             row: 0,
             col: 0,
+            refused,
         });
     }
 
@@ -476,7 +493,14 @@ impl GuiState {
                 osk_cycle_last_char(&mut osk.buffer);
                 self.osk = Some(osk);
             }
-            Key::Plus | Key::Z => {
+            // ZR is the line-break key. It is the one button this modal had
+            // left: ZL still walks the tabs, and [+] confirms. A field that
+            // does not hold a line break says so instead of ignoring it.
+            Key::Z => {
+                osk_newline(&mut osk);
+                self.osk = Some(osk);
+            }
+            Key::Plus => {
                 self.osk_result = Some((osk.req_idx, osk.buffer));
             }
             Key::Minus => {
@@ -1783,8 +1807,10 @@ impl GuiState {
                     Screen::Hunts => ed.hunt_field = sub.min(3),
                     Screen::Roster => ed.roster_field = sub.min(2),
                     Screen::Guild => {
-                        ed.guild_field = sub.min(2);
-                        if sub == 2 {
+                        ed.guild_field = sub.min(mhnx_core::hbedit::GUILD_FIELDS - 1);
+                        // A tap on a text row opens its keyboard; the number
+                        // rows take a step, exactly what [A] does with the pad.
+                        if sub >= mhnx_core::hbedit::GUILD_ROW_COMMENT {
                             ed.input(Key::A);
                         }
                     }
@@ -1963,9 +1989,12 @@ impl GuiState {
             }
             UiAction::OskSpace => {
                 if let Some(osk) = &mut self.osk {
-                    if osk.buffer.len() < osk.max_bytes {
-                        osk.buffer.push(' ');
-                    }
+                    osk_push(osk, " ");
+                }
+            }
+            UiAction::OskNewline => {
+                if let Some(osk) = &mut self.osk {
+                    osk_newline(osk);
                 }
             }
             UiAction::OskConfirm => {
@@ -2487,7 +2516,7 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
                 ed.arena_row = clamped.min(ARENA_ROWS.saturating_sub(1));
                 ed.arena_edit = false;
             } else {
-                ed.guild_field = clamped;
+                ed.guild_field = clamped.min(mhnx_core::hbedit::GUILD_FIELDS - 1);
             }
         }
         Screen::Progress => ed.set_progress_cursor(clamped),
@@ -3073,22 +3102,21 @@ impl GuiState {
             .unwrap_or_else(|| String::from("未読込"));
         c.round_rect(slot_x, 4, slot_w, 40, t.corner_r, t.bg_panel);
         c.round_rect_border(slot_x, 4, slot_w, 40, t.corner_r, 1, t.border_subtle);
-        c.text_clipped(
-            slot_x + 10,
-            6,
-            slot_w - 20,
-            &format!("Slot {}", ed.slot + 1),
-            t.text_muted,
-            FontSize::Small,
-        );
-        c.text_clipped(
-            slot_x + 10,
-            22,
-            slot_w - 20,
-            &slot_name,
-            t.text_primary,
-            FontSize::Small,
-        );
+        // The slot number and the first line share one row, which leaves the
+        // second row for the second line of a name. The game draws that line,
+        // so the badge does too; a third line and beyond say they are there.
+        let mut first = format!("{}: {}", ed.slot + 1, mhnx_core::save::name_lines(&slot_name)[0]);
+        if slot_name.contains('\n') {
+            let lines = mhnx_core::save::name_lines(&slot_name);
+            if lines.len() > 2 {
+                first.push('…');
+            }
+        }
+        c.text_clipped(slot_x + 10, 6, slot_w - 20, &first, t.text_primary, FontSize::Small);
+        let second = mhnx_core::save::name_lines(&slot_name).get(1).copied().unwrap_or("");
+        if !second.is_empty() || slot_name.contains('\n') {
+            c.text_clipped(slot_x + 10, 26, slot_w - 20, second, t.text_muted, FontSize::Small);
+        }
         self.add_hit(slot_x, 4, slot_w, 40, UiAction::SelectSlot((ed.slot + 1) % 3));
 
         // [X] Save Button
@@ -3698,38 +3726,55 @@ impl GuiState {
 
             // 2. Right Value (clipped to max 230px so it never crowds the left title)
             let right_edge = MAIN_X + V1_LIST_W - 22;
+            // A name value may hold a line break, and the game draws the second
+            // line: the row draws them both, small, instead of clipping after
+            // the first one.
+            let val_lines = mhnx_core::save::name_lines(val);
+            let val_multiline = val_lines.len() > 1;
             let val_w = if val.is_empty() {
                 0
             } else {
-                let raw_vw = c.text_width_sized(val, FontSize::Medium);
                 let max_vw = 230;
-                let actual_vw = raw_vw.min(max_vw);
                 let val_col = if is_sel { t.accent_primary } else { t.text_primary };
-                if raw_vw <= max_vw {
-                    c.text_right(right_edge, ry + 16, val, val_col, FontSize::Medium);
+                if val_multiline {
+                    for (li, line) in val_lines.iter().take(2).enumerate() {
+                        let mut drawn = String::from(*line);
+                        if li == 1 && val_lines.len() > 2 {
+                            drawn.push('…');
+                        }
+                        c.text_right(right_edge, ry + 7 + (li as i32) * 18, &drawn, val_col, FontSize::Small);
+                    }
+                    max_vw + 20
                 } else {
-                    c.text_clipped(
-                        right_edge - max_vw,
-                        ry + 16,
-                        max_vw,
-                        val,
-                        val_col,
-                        FontSize::Medium,
-                    );
+                    let raw_vw = c.text_width_sized(val, FontSize::Medium);
+                    let actual_vw = raw_vw.min(max_vw);
+                    if raw_vw <= max_vw {
+                        c.text_right(right_edge, ry + 16, val, val_col, FontSize::Medium);
+                    } else {
+                        c.text_clipped(
+                            right_edge - max_vw,
+                            ry + 16,
+                            max_vw,
+                            val,
+                            val_col,
+                            FontSize::Medium,
+                        );
+                    }
+                    actual_vw + 20
                 }
-                actual_vw + 20
             };
 
             // 3. Left Title (strictly clipped to the space before `val`)
+            // A name title keeps its lines too: the row is 56 tall, so two
+            // lines of the small font fit where one line of the medium font
+            // sat.
             let max_title_w = (right_edge - val_w - tx).max(60);
-            c.text_clipped(
-                tx,
-                ry + 16,
-                max_title_w,
-                title,
-                if is_sel { t.text_primary } else { t.text_secondary },
-                FontSize::Medium,
-            );
+            let title_col = if is_sel { t.text_primary } else { t.text_secondary };
+            if title.contains('\n') {
+                draw_name_box(c, tx, ry + 7, max_title_w, title, 2, 18, title_col, FontSize::Small);
+            } else {
+                c.text_clipped(tx, ry + 16, max_title_w, title, title_col, FontSize::Medium);
+            }
         }
 
         // Amber warning strip, pinned to the bottom of the list panel.
@@ -3899,7 +3944,24 @@ impl GuiState {
         }
 
         // Slot 2 (iy + 40): Selected Item Title
-        c.text_clipped(ix + 20, iy + 40, iw - 40, title, t.text_primary, FontSize::Medium);
+        // A name keeps its lines here too: the second line sits where the meta
+        // line would be, so a two-line name does not hide its own last line.
+        if title.contains('\n') {
+            let used = draw_name_box(
+                c,
+                ix + 20,
+                iy + 38,
+                iw - 40,
+                title,
+                2,
+                20,
+                t.text_primary,
+                FontSize::Small,
+            );
+            let _ = used;
+        } else {
+            c.text_clipped(ix + 20, iy + 40, iw - 40, title, t.text_primary, FontSize::Medium);
+        }
 
         // Slot 3 (iy + 70): Concise Meta Info (if non-empty)
         if !meta.is_empty() {
@@ -3915,16 +3977,30 @@ impl GuiState {
         let disp_val = if val.is_empty() { title.as_str() } else { val.as_str() };
         c.round_rect(ix + 20, iy + 110, iw - 40, 48, 6, t.bg_val_box);
         c.round_rect_border(ix + 20, iy + 110, iw - 40, 48, 6, 1, t.border_subtle);
-        btn_text(
-            c,
-            ix + 20,
-            iy + 110,
-            iw - 40,
-            48,
-            disp_val,
-            t.accent_primary,
-            FontSize::Large,
-        );
+        if disp_val.contains('\n') {
+            draw_name_box(
+                c,
+                ix + 32,
+                iy + 114,
+                iw - 64,
+                disp_val,
+                2,
+                20,
+                t.accent_primary,
+                FontSize::Small,
+            );
+        } else {
+            btn_text(
+                c,
+                ix + 20,
+                iy + 110,
+                iw - 40,
+                48,
+                disp_val,
+                t.accent_primary,
+                FontSize::Large,
+            );
+        }
         self.add_hit(ix + 20, iy + 110, iw - 40, 48, UiAction::ActivateRow(row_idx));
 
         // Slot 5 (iy + 168, h = 42): Primary [A] Button
@@ -4901,7 +4977,23 @@ impl GuiState {
             } else {
                 (String::from("(未読込)"), 0, 0, 0, 0, 0)
             };
-            c.text_clipped(x + 20, y + 66, card_w - 40, &summary, t.text_primary, FontSize::Large);
+            // A name may hold a line break, and both lines are part of what the
+            // card is: draw them where the single large line used to be.
+            if summary.contains('\n') {
+                draw_name_box(
+                    c,
+                    x + 20,
+                    y + 60,
+                    card_w - 40,
+                    &summary,
+                    2,
+                    24,
+                    t.text_primary,
+                    FontSize::Medium,
+                );
+            } else {
+                c.text_clipped(x + 20, y + 66, card_w - 40, &summary, t.text_primary, FontSize::Large);
+            }
             c.hline(x + 20, y + 110, card_w - 40, t.border_subtle);
 
             if ed.save.is_some() {
@@ -5777,7 +5869,7 @@ impl GuiState {
         rows.push((
             SET_ROW_NAME,
             String::from("名前"),
-            String::from("全角10文字まで / ◀ ▶ でも入力を開く"),
+            String::from("最大31バイト / 改行可（[A] で入力）"),
             shown_name,
             String::from("#01"),
         ));
@@ -5884,7 +5976,7 @@ impl GuiState {
             if set_name.is_empty() {
                 String::from("(無題)")
             } else {
-                set_name
+                mhnx_core::hbedit::name_preview(&set_name)
             },
             used
         );
@@ -5969,7 +6061,11 @@ impl GuiState {
                 format!("#{:02}", row.part + 1),
             ));
         }
-        let hdr = format!("オトモ装備 — {}（ロスター #{}）", who, roster_no);
+        let hdr = format!(
+            "オトモ装備 — {}（ロスター #{}）",
+            mhnx_core::hbedit::name_preview(&who),
+            roster_no
+        );
         // The names are not in the catalogue, so the one line that says so is
         // pinned under the list, where `draw_adaptive_rows_warn` reserves room
         // for it instead of letting it draw over the last row.
@@ -6035,7 +6131,7 @@ impl GuiState {
         let hdr = format!(
             "オトモ{} — {}（#{}）  {}/{} 枠",
             palico_skill_tab_name(tab),
-            who,
+            mhnx_core::hbedit::name_preview(&who),
             roster_no,
             used,
             rows_total
@@ -6180,6 +6276,7 @@ impl GuiState {
         let hr = mhnx_core::guildcard::hunter_rank(save, ed.slot).unwrap_or(0);
         let time = mhnx_core::guildcard::play_time(save, ed.slot).unwrap_or(0);
         let comment = mhnx_core::guildcard::comment(save, ed.slot).unwrap_or_default();
+        let card_name = mhnx_core::guildcard::card_name(save, ed.slot).unwrap_or_default();
         let rows = alloc::vec![
             (
                 0,
@@ -6201,11 +6298,18 @@ impl GuiState {
                 String::from("#02"),
             ),
             (
-                2,
+                mhnx_core::hbedit::GUILD_ROW_COMMENT,
                 String::from("コメント"),
-                String::from("Greeting"),
+                String::from("Greeting / 改行可"),
                 comment,
                 String::from("#03"),
+            ),
+            (
+                mhnx_core::hbedit::GUILD_ROW_NAME,
+                String::from("カード名"),
+                String::from("Name / 改行可（カード側の写し）"),
+                card_name,
+                String::from("#04"),
             ),
         ];
         // The card ends with the arena log, so the list says where the other
@@ -6226,7 +6330,7 @@ impl GuiState {
             "ギルドカード",
             &sub,
             &rows,
-            ed.guild_field.min(2),
+            ed.guild_field.min(mhnx_core::hbedit::GUILD_FIELDS - 1),
             true,
             // The row's own word: コメント is text ([A] opens the keyboard),
             // HR and 時間 are numbers ([A] adds one step, like ▶).
@@ -7374,21 +7478,21 @@ impl GuiState {
         c.round_rect(mx, my, mw, mh, 12, t.bg_panel);
         c.round_rect_border(mx, my, mw, mh, 12, 2, t.border_focus);
 
-        c.text_clipped(
-            mx + 24,
-            my + 16,
-            500,
-            &format!("文字入力: {}", osk.header),
-            t.text_primary,
-            FontSize::Medium,
-        );
-        c.text_right(
-            mx + mw - 24,
-            my + 20,
-            "[A] 入力  [B] 削除  [L/R] 文字種  [+] 確定",
-            t.text_secondary,
-            FontSize::Small,
-        );
+        // The title carries the one refusal the modal has to explain: a
+        // character the field cannot hold was dropped, never typed.
+        let mut title = format!("文字入力: {}", osk.header);
+        if let Some(c) = osk.refused {
+            title.push_str(&format!(" / その文字は使えません（U+{:04X}）", c as u32));
+        }
+        c.text_clipped(mx + 24, my + 16, 640, &title, t.text_primary, FontSize::Medium);
+        // The key legend names the line-break key, because a player who is not
+        // told about it will never find it. A one-line field says so instead.
+        let legend = if osk.spec.multiline {
+            "[A] 入力  [B] 削除  [ZR] 改行  [L/R] 文字種  [+] 確定"
+        } else {
+            "[A] 入力  [B] 削除  [L/R] 文字種  [+] 確定（改行不可）"
+        };
+        c.text_right(mx + mw - 24, my + 20, legend, t.text_secondary, FontSize::Small);
 
         let ib_x = mx + 24;
         let ib_y = my + 56;
@@ -7396,10 +7500,33 @@ impl GuiState {
         let ib_h = 50;
         c.round_rect(ib_x, ib_y, ib_w, ib_h, 6, t.bg_val_box);
         c.round_rect_border(ib_x, ib_y, ib_w, ib_h, 6, 1, t.border_focus);
-        let disp_text = format!("{}|", osk.buffer);
-        c.text_clipped(ib_x + 16, ib_y + 11, ib_w - 160, &disp_text, t.accent_primary, FontSize::Large);
+        // Every line of the text is drawn - an empty one included, because the
+        // game draws it and the cursor sits on it. The box shows the last two,
+        // which is where the cursor is when a name gets long; an ellipsis says
+        // that something is above.
+        let lines = mhnx_core::save::name_lines(&osk.buffer);
+        let shown = lines.len().saturating_sub(2);
+        for (li, line) in lines.iter().skip(shown).enumerate() {
+            let mut text = String::from(*line);
+            if li == 0 && shown > 0 {
+                text.insert(0, '…');
+            }
+            if shown + li + 1 == lines.len() {
+                text.push('|');
+            }
+            c.text_clipped(
+                ib_x + 12,
+                ib_y + 5 + (li as i32) * 22,
+                ib_w - 200,
+                &text,
+                t.accent_primary,
+                FontSize::Small,
+            );
+        }
 
-        let cnt_str = format!("{} / {} B", osk.buffer.len(), osk.max_bytes);
+        // Bytes and lines, the same figure the status row prints:
+        // 「13/31 バイト（2行）」.
+        let cnt_str = osk.spec.length_label(&osk.buffer);
         c.text_right(ib_x + ib_w - 16, ib_y + 16, &cnt_str, t.text_secondary, FontSize::Small);
 
         // Keyboard Mode Tabs (L / R or Touch)
@@ -7481,13 +7608,28 @@ impl GuiState {
         // Bottom Action Buttons Row
         let by = my + 560;
         let bh = 48;
+        // The line-break key sits in the footer, next to the rest: ZR inserts
+        // U+000A, which a name field stores as one byte (UTF-8) or the unit
+        // 0x000A (the two guild card fields).
+        let newline_bg = if osk.spec.multiline {
+            t.bg_btn_primary
+        } else {
+            t.bg_btn
+        };
         let actions: &[(&str, i32, Color, Color, UiAction)] = &[
-            ("[B] 1字削除", 160, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
-            ("[X] クリア", 140, t.bg_danger, t.accent_danger, UiAction::OskClear),
-            ("[Y] 濁点/小字", 176, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
-            ("空白", 110, t.bg_btn, t.border_subtle, UiAction::OskSpace),
-            ("[-] 取消", 160, t.bg_btn, t.border_subtle, UiAction::OskCancel),
-            ("[+] 確定", 220, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
+            ("[B] 1字削除", 128, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
+            ("[X] クリア", 116, t.bg_danger, t.accent_danger, UiAction::OskClear),
+            ("[Y] 濁点/小字", 148, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
+            (
+                if osk.spec.multiline { "[ZR] 改行" } else { "改行不可" },
+                124,
+                newline_bg,
+                t.accent_primary,
+                UiAction::OskNewline,
+            ),
+            ("空白", 96, t.bg_btn, t.border_subtle, UiAction::OskSpace),
+            ("[-] 取消", 128, t.bg_btn, t.border_subtle, UiAction::OskCancel),
+            ("[+] 確定", 180, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
         ];
         let mut bx = ib_x;
         for &(label, bw, bg, border, act) in actions {
@@ -7504,6 +7646,34 @@ impl GuiState {
 // Pure Helper Functions (Pagination, MIB Choices, OSK Character Tables)
 // ---------------------------------------------------------------------------
 
+/// Draw the lines of a name into a box, one glyph line per line break.
+///
+/// The game draws every line a name holds, an empty one included, so this does
+/// too: a name that ends with a break keeps its empty last line. `max_lines`
+/// bounds the box; when there are more, the last drawn line gets an ellipsis so
+/// the truncation is visible rather than silent. Returns the height used.
+fn draw_name_box(
+    c: &mut Canvas,
+    x: i32,
+    y: i32,
+    w: i32,
+    text: &str,
+    max_lines: usize,
+    line_h: i32,
+    color: Color,
+    size: FontSize,
+) -> i32 {
+    let lines = mhnx_core::save::name_lines(text);
+    let shown = lines.len().min(max_lines.max(1));
+    for (i, line) in lines.iter().take(shown).enumerate() {
+        let mut drawn = String::from(*line);
+        if i + 1 == shown && lines.len() > shown {
+            drawn.push('…');
+        }
+        c.text_clipped(x, y + (i as i32) * line_h, w, &drawn, color, size);
+    }
+    (shown as i32) * line_h
+}
 fn window_start(cursor: usize, total: usize, visible: usize) -> usize {
     if total <= visible {
         return 0;
@@ -7777,6 +7947,28 @@ fn osk_grid_for(tab: usize) -> &'static [[&'static str; 10]; 5] {
     }
 }
 
+/// Put typed text into the keyboard buffer, refusing what the field cannot hold.
+///
+/// This is the only door into the buffer, which is why a tab or a NUL cannot be
+/// entered at all: the field spec drops it before it is stored and remembers the
+/// code point, so the modal can say which one it refused. Nothing is added past
+/// the capacity the field stores.
+fn osk_push(osk: &mut OskState, text: &str) {
+    if let Some(c) = osk.spec.push_str(&mut osk.buffer, text) {
+        osk.refused = Some(c);
+    }
+}
+
+/// Insert the line break, when the field holds one (a name does).
+fn osk_newline(osk: &mut OskState) {
+    if !osk.spec.multiline {
+        // A filter or a number has no second line; the footer says so and the
+        // key does nothing rather than blaming a character.
+        return;
+    }
+    osk_push(osk, "\n");
+}
+
 fn osk_press_cell(osk: &mut OskState, row: usize, col: usize) {
     let grid = osk_grid_for(osk.tab);
     let Some(&cell) = grid.get(row).and_then(|r| r.get(col)) else {
@@ -7786,11 +7978,7 @@ fn osk_press_cell(osk: &mut OskState, row: usize, col: usize) {
         "゛濁" => osk_apply_dakuten(&mut osk.buffer),
         "゜半" => osk_apply_handakuten(&mut osk.buffer),
         "小ぁ" | "小ァ" | "a↔A" => osk_apply_small_or_case(&mut osk.buffer),
-        text => {
-            if osk.buffer.len() + text.len() <= osk.max_bytes {
-                osk.buffer.push_str(text);
-            }
-        }
+        text => osk_push(osk, text),
     }
 }
 

@@ -36,7 +36,7 @@ use crate::questfields::{self, FieldKind};
 use crate::questprogress::{self, Progress};
 use crate::requests;
 use crate::romfstables::RequestRecord;
-use crate::save::{Character, Save, SaveKind};
+use crate::save::{Character, NameError, NameFit, NameUnit, NameWarning, Save, SaveKind};
 
 /// Which screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1089,7 +1089,12 @@ pub const TEXT_SAVE_NAME: usize = usize::MAX - 4;
 /// Sentinel base for "ask for the name of palico N": N is added to this.
 pub const TEXT_PALICO_NAME: usize = usize::MAX - 1_000;
 /// Sentinel id for "ask for the guild card comment".
-pub const TEXT_GUILD_COMMENT: usize = usize::MAX - 999;
+///
+/// It sits **below** [`TEXT_PALICO_NAME`] like the other one-off ids, because
+/// the console layer answers one contiguous range above that base as palico
+/// names. It used to be `MAX - 999`, which is `TEXT_PALICO_NAME + 1`: asking
+/// for the second palico's name opened the comment box instead.
+pub const TEXT_GUILD_COMMENT: usize = usize::MAX - 1_009;
 /// Sentinel id for "ask which equipment to show".
 pub const TEXT_EQUIP_FILTER: usize = usize::MAX - 5;
 /// Sentinel id for "ask for a decoration name to filter the jewel picker by".
@@ -1122,6 +1127,311 @@ pub const TEXT_HUNT_COUNT: usize = usize::MAX - 1_006;
 pub const TEXT_REWARD_PROB: usize = usize::MAX - 1_007;
 /// Sentinel id for "ask for the count of the selected reward row".
 pub const TEXT_REWARD_COUNT: usize = usize::MAX - 1_008;
+/// Sentinel id for "ask for the guild card name" (the card's own copy).
+pub const TEXT_CARD_NAME: usize = usize::MAX - 1_010;
+/// Sentinel base for "ask for the name of item set N": N is added to this.
+///
+/// The two my-set names sit in one field of the same width, so the base is
+/// given a band of its own instead of a single id.
+pub const TEXT_ITEM_SET_NAME: usize = usize::MAX - 1_100;
+
+// ---------------------------------------------------------------------------
+// Names: the six fields the screens edit, and what a text field accepts
+// ---------------------------------------------------------------------------
+//
+// Every name is a fixed width, NUL padded run of bytes, and the game draws
+// U+000A in one as a second line. The core writers already refuse the other
+// control characters and report ragged breaks as warnings; this is the same
+// rule in the shape an input widget needs, so the two keyboards and the two
+// screens cannot each invent their own.
+//
+// A name is always multiline. What a widget has to know is only how many bytes
+// the field stores (one per UTF-8 byte for the hunter, the palicos and both
+// my-set names; two per UTF-16 unit for the two guild card fields) and that a
+// line break is a character rather than something to swallow.
+
+/// What a text field accepts, for the widget that is typing into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameSpec {
+    /// Bytes the field stores, terminator excluded.
+    pub capacity: usize,
+    /// How one stored character is counted against `capacity`.
+    pub unit: NameUnit,
+    /// Whether U+000A is a character the field can hold.
+    pub multiline: bool,
+}
+
+impl NameSpec {
+    /// A name field: it stores `capacity` bytes and takes a line break.
+    pub const fn name(capacity: usize, unit: NameUnit) -> Self {
+        Self {
+            capacity,
+            unit,
+            multiline: true,
+        }
+    }
+
+    /// A one-line value (a filter, a file name, a quest line): no line breaks.
+    pub const fn singleline(capacity: usize) -> Self {
+        Self {
+            capacity,
+            unit: NameUnit::Bytes,
+            multiline: false,
+        }
+    }
+
+    /// Bytes `text` occupies in the field.
+    pub fn stored_len(&self, text: &str) -> usize {
+        crate::save::name_bytes(text, self.unit)
+    }
+
+    /// How many lines the screen has to draw. Never zero.
+    pub fn lines(&self, text: &str) -> usize {
+        crate::save::name_line_count(text)
+    }
+
+    /// 「29/31 バイト（2行）」 — the length every name widget prints.
+    pub fn length_label(&self, text: &str) -> String {
+        format!(
+            "{}/{} バイト（{}行）",
+            self.stored_len(text),
+            self.capacity,
+            self.lines(text)
+        )
+    }
+
+    /// Is this character one the field holds?
+    pub fn accepts(&self, c: char) -> bool {
+        if c == '\n' {
+            self.multiline
+        } else {
+            !crate::save::is_forbidden_name_char(c)
+        }
+    }
+
+    /// Add typed text to a name, refusing what the field cannot hold.
+    ///
+    /// A refused character is dropped and reported (the first one, so the
+    /// screen can name it), and nothing is added past `capacity`. This is the
+    /// only way text reaches a name buffer, which is why a tab cannot be typed
+    /// into one.
+    pub fn push_str(&self, buffer: &mut String, add: &str) -> Option<char> {
+        let mut refused = None;
+        for ch in add.chars() {
+            if !self.accepts(ch) {
+                refused.get_or_insert(ch);
+                continue;
+            }
+            let cost = match self.unit {
+                NameUnit::Bytes => ch.len_utf8(),
+                NameUnit::Utf16 => self.unit.width(),
+            };
+            if self.stored_len(buffer) + cost <= self.capacity {
+                buffer.push(ch);
+            }
+        }
+        refused
+    }
+
+    /// Keep only the characters the field holds, reporting the first refused.
+    ///
+    /// Used on text that did not come from the widget's own insertion path -
+    /// what a keyboard applet returned, or what an old save already held.
+    pub fn filter(&self, text: &str) -> (String, Option<char>) {
+        let mut out = String::with_capacity(text.len());
+        let mut refused = None;
+        for ch in text.chars() {
+            if self.accepts(ch) {
+                out.push(ch);
+            } else {
+                refused.get_or_insert(ch);
+            }
+        }
+        (out, refused)
+    }
+
+    /// What writing `text` would do to the field, without writing it.
+    pub fn fit(&self, text: &str) -> Result<NameFit, NameError> {
+        crate::save::check_name(text, self.capacity, self.unit)
+    }
+}
+
+/// One of the six names the screens can edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameTarget {
+    /// The hunter name of the open slot (both copies are written).
+    Hunter,
+    /// One record of the palico roster.
+    Palico(usize),
+    /// One item set's name.
+    ItemSet(usize),
+    /// One equipment set's name.
+    EquipSet(usize),
+    /// The guild card's own copy of the hunter name (UTF-16, eleven units).
+    CardName,
+    /// The guild card's profile comment (UTF-16, twenty-eight units).
+    CardComment,
+}
+
+impl NameTarget {
+    /// What the field stores and how the widget has to count it.
+    pub fn spec(self) -> NameSpec {
+        match self {
+            NameTarget::Hunter
+            | NameTarget::Palico(_)
+            | NameTarget::ItemSet(_)
+            | NameTarget::EquipSet(_) => NameSpec::name(
+                crate::save::NAME_CAPACITY,
+                NameUnit::Bytes,
+            ),
+            NameTarget::CardName => NameSpec::name(
+                crate::guildcard::NAME_CAPACITY,
+                NameUnit::Utf16,
+            ),
+            NameTarget::CardComment => NameSpec::name(
+                crate::guildcard::COMMENT_CAPACITY,
+                NameUnit::Utf16,
+            ),
+        }
+    }
+
+    /// The name the screens put in a header and in the status line.
+    pub fn label(self) -> &'static str {
+        match self {
+            NameTarget::Hunter => "ハンター名",
+            NameTarget::Palico(_) => "オトモ名",
+            NameTarget::ItemSet(_) => "アイテムセット名",
+            NameTarget::EquipSet(_) => "装備セット名",
+            NameTarget::CardName => "ギルドカード名",
+            NameTarget::CardComment => "ギルドカードコメント",
+        }
+    }
+
+    /// The label an undo step carries. The old per-field names are kept, so a
+    /// step reads the same way it did before the fields shared one writer.
+    pub fn undo_label(self) -> &'static str {
+        match self {
+            NameTarget::Hunter => "名前",
+            NameTarget::Palico(_) => "オトモの名前",
+            NameTarget::ItemSet(_) | NameTarget::EquipSet(_) => "マイセット名",
+            NameTarget::CardName => "ギルドカードの名前",
+            NameTarget::CardComment => "ギルドカードのコメント",
+        }
+    }
+
+    /// The value the field holds now, or None when the record does not exist.
+    pub fn current(self, save: &Save, slot: usize) -> Option<String> {
+        match self {
+            NameTarget::Hunter => Some(save.read_character(slot)?.name),
+            NameTarget::Palico(index) => crate::palico::roster(save, slot)
+                .get(index)
+                .map(|p| p.name.clone()),
+            NameTarget::ItemSet(index) => crate::myset::item_sets(save, slot)
+                .get(index)
+                .map(|s| s.name.clone()),
+            NameTarget::EquipSet(index) => crate::myset::equip_sets(save, slot)
+                .get(index)
+                .map(|s| s.name.clone()),
+            NameTarget::CardName => crate::guildcard::card_name(save, slot),
+            NameTarget::CardComment => crate::guildcard::comment(save, slot),
+        }
+    }
+
+    /// Write `text` through the field's checked writer.
+    ///
+    /// The check happens first, so a refused name leaves the save exactly as
+    /// it was; the fit comes back with the write so the caller can print the
+    /// length and the warnings.
+    pub fn write(self, save: &mut Save, slot: usize, text: &str) -> Result<NameFit, NameError> {
+        match self {
+            NameTarget::Hunter => {
+                let mut c = save.read_character(slot).ok_or(NameError::NoField)?;
+                c.name = String::from(text);
+                c.slot = slot;
+                save.write_character_checked(&c)
+            }
+            NameTarget::Palico(index) => crate::palico::set_name_checked(save, slot, index, text),
+            NameTarget::ItemSet(index) => {
+                crate::myset::set_item_set_name_checked(save, slot, index, text)
+            }
+            NameTarget::EquipSet(index) => {
+                crate::myset::set_equip_set_name_checked(save, slot, index, text)
+            }
+            NameTarget::CardName => crate::guildcard::set_card_name_checked(save, slot, text),
+            NameTarget::CardComment => crate::guildcard::set_comment_checked(save, slot, text),
+        }
+    }
+}
+
+/// 「29/31 バイト（2行）」 for a fit the writer already returned.
+pub fn name_fit_label(fit: &NameFit) -> String {
+    format!(
+        "{}/{} バイト（{}行）",
+        fit.len, fit.capacity, fit.lines
+    )
+}
+
+/// One line per warning, as the status row prints them.
+///
+/// None of them is an instruction: a leading, trailing or doubled line break is
+/// where the player put it, and the editor only says what it sees.
+pub fn name_warning_lines(fit: &NameFit) -> Vec<String> {
+    let mut out = Vec::with_capacity(fit.warnings.len());
+    for w in &fit.warnings {
+        out.push(match w {
+            NameWarning::LeadingNewline => {
+                String::from("先頭が改行です（1行目は空行になります）")
+            }
+            NameWarning::TrailingNewline => {
+                String::from("末尾が改行です（最後の行は空行になります）")
+            }
+            NameWarning::EmptyLine { line } => {
+                format!("{}行目が空行です", line + 1)
+            }
+            NameWarning::TooLong { len, capacity } => format!(
+                "{}バイトで上限 {} バイトを超えています（保存時に切り詰めます）",
+                len, capacity
+            ),
+        });
+    }
+    out
+}
+
+/// The status line a refused name leaves behind.
+///
+/// The wording is the one the player reads at the bottom of the screen, so a
+/// control character is named by its code point: 「その文字は使えません
+/// （U+0009）」. Nothing was written when this is shown.
+pub fn name_refusal_line(e: NameError) -> String {
+    match e {
+        NameError::Control(c) => format!("その文字は使えません（U+{:04X}）— 何も書き込んでいません", c as u32),
+        NameError::NoField => String::from("書き込む欄が見つかりません — 何も書き込んでいません"),
+    }
+}
+
+/// Everything a name write says in the status row: the field, its length, the
+/// warnings (none of them repaired).
+pub fn name_status_line(label: &str, text: &str, fit: &NameFit) -> String {
+    let mut out = format!(
+        "{}を「{}」にしました（{}）",
+        label,
+        name_preview(text),
+        name_fit_label(fit)
+    );
+    for w in name_warning_lines(fit) {
+        out.push_str(" / ");
+        out.push_str(&w);
+    }
+    out
+}
+
+/// A name as one status line can hold it: the lines joined with a slash.
+///
+/// The list, the header and the input box draw every line; this is only for the
+/// one-row status message, where a line break would reflow the footer.
+pub fn name_preview(text: &str) -> String {
+    text.replace('\n', "/")
+}
 
 // ---------------------------------------------------------------------------
 // 闘技大会 (the arena log): the guild screen's second view
@@ -1141,6 +1451,15 @@ pub const GUILD_TAB_CARD: usize = 0;
 pub const GUILD_TAB_ARENA: usize = 1;
 /// Views the guild screen has.
 pub const GUILD_TABS: usize = 2;
+
+/// Rows of the guild card view: HR, the clock, the comment, and the name the
+/// card carries. The name is last so the three rows the screen always had keep
+/// their numbers.
+pub const GUILD_FIELDS: usize = 4;
+/// The guild card row that holds the comment.
+pub const GUILD_ROW_COMMENT: usize = 2;
+/// The guild card row that holds the card own copy of the hunter name.
+pub const GUILD_ROW_NAME: usize = 3;
 
 /// Arena rows the view lists: one per arena of the log.
 pub const ARENA_ROWS: usize = crate::guildcard::ARENA_COUNT;
@@ -3176,17 +3495,141 @@ impl Editor {
     }
 
     /// The I/O layer answers a character-name request with this.
+    ///
+    /// Same write as Editor::apply_name_checked, with the refusal swallowed for
+    /// the callers that predate the check. Anything the screens do goes through
+    /// the checked form, so a tab cannot reach the save.
     pub fn apply_name(&mut self, text: String) {
-        self.push_undo("名前");
-        if let Some(mut c) = self.character() {
-            c.name = text;
-            c.slot = self.slot;
-            if let Some(s) = &mut self.save {
-                let _ = s.write_character(&c);
-                self.dirty = true;
-                self.message = String::from("名前を更新しました（A でセーブに書き込み）");
+        let _ = self.apply_name_checked(&text);
+    }
+
+    /// The checked form of Editor::apply_name: a name that holds a control
+    /// character is refused before the undo step or the save is touched.
+    pub fn apply_name_checked(&mut self, text: &str) -> Result<NameFit, NameError> {
+        self.apply_name_target(NameTarget::Hunter, text)
+    }
+
+    /// Write one of the six names, as one undo step.
+    ///
+    /// The target checked writer runs first, so a refused name writes nothing
+    /// and takes no undo step; a name that fits goes in, and the status line
+    /// carries its length, its line count and every warning the writer
+    /// reported. Nothing is ever repaired here: a line break the player typed
+    /// is theirs.
+    pub fn apply_name_target(
+        &mut self,
+        target: NameTarget,
+        text: &str,
+    ) -> Result<NameFit, NameError> {
+        // The field refuses before anything else happens: a control
+        // character must not leave an undo step behind either.
+        target.spec().fit(text)?;
+        let slot = self.slot;
+        {
+            let Some(save) = self.save.as_ref() else {
+                return Err(NameError::NoField);
+            };
+            if target.current(save, slot).is_none() {
+                return Err(NameError::NoField);
             }
         }
+        self.push_undo(target.undo_label());
+        let Some(save) = self.save.as_mut() else {
+            return Err(NameError::NoField);
+        };
+        let target_fit = target.write(save, slot, text)?;
+        self.dirty = true;
+        self.message = name_status_line(target.label(), text, &target_fit);
+        Ok(target_fit)
+    }
+
+    /// Which name a text request sentinel edits, if it edits one.
+    ///
+    /// The screens take a request as a bare index; this is the one place that
+    /// turns it back into a field, so the keyboard knows the width to count in
+    /// and the answer goes to the right checked writer.
+    pub fn text_request_name(&self, idx: usize) -> Option<NameTarget> {
+        if idx == TEXT_NAME {
+            return Some(NameTarget::Hunter);
+        }
+        if idx >= TEXT_PALICO_NAME && idx < TEXT_PALICO_NAME.saturating_add(crate::palico::SLOTS)
+        {
+            return Some(NameTarget::Palico(idx - TEXT_PALICO_NAME));
+        }
+        if idx >= TEXT_ITEM_SET_NAME
+            && idx < TEXT_ITEM_SET_NAME.saturating_add(crate::myset::ITEM_SETS)
+        {
+            return Some(NameTarget::ItemSet(idx - TEXT_ITEM_SET_NAME));
+        }
+        if idx == TEXT_SET_NAME {
+            return Some(NameTarget::EquipSet(self.set_edit.map(|e| e.set).unwrap_or(0)));
+        }
+        if idx == TEXT_CARD_NAME {
+            return Some(NameTarget::CardName);
+        }
+        if idx == TEXT_GUILD_COMMENT {
+            return Some(NameTarget::CardComment);
+        }
+        None
+    }
+
+    /// The guild card own name, as a text request.
+    pub fn request_card_name(&mut self) -> bool {
+        let slot = self.slot;
+        let Some(save) = self.save.as_ref() else {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        };
+        let Some(cur) = crate::guildcard::card_name(save, slot) else {
+            self.message = String::from("ギルドカードを読めません");
+            return false;
+        };
+        self.pending_text = Some((TEXT_CARD_NAME, cur));
+        true
+    }
+
+    /// The item set name, as a text request.
+    pub fn request_item_set_name(&mut self) -> bool {
+        let Some(e) = self.item_set_edit else {
+            return false;
+        };
+        let slot = self.slot;
+        let Some(save) = self.save.as_ref() else {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        };
+        let Some(cur) = NameTarget::ItemSet(e.set).current(save, slot) else {
+            self.message = String::from("そのアイテムセットは読めません");
+            return false;
+        };
+        self.pending_text = Some((TEXT_ITEM_SET_NAME + e.set, cur));
+        true
+    }
+
+    /// The checked form of Editor::set_guild_comment.
+    pub fn set_guild_comment_checked(&mut self, text: &str) -> Result<NameFit, NameError> {
+        self.apply_name_target(NameTarget::CardComment, text)
+    }
+
+    /// The checked form of Editor::rename_palico.
+    pub fn rename_palico_checked(&mut self, which: usize, name: &str) -> Result<NameFit, NameError> {
+        self.apply_name_target(NameTarget::Palico(which), name)
+    }
+
+    /// The checked form of Editor::apply_set_name.
+    pub fn apply_set_name_checked(&mut self, text: &str) -> Result<NameFit, NameError> {
+        let Some(e) = self.set_edit else {
+            return Err(NameError::NoField);
+        };
+        self.apply_name_target(NameTarget::EquipSet(e.set), text)
+    }
+
+    /// The checked form of the item set name write.
+    pub fn apply_item_set_name_checked(&mut self, text: &str) -> Result<NameFit, NameError> {
+        let Some(e) = self.item_set_edit else {
+            return Err(NameError::NoField);
+        };
+        self.apply_name_target(NameTarget::ItemSet(e.set), text)
     }
 
     /// The guild card comment for the open slot, as one undo step.
@@ -3196,20 +3639,7 @@ impl Editor {
     /// guild card edit the undo could not see. Going through the editor keeps
     /// the step and the message in the same place as every other write.
     pub fn set_guild_comment(&mut self, text: &str) -> bool {
-        if self.save.is_none() {
-            return false;
-        }
-        self.push_undo("ギルドカードのコメント");
-        let slot = self.slot;
-        let Some(save) = &mut self.save else {
-            return false;
-        };
-        if !crate::guildcard::set_comment(save, slot, text) {
-            return false;
-        }
-        self.dirty = true;
-        self.message = String::from("コメントを変更しました（[X] でセーブ保存）");
-        true
+        self.set_guild_comment_checked(text).is_ok()
     }
 
     // ------------------------------------------------------- arena log view
@@ -3419,20 +3849,7 @@ impl Editor {
 
     /// Rename one palico of the open slot, as one undo step.
     pub fn rename_palico(&mut self, which: usize, name: &str) -> bool {
-        if self.save.is_none() {
-            return false;
-        }
-        self.push_undo("オトモの名前");
-        let slot = self.slot;
-        let Some(save) = &mut self.save else {
-            return false;
-        };
-        if !crate::palico::set_name(save, slot, which, name) {
-            return false;
-        }
-        self.dirty = true;
-        self.message = format!("オトモ {} の名前を変更しました", which);
-        true
+        self.rename_palico_checked(which, name).is_ok()
     }
 
     // ------------------------------------------------------------- loading
@@ -3533,7 +3950,9 @@ impl Editor {
         let base = match self.screen {
             Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
             Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
-            Screen::Char => "[◀/▶] 増減  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
+            // Row 0 is the name: ◀ / ▶ opens the keyboard, and the name may hold
+            // a line break, which the footer says because no key hints at it.
+            Screen::Char => "[◀/▶] 増減（0行目=名前・改行可）  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
             Screen::Items if self.item_menu_open => {
                 "[▲/▼] 選択  [A] 実行（2回）  [-] 閉じる  [B] 戻る  [X] 保存"
             }
@@ -4004,7 +4423,7 @@ impl Editor {
     /// [◀/▶] take. It used to print 編集 on every row and do nothing on two of
     /// them.
     pub fn guild_a_label(&self) -> &'static str {
-        if self.guild_field == 2 {
+        if self.guild_field >= 2 {
             "編集"
         } else {
             "+刻み"
@@ -4016,7 +4435,7 @@ impl Editor {
     /// Shared by [A] and ▶ so the two cannot drift apart. The comment row has
     /// no number to step and answers false.
     pub fn guild_step_row(&mut self) -> bool {
-        if self.guild_field == 2 {
+        if self.guild_field >= 2 {
             return false;
         }
         let slot = self.slot;
@@ -4362,7 +4781,8 @@ impl Editor {
                 ok
             }
             _ => {
-                self.message = String::from("コメント行に最大値はありません（[A] でテキスト入力）");
+                self.message =
+                    String::from("コメント行とカード名には最大値がありません（[A] でテキスト入力）");
                 false
             }
         }
@@ -4755,9 +5175,10 @@ impl Editor {
                 true
             }
             _ => {
-                // The comment is text too, and [A] already opens it: asking
-                // here as well would be the same key twice.
-                self.message = String::from("コメントは [A] で入力します（この行の数値はありません）");
+                // The two text rows (the comment and the card's own name) are
+                // opened by [A], so there is no number here to type.
+                self.message =
+                    String::from("コメントとカード名は [A] で入力します（この行の数値はありません）");
                 false
             }
         }
@@ -7196,12 +7617,13 @@ impl Editor {
         if self.guild_view() == GUILD_TAB_ARENA {
             return self.input_arena(key);
         }
-        // Field 0 is the rank, 1 is the card's own clock, 2 the comment.
+        // Field 0 is the rank, 1 is the card's own clock, 2 the comment and 3
+        // the name the card carries (its own copy of the hunter name).
         match key {
-            Key::Up => self.guild_field = (self.guild_field + 2) % 3,
+            Key::Up => self.guild_field = (self.guild_field + GUILD_FIELDS - 1) % GUILD_FIELDS,
             // [X] is the save key on every screen, so it is no longer a second
             // "next field" here (it used to be, and nothing said so).
-            Key::Down => self.guild_field = (self.guild_field + 1) % 3,
+            Key::Down => self.guild_field = (self.guild_field + 1) % GUILD_FIELDS,
             Key::Left | Key::Right => {
                 let up = key == Key::Right;
                 let slot = self.slot;
@@ -7244,13 +7666,18 @@ impl Editor {
             // exactly what [▶] would add. It used to print 編集 on every row
             // and do nothing on two of them.
             Key::A => {
-                if self.guild_field == 2 {
+                if self.guild_field == GUILD_ROW_COMMENT {
                     if let Some(save) = &self.save {
                         let cur = crate::guildcard::comment(save, self.slot).unwrap_or_default();
                         self.pending_text = Some((TEXT_GUILD_COMMENT, cur));
                     } else {
                         self.message = String::from("先にセーブを開いてください");
                     }
+                } else if self.guild_field == GUILD_ROW_NAME {
+                    // The card keeps its own copy of the name: a line break in
+                    // it is the unit 0x000A, which is the second line the game
+                    // draws on the card screen.
+                    self.request_card_name();
                 } else if !self.guild_step_row() {
                     self.message = String::from("先にセーブを開いてください");
                 }
@@ -9218,28 +9645,16 @@ impl Editor {
     }
 
     /// The io layer answers a set-name request with this.
+    ///
+    /// The checked writer runs first, so a refused name writes nothing. The
+    /// warnings the name carries (a leading, trailing or doubled line break)
+    /// are part of the status line rather than an edit.
     pub fn apply_set_name(&mut self, text: String) {
-        let Some(e) = self.set_edit else {
+        if let Err(e) = self.apply_set_name_checked(&text) {
+            self.message = name_refusal_line(e);
             return;
-        };
-        let slot = self.slot;
-        let set = e.set;
-        self.push_undo("マイセット名");
-        let wrote = match &mut self.save {
-            Some(s) => crate::myset::set_name(s, slot, set, &text),
-            None => false,
-        };
-        if wrote {
-            self.dirty = true;
-            let n = self.refresh_set_warnings();
-            self.message = alloc::format!(
-                "セット名を「{}」にしました（[B] で一覧 → [X] でセーブ保存 / 警告 {} 件）",
-                text,
-                n
-            );
-        } else {
-            self.message = String::from("セット名を書き込めませんでした");
         }
+        self.refresh_set_warnings();
     }
 
     // -----------------------------------------------------------------------
@@ -9601,7 +10016,7 @@ impl Editor {
             return String::from("アイテムセットを選んで [A]");
         };
         alloc::format!(
-            "枠 {:02} {} — [◀/▶] アイテムBOX を巡回 / [A] 決定 / [Y] ポーチから取込 / [-] 2回でポーチへ適用",
+            "枠 {:02} {} — [◀/▶] 巡回 / [A] 決定 / [Y] 取込 / [-] 2回で適用 / [ZR] 名前",
             e.field + 1,
             self.item_set_row_label(e.field)
         )
@@ -9633,6 +10048,16 @@ impl Editor {
             Key::Y => {
                 self.item_set_edit = Some(e);
                 self.item_set_from_pouch();
+                return;
+            }
+            // The set name is the one thing this form does not list as a row,
+            // so [ZR] opens the keyboard for it instead of adding a row the
+            // 32 entries would have to be renumbered around.
+            Key::Z => {
+                self.item_set_edit = Some(e);
+                if !self.request_item_set_name() {
+                    self.message = String::from("アイテムセット名を入力できません");
+                }
                 return;
             }
             Key::Minus => {
@@ -12031,6 +12456,9 @@ impl Editor {
                 let hr = crate::guildcard::hunter_rank(save, self.slot).unwrap_or(0);
                 let time = crate::guildcard::play_time(save, self.slot).unwrap_or(0);
                 let comment = crate::guildcard::comment(save, self.slot).unwrap_or_default();
+                let card = crate::guildcard::full_card(save, self.slot)
+                    .map(crate::guildcard::name_lines_in)
+                    .unwrap_or_default();
                 // The field being edited is bracketed, so Left/Right is
                 // never a guess.
                 let mk = |f: usize| if self.guild_field == f { "[" } else { " " };
@@ -12069,7 +12497,27 @@ impl Editor {
                 );
                 push(
                     &mut out,
-                    alloc::format!("  comment : {}{}{}", mk(2), comment, cl(2)),
+                    alloc::format!("  comment : {}{}{}", mk(2), comment.replace('\n', " / "), cl(2)),
+                    false,
+                    false,
+                );
+                // The card name is UTF-16 and may hold a line break; every
+                // line is printed, an empty one included.
+                for (i, line) in card.iter().enumerate() {
+                    push(
+                        &mut out,
+                        if i == 0 {
+                            alloc::format!("  name    : {}{}{}", mk(3), line, cl(3))
+                        } else {
+                            alloc::format!("            {}", line)
+                        },
+                        false,
+                        false,
+                    );
+                }
+                push(
+                    &mut out,
+                    String::from("  comment / name は [A] で入力（name はカード側の写し）"),
                     false,
                     false,
                 );

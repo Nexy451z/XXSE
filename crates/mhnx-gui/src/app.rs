@@ -1440,10 +1440,16 @@ impl MhnxEditor {
         if !s.slot_used(self.slot) {
             s.set_slot_used(self.slot, true);
         }
-        if let Err(e) = s.write_character(&self.edit) {
-            self.message = format!("適用失敗: {}", e);
-            return;
-        }
+        // The checked writer runs first: a name whose text holds a control
+        // character is refused before the save is touched, and the status row
+        // names the code point instead of a vague failure.
+        let name_fit = match s.write_character_checked(&self.edit) {
+            Ok(fit) => fit,
+            Err(e) => {
+                self.message = mhnx_core::hbedit::name_refusal_line(e);
+                return;
+            }
+        };
         if !self.items.is_empty() {
             if let Err(e) = s.write_item_box(self.slot, &self.items) {
                 self.message = format!("アイテム適用失敗: {}", e);
@@ -1451,7 +1457,18 @@ impl MhnxEditor {
             }
         }
         self.dirty = true;
-        self.message = "編集内容を保存データに反映しました (まだファイルには書いていません)".to_owned();
+        // The name is the one field that can be long enough or ragged enough to
+        // have something to say, so its length, line count and warnings travel
+        // with the usual message.
+        let mut note = mhnx_core::hbedit::name_fit_label(&name_fit);
+        let warnings = name_warnings_text(&name_fit);
+        if !warnings.is_empty() {
+            note.push_str(" / ");
+            note.push_str(&warnings);
+        }
+        self.message = format!(
+            "編集内容を保存データに反映しました (まだファイルには書いていません) — 名前 {note}"
+        );
     }
 
     /// Copy the file that is about to be overwritten to <name>.bak.
@@ -1954,7 +1971,7 @@ impl MhnxEditor {
         if !save.slot_used(slot) {
             save.set_slot_used(slot, true);
         }
-        save.write_character(&edit).ok()?;
+        save.write_character_checked(&edit).ok()?;
         if !self.items.is_empty() {
             save.write_item_box(slot, &self.items).ok()?;
         }
@@ -3904,10 +3921,16 @@ impl MhnxEditor {
                                     .read_character(i)
                                     .map(|c| c.name)
                                     .unwrap_or_default();
+                                // A name may hold a line break, and the slot list
+                                // is where a save is chosen: both lines are shown.
                                 let label = format!(
                                     "{}: {}{}",
                                     i + 1,
-                                    if name.is_empty() { "(空)" } else { name.as_str() },
+                                    if name.is_empty() {
+                                        String::from("(空)")
+                                    } else {
+                                        name_label_text(&name)
+                                    },
                                     if used { "" } else { " [未使用]" }
                                 );
                                 if ui.selectable_label(self.slot == i, label).clicked() {
@@ -4469,7 +4492,21 @@ impl MhnxEditor {
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("char").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                 ui.label("名前");
-                ui.text_edit_singleline(&mut self.edit.name);
+                ui.vertical(|ui| {
+                    let spec = mhnx_core::hbedit::NameTarget::Hunter.spec();
+                    let (_, refused) = name_edit(ui, &mut self.edit.name, spec, 320.0);
+                    if let Some(c) = refused {
+                        self.message = mhnx_core::hbedit::name_refusal_line(
+                            mhnx_core::save::NameError::Control(c),
+                        );
+                    }
+                    ui.label(egui::RichText::new(spec.length_label(&self.edit.name)).weak().small());
+                    if let Ok(fit) = spec.fit(&self.edit.name) {
+                        for w in mhnx_core::hbedit::name_warning_lines(&fit) {
+                            ui.colored_label(warning_color(), w);
+                        }
+                    }
+                });
                 ui.end_row();
 
                 ui.label("プレイ時間 (秒)");
@@ -6958,7 +6995,10 @@ impl MhnxEditor {
                                 }
                             })
                             .body(|body| {
-                                body.rows(20.0, sets.len(), |mut row| {
+                                // A set name may hold a line break; the row is
+                                // tall enough to draw both lines, empty ones
+                                // included, rather than clipping after the first.
+                                body.rows(36.0, sets.len(), |mut row| {
                                     let set = &sets[row.index()];
                                     row.set_selected(selected == Some(set.index));
                                     row.col(|ui| {
@@ -6970,7 +7010,7 @@ impl MhnxEditor {
                                         {
                                             ui.label(egui::RichText::new("（名前なし）").weak());
                                         } else {
-                                            ui.label(set.name.clone());
+                                            ui.label(name_label_text(&set.name));
                                         }
                                     });
                                     row.col(|ui| {
@@ -7053,15 +7093,20 @@ impl MhnxEditor {
         ui.label(egui::RichText::new(format!("セット {} の編集", index)).strong());
         ui.horizontal(|ui| {
             ui.label("名前");
+            // The name may hold a line break (the game draws it as a second
+            // line on the set list) and it counts bytes, not characters, so the
+            // widget is the shared multiline one and the length is printed
+            // beside it.
+            let spec = mhnx_core::hbedit::NameTarget::ItemSet(index).spec();
             let mut name = set.name.clone();
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut name)
-                        .desired_width(230.0)
-                        .hint_text("セット名"),
-                )
-                .changed()
-            {
+            let (edited, refused) = name_edit(ui, &mut name, spec, 230.0);
+            ui.label(egui::RichText::new(spec.length_label(&name)).weak().small());
+            if let Some(c) = refused {
+                self.message = mhnx_core::hbedit::name_refusal_line(
+                    mhnx_core::save::NameError::Control(c),
+                );
+            }
+            if edited {
                 self.item_set_name_write(index, &name);
             }
         });
@@ -7343,7 +7388,7 @@ impl MhnxEditor {
                                 }
                             })
                             .body(|body| {
-                                body.rows(20.0, sets.len(), |mut row| {
+                                body.rows(36.0, sets.len(), |mut row| {
                                     let set = &sets[row.index()];
                                     row.set_selected(pick.or(self.set_selected) == Some(set.index));
                                     row.col(|ui| {
@@ -7355,7 +7400,7 @@ impl MhnxEditor {
                                         } else if set.name.trim().is_empty() {
                                             ui.label(egui::RichText::new("（名前なし）").weak());
                                         } else {
-                                            ui.label(set.name.clone());
+                                            ui.label(name_label_text(&set.name));
                                         }
                                     });
                                     row.col(|ui| {
@@ -7446,15 +7491,18 @@ impl MhnxEditor {
         ui.label(egui::RichText::new(format!("セット {} の編集", index)).strong());
         ui.horizontal(|ui| {
             ui.label("名前");
+            // Same rule as the item set name: a line break is a character, the
+            // ceiling is 31 stored bytes, and the length is on screen.
+            let spec = mhnx_core::hbedit::NameTarget::EquipSet(index).spec();
             let mut name = set.name.clone();
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut name)
-                        .desired_width(250.0)
-                        .hint_text("セット名"),
-                )
-                .changed()
-            {
+            let (edited, refused) = name_edit(ui, &mut name, spec, 250.0);
+            ui.label(egui::RichText::new(spec.length_label(&name)).weak().small());
+            if let Some(c) = refused {
+                self.message = mhnx_core::hbedit::name_refusal_line(
+                    mhnx_core::save::NameError::Control(c),
+                );
+            }
+            if edited {
                 self.set_name_write(index, &name);
             }
         });
@@ -7660,17 +7708,27 @@ impl MhnxEditor {
     }
 
     /// Rename a saved equipment set.
+    ///
+    /// The checked writer runs first: a control character other than U+000A
+    /// refuses the whole name and nothing is written; a name that fits keeps
+    /// its line breaks and reports them.
     pub fn set_name_write(&mut self, index: usize, name: &str) -> bool {
         self.push_undo(format!("セット {} の名前", index));
         let slot = self.slot;
         let Some(save) = &mut self.save else {
             return false;
         };
-        let ok = mhnx_core::myset::set_name(save, slot, index, name);
-        if ok {
-            self.dirty = true;
+        match mhnx_core::myset::set_equip_set_name_checked(save, slot, index, name) {
+            Ok(fit) => {
+                self.dirty = true;
+                self.message = mhnx_core::hbedit::name_status_line("装備セット名", name, &fit);
+                true
+            }
+            Err(e) => {
+                self.message = mhnx_core::hbedit::name_refusal_line(e);
+                false
+            }
         }
-        ok
     }
 
     /// Point one part of a saved set at an equipment box record.
@@ -8022,6 +8080,10 @@ impl MhnxEditor {
     // -------------------------------------------------- item sets / pouch
 
     /// Rename one of the twenty-four item sets.
+    ///
+    /// Same rule as the equipment set: checked first, so a refused name writes
+    /// nothing, and the fit comes back so the message can carry the length, the
+    /// line count and the ragged-break warnings.
     pub fn item_set_name_write(&mut self, index: usize, name: &str) -> bool {
         let slot = self.slot;
         self.push_undo(format!("セット {} の名前", index));
@@ -8029,13 +8091,18 @@ impl MhnxEditor {
             self.message = String::from("セーブが開かれていません");
             return false;
         };
-        let ok = mhnx_core::myset::set_item_set_name(save, slot, index, name);
-        if ok {
-            self.dirty = true;
-        } else {
-            self.message = format!("セット {} の名前を書き換えられませんでした", index);
+        match mhnx_core::myset::set_item_set_name_checked(save, slot, index, name) {
+            Ok(fit) => {
+                self.dirty = true;
+                self.message =
+                    mhnx_core::hbedit::name_status_line("アイテムセット名", name, &fit);
+                true
+            }
+            Err(e) => {
+                self.message = mhnx_core::hbedit::name_refusal_line(e);
+                false
+            }
         }
-        ok
     }
 
     /// Write one of the thirty-two entries of an item set.
@@ -8339,17 +8406,42 @@ impl MhnxEditor {
                                 self.palico_selected = Some(p.index);
                             }
                             let mut name = p.name.clone();
-                            let name_edit = ui.add(
-                                egui::TextEdit::singleline(&mut name).desired_width(140.0),
-                            );
+                            // A palico name takes a line break too, and the
+                            // field is 31 bytes; the editor counts the bytes
+                            // and refuses everything but U+000A among the
+                            // controls, so a tab cannot be typed in here.
+                            let spec = mhnx_core::hbedit::NameTarget::Palico(p.index).spec();
+                            let (edited, refused) = name_edit(ui, &mut name, spec, 140.0);
+                            if let Some(c) = refused {
+                                self.message = mhnx_core::hbedit::name_refusal_line(
+                                    mhnx_core::save::NameError::Control(c),
+                                );
+                            }
                             // The step is taken before the first byte moves, so
                             // one Ctrl+Z puts the name back the way it was.
-                            if name_edit.changed() {
+                            if edited {
                                 self.push_undo(format!("オトモ {} の名前", p.index));
                                 if let Some(s) = &mut self.save {
-                                    mhnx_core::palico::set_name(s, self.slot, p.index, &name);
+                                    match mhnx_core::palico::set_name_checked(
+                                        s,
+                                        self.slot,
+                                        p.index,
+                                        &name,
+                                    ) {
+                                        Ok(fit) => {
+                                            self.message = mhnx_core::hbedit::name_status_line(
+                                                "オトモ名",
+                                                &name,
+                                                &fit,
+                                            );
+                                            changed = true;
+                                        }
+                                        Err(e) => {
+                                            self.message =
+                                                mhnx_core::hbedit::name_refusal_line(e);
+                                        }
+                                    }
                                 }
-                                changed = true;
                             }
                             ui.horizontal(|ui| {
                                 let mut lvl = p.level as i32;
@@ -9491,18 +9583,29 @@ impl MhnxEditor {
         let mut new_time = time;
         let mut new_comment = comment.clone();
         let mut changed = false;
+        let mut refused: Option<char> = None;
+        // The two card text fields are UTF-16, so their ceilings are counted in
+        // units (two bytes each) and a line break is the unit 0x000A. The
+        // widgets are multiline for that reason: the game draws the break.
+        let name_spec = mhnx_core::hbedit::NameTarget::CardName.spec();
+        let comment_spec = mhnx_core::hbedit::NameTarget::CardComment.spec();
         egui::Grid::new("gcinfo").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
             ui.label("名前");
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut new_name)
-                        .desired_width(360.0)
-                        .char_limit(mhnx_core::guildcard::GC_NAME_UNITS),
-                )
-                .changed()
-            {
-                changed = true;
-            }
+            ui.vertical(|ui| {
+                let (edited, bad) = name_edit(ui, &mut new_name, name_spec, 360.0);
+                if edited {
+                    changed = true;
+                }
+                if bad.is_some() {
+                    refused = bad;
+                }
+                ui.label(egui::RichText::new(name_spec.length_label(&new_name)).weak().small());
+                if let Ok(fit) = name_spec.fit(&new_name) {
+                    for w in mhnx_core::hbedit::name_warning_lines(&fit) {
+                        ui.colored_label(warning_color(), w);
+                    }
+                }
+            });
             ui.end_row();
             ui.label("ハンターランク");
             if ui
@@ -9536,44 +9639,99 @@ impl MhnxEditor {
             ui.label(id.iter().map(|b| format!("{:02X}", b)).collect::<String>());
             ui.end_row();
             ui.label("コメント");
-            if ui
-                .add(
-                    egui::TextEdit::singleline(&mut new_comment)
-                        .desired_width(360.0)
-                        .char_limit(mhnx_core::guildcard::GC_COMMENT_CHARS),
-                )
-                .changed()
-            {
-                changed = true;
-            }
+            ui.vertical(|ui| {
+                let (edited, bad) = name_edit(ui, &mut new_comment, comment_spec, 360.0);
+                if edited {
+                    changed = true;
+                }
+                if bad.is_some() {
+                    refused = bad;
+                }
+                ui.label(
+                    egui::RichText::new(comment_spec.length_label(&new_comment))
+                        .weak()
+                        .small(),
+                );
+                if let Ok(fit) = comment_spec.fit(&new_comment) {
+                    for w in mhnx_core::hbedit::name_warning_lines(&fit) {
+                        ui.colored_label(warning_color(), w);
+                    }
+                }
+            });
             ui.end_row();
         });
         ui.label(
             egui::RichText::new(
                 "名前はカード側の写しを書き換えます（キャラクター本体の名前はキャラクタータブ）。\
-                 欄は 11 文字までで、終端より後ろの残りバイトには触れません。",
+                 欄は 11 文字（22 バイト）まで、コメントは 28 文字（56 バイト）まで。\
+                 どちらも Enter で改行が入り、ゲームは 2 行目として描きます。\
+                 終端より後ろの残りバイトには触れません。",
             )
             .weak()
             .small(),
         );
+        if let Some(c) = refused {
+            self.message = mhnx_core::hbedit::name_refusal_line(
+                mhnx_core::save::NameError::Control(c),
+            );
+        }
         if changed {
             self.push_undo(String::from("ギルドカードの基本情報"));
+            // The two text fields go through the checked writers, so a name that
+            // holds a control character is refused and leaves the card alone.
+            // Everything else in this block is a number the widget already
+            // clamped.
+            let mut name_fit = None;
+            let mut comment_fit = None;
+            let mut failure = None;
             if let Some(save) = &mut self.save {
                 if new_name != name {
-                    mhnx_core::guildcard::set_card_name(save, slot, &new_name);
+                    match mhnx_core::guildcard::set_card_name_checked(save, slot, &new_name) {
+                        Ok(fit) => name_fit = Some(fit),
+                        Err(e) => failure = Some(e),
+                    }
                 }
-                if new_hr != hr {
-                    mhnx_core::guildcard::set_hunter_rank(save, slot, new_hr);
-                }
-                if new_time != time {
-                    mhnx_core::guildcard::set_play_time(save, slot, new_time);
-                }
-                if new_comment != comment {
-                    mhnx_core::guildcard::set_comment(save, slot, &new_comment);
+                if failure.is_none() {
+                    if new_hr != hr {
+                        mhnx_core::guildcard::set_hunter_rank(save, slot, new_hr);
+                    }
+                    if new_time != time {
+                        mhnx_core::guildcard::set_play_time(save, slot, new_time);
+                    }
+                    if new_comment != comment {
+                        match mhnx_core::guildcard::set_comment_checked(save, slot, &new_comment) {
+                            Ok(fit) => comment_fit = Some(fit),
+                            Err(e) => failure = Some(e),
+                        }
+                    }
                 }
             }
-            self.dirty = true;
-            self.message = "ギルドカードを更新しました（まだファイルには書いていません）".to_owned();
+            if let Some(e) = failure {
+                self.message = mhnx_core::hbedit::name_refusal_line(e);
+            } else {
+                self.dirty = true;
+                let mut msg =
+                    String::from("ギルドカードを更新しました（まだファイルには書いていません）");
+                if let Some(fit) = &name_fit {
+                    msg.push_str(" — 名前 ");
+                    msg.push_str(&mhnx_core::hbedit::name_fit_label(fit));
+                    let warns = name_warnings_text(fit);
+                    if !warns.is_empty() {
+                        msg.push_str(" / ");
+                        msg.push_str(&warns);
+                    }
+                }
+                if let Some(fit) = &comment_fit {
+                    msg.push_str(" / コメント ");
+                    msg.push_str(&mhnx_core::hbedit::name_fit_label(fit));
+                    let warns = name_warnings_text(fit);
+                    if !warns.is_empty() {
+                        msg.push_str(" / ");
+                        msg.push_str(&warns);
+                    }
+                }
+                self.message = msg;
+            }
         }
         ui.separator();
         self.guild_weapon_usage(ui);
@@ -10092,9 +10250,9 @@ impl MhnxEditor {
                                 pick = Some(row.slot);
                             }
                             ui.label(if row.name.is_empty() {
-                                "(名前なし)"
+                                String::from("(名前なし)")
                             } else {
-                                row.name.as_str()
+                                name_label_text(&row.name)
                             });
                             ui.label(format!("{}", row.hunter_rank));
                             ui.label(egui::RichText::new(&row.id).monospace());
@@ -15327,6 +15485,52 @@ impl MhnxEditor {
     }
 }
 
+/// A name as a multi-line label: every line the field holds, empty ones too.
+///
+/// `egui` draws nothing for a trailing empty line, and the game does draw it -
+/// that is where the cursor sits after a name that ends with a break - so an
+/// empty line is spelled with a non-breaking space to keep its row height.
+fn name_label_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in mhnx_core::save::name_lines(text).iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(if line.is_empty() { "\u{00A0}" } else { line });
+    }
+    out
+}
+
+/// The warnings a name fit carries, as one status line.
+///
+/// Reported, never repaired: a leading, trailing or doubled line break is where
+/// the player put it.
+fn name_warnings_text(fit: &mhnx_core::save::NameFit) -> String {
+    mhnx_core::hbedit::name_warning_lines(fit).join(" / ")
+}
+
+/// The multiline editor every name field on this side uses.
+///
+/// Enter inserts a line break (the game draws it as a second line), and the
+/// text is filtered through the field spec, so a tab pasted from another window
+/// cannot enter a name here any more than it can on the console.
+fn name_edit(ui: &mut egui::Ui, text: &mut String, spec: mhnx_core::hbedit::NameSpec, width: f32) -> (bool, Option<char>) {
+    let response = ui.add(
+        egui::TextEdit::multiline(text)
+            .desired_width(width)
+            .desired_rows(2)
+            .hint_text("改行は Enter（ゲームは 2 行目を描きます）"),
+    );
+    let mut refused = None;
+    if response.changed() {
+        let (filtered, bad) = spec.filter(text);
+        if filtered != *text {
+            *text = filtered;
+        }
+        refused = bad;
+    }
+    (response.changed(), refused)
+}
 /// The chance totals the reward table prints above its rows.
 ///
 /// One line per roll group, e.g. 「グループ1（フラグ 1）: 合計 100% / 6枠」.
@@ -21161,6 +21365,99 @@ mod tests {
         );
     }
 
+    /// A line break typed on the PC side has to survive the same write path the
+    /// window uses, and come back out of a reopened save.
+    #[test]
+    fn a_pc_name_with_a_line_break_round_trips_through_the_panels() {
+        let dir = Scratch::new("pcnamebreak");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // The character tab edits a working copy; apply_to_save is the write.
+        app.edit.name = String::from("ナナ\nハル");
+        app.apply_to_save();
+        assert!(
+            app.message.contains("13/31 バイト（2行）"),
+            "{}",
+            app.message
+        );
+        let stored = app
+            .save
+            .as_ref()
+            .expect("save")
+            .read_character(0)
+            .expect("slot 0");
+        assert_eq!(stored.name, "ナナ\nハル");
+        assert_eq!(stored.name_lines(), vec!["ナナ", "ハル"]);
+
+        // Both my-set names, through the two panel writes.
+        assert!(app.item_set_name_write(0, "旅\n支度"), "{}", app.message);
+        assert!(app.set_name_write(0, "装備\nセット"), "{}", app.message);
+        let save = app.save.as_ref().expect("save");
+        assert_eq!(mhnx_core::myset::item_sets(save, 0)[0].name, "旅\n支度");
+        assert_eq!(mhnx_core::myset::equip_sets(save, 0)[0].name, "装備\nセット");
+
+        // The bytes that would be written, read back through the parser.
+        let bytes = app.save.as_ref().expect("save").to_bytes();
+        let reopened = Save::from_bytes(&bytes).expect("a save");
+        assert_eq!(
+            reopened.read_character(0).expect("slot 0").name,
+            "ナナ\nハル"
+        );
+        assert_eq!(mhnx_core::myset::item_sets(&reopened, 0)[0].name, "旅\n支度");
+    }
+
+    /// A control character cannot be typed into a PC name field, and the write
+    /// path refuses one that got in anyway without touching the save.
+    #[test]
+    fn a_tab_in_a_pc_name_is_refused_and_writes_nothing() {
+        let dir = Scratch::new("pcnametab");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // The widget filter is the same one the console keyboard uses: a tab
+        // is dropped before it can reach the editing buffer.
+        let spec = mhnx_core::hbedit::NameTarget::Hunter.spec();
+        let (clean, refused) = spec.filter("ナナ\tハル");
+        assert_eq!(clean, "ナナハル");
+        assert_eq!(refused, Some('\t'));
+
+        // A first, accepted write marks the slot used; that byte is not part of
+        // what the refused write must leave alone.
+        app.edit.name = String::from("ナナ");
+        app.apply_to_save();
+        let before = app.save.as_ref().expect("save").body().to_vec();
+        app.edit.name = String::from("ナナ\tハル");
+        app.apply_to_save();
+        assert!(app.message.contains("U+0009"), "{}", app.message);
+        assert!(app.message.contains("何も書き込んでいません"), "{}", app.message);
+        assert_eq!(
+            app.save.as_ref().expect("save").body(),
+            &before[..],
+            "a refused name must not move a byte"
+        );
+        assert_eq!(
+            app.save.as_ref().expect("save").read_character(0).expect("slot 0").name,
+            "ナナ"
+        );
+    }
+
+    /// The list labels keep every line of a name, an empty one included.
+    #[test]
+    fn a_pc_name_label_draws_every_line_including_an_empty_one() {
+        assert_eq!(name_label_text("ナナ"), "ナナ");
+        assert_eq!(name_label_text("ナナ\nハル"), "ナナ\nハル");
+        assert_eq!(
+            name_label_text("ナナ\n"),
+            format!("ナナ\n{}", '\u{00A0}'),
+            "a trailing break keeps an empty last line"
+        );
+        assert_eq!(name_label_text(""), format!("{}", '\u{00A0}'));
+    }
     /// On the real save the four pairs agree, for every slot: the offsets the
     /// panel reads are the ones the game writes, not four numbers picked to
     /// make the panel look right.

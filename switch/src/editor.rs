@@ -1253,10 +1253,20 @@ fn key_from(buttons: u64) -> Option<Key> {
 
 /// Apply a completed text input (from `swkbd` or the built-in OSK) to `Editor`.
 fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
-    if idx == mhnx_core::hbedit::TEXT_NAME {
-        let clipped: String = s.chars().take(31).collect();
-        ed.apply_name(clipped);
-    } else if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
+    // A name goes through the core checked writers. A control character the
+    // keyboard should never have produced is refused there: the save, the undo
+    // stack and the field stay exactly as they were, and the status row names
+    // the code point. A name that fits keeps every line break the player put in
+    // it, and the status row carries its length, its line count and the ragged
+    // break warnings. Nothing here clips by characters - the field counts the
+    // bytes it stores, so the core is the only place that may cut.
+    if let Some(target) = ed.text_request_name(idx) {
+        if let Err(e) = ed.apply_name_target(target, &s) {
+            ed.message = mhnx_core::hbedit::name_refusal_line(e);
+        }
+        return;
+    }
+    if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
         ed.apply_item_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
         ed.apply_skill_filter(s);
@@ -1269,16 +1279,6 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.apply_equip_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
         ed.apply_jewel_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_SET_NAME {
-        // The set editor stays open: a rename is one field of the form, and
-        // the record it belongs to is the one on screen.
-        ed.apply_set_name(s);
-    } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
-        // Through the editor, not straight into the save: the comment is a
-        // guild card edit like any other and has to reach the undo stack.
-        if !ed.set_guild_comment(&s) {
-            ed.message = String::from("コメントを変更できませんでした");
-        }
     } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
         // The parser in the core owns the format (and the message a bad one
         // gets), so the layer only hands the text over.
@@ -1299,14 +1299,30 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         // The row's own field says which number is written; the sentinel only
         // says that a reward row asked for one.
         ed.apply_reward_text(&s);
-    } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME {
-        let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
-        let clipped: String = s.chars().take(20).collect();
-        if !ed.rename_palico(which, &clipped) {
-            ed.message = alloc::format!("オトモ {} の名前を変更できませんでした", which);
-        }
     } else {
         ed.apply_text(idx, s);
+    }
+}
+
+/// The title the built-in keyboard shows for one of the six names.
+///
+/// The capacity is the bytes the field stores - the same figure the status row
+/// prints - and the line-break key is named in the title as well as in the
+/// footer, because that key is the whole point of the multiline keyboard.
+fn name_header(target: mhnx_core::hbedit::NameTarget) -> String {
+    use mhnx_core::hbedit::NameTarget;
+    let spec = target.spec();
+    let unit = match spec.unit {
+        mhnx_core::save::NameUnit::Utf16 => format!(" = {} 文字", spec.capacity / 2),
+        mhnx_core::save::NameUnit::Bytes => String::new(),
+    };
+    match target {
+        NameTarget::Hunter => format!("ハンター名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::Palico(_) => format!("オトモ名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::ItemSet(_) => format!("アイテムセット名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::EquipSet(_) => format!("装備セット名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::CardName => format!("ギルドカード名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::CardComment => format!("ギルドカードのコメント（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
     }
 }
 
@@ -1484,10 +1500,19 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
 
     if let Some((idx, initial)) = ed.take_text_request() {
         force_redraw = true;
-        let (header, max_bytes) = if idx == mhnx_core::hbedit::TEXT_NAME {
-            ("キャラクター名 (最大31B / 全角10文字)", 31usize)
-        } else if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
-            ("アイテム名で絞り込み", 60)
+        // A name always opens the built-in keyboard, even when the applet is
+        // available: only the built-in one has a key for the line break the
+        // field holds, and the applet is single line. What came back from an
+        // old keyboard is filtered first, so a stray tab or NUL does not even
+        // reach the input box.
+        if let Some(target) = ed.text_request_name(idx) {
+            let spec = target.spec();
+            let (initial, _) = spec.filter(&initial);
+            gui.open_osk(idx, &name_header(target), &initial, spec);
+            return force_redraw;
+        }
+        let (header, max_bytes) = if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
+            ("アイテム名で絞り込み", 60usize)
         } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
             ("スキル名で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {
@@ -1498,10 +1523,6 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("装備名か種類で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
             ("装飾品名で絞り込み", 60)
-        } else if idx == mhnx_core::hbedit::TEXT_SET_NAME {
-            ("マイセットの名前 (最大31B / 全角10文字)", 31)
-        } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
-            ("ギルドカードのコメント", 54)
         } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
             // m:ss.cc is at most "10:55.35" (8 bytes); the keyboard still
             // allows the raw hundredths form the parser accepts.
@@ -1518,10 +1539,6 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("報酬の確率 % (0〜100)", 4)
         } else if idx == mhnx_core::hbedit::TEXT_REWARD_COUNT {
             ("報酬の個数 (0〜99)", 4)
-        } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME
-            && idx < mhnx_core::hbedit::TEXT_GUILD_COMMENT
-        {
-            ("オトモの名前 (最大20B / 全角6文字)", 20)
         } else {
             let label = mhnx_core::quest::Gmd::LABELS
                 .get(idx)
@@ -1529,10 +1546,11 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                 .unwrap_or("クエスト文章");
             (label, 512)
         };
+        let spec = mhnx_core::hbedit::NameSpec::singleline(max_bytes);
         if !crate::swkbd::is_available() {
             // In Applet mode (launched from Album), Horizon OS forbids launching
             // the swkbd LibraryApplet. Use our built-in touch & controller OSK!
-            gui.open_osk(idx, header, &initial, max_bytes);
+            gui.open_osk(idx, header, &initial, spec);
         } else {
             match crate::swkbd::input_text(header, &initial, max_bytes) {
                 Some(s) => apply_text_result(ed, idx, s),
@@ -1631,10 +1649,11 @@ pub fn run() -> i32 {
                 // press so a release inside the keyboard cannot reach it later.
                 l_pending = false;
                 l_fired = false;
+                // ZL walks the character tabs; ZR inserts a line break (Key::Z
+                // is the raw ZR and no longer remapped to [R] here, because a
+                // name field has to be able to hold a second line).
                 if down & BTN_ZL != 0 {
                     key = Some(Key::L);
-                } else if down & BTN_ZR != 0 {
-                    key = Some(Key::R);
                 }
                 if let Some(k) = key {
                     if painter.gui.handle_osk_key(k) {
