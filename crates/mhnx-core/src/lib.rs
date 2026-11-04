@@ -79,6 +79,8 @@ pub mod hunts;
 pub mod itembox;
 pub mod quest;
 pub mod questfields;
+/// The smithy's recipes: what each product costs, and what each item makes.
+pub mod recipes;
 pub mod save;
 #[cfg(feature = "std")] pub mod safety;
 pub mod savemap;

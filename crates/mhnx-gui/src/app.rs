@@ -19,6 +19,7 @@ use mhnx_core::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT};
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::questfields::FieldKind;
 use mhnx_core::questprogress::{self, Progress};
+use mhnx_core::recipes::{self, Product};
 use mhnx_core::requests;
 use mhnx_core::romfstables::{self, RequestRecord};
 use mhnx_core::safety;
@@ -756,8 +757,75 @@ struct DatabaseLoad {
     dir: PathBuf,
     /// The tables that read, in file name order.
     tables: Vec<mhnx_core::database::Table>,
+    /// The smithy's recipes of the same folder, empty when no table read.
+    ///
+    /// They live beside the text tables (`nativeNX/table` holds both in this
+    /// dump), so one 読み込む reads both and the tab cannot end up showing one
+    /// dump's names next to another dump's recipes.
+    recipes: recipes::Book,
     /// The line under the path field.
     report: String,
+}
+
+/// Which half of the データベース tab is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DbSection {
+    /// The game's tables, one file at a time.
+    #[default]
+    Tables,
+    /// The smithy's recipes: what a product costs, and what a material makes.
+    Recipes,
+}
+
+/// Which direction the レシピ half reads in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecipeMode {
+    /// One product, and everything it costs.
+    #[default]
+    Product,
+    /// One material, and everything that asks for it.
+    Material,
+}
+
+/// One row of the recipe half's product list.
+///
+/// The label and the folded needle are built once per load rather than once per
+/// frame: looking a name up for 8,907 products on every frame would be more
+/// work than the rest of the tab put together.
+struct RecipeRow {
+    /// What the row is.
+    product: Product,
+    /// Type and name, for the list and the heading.
+    label: String,
+    /// The name alone, for the 装備 / アイテム filter the link sets.
+    name: String,
+    /// Lower case label plus the id, for the search box.
+    needle: String,
+}
+
+/// One row of the recipe half's material list.
+struct RecipeItemRow {
+    /// Item id.
+    item: u16,
+    /// Name, for the list and the heading.
+    label: String,
+    /// Lower case label plus the id, for the search box.
+    needle: String,
+    /// How many recipes ask for it.
+    uses: usize,
+}
+
+/// What a click in the レシピ half asked the window to do.
+///
+/// The panel is drawn from a shared borrow of the editor (egui closures cannot
+/// hand it back), so a click records the jump here and the caller performs it
+/// once the panels are done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecipeJump {
+    /// Open the item box at this item.
+    Item(u16),
+    /// Open the equipment box filtered to this product's name.
+    Equipment(Product),
 }
 
 pub struct MhnxEditor {
@@ -1046,6 +1114,26 @@ pub struct MhnxEditor {
     pub db_dir: Option<PathBuf>,
     /// What the last 読み込む found, shown under the path field.
     pub db_status: String,
+    /// Which half of the tab is on screen (テーブル / レシピ).
+    pub db_section: DbSection,
+    /// Which direction the レシピ half reads in.
+    pub recipe_mode: RecipeMode,
+    /// The smithy's recipes of the loaded folder.
+    pub recipes: recipes::Book,
+    /// The products the レシピ half lists, built when a dump is read.
+    recipe_rows: Vec<RecipeRow>,
+    /// The needle the cached product list was built for, and the rows that
+    /// answered it. Rebuilt only when the needle changes, for the same reason
+    /// `db_hits` is: answering reads every row.
+    recipe_hits: Option<(String, Vec<usize>)>,
+    /// Row of the product list whose recipes the detail panel shows.
+    pub recipe_selected: Option<usize>,
+    /// The materials the レシピ half lists, built when a dump is read.
+    recipe_items: Vec<RecipeItemRow>,
+    /// Item the 素材 half's detail panel shows.
+    pub recipe_item_selected: Option<u16>,
+    /// Text filter of whichever half of the レシピ list is on screen.
+    pub recipe_filter: String,
     /// Set once the launch-time hooks this file owns have been applied, so a
     /// later frame cannot run them again.
     pub launch_env_done: bool,
@@ -1186,6 +1274,15 @@ impl Default for MhnxEditor {
             db_hits: None,
             db_dir: None,
             db_status: String::new(),
+            db_section: DbSection::Tables,
+            recipe_mode: RecipeMode::Product,
+            recipes: recipes::Book::new(),
+            recipe_rows: Vec::new(),
+            recipe_hits: None,
+            recipe_selected: None,
+            recipe_items: Vec::new(),
+            recipe_item_selected: None,
+            recipe_filter: String::new(),
             launch_env_done: false,
             screenshot_path: None,
             screenshot_frames: 0,
@@ -12089,13 +12186,32 @@ impl MhnxEditor {
         ui.heading("データベース");
         ui.label(
             egui::RichText::new(
-                "ゲームのテキストを、あなたの romfs から実行時に読んで一覧します。読み取り専用で、値は書き換えません。このアプリにはゲームのデータを同梱していません。",
+                "ゲームのテキストと生産・強化のレシピを、あなたの romfs から実行時に読みます。読み取り専用で、値は書き換えません。このアプリにはゲームのデータを同梱していません。",
             )
             .weak()
             .small(),
         );
         self.database_bar(ui);
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.db_section, DbSection::Tables, "テーブル");
+            ui.selectable_value(&mut self.db_section, DbSection::Recipes, "レシピ（関係）");
+            if !self.recipes.is_empty() {
+                ui.label(
+                    egui::RichText::new(self.recipes.summary())
+                        .weak()
+                        .small(),
+                );
+            }
+        });
         ui.separator();
+        match self.db_section {
+            DbSection::Tables => self.database_tables(ui),
+            DbSection::Recipes => self.database_recipes(ui),
+        }
+    }
+
+    /// データベース → テーブル: the game's own text tables, one file at a time.
+    fn database_tables(&mut self, ui: &mut egui::Ui) {
         if self.db_tables.is_empty() {
             ui.add_space(6.0);
             ui.label(
@@ -12266,6 +12382,576 @@ impl MhnxEditor {
             .show(ui, |ui| {
                 ui.add(egui::Label::new(egui::RichText::new(text).monospace().small()));
             });
+    }
+
+    // ------------------------------------------- database: recipes (レシピ)
+
+    /// データベース → レシピ: the smithy's recipes, from both ends.
+    ///
+    /// Read-only like the rest of the tab: nothing here reaches a writer, and
+    /// the 所持 column only counts what the open save's item box already holds.
+    fn database_recipes(&mut self, ui: &mut egui::Ui) {
+        if self.recipes.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                "romfs の nativeNX/table を指定して「読み込む」を押すと、生産と強化のレシピ（素材と個数）を読み、必要素材と、その素材から作れるものを表示します",
+            );
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut self.recipe_mode, RecipeMode::Product, "生産物 → 必要素材");
+            ui.radio_value(&mut self.recipe_mode, RecipeMode::Material, "素材 → 作れるもの");
+            if !self.recipe_filter.is_empty() && ui.small_button("絞り込みを消す").clicked() {
+                self.recipe_filter.clear();
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "読み取り専用です。所持数は開いているセーブのアイテムボックスから数えただけで、値は書き換えません。",
+            )
+            .weak()
+            .small(),
+        );
+        match self.recipe_mode {
+            RecipeMode::Product => self.recipe_product_panel(ui),
+            RecipeMode::Material => self.recipe_material_panel(ui),
+        }
+    }
+
+    /// The 生産物 half: every product a filter lets through, and one's cost.
+    fn recipe_product_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("検索");
+            Self::filter_edit(
+                ui,
+                &mut self.recipe_filter,
+                240.0,
+                "生産物の名前・ID",
+                &mut self.focus_filter,
+            );
+        });
+        // The list is rebuilt only when the needle changes: answering it prunes
+        // 8,907 rows, which is not something to do on every frame.
+        let needle = self.recipe_filter.trim().to_lowercase();
+        if self
+            .recipe_hits
+            .as_ref()
+            .map(|(cached, _)| cached != &needle)
+            .unwrap_or(true)
+        {
+            let hits = Self::recipe_rows_matching(&self.recipe_rows, &needle);
+            // Keep the detail panel on a row the list still holds: a filter
+            // that hides the selected product would leave the panel describing
+            // something that is no longer on screen.
+            if !hits.is_empty()
+                && !self
+                    .recipe_selected
+                    .map(|index| hits.contains(&index))
+                    .unwrap_or(false)
+            {
+                self.recipe_selected = Some(hits[0]);
+            }
+            self.recipe_hits = Some((needle, hits));
+        }
+        let hits: Vec<usize> = self
+            .recipe_hits
+            .as_ref()
+            .map(|(_, hits)| hits.clone())
+            .unwrap_or_default();
+        let selected = self
+            .recipe_selected
+            .and_then(|index| self.recipe_rows.get(index))
+            .map(|row| (row.product, row.label.clone(), row.name.clone()));
+        let mut pick: Option<usize> = None;
+        let mut jump: Option<RecipeJump> = None;
+        const PANEL_W: f32 = 430.0;
+        ui.horizontal_top(|ui| {
+            let list_w = (ui.available_width() - PANEL_W - 14.0).max(320.0);
+            ui.vertical(|ui| {
+                ui.set_width(list_w);
+                ui.set_height(ui.available_height());
+                ui.label(
+                    egui::RichText::new(format!("{} 件", hits.len()))
+                        .weak()
+                        .small(),
+                );
+                // Only the rows on screen are built, the same way the 装備 and
+                // アイテム lists do it: a dump holds nearly nine thousand
+                // products.
+                TableBuilder::new(ui)
+                    .id_salt("recipelist")
+                    .striped(true)
+                    .sense(egui::Sense::click())
+                    .column(Column::remainder().clip(true))
+                    .column(Column::exact(56.0))
+                    .header(22.0, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("生産物");
+                        });
+                        header.col(|ui| {
+                            ui.strong("レシピ");
+                        });
+                    })
+                    .body(|body| {
+                        body.rows(20.0, hits.len(), |mut row| {
+                            let index = hits[row.index()];
+                            let Some(product) = self.recipe_rows.get(index) else {
+                                return;
+                            };
+                            row.set_selected(self.recipe_selected == Some(index));
+                            row.col(|ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(&product.label).small())
+                                        .truncate(),
+                                )
+                                .on_hover_text(&product.label);
+                            });
+                            row.col(|ui| {
+                                let count = self.recipes.of_product(product.product).len();
+                                ui.label(egui::RichText::new(count.to_string()).small());
+                            });
+                            if row.response().clicked() {
+                                pick = Some(index);
+                            }
+                        });
+                    });
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_width(PANEL_W);
+                jump = Self::recipe_product_detail(ui, &self.recipes, &self.items, selected);
+            });
+        });
+        if let Some(index) = pick {
+            self.recipe_selected = Some(index);
+        }
+        if let Some(jump) = jump {
+            self.apply_recipe_jump(jump);
+        }
+    }
+
+    /// The 素材 half: every item a recipe asks for, and everything it makes.
+    fn recipe_material_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("検索");
+            Self::filter_edit(
+                ui,
+                &mut self.recipe_filter,
+                240.0,
+                "素材の名前・ID",
+                &mut self.focus_filter,
+            );
+        });
+        // 1,821 rows, so this one is filtered every frame: cheaper than the
+        // cache above would be, and it cannot go stale.
+        let needle = self.recipe_filter.trim().to_lowercase();
+        let hits: Vec<usize> = self
+            .recipe_items
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| needle.is_empty() || row.needle.contains(&needle))
+            .map(|(index, _)| index)
+            .collect();
+        // Same as the product list: the panel must not describe an item the
+        // filter has taken off the list.
+        let selected_item = {
+            let visible = self
+                .recipe_item_selected
+                .map(|item| hits.iter().any(|index| self.recipe_items[*index].item == item))
+                .unwrap_or(false);
+            if !visible {
+                hits.first().map(|index| self.recipe_items[*index].item)
+            } else {
+                self.recipe_item_selected
+            }
+        };
+        if selected_item != self.recipe_item_selected {
+            self.recipe_item_selected = selected_item;
+        }
+        let mut pick: Option<u16> = None;
+        let mut jump: Option<RecipeJump> = None;
+        const PANEL_W: f32 = 430.0;
+        ui.horizontal_top(|ui| {
+            let list_w = (ui.available_width() - PANEL_W - 14.0).max(320.0);
+            ui.vertical(|ui| {
+                ui.set_width(list_w);
+                ui.set_height(ui.available_height());
+                ui.label(
+                    egui::RichText::new(format!("{} 件", hits.len()))
+                        .weak()
+                        .small(),
+                );
+                TableBuilder::new(ui)
+                    .id_salt("recipeitemlist")
+                    .striped(true)
+                    .sense(egui::Sense::click())
+                    .column(Column::remainder().clip(true))
+                    .column(Column::exact(56.0))
+                    .header(22.0, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("素材");
+                        });
+                        header.col(|ui| {
+                            ui.strong("使用");
+                        });
+                    })
+                    .body(|body| {
+                        body.rows(20.0, hits.len(), |mut row| {
+                            let index = hits[row.index()];
+                            let Some(material) = self.recipe_items.get(index) else {
+                                return;
+                            };
+                            row.set_selected(selected_item == Some(material.item));
+                            row.col(|ui| {
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(&material.label).small())
+                                        .truncate(),
+                                )
+                                .on_hover_text(&material.label);
+                            });
+                            row.col(|ui| {
+                                ui.label(egui::RichText::new(material.uses.to_string()).small());
+                            });
+                            if row.response().clicked() {
+                                pick = Some(material.item);
+                            }
+                        });
+                    });
+            });
+            ui.separator();
+            ui.vertical(|ui| {
+                ui.set_width(PANEL_W);
+                jump = Self::recipe_material_detail(ui, &self.recipes, &self.items, selected_item);
+            });
+        });
+        if let Some(item) = pick {
+            self.recipe_item_selected = Some(item);
+        }
+        if let Some(jump) = jump {
+            self.apply_recipe_jump(jump);
+        }
+    }
+
+    /// The 生産物 half's detail panel: what one product costs.
+    ///
+    /// Free of the editor on purpose: it draws while the list borrows it, and
+    /// answers with the single jump a click asked for.
+    fn recipe_product_detail(
+        ui: &mut egui::Ui,
+        book: &recipes::Book,
+        box_items: &[ItemSlot],
+        selected: Option<(Product, String, String)>,
+    ) -> Option<RecipeJump> {
+        let Some((product, label, name)) = selected else {
+            ui.label(egui::RichText::new("生産物を選ぶと、必要素材と所持数を表示します").weak());
+            return None;
+        };
+        let mut jump = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(&label).strong());
+            let equipment = product.is_equipment();
+            if ui
+                .small_button(if equipment { "装備画面へ" } else { "アイテム画面へ" })
+                .on_hover_text(if equipment {
+                    "装備タブでこの名前を絞り込みます"
+                } else {
+                    "アイテムタブでこの名前を絞り込みます"
+                })
+                .clicked()
+            {
+                jump = Some(if equipment {
+                    RecipeJump::Equipment(product)
+                } else {
+                    RecipeJump::Item(product.equip_id())
+                });
+            }
+        });
+        let mut list: Vec<&recipes::Recipe> = book.of_product(product);
+        if let Product::Armor { series, .. } = product {
+            // An armour upgrade is stored once per series, not once per part,
+            // so the part's panel shows the rows that apply to all five.
+            list.extend(book.of_product(Product::ArmorSeries { series }));
+            list.sort_by_key(|recipe| recipe.level);
+        }
+        if list.is_empty() {
+            ui.label(egui::RichText::new("この生産物のレシピはありません").weak());
+            return jump;
+        }
+        ui.label(
+            egui::RichText::new(format!("{} 段階 · {}", list.len(), name))
+                .weak()
+                .small(),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("recipedetail")
+            .max_height(ui.available_height().max(120.0))
+            .show(ui, |ui| {
+                for recipe in list {
+                    ui.horizontal_wrapped(|ui| {
+                        let level = if recipe.is_forge() {
+                            String::from("生産")
+                        } else {
+                            format!("強化 Lv{}", recipe.level)
+                        };
+                        ui.label(egui::RichText::new(level).strong().small());
+                        if recipe.provision.is_used() {
+                            // The second way to pay: a group of scrap whose
+                            // values add up to this number, shown as the two
+                            // numbers it is because the game names no group.
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "端材グループ {} / 値 {}",
+                                    recipe.provision.group, recipe.provision.value
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                        }
+                    });
+                    let materials = recipe.material_list();
+                    if materials.is_empty() {
+                        ui.label(egui::RichText::new("素材なし（費用だけ）").weak().small());
+                    }
+                    for material in materials {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} ×{}",
+                                    item_name(material.item),
+                                    material.count
+                                ))
+                                .small(),
+                            );
+                            let have = itembox::count_of(box_items, material.item);
+                            let text = if box_items.is_empty() {
+                                String::from("所持 —")
+                            } else {
+                                format!("所持 {}", have)
+                            };
+                            let held = egui::RichText::new(text).small();
+                            let held = if !box_items.is_empty() && have < material.count as u32 {
+                                held.color(warning_color())
+                            } else {
+                                held.weak()
+                            };
+                            ui.label(held);
+                            if ui
+                                .small_button("アイテム")
+                                .on_hover_text("アイテム画面でこの素材を開きます")
+                                .clicked()
+                            {
+                                jump = Some(RecipeJump::Item(material.item));
+                            }
+                        });
+                    }
+                    let returned = recipe.returned_list();
+                    if !returned.is_empty() {
+                        let text = returned
+                            .iter()
+                            .map(|m| format!("{} ×{}", item_name(m.item), m.count))
+                            .collect::<Vec<String>>()
+                            .join(" / ");
+                        ui.label(egui::RichText::new(format!("戻り {}", text)).weak().small());
+                    }
+                    ui.separator();
+                }
+            });
+        jump
+    }
+
+    /// The 素材 half's detail panel: everything that asks for one item.
+    fn recipe_material_detail(
+        ui: &mut egui::Ui,
+        book: &recipes::Book,
+        box_items: &[ItemSlot],
+        selected: Option<u16>,
+    ) -> Option<RecipeJump> {
+        let Some(item) = selected else {
+            ui.label(egui::RichText::new("素材を選ぶと、それを使うレシピを表示します").weak());
+            return None;
+        };
+        let mut jump = None;
+        let have = itembox::count_of(box_items, item);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(item_name(item)).strong());
+            let text = if box_items.is_empty() {
+                String::from("所持 —")
+            } else {
+                format!("所持 {}", have)
+            };
+            ui.label(egui::RichText::new(text).weak().small());
+            if ui.small_button("アイテム画面へ").clicked() {
+                jump = Some(RecipeJump::Item(item));
+            }
+        });
+        let list = book.of_material(item);
+        if list.is_empty() {
+            ui.label(egui::RichText::new("この素材を使うレシピはありません").weak());
+            return jump;
+        }
+        ui.label(
+            egui::RichText::new(format!("{} 件のレシピが使います", list.len()))
+                .weak()
+                .small(),
+        );
+        const SHOWN: usize = 200;
+        egui::ScrollArea::vertical()
+            .id_salt("recipematerialdetail")
+            .max_height(ui.available_height().max(120.0))
+            .show(ui, |ui| {
+                for recipe in list.iter().take(SHOWN) {
+                    ui.horizontal_wrapped(|ui| {
+                        let equipment = recipe.product.is_equipment();
+                        ui.label(egui::RichText::new(Self::recipe_label(recipe.product)).small());
+                        let level = if recipe.is_forge() {
+                            String::from("生産")
+                        } else {
+                            format!("強化 Lv{}", recipe.level)
+                        };
+                        ui.label(egui::RichText::new(level).weak().small());
+                        // How much of this item the recipe asks for.
+                        let need: u32 = recipe
+                            .materials
+                            .iter()
+                            .filter(|m| m.item == item)
+                            .map(|m| m.count as u32)
+                            .sum();
+                        ui.label(egui::RichText::new(format!("×{}", need)).small());
+                        if ui
+                            .small_button(if equipment { "装備" } else { "アイテム" })
+                            .on_hover_text("この生産物の編集画面へ")
+                            .clicked()
+                        {
+                            jump = Some(if equipment {
+                                RecipeJump::Equipment(recipe.product)
+                            } else {
+                                RecipeJump::Item(recipe.product.equip_id())
+                            });
+                        }
+                    });
+                }
+                if list.len() > SHOWN {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "先頭 {} 件を表示（全 {} 件）",
+                            SHOWN,
+                            list.len()
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                }
+            });
+        jump
+    }
+
+    /// Do what a レシピ panel click asked for.
+    fn apply_recipe_jump(&mut self, jump: RecipeJump) {
+        match jump {
+            RecipeJump::Item(item) => self.open_item_edit(item),
+            RecipeJump::Equipment(product) => self.open_equip_edit(product),
+        }
+    }
+
+    /// Jump from the データベース tab to the item box with this item selected.
+    ///
+    /// The link the audit asked for: a recipe names a material, and this is how
+    /// a hunter gets from that name to the row they can change. Nothing is
+    /// written; the row is only selected and scrolled to.
+    pub fn open_item_edit(&mut self, item: u16) {
+        let name = item_name(item);
+        self.tab = Tab::Items;
+        self.item_filter = name.clone();
+        self.item_selected = self.items.iter().position(|slot| slot.id == item);
+        self.scroll_to_item = self.item_selected;
+        let have = itembox::count_of(&self.items, item);
+        self.message = format!("{} をアイテム画面で開きました（所持 {}）", name, have);
+    }
+
+    /// Jump from the データベース tab to the equipment box, filtered to a name.
+    pub fn open_equip_edit(&mut self, product: Product) {
+        let name = Self::recipe_name(product);
+        self.tab = Tab::Equip;
+        self.equip_filter = name.clone();
+        // Land on the first record of that name rather than on whatever was
+        // selected before the jump.
+        self.equip_selected = None;
+        self.message = format!("{} を装備画面で開きました", name);
+    }
+
+    /// The list label of a product: its type and its name.
+    fn recipe_label(product: Product) -> String {
+        match product {
+            Product::Deco { .. } => format!("装飾品 {}", Self::recipe_name(product)),
+            Product::ArmorSeries { .. } => {
+                format!("{}（シリーズ強化）", Self::recipe_name(product))
+            }
+            _ => format!(
+                "{} {}",
+                mhnx_core::equip::type_name(product.equip_kind()),
+                Self::recipe_name(product)
+            ),
+        }
+    }
+
+    /// The game's own name of a product, without the type in front.
+    fn recipe_name(product: Product) -> String {
+        match product {
+            Product::Deco { item } => item_name(item),
+            // A series has five names and the head's is the one the game lists
+            // first; the upgrade rows say シリーズ next to it.
+            Product::ArmorSeries { series } => {
+                mhnx_core::equip::name(&equipment_for(1, series)).to_owned()
+            }
+            _ => mhnx_core::equip::name(&equipment_for(
+                product.equip_kind(),
+                product.equip_id(),
+            ))
+            .to_owned(),
+        }
+    }
+
+    /// Every product of a book, named once.
+    fn recipe_rows_from(book: &recipes::Book) -> Vec<RecipeRow> {
+        book.products()
+            .into_iter()
+            .map(|product| {
+                let label = Self::recipe_label(product);
+                let needle = format!("{} {}", label.to_lowercase(), product.equip_id());
+                RecipeRow {
+                    product,
+                    name: Self::recipe_name(product),
+                    label,
+                    needle,
+                }
+            })
+            .collect()
+    }
+
+    /// Every material of a book, named once.
+    fn recipe_items_from(book: &recipes::Book) -> Vec<RecipeItemRow> {
+        book.materials()
+            .into_iter()
+            .map(|(item, uses)| {
+                let label = item_name(item);
+                let needle = format!("{} {}", label.to_lowercase(), item);
+                RecipeItemRow {
+                    item,
+                    label,
+                    needle,
+                    uses,
+                }
+            })
+            .collect()
+    }
+
+    /// The product rows a filter lets through, in list order.
+    fn recipe_rows_matching(rows: &[RecipeRow], needle: &str) -> Vec<usize> {
+        rows.iter()
+            .enumerate()
+            .filter(|(_, row)| needle.is_empty() || row.needle.contains(needle))
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// The romfs row of the データベース tab: the path, a picker, and 読み込む.
@@ -12863,6 +13549,35 @@ impl MhnxEditor {
         if std::env::var("MHNXEDITOR_DATABASE").is_ok() {
             self.load_database();
         }
+        // The レシピ half of the データベース tab, for the screenshot harness:
+        // the section, the direction, the filter and the selected row are all
+        // clicks otherwise, and the harness has none. These run after the load
+        // above, because loading a dump drops the selection.
+        if let Ok(s) = std::env::var("MHNXEDITOR_DB_SECTION") {
+            if s.trim().eq_ignore_ascii_case("recipes") || s.trim() == "レシピ" {
+                self.db_section = DbSection::Recipes;
+            }
+        }
+        if let Ok(s) = std::env::var("MHNXEDITOR_RECIPE_MODE") {
+            self.recipe_mode = if s.trim().eq_ignore_ascii_case("material") {
+                RecipeMode::Material
+            } else {
+                RecipeMode::Product
+            };
+        }
+        if let Ok(s) = std::env::var("MHNXEDITOR_RECIPE_FILTER") {
+            self.recipe_filter = s;
+        }
+        if let Ok(s) = std::env::var("MHNXEDITOR_RECIPE_SELECT") {
+            if let Ok(index) = s.trim().parse::<usize>() {
+                self.recipe_selected = Some(index);
+            }
+        }
+        if let Ok(s) = std::env::var("MHNXEDITOR_RECIPE_ITEM") {
+            if let Ok(item) = s.trim().parse::<u16>() {
+                self.recipe_item_selected = Some(item);
+            }
+        }
         // The 設定 window, for the same reason: the language chooser lives in
         // it, and no other hook can open it.
         if std::env::var("MHNXEDITOR_SETTINGS").is_ok() {
@@ -13163,6 +13878,37 @@ impl MhnxEditor {
         best.map(|(_, dir)| dir)
     }
 
+    /// Read the smithy's recipe tables of a folder.
+    ///
+    /// They sit in the same folder as the text tables in this dump, so one
+    /// 読み込む fills both halves of the tab and the list cannot show one dump's
+    /// names beside another dump's recipes. A file whose name is not one of the
+    /// five is skipped without a word - the folder holds 214 others - and a
+    /// file that is named like a table but does not read is counted by the
+    /// book itself, so the report can say how much of the dump was left out.
+    fn read_recipes(dir: &std::path::Path) -> recipes::Book {
+        let mut book = recipes::Book::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return book;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if recipes::kind_of(name).is_none() {
+                continue;
+            }
+            if let Ok(bytes) = std::fs::read(&path) {
+                book.add(name, &bytes);
+            }
+        }
+        book
+    }
+
     /// Read every table of a folder, skipping what this build cannot read.
     ///
     /// One file per table: the language variants are grouped first, so the list
@@ -13174,6 +13920,7 @@ impl MhnxEditor {
             return DatabaseLoad {
                 dir: dir.to_path_buf(),
                 tables: Vec::new(),
+                recipes: recipes::Book::new(),
                 report: format!("{} を開けません", dir.display()),
             };
         };
@@ -13232,10 +13979,15 @@ impl MhnxEditor {
                 None => failed += 1,
             }
         }
+        let recipe_book = Self::read_recipes(dir);
         let mut parts: Vec<String> = vec![
             format!("{} テーブル", tables.len()),
             format!("{} 件", tables.iter().map(|t| t.count()).sum::<usize>()),
+            format!("{} レシピ", recipe_book.len()),
         ];
+        if recipe_book.skipped() > 0 {
+            parts.push(format!("読めないレシピ {} ファイル", recipe_book.skipped()));
+        }
         if other_language > 0 {
             parts.push(format!("他言語 {}", other_language));
         }
@@ -13248,6 +14000,7 @@ impl MhnxEditor {
         DatabaseLoad {
             dir: dir.to_path_buf(),
             tables,
+            recipes: recipe_book,
             report: format!(
                 "{} から読み込みました: {}",
                 dir.display(),
@@ -13288,6 +14041,7 @@ impl MhnxEditor {
             self.db_tables.clear();
             self.db_selected = None;
             self.db_dir = None;
+            self.clear_recipes();
             self.db_status = format!(
                 "{} にテーブルが見つかりません（nativeNX/table を探しました）",
                 raw
@@ -13299,6 +14053,22 @@ impl MhnxEditor {
         self.db_status = load.report.clone();
         self.db_dir = Some(load.dir);
         self.db_tables = load.tables;
+        // The recipe half is rebuilt with the tables: its labels are looked up
+        // once here, and the list, the filter and the selection are dropped so
+        // nothing of the previous dump can survive under this one.
+        self.recipes = load.recipes;
+        self.recipe_rows = Self::recipe_rows_from(&self.recipes);
+        self.recipe_items = Self::recipe_items_from(&self.recipes);
+        self.recipe_hits = None;
+        self.recipe_filter.clear();
+        self.recipe_item_selected = None;
+        // Land on the first product, the way the table list lands on a named
+        // table: an empty panel looks like the half has nothing to show.
+        self.recipe_selected = if self.recipe_rows.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
         // Land on a table the catalogue names. The alphabetically first file of
         // a dump is a message table, and opening on one says less about what the
         // dump holds than opening on the award table does.
@@ -13320,8 +14090,20 @@ impl MhnxEditor {
         self.db_selected = None;
         self.db_hits = None;
         self.db_dir = None;
+        self.clear_recipes();
         self.db_status = String::from("テーブルを読み込んでいません");
         self.message = "データベースの読み込みを解除しました".to_owned();
+    }
+
+    /// Drop the recipes and everything cached about them.
+    fn clear_recipes(&mut self) {
+        self.recipes = recipes::Book::new();
+        self.recipe_rows.clear();
+        self.recipe_items.clear();
+        self.recipe_hits = None;
+        self.recipe_selected = None;
+        self.recipe_item_selected = None;
+        self.recipe_filter.clear();
     }
 
     /// One award bit, false when the slot holds no character.
@@ -19478,6 +20260,117 @@ mod tests {
             assert!(!copies[0].live.is_empty(), "slot {} has no name", slot);
         }
     }
+
+
+
+    // ------------------------------------------------------------ recipes (レシピ)
+
+    /// A weaponCreateWNN table with the given rows.
+    ///
+    /// Built by hand so the recipe half can be tested without a dump: the same
+    /// layout the module documents, with every unread field left at zero.
+    fn recipe_table(rows: &[(u16, [(u16, u8); 4])]) -> Vec<u8> {
+        let mut out = vec![0x00, 0x00, 0x80, 0x3f];
+        out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for (id, mats) in rows {
+            let mut record = vec![0u8; 38];
+            record[2..4].copy_from_slice(&id.to_le_bytes());
+            for (slot, (item, count)) in mats.iter().enumerate() {
+                let at = 6 + 4 * slot;
+                record[at..at + 2].copy_from_slice(&item.to_le_bytes());
+                record[at + 2] = *count;
+            }
+            out.extend_from_slice(&record);
+        }
+        out
+    }
+
+    #[test]
+    fn recipe_labels_name_the_product_from_the_game_tables() {
+        // A weapon, an armour part, a series and a decoration all take their
+        // name from the tables the rest of the window uses.
+        let weapon = MhnxEditor::recipe_label(Product::Weapon { class: 0, id: 1 });
+        assert!(weapon.starts_with("大剣 "), "{}", weapon);
+        assert_eq!(
+            weapon,
+            format!(
+                "大剣 {}",
+                MhnxEditor::recipe_name(Product::Weapon { class: 0, id: 1 })
+            )
+        );
+        let head = MhnxEditor::recipe_label(Product::Armor { series: 1, part: 1 });
+        assert!(head.starts_with("頭 "), "{}", head);
+        let series = MhnxEditor::recipe_label(Product::ArmorSeries { series: 1 });
+        assert!(series.ends_with("（シリーズ強化）"), "{}", series);
+        // A decoration is an item, not equipment: it must not take the
+        // equipment type name, which is "空き" for kind 0.
+        let deco = MhnxEditor::recipe_label(Product::Deco { item: 2638 });
+        assert!(deco.starts_with("装飾品 "), "{}", deco);
+    }
+
+    #[test]
+    fn the_recipe_list_filters_by_name_and_id() {
+        let mut book = recipes::Book::new();
+        book.add(
+            "weaponCreateW00.wcd",
+            &recipe_table(&[
+                (1, [(318, 4), (319, 1), (0, 0), (0, 0)]),
+                (45, [(975, 6), (0, 0), (0, 0), (0, 0)]),
+            ]),
+        );
+        let rows = MhnxEditor::recipe_rows_from(&book);
+        assert_eq!(rows.len(), 2);
+        // The needle carries the name and the id, so both find the row.
+        let name = MhnxEditor::recipe_name(Product::Weapon { class: 0, id: 45 }).to_lowercase();
+        let by_name = MhnxEditor::recipe_rows_matching(&rows, &name);
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(rows[by_name[0]].product, Product::Weapon { class: 0, id: 45 });
+        assert_eq!(MhnxEditor::recipe_rows_matching(&rows, "45").len(), 1);
+        // An empty needle matches every row, so the caller needs no branch.
+        assert_eq!(MhnxEditor::recipe_rows_matching(&rows, "").len(), 2);
+        assert!(MhnxEditor::recipe_rows_matching(&rows, "no such name").is_empty());
+        // The material side names the items the recipes read, by item id.
+        let items = MhnxEditor::recipe_items_from(&book);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].item, 318);
+        assert_eq!(items[0].uses, 1);
+        assert!(items[0].needle.ends_with("318"), "{}", items[0].needle);
+    }
+
+    #[test]
+    fn the_recipe_link_opens_the_row_it_names() {
+        let mut app = MhnxEditor::default();
+        app.items = vec![
+            ItemSlot { id: 318, count: 5 },
+            ItemSlot { id: 0, count: 0 },
+            ItemSlot { id: 975, count: 1 },
+        ];
+        app.open_item_edit(975);
+        assert_eq!(app.tab, Tab::Items);
+        assert_eq!(app.item_selected, Some(2));
+        assert_eq!(app.scroll_to_item, Some(2));
+        assert_eq!(app.item_filter, item_name(975));
+        assert!(app.message.contains("所持 1"), "{}", app.message);
+        // An item the box does not hold still opens the list, filtered, with no
+        // row selected: that is what "not carried" looks like.
+        app.open_item_edit(407);
+        assert_eq!(app.item_selected, None);
+        assert_eq!(app.item_filter, item_name(407));
+        // Equipment goes to 装備, filtered to the name, with no stale selection
+        // left over from whatever was on screen before the jump.
+        app.equip_selected = Some(7);
+        app.open_equip_edit(Product::Weapon { class: 0, id: 1 });
+        assert_eq!(app.tab, Tab::Equip);
+        assert_eq!(
+            app.equip_filter,
+            MhnxEditor::recipe_name(Product::Weapon { class: 0, id: 1 })
+        );
+        assert_eq!(app.equip_selected, None);
+        // A decoration is an item, so its link lands in the item box.
+        app.open_item_edit(Product::Deco { item: 2638 }.equip_id());
+        assert_eq!(app.tab, Tab::Items);
+        assert!(app.message.contains("所持 0"), "{}", app.message);
+    }
 }
 
 
@@ -19570,6 +20463,22 @@ fn transmog_label(e: &mhnx_core::equip::Equipment) -> String {
     let mut look = *e;
     look.id = e.transmog;
     format!("{} Lv{}", mhnx_core::equip::name(&look), e.transmog_level)
+}
+
+/// An equipment record that exists only so a name can be looked up.
+///
+/// The name tables are indexed by type and id ([mhnx_core::equip::name]), so a
+/// recipe that names a product needs a record to ask with. The level fields are
+/// filled with 1 because a level of 0 is not a value the game writes.
+fn equipment_for(kind: u8, id: u16) -> mhnx_core::equip::Equipment {
+    mhnx_core::equip::Equipment {
+        index: 0,
+        kind,
+        level: 1,
+        transmog_level: 1,
+        id,
+        transmog: 0,
+    }
 }
 
 /// Item name looked up in the generated game data tables.
