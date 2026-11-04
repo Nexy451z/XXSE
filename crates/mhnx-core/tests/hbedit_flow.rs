@@ -1081,17 +1081,29 @@ fn y_on_a_skill_row_opens_the_name_picker() {
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::SkillPick);
     assert_eq!(ed.skill_pick_field, 1);
-    assert_eq!(
-        ed.skill_pick_matches().len(),
-        306,
-        "the whole table is reachable"
-    );
+    // The picker lists the kind's own row of the game's point table, not the
+    // whole 306 entry name table: a 天 offers 62 skills in slot 1. Before the
+    // filter existed this answered 306 and invited records the game never
+    // writes (攻撃 is a 天's *second* skill, not its first).
+    let kind = ed.charm_edit.expect("the form is open").kind;
+    let pool = mhnx_core::charm::allowed_skill_ids(kind, false);
+    assert_eq!(ed.skill_pick_matches(), pool, "the picker shows the pool");
+    assert!(pool.len() <= 62, "kind {}: {} ids", kind, pool.len());
+    assert!(ed.skill_pick_matches().len() < 306, "the name table is filtered");
     let lines = ed.lines();
     assert!(lines[0].text.contains("PICK SKILL 1"), "{}", lines[0].text);
-    // The first rows carry real Japanese names.
+    // The first rows carry real Japanese names - of the pool, not of the whole
+    // name table, so 毒 (a skill no 天 can carry in slot 1) is not one of them.
+    let first_name = mhnx_core::skills::skill_name(pool[0]).expect("a name");
     assert!(
-        lines.iter().any(|l| l.text.contains("毒")),
-        "skill names must be rendered"
+        lines.iter().any(|l| l.text.contains(first_name)),
+        "skill names must be rendered: {:?}",
+        first_name
+    );
+    assert!(
+        !lines.iter().any(|l| l.text.contains("PICK SKILL 1 / ?")),
+        "the header must name the kind: {}",
+        lines[0].text
     );
 }
 
@@ -1107,10 +1119,21 @@ fn filtering_by_name_and_choosing_writes_the_skill() {
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::SkillPick);
 
-    ed.apply_skill_filter(String::from("攻撃"));
+    // A name from the kind's own pool: 攻撃 is not a 天's first skill, so the
+    // filtered list must not be asked for one it cannot carry.
+    let kind = ed.charm_edit.expect("open").kind;
+    let pool = mhnx_core::charm::allowed_skill_ids(kind, false);
+    let target = pool[pool.len() / 2];
+    let name = mhnx_core::skills::skill_name(target).expect("a name").to_string();
+    ed.apply_skill_filter(name.clone());
     let matches = ed.skill_pick_matches();
-    assert!(!matches.is_empty(), "the filter must find 攻撃");
-    let want = matches[0];
+    assert!(!matches.is_empty(), "the filter must find {}", name);
+    assert!(
+        matches.iter().all(|id| pool.contains(id)),
+        "a filtered list may only hold ids of the pool: {:?}",
+        matches
+    );
+    let want = *matches.iter().find(|id| **id == target).expect("the target");
 
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit, "choosing returns to the form");
@@ -1119,7 +1142,7 @@ fn filtering_by_name_and_choosing_writes_the_skill() {
         Some(want),
         "the chosen id must land in skill 1"
     );
-    assert!(ed.message.contains("攻撃"), "message was {}", ed.message);
+    assert!(ed.message.contains(&name), "message was {}", ed.message);
 }
 
 #[test]
@@ -4072,12 +4095,32 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
     ed.input(Key::Up);
     assert_eq!(ed.charm_edit.expect("open").field, 3);
 
-    // Y on a skill row opens the name picker.
+    // Y on a skill row opens the name picker, which lists the kind's own pool.
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::SkillPick);
+    let pick_kind = ed.charm_edit.expect("the form is open").kind;
+    let pool = mhnx_core::charm::allowed_skill_ids(pick_kind, false);
+    assert_eq!(
+        ed.skill_pick_matches(),
+        pool,
+        "the console must list the kind's pool"
+    );
     assert!(ed.skill_pick_matches().len() > 3);
-    ed.apply_skill_filter(String::from("攻撃"));
-    assert!(!ed.skill_pick_matches().is_empty(), "the filter must find 攻撃");
+    let want_id = pool[pool.len() / 2];
+    let want_name = mhnx_core::skills::skill_name(want_id)
+        .expect("a name")
+        .to_string();
+    ed.apply_skill_filter(want_name.clone());
+    assert!(
+        !ed.skill_pick_matches().is_empty(),
+        "the filter must find {}",
+        want_name
+    );
+    ed.skill_pick_cursor = ed
+        .skill_pick_matches()
+        .iter()
+        .position(|id| *id == want_id)
+        .expect("the target is in the filtered list");
     let chosen = ed.skill_pick_matches()[ed.skill_pick_cursor];
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit);

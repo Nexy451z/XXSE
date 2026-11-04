@@ -23,9 +23,9 @@ fn real_save() -> Option<Save> {
 // The real talisman point ranges, now that the table indexing is known.
 // ---------------------------------------------------------------------------
 
-/// The reference editor reads the type from +0x02, maps it through
-/// TALISMAN_RARITY and indexes the per-rarity table by skill id - 1.
-/// Every talisman in the sample save must agree with that.
+/// The editor reads the type from +0x02, maps it through TALISMAN_RARITY
+/// and indexes the per-rarity table by skill id directly (cell 0 is the
+/// "(none)" row). Every talisman in the sample save must agree with that.
 #[test]
 fn every_real_talisman_is_inside_the_published_range() {
     let Some(src) = real_save() else { return };

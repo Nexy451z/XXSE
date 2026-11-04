@@ -406,6 +406,15 @@ impl CharmEdit {
             ),
         }
     }
+
+    /// Can the kind on the form carry a second skill at all?
+    ///
+    /// False for 兵士 / 闘士: rarity 97 has no slot-2 rows in the game's own
+    /// point table, so there is nothing a picker could offer. The form prints
+    /// 「選択不可」 on that row instead of opening one.
+    pub fn second_skill_available(&self) -> bool {
+        charm::second_skill_available(self.kind)
+    }
 }
 
 /// One row of the drawn talisman form.
@@ -508,18 +517,34 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
             value: format!("{:+}", e.points1),
             badge: String::from("#05"),
         },
+        // 兵士 / 闘士 cannot carry a second skill at all, so the row says so
+        // rather than offering a picker with nothing in it. A record that
+        // carries one anyway (an imported or hand-written record) still shows
+        // the name it holds: the warning line is what explains it.
         CharmFormRow {
             field: 5,
             title: String::from("第2スキル"),
-            meta: format!("Skill ID: {}", e.skill2),
-            value: s2.to_string(),
+            meta: if e.second_skill_available() {
+                format!("Skill ID: {}", e.skill2)
+            } else {
+                String::from("この種類は第2スキルを持てません")
+            },
+            value: if e.second_skill_available() || e.skill2 != 0 {
+                s2.to_string()
+            } else {
+                String::from("選択不可")
+            },
             badge: String::from("#06"),
         },
         CharmFormRow {
             field: 6,
             title: String::from("第2スキル値"),
             meta: range_of(e.skill2, true),
-            value: format!("{:+}", e.points2),
+            value: if !e.second_skill_available() && e.skill2 == 0 {
+                String::from("—")
+            } else {
+                format!("{:+}", e.points2)
+            },
             badge: String::from("#07"),
         },
     ]
@@ -1555,15 +1580,14 @@ pub fn charm_points_ceiling(e: &CharmEdit, second: bool) -> Option<i8> {
     if skill == 0 {
         return None;
     }
-    let limits = charm::kind_limits(e.kind);
-    let kind_cap = limits.and_then(|l| l.max_points(second));
-    match charm::allowed_points_rarity(e.grade.rarity(), skill, second) {
+    match charm::allowed_points_for_kind(e.kind, skill, second) {
+        // "0~0" is the table (or the kind's missing slot 2) refusing the skill:
+        // there is no value to jump to.
         Some(r) if r.min == 0 && r.max == 0 => None,
-        Some(r) => Some(match kind_cap {
-            Some(c) => r.max.min(c),
-            None => r.max,
-        }),
-        None => kind_cap,
+        Some(r) => Some(r.max),
+        // Past the end of the talisman tables: the kind's own ceiling is the
+        // only answer left.
+        None => charm::kind_limits(e.kind).and_then(|l| l.max_points(second)),
     }
 }
 
@@ -5093,12 +5117,28 @@ impl Editor {
             // hopeless when there are 306 skills.
             Key::Y => {
                 if e.field == 3 || e.field == 5 {
-                    self.skill_pick_field = if e.field == 3 { 1 } else { 2 };
-                    self.skill_pick_filter.clear();
-                    self.skill_pick_cursor = 0;
-                    self.charm_edit = Some(e);
-                    self.screen = Screen::SkillPick;
-                    self.message = String::from("スキルを名前から選んでください");
+                    let second = e.field == 5;
+                    if second && !e.second_skill_available() {
+                        // Nothing to choose: rarity 97 has no slot-2 rows, so
+                        // the row is 選択不可 rather than an empty picker.
+                        self.message = format!(
+                            "{} は第2スキルを選べません（この種類は第2スキルを持てません）",
+                            charm::kind_name(e.kind).unwrap_or("?")
+                        );
+                    } else {
+                        self.skill_pick_field = if second { 2 } else { 1 };
+                        self.skill_pick_filter.clear();
+                        self.skill_pick_cursor = 0;
+                        self.charm_edit = Some(e);
+                        self.screen = Screen::SkillPick;
+                        let n = charm::allowed_skill_ids(e.kind, second).len();
+                        self.message = format!(
+                            "スキルを名前から選んでください（{} / スキル{}: {}種）",
+                            charm::kind_name(e.kind).unwrap_or("?"),
+                            self.skill_pick_field,
+                            n
+                        );
+                    }
                 } else {
                     self.message = String::from("先にスキルの行へ移動してください");
                 }
@@ -6601,14 +6641,36 @@ impl Editor {
         }
     }
 
+    /// Skill ids the picker offers before the name filter, in id order.
+    ///
+    /// The picker belongs to the talisman form, so the kind on the form decides
+    /// the set: [crate::charm::allowed_skill_ids] is the rows of the game's own
+    /// point table for that rarity and slot - 59 / 71 / 56 / 62 ids in slot 1
+    /// and 0 / 74 / 105 / 94 in slot 2. A kind without a second skill answers an
+    /// empty list, and [CharmEdit::second_skill_available] is what keeps that
+    /// row from opening this screen at all.
+    pub fn skill_pick_allowed(&self) -> Vec<u8> {
+        let Some(e) = self.charm_edit else {
+            return Vec::new();
+        };
+        crate::charm::allowed_skill_ids(e.kind, self.skill_pick_field == 2)
+    }
+
     /// Skill ids whose name matches the current filter, in id order.
+    ///
+    /// Only the ids the form's kind allows are listed, so the console and the
+    /// desktop picker cannot offer a skill the game would never put on that
+    /// talisman. The 306 name table is no longer walked directly: ids 206 and
+    /// up are past the end of the talisman tables and cannot be on a charm.
     pub fn skill_pick_matches(&self) -> Vec<u8> {
         let needle = self.skill_pick_filter.trim().to_lowercase();
         #[cfg(feature = "gamedata")]
         {
             let mut out = Vec::new();
-            for (i, name) in crate::skills::SKILL_NAMES.iter().enumerate() {
-                let id = (i + 1) as u8;
+            for id in self.skill_pick_allowed() {
+                let Some(name) = crate::skills::skill_name(id) else {
+                    continue;
+                };
                 if needle.is_empty() || name.to_lowercase().contains(&needle) {
                     out.push(id);
                 }
@@ -6619,6 +6681,30 @@ impl Editor {
         {
             let _ = needle;
             Vec::new()
+        }
+    }
+
+    /// One line naming the slot, the kind and how many ids the picker holds.
+    ///
+    /// Both screens print it, so a list that looks short says why: 「スキル選択
+    /// スキル1 / 天の護石 (62種)」.
+    pub fn skill_pick_heading(&self) -> String {
+        let second = self.skill_pick_field == 2;
+        let slot = if second { "スキル2" } else { "スキル1" };
+        match self.charm_edit {
+            Some(e) => {
+                let kind = crate::charm::kind_name(e.kind).unwrap_or("?");
+                let n = self.skill_pick_allowed().len();
+                if self.skill_pick_filter.is_empty() {
+                    format!("スキル選択 {} / {} ({}種)", slot, kind, n)
+                } else {
+                    format!(
+                        "スキル選択 {} / {} ({}種 検索: {})",
+                        slot, kind, n, self.skill_pick_filter
+                    )
+                }
+            }
+            None => String::from("スキル選択"),
         }
     }
 
@@ -12292,17 +12378,27 @@ impl Editor {
             }
             Screen::SkillPick => {
                 let matches = self.skill_pick_matches();
+                // The pool size sits in the header so a short list explains
+                // itself: the kind on the form decides it (62 ids for a 天's
+                // first skill), not the 306 name table.
+                let pool = self.skill_pick_allowed().len();
+                let kind = self
+                    .charm_edit
+                    .map(|e| crate::charm::kind_name(e.kind).unwrap_or("?"))
+                    .unwrap_or("?");
                 push(
                     &mut out,
                     alloc::format!(
-                        "PICK SKILL {}   filter: {}   ({} match)",
+                        "PICK SKILL {} / {}   filter: {}   ({} of {} ids)",
                         self.skill_pick_field,
+                        kind,
                         if self.skill_pick_filter.is_empty() {
                             "(all)"
                         } else {
                             &self.skill_pick_filter
                         },
-                        matches.len()
+                        matches.len(),
+                        pool
                     ),
                     false,
                     false,
@@ -12371,11 +12467,15 @@ impl Editor {
                     (String::from("スキル1 ポイント"), format!("{:+}", e.points1)),
                     (
                         String::from("スキル2 ID"),
-                        format!(
-                            "{}  ({})",
-                            e.skill2,
-                            crate::skills::skill_name(e.skill2).unwrap_or("none")
-                        ),
+                        if !e.second_skill_available() && e.skill2 == 0 {
+                            String::from("選択不可（この種類は第2スキルを持てません）")
+                        } else {
+                            format!(
+                                "{}  ({})",
+                                e.skill2,
+                                crate::skills::skill_name(e.skill2).unwrap_or("none")
+                            )
+                        },
                     ),
                     (String::from("スキル2 ポイント"), format!("{:+}", e.points2)),
                 ];

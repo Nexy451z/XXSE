@@ -82,6 +82,13 @@
 //! while the 天 tops out at +10. Nothing here clamps a record on its own -
 //! [clamp_points] and [clamp_points_to_kind] only move a value when a caller
 //! asks, and [grade_warnings] reports instead of writing.
+//!
+//! The same tables say which skills a kind offers at all: [allowed_skill_ids]
+//! is the list the pickers show (59 / 71 / 56 / 62 ids in slot 1 and
+//! 0 / 74 / 105 / 94 in slot 2), [skill_allowed] answers for one id, and
+//! [allowed_points_for_kind] gives one skill's range with the kind's ceiling
+//! already applied - the per-skill table is the narrower of the two, so 聴覚保護
+//! stops at +7 on a 天 whose kind reaches +10.
 
 use alloc::vec::Vec;
 
@@ -165,16 +172,22 @@ impl Charm {
 
 /// The points range the game actually allows for one skill on one talisman.
 ///
-/// The reference editor indexes it like this (EditTalismanDialog.cs:61): the
-/// byte at +0x02 is the talisman type, TALISMAN_RARITY[type] gives the rarity,
-/// the rarity picks one of four tables, and the table is indexed by skill id
-/// directly (the combo box lists a leading "(none)", so SelectedIndex equals
-/// the id). A cell reads "min~max:min2~max2": the first pair bounds skill 1's
-/// points, the second bounds skill 2's. "0~0" means the skill is not allowed
-/// there at all.
+/// The four tables the game ships are indexed by skill id directly: cell 0 is
+/// the "(none)" row, so skill id N is `table[N]`. A cell reads
+/// "min~max:min2~max2": the first pair bounds skill 1's points, the second
+/// bounds skill 2's. "0~0" means the skill is not allowed there at all.
+///
+/// The index is not a guess. Each `amuletSkillData00..07.amskl` file is an 8
+/// byte header followed by 4 byte rows (u16 skill id, s8 min, s8 max), and the
+/// four pairs 00/01, 02/03, 04/05, 06/07 hold exactly the slot 1 / slot 2 rows
+/// of rarity 97 / 98 / 99 / 100: 59 / 0 / 71 / 74 / 56 / 105 / 62 / 94 rows,
+/// which reproduce `gamedata::TALISMAN_*` cell for cell (tests/
+/// talisman_skill_tables.rs reads the files themselves when they are present).
 ///
 /// Verified against the sample saves: all 1292 skill values across 650
-/// talismans fall inside the published range.
+/// talismans fall inside the range of the table their kind selects, and 609 of
+/// the records fit *only* that table, so the kind -> rarity -> table road is
+/// the one the game really writes.
 ///
 /// It matches every one of the 650 talismans in the sample saves:
 /// type 0x0A -> rarity 100, 0x07 -> 99, 0x06 -> 99, 0x04 -> 98, 0x00 -> 0.
@@ -200,29 +213,49 @@ pub fn rarity_of(_type_byte: u8) -> Option<i32> {
     None
 }
 
-/// The legal points range for a skill on a talisman.
+/// The point table of one rarity (97..=100), or None for anything else.
 #[cfg(feature = "gamedata")]
-pub fn allowed_points(type_byte: u8, skill: u8, second: bool) -> Option<AllowedPoints> {
+fn skill_table(rarity: u8) -> Option<&'static [&'static str]> {
     use crate::gamedata::{
-        TALISMAN_ENDURING_SKILL, TALISMAN_SHINING_SKILL, TALISMAN_TIMEWORN_SKILL,
+        TALISMAN_ENDURING_SKILL, TALISMAN_MYSTERY_SKILL, TALISMAN_SHINING_SKILL,
+        TALISMAN_TIMEWORN_SKILL,
     };
-    if skill == 0 {
-        return None;
+    match rarity {
+        97 => Some(TALISMAN_MYSTERY_SKILL),
+        98 => Some(TALISMAN_SHINING_SKILL),
+        99 => Some(TALISMAN_TIMEWORN_SKILL),
+        100 => Some(TALISMAN_ENDURING_SKILL),
+        _ => None,
     }
-    let table: &[&str] = match rarity_of(type_byte)? {
-        98 => TALISMAN_SHINING_SKILL,
-        99 => TALISMAN_TIMEWORN_SKILL,
-        100 => TALISMAN_ENDURING_SKILL,
-        _ => return None,
-    };
-    // The reference combo box lists the skills with a leading "(none)", so
-    // SelectedIndex for skill id N is N, not N - 1.
-    let cell = table.get(skill as usize)?;
+}
+
+/// One half of a cell, "min~max", picked by `second`.
+#[cfg(feature = "gamedata")]
+fn cell_range(cell: &str, second: bool) -> Option<(i8, i8)> {
+    // The cell is "min1~max1:min2~max2"; cell 0 carries "0~0:0~0" for "(none)".
     let mut halves = cell.split(':');
     let pair = if second { halves.nth(1)? } else { halves.next()? };
     let mut bits = pair.split('~');
     let min: i8 = bits.next()?.trim().parse().ok()?;
     let max: i8 = bits.next()?.trim().parse().ok()?;
+    Some((min, max))
+}
+
+/// The legal points range for a skill on a talisman.
+///
+/// `type_byte` is the kind byte at +0x02. Table cell 0 is the "(none)" row,
+/// so skill id N is `table[N]`; 0 answers None because there is no skill.
+#[cfg(feature = "gamedata")]
+pub fn allowed_points(type_byte: u8, skill: u8, second: bool) -> Option<AllowedPoints> {
+    if skill == 0 {
+        return None;
+    }
+    let rarity = rarity_of(type_byte)?;
+    if !(97..=100).contains(&rarity) {
+        return None;
+    }
+    let table = skill_table(rarity as u8)?;
+    let (min, max) = cell_range(table.get(skill as usize)?, second)?;
     Some(AllowedPoints { min, max })
 }
 
@@ -234,11 +267,16 @@ pub fn allowed_points(_type_byte: u8, _skill: u8, _second: bool) -> Option<Allow
 
 /// The points range actually seen for one skill at one rarity.
 ///
-/// The game data ships four tables of allowed ranges (TALISMAN_*_SKILL), but
-/// how they are indexed could not be established with confidence, so this
-/// derives the answer from the box itself instead of guessing: every talisman
-/// in it contributes one sample. A value outside the observed range is not
-/// proof of an illegal record, but it is worth flagging.
+/// The four tables of allowed ranges (`TALISMAN_*_SKILL`) are the answer the
+/// editor clamps and warns with ([allowed_points_rarity], [grade_warnings],
+/// [clamp_points]); their indexing was resolved and the sample saves agree with
+/// them on every value, so nothing here is needed to decide what is legal.
+///
+/// This stays as a *diagnostic* that reads the box instead of the tables: every
+/// talisman contributes one sample, which is how a save carrying something the
+/// published tables would not allow can be found without trusting them. A
+/// value outside the observed range is not proof of an illegal record (a skill
+/// may simply have been seen only at low values), but it is worth flagging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PointsRange {
     /// Lowest points seen.
@@ -545,12 +583,21 @@ pub fn kind_rarity(kind: u8) -> Option<u8> {
 ///   pairing is not a guess: those eight files reproduce the four
 ///   `gamedata::TALISMAN_*_SKILL` tables cell for cell (824 cells, 0
 ///   mismatches), and the reference editor indexes them by rarity.
+/// * A file is an 8 byte header and then 4 byte rows (u16 skill id, s8 min,
+///   s8 max) - it lists only the skills that rarity allows in that slot, not
+///   all 206 cells. The row counts are 59 / 0 / 71 / 74 / 56 / 105 / 62 / 94,
+///   which is what pins the pairing down even before the cells are compared:
+///   no other assignment of two files per rarity matches the table's row
+///   counts. `tests/talisman_skill_tables.rs` re-reads the files themselves
+///   when the romfs is present.
 /// * `max_first` / `max_second` are the largest `max` in each half. Rarity 97
-///   has *no rows at all* in its second half, so 兵士 / 闘士 cannot carry a
-///   second skill - the editor's table says `0~0` for every second cell there.
-/// * `first_skills` / `second_skills` count the rows, i.e. how many skill ids
-///   the kind can roll at all. 女王 / 王 / 龍 offer 56 in slot 1 and 105 in
-///   slot 2; 英雄 / 伝説 / 天 offer 62 and 94.
+///   has *no rows at all* in its second half (`amuletSkillData01.amskl` is the
+///   header and nothing else), so 兵士 / 闘士 cannot carry a second skill -
+///   the editor's table says `0~0` for every second cell there.
+/// * `first_skills` / `second_skills` are those row counts, i.e. how many skill
+///   ids the kind can roll at all; [allowed_skill_ids] turns them into the
+///   list a picker shows. 女王 / 王 / 龍 offer 56 in slot 1 and 105 in slot 2;
+///   英雄 / 伝説 / 天 offer 62 and 94.
 /// * `max_slots` is the highest slot index whose probability is non-zero
 ///   anywhere in the rarity's slot table: 1 / 2 / 3 / 3.
 ///
@@ -566,6 +613,10 @@ pub fn kind_rarity(kind: u8) -> Option<u8> {
 /// * The observed maxima agree: 天 (rarity 100) reaches +10 in slot 1 (skills
 ///   42/43, exactly the rows `amuletSkillData06` caps at 10) and +13 in slot 2
 ///   (skills 27..31, `amuletSkillData07`). 龍 (99) reaches +12 of its +13.
+/// * Of the 116 (rarity, slot, skill) pairs the sample save exercises, 75 reach
+///   the table's maximum exactly and the other 41 stay below it because the
+///   sample is small; *none* exceeds it and no value falls outside its row, so
+///   the table is adopted as the truth the two editors clamp and warn with.
 /// * `../extract/god_talisman_report.md` records the binary's own fallbacks:
 ///   聴覚保護 caps at +7 and 攻撃 at +10, which are the
 ///   `amuletSkillData06/07` numbers for skill ids 5 and 18.
@@ -936,27 +987,121 @@ pub fn rarity_of_record(rec: &[u8]) -> Option<TalismanGrade> {
 /// type byte.
 #[cfg(feature = "gamedata")]
 pub fn allowed_points_rarity(rarity: u8, skill: u8, second: bool) -> Option<AllowedPoints> {
-    use crate::gamedata::{
-        TALISMAN_ENDURING_SKILL, TALISMAN_MYSTERY_SKILL, TALISMAN_SHINING_SKILL,
-        TALISMAN_TIMEWORN_SKILL,
-    };
     if skill == 0 {
         return None;
     }
-    let table: &[&str] = match rarity {
-        97 => TALISMAN_MYSTERY_SKILL,
-        98 => TALISMAN_SHINING_SKILL,
-        99 => TALISMAN_TIMEWORN_SKILL,
-        100 => TALISMAN_ENDURING_SKILL,
-        _ => return None,
-    };
-    let cell = table.get(skill as usize)?;
-    let mut halves = cell.split(':');
-    let pair = if second { halves.nth(1)? } else { halves.next()? };
-    let mut bits = pair.split('~');
-    let min: i8 = bits.next()?.trim().parse().ok()?;
-    let max: i8 = bits.next()?.trim().parse().ok()?;
+    let table = skill_table(rarity)?;
+    let (min, max) = cell_range(table.get(skill as usize)?, second)?;
     Some(AllowedPoints { min, max })
+}
+
+/// Every skill id a rarity's table allows in one slot, in ascending order.
+///
+/// This is the list a picker has to show: the tables have 206 cells (ids
+/// 0..=205, cell 0 is "(none)") and a "0~0" half means the skill cannot be put
+/// in that slot at all, so the answer is every id whose own half is not "0~0".
+/// Counted per rarity, slot 1 / slot 2:
+///
+/// | rarity | slot 1 | slot 2 |
+/// |---|---|---|
+/// | 97 兵士 / 闘士 | 59 | 0 |
+/// | 98 騎士 / 城塞 | 71 | 74 |
+/// | 99 女王 / 王 / 龍 | 56 | 105 |
+/// | 100 英雄 / 伝説 / 天 | 62 | 94 |
+///
+/// The numbers are the row counts of the `amuletSkillData*.amskl` files
+/// themselves, and they equal [KindLimits::first_skills] /
+/// [KindLimits::second_skills].
+#[cfg(feature = "gamedata")]
+pub fn allowed_skill_ids_rarity(rarity: u8, second: bool) -> Vec<u8> {
+    let Some(table) = skill_table(rarity) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (id, cell) in table.iter().enumerate() {
+        // Id 0 is "(none)"; the table has 206 cells, so every index is a u8.
+        if id == 0 || id > u8::MAX as usize {
+            continue;
+        }
+        if let Some((min, max)) = cell_range(cell, second) {
+            if min != 0 || max != 0 {
+                out.push(id as u8);
+            }
+        }
+    }
+    out
+}
+
+/// Every skill id a rarity's table allows in one slot, in ascending order.
+#[cfg(not(feature = "gamedata"))]
+pub fn allowed_skill_ids_rarity(_rarity: u8, _second: bool) -> Vec<u8> {
+    Vec::new()
+}
+
+/// Every skill id a kind can carry in one slot, in ascending order.
+///
+/// Empty when the byte is not a kind the game ships, and empty for slot 2 of
+/// 兵士 / 闘士: rarity 97 has no slot-2 rows at all, so those kinds cannot hold
+/// a second skill rather than merely being unlikely to roll one.
+pub fn allowed_skill_ids(kind: u8, second: bool) -> Vec<u8> {
+    let Some(limits) = kind_limits(kind) else {
+        return Vec::new();
+    };
+    if second && !limits.has_second_skill() {
+        return Vec::new();
+    }
+    allowed_skill_ids_rarity(limits.rarity, second)
+}
+
+/// Can this kind carry a second skill at all?
+///
+/// False for 兵士 / 闘士 (rarity 97) and for every byte that is not a kind the
+/// game ships. The two screens use it to print 「第2スキルは選択不可」 instead
+/// of offering a picker that has nothing in it.
+pub fn second_skill_available(kind: u8) -> bool {
+    kind_limits(kind).map(|l| l.has_second_skill()).unwrap_or(false)
+}
+
+/// The legal points range for a skill on a kind, its own ceiling included.
+///
+/// The per-skill table is the narrowest answer - 聴覚保護 stops at +7 on a 天
+/// even though the kind reaches +10 - so the returned range is the table's
+/// `min` and the smaller of the table's `max` and [KindLimits::max_points].
+///
+/// `Some(0, 0)` is the table saying the skill cannot go in that slot of that
+/// kind at all, which is also what a kind without a second skill answers for
+/// its slot 2. `None` means the id is past the end of the talisman table (the
+/// four tables stop at id 205 while the skill list runs to 306), i.e. no
+/// talisman can carry it.
+pub fn allowed_points_for_kind(
+    kind: u8,
+    skill: u8,
+    second: bool,
+) -> Option<AllowedPoints> {
+    let limits = kind_limits(kind)?;
+    if skill == 0 {
+        return None;
+    }
+    if second && !limits.has_second_skill() {
+        return Some(AllowedPoints { min: 0, max: 0 });
+    }
+    let r = allowed_points_rarity(limits.rarity, skill, second)?;
+    if r.min == 0 && r.max == 0 {
+        return Some(r);
+    }
+    let cap = limits.max_points(second)?;
+    Some(AllowedPoints {
+        min: r.min,
+        max: r.max.min(cap),
+    })
+}
+
+/// May this skill be placed in this slot of this kind?
+pub fn skill_allowed(kind: u8, skill: u8, second: bool) -> bool {
+    match allowed_points_for_kind(kind, skill, second) {
+        Some(r) => r.min != 0 || r.max != 0,
+        None => false,
+    }
 }
 
 /// Legal points range for a skill at a rarity.
@@ -1085,15 +1230,31 @@ pub fn grade_warnings(
             continue;
         }
         let pts = box_bytes[o + pts_at] as i8;
-        // The per-skill table is the narrowest answer, so it speaks first; the
-        // kind's ceiling only speaks when the table had nothing to say (no
-        // gamedata feature, or a skill id past the end of it). Both lines for
-        // one value would be noise.
-        let mut flagged = false;
-        match allowed_points_rarity(grade.rarity(), skill, second) {
+        // A kind without a second slot says so before any table is consulted:
+        // 兵士 / 闘士 have no slot-2 rows anywhere, and reporting "outside the
+        // range" would suggest a value could make the skill legal.
+        if second {
+            if let Some(l) = limits {
+                if !l.has_second_skill() {
+                    out.push(format!(
+                        "{} は{}に設定できません（この種類は第2スキルを持てません）",
+                        label,
+                        l.name()
+                    ));
+                    continue;
+                }
+            }
+        }
+        // The per-skill table is the narrowest answer and it already carries the
+        // kind's own ceiling ([allowed_points_for_kind]), so one line per value
+        // is all that is ever printed.
+        let range = match limits {
+            Some(l) => allowed_points_for_kind(l.kind, skill, second),
+            None => allowed_points_rarity(grade.rarity(), skill, second),
+        };
+        match range {
             Some(r) if r.min == 0 && r.max == 0 => {
                 out.push(format!("{} は{}では付けられません", label, who));
-                flagged = true;
             }
             Some(r) => {
                 if pts < r.min || pts > r.max {
@@ -1101,7 +1262,6 @@ pub fn grade_warnings(
                         "{} {} は {}〜{} の範囲外です",
                         label, pts, r.min, r.max
                     ));
-                    flagged = true;
                 }
             }
             None => {
@@ -1109,37 +1269,29 @@ pub fn grade_warnings(
                 // tables compiled in that means the id is past the end of the
                 // talisman table (the four tables stop at id 205, while the
                 // skill list runs to 306): a skill the game can never roll on a
-                // charm. Without the tables nothing is known, so the build
-                // stays quiet and the kind's ceiling speaks instead.
+                // charm. Without the tables nothing is known, so the kind's
+                // ceiling speaks instead.
                 #[cfg(feature = "gamedata")]
                 if TalismanGrade::from_rarity(grade.rarity()).is_some() {
                     out.push(format!(
                         "{} のスキルID {} は護石の表に無いため付けられません",
                         label, skill
                     ));
-                    flagged = true;
+                }
+                #[cfg(not(feature = "gamedata"))]
+                if let Some(cap) = limits.and_then(|l| l.max_points(second)) {
+                    if pts > cap {
+                        out.push(format!(
+                            "{} {} は {:+} ですが、{} の上限は {:+} です",
+                            label,
+                            skill_label(skill),
+                            pts,
+                            who,
+                            cap
+                        ));
+                    }
                 }
             }
-        }
-        if flagged {
-            continue;
-        }
-        let Some(l) = limits else { continue };
-        match l.max_points(second) {
-            Some(cap) if pts > cap => out.push(format!(
-                "{} {} は {:+} ですが、{} の上限は {:+} です",
-                label,
-                skill_label(skill),
-                pts,
-                l.name(),
-                cap
-            )),
-            None => out.push(format!(
-                "{} は{}に設定できません（この種類は第2スキルを持てません）",
-                label,
-                l.name()
-            )),
-            _ => {}
         }
     }
     out

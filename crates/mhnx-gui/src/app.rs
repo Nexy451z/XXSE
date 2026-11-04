@@ -11258,51 +11258,71 @@ impl MhnxEditor {
         }
     }
 
-    /// Searchable skill picker: 306 Japanese names, index = id - 1.
+    /// Searchable skill picker: only the ids this kind can carry in this slot.
+    ///
+    /// `allowed` is the point table row list of the kind's rarity and slot
+    /// (charm::allowed_skill_ids): 59 / 71 / 56 / 62 ids in slot 1 and
+    /// 0 / 74 / 105 / 94 in slot 2. Listing all 306 names invited a record the
+    /// game never writes - 攻撃 cannot be a 天's first skill and no 兵士 has a
+    /// second skill at all. `enabled` false draws the field greyed out and is
+    /// what 兵士 / 闘士 get on their 第2スキル row (選択不可).
     fn skill_combo(
         ui: &mut egui::Ui,
         id_salt: &str,
         current: &mut u8,
         search: &mut String,
+        allowed: &[u8],
+        enabled: bool,
     ) -> bool {
         let shown = mhnx_core::skills::skill_name(*current)
             .map(|s| format!("{} ({})", s, current))
             .unwrap_or_else(|| format!("なし ({})", current));
         let mut picked: Option<u8> = None;
-        egui::ComboBox::from_id_salt(id_salt)
-            .selected_text(shown)
-            .width(260.0)
-            .show_ui(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(search)
-                        .hint_text("スキル名で検索")
-                        .desired_width(240.0),
-                );
-                if ui.small_button("クリア").clicked() {
-                    search.clear();
-                }
-                if *current != 0 && ui.small_button("なし に戻す").clicked() {
-                    picked = Some(0);
-                }
-                let needle = search.trim().to_lowercase();
-                egui::ScrollArea::vertical()
-                    .id_salt(id_salt)
-                    .max_height(240.0)
-                    .show(ui, |ui| {
-                        for (i, name) in mhnx_core::skills::SKILL_NAMES.iter().enumerate() {
-                            let id = (i + 1) as u8;
-                            if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
-                                continue;
+        ui.add_enabled_ui(enabled, |ui| {
+            egui::ComboBox::from_id_salt(id_salt)
+                .selected_text(shown)
+                .width(260.0)
+                .show_ui(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(search)
+                            .hint_text("スキル名で検索")
+                            .desired_width(240.0),
+                    );
+                    if ui.small_button("クリア").clicked() {
+                        search.clear();
+                    }
+                    if *current != 0 && ui.small_button("なし に戻す").clicked() {
+                        picked = Some(0);
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("この種類で選べるスキル: {} 種", allowed.len()))
+                            .weak()
+                            .small(),
+                    );
+                    if allowed.is_empty() {
+                        ui.label("この種類で選べるスキルはありません");
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt(id_salt)
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            for id in Self::skill_ids_matching(allowed, search) {
+                                let Some(name) = mhnx_core::skills::skill_name(id) else {
+                                    continue;
+                                };
+                                if ui
+                                    .selectable_label(
+                                        *current == id,
+                                        format!("{:<4} {}", id, name),
+                                    )
+                                    .clicked()
+                                {
+                                    picked = Some(id);
+                                }
                             }
-                            if ui
-                                .selectable_label(*current == id, format!("{:<4} {}", id, name))
-                                .clicked()
-                            {
-                                picked = Some(id);
-                            }
-                        }
-                    });
-            });
+                        });
+                });
+        });
         match picked {
             Some(id) => {
                 *current = id;
@@ -11311,6 +11331,23 @@ impl MhnxEditor {
             }
             None => false,
         }
+    }
+
+    /// Ids of `allowed` whose Japanese name matches `needle`.
+    ///
+    /// The filter is a name search over the picker's own pool, never over the
+    /// whole 306 entry name table: a skill the kind cannot carry must not come
+    /// back merely because its name was typed.
+    fn skill_ids_matching(allowed: &[u8], needle: &str) -> Vec<u8> {
+        let needle = needle.trim().to_lowercase();
+        allowed
+            .iter()
+            .copied()
+            .filter(|id| match mhnx_core::skills::skill_name(*id) {
+                Some(name) => needle.is_empty() || name.to_lowercase().contains(&needle),
+                None => false,
+            })
+            .collect()
     }
 
     /// Talisman editing: the list on the left, the editor on the right.
@@ -11449,6 +11486,13 @@ impl MhnxEditor {
                 }
                 .unwrap_or(self.charm_new_kind);
                 let shown_limits = mhnx_core::charm::kind_limits(shown_kind);
+                // What the kind can carry at all, per slot. The pickers list
+                // only these ids (the game's own point table rows), and a kind
+                // with no slot-2 rows - 兵士 / 闘士 - gets 選択不可 instead of
+                // an empty list.
+                let allowed_first = mhnx_core::charm::allowed_skill_ids(shown_kind, false);
+                let allowed_second = mhnx_core::charm::allowed_skill_ids(shown_kind, true);
+                let second_ok = mhnx_core::charm::second_skill_available(shown_kind);
                 let max_slots = bound
                     .map(|g| {
                         shown_limits
@@ -11485,7 +11529,14 @@ impl MhnxEditor {
                 // a single row pushed the points field off the right edge.
                 ui.horizontal_wrapped(|ui| {
                     ui.label("スキル1");
-                    Self::skill_combo(ui, "sk1", &mut self.charm_skill1, &mut self.skill_search1);
+                    Self::skill_combo(
+                        ui,
+                        "sk1",
+                        &mut self.charm_skill1,
+                        &mut self.skill_search1,
+                        &allowed_first,
+                        true,
+                    );
                     ui.label("ポイント");
                     let allowed = Self::charm_allowed(bound, shown_kind, self.charm_skill1, false);
                     Self::charm_points_field(ui, allowed, &mut self.charm_points1);
@@ -11497,25 +11548,58 @@ impl MhnxEditor {
                     Self::charm_allowed(bound, shown_kind, self.charm_skill1, false),
                     self.charm_skill1,
                     "スキル1",
+                    false,
+                    shown_kind,
                 );
                 ui.horizontal_wrapped(|ui| {
                     ui.label("スキル2");
-                    Self::skill_combo(ui, "sk2", &mut self.charm_skill2, &mut self.skill_search2);
+                    Self::skill_combo(
+                        ui,
+                        "sk2",
+                        &mut self.charm_skill2,
+                        &mut self.skill_search2,
+                        &allowed_second,
+                        second_ok,
+                    );
                     ui.label("ポイント");
                     let allowed = Self::charm_allowed(bound, shown_kind, self.charm_skill2, true);
                     Self::charm_points_field(ui, allowed, &mut self.charm_points2);
                 });
+                // 兵士 / 闘士 carry no second skill, so the row above is drawn
+                // disabled and this line says why. A record that holds one
+                // anyway (an imported or hand-written record) keeps it and is
+                // reported by grade_warnings below; the button is there so the
+                // disabled field is not a dead end - without it the only way to
+                // clear such a skill would be to change the kind.
+                if !second_ok {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(235, 190, 90),
+                            format!(
+                                "第2スキルは選択不可（{} は第2スキルを持てません）",
+                                mhnx_core::charm::kind_name(shown_kind).unwrap_or("?")
+                            ),
+                        );
+                        if self.charm_skill2 != 0 && ui.small_button("第2スキルを外す").clicked() {
+                            self.charm_skill2 = 0;
+                            self.charm_points2 = 0;
+                        }
+                    });
+                }
                 Self::charm_points_note(
                     ui,
                     Self::charm_allowed(bound, shown_kind, self.charm_skill2, true),
                     self.charm_skill2,
                     "スキル2",
+                    true,
+                    shown_kind,
                 );
-                // The published per-rarity range. The indexing was resolved
-                // from the reference editor: the byte at +0x02 is the talisman
-                // type, TALISMAN_RARITY[type] the rarity, and the table is
-                // indexed by skill id - 1. Verified against all 650 talismans
-                // in the sample save.
+                // The published per-skill range. The byte at +0x02 is the
+                // kind, TALISMAN_RARITY[type] the rarity, and the table is
+                // indexed by skill id directly (cell 0 is "(none)"), not by id
+                // - 1. Verified against all 650 talismans in the sample save:
+                // no value falls outside its row, and the rows are the game's
+                // own amuletSkillData*.amskl tables.
                 if !charm_box.is_empty() {
                     // The kind is the byte at +0x02, and it is what names the
                     // talisman in game: the rows of amuletData_jpn.gmd, 1
@@ -11879,22 +11963,13 @@ impl MhnxEditor {
         second: bool,
     ) -> Option<mhnx_core::charm::AllowedPoints> {
         match grade {
-            Some(g) if skill != 0 => {
-                let r = mhnx_core::charm::allowed_points_rarity(g.rarity(), skill, second)?;
-                // The kind's measured ceiling is the tighter of the two, so
-                // the field stops where the game stops. A "0〜0" cell stays
-                // "0〜0": that is the table saying the skill cannot go here at
-                // all, not a ceiling of zero.
-                if r.min == 0 && r.max == 0 {
-                    return Some(r);
-                }
-                match mhnx_core::charm::kind_limits(kind).and_then(|l| l.max_points(second)) {
-                    Some(c) if c < r.max => Some(mhnx_core::charm::AllowedPoints {
-                        min: r.min,
-                        max: c,
-                    }),
-                    _ => Some(r),
-                }
+            // The core owns the answer: the per-skill table is the narrowest
+            // one (聴覚保護 stops at +7 on a 天 whose kind reaches +10), so
+            // allowed_points_for_kind applies the kind's ceiling on top of
+            // it. A "0〜0" cell stays "0〜0" - the table saying the skill
+            // cannot go here at all, not a ceiling of zero.
+            Some(_) if skill != 0 => {
+                mhnx_core::charm::allowed_points_for_kind(kind, skill, second)
             }
             _ => None,
         }
@@ -11930,6 +12005,8 @@ impl MhnxEditor {
         allowed: Option<mhnx_core::charm::AllowedPoints>,
         skill: u8,
         row: &str,
+        second: bool,
+        kind: u8,
     ) {
         let Some(r) = allowed else {
             return;
@@ -11938,10 +12015,19 @@ impl MhnxEditor {
             return;
         }
         let name = mhnx_core::skills::skill_name(skill).unwrap_or("?");
-        ui.colored_label(
-            egui::Color32::from_rgb(235, 190, 90),
-            format!("{} {} はこのレア度では付けられません", row, name),
-        );
+        // A kind without a second slot says so in its own words; anything
+        // else is the per-skill table's "0〜0", which is about that skill
+        // alone.
+        let why = if second && !mhnx_core::charm::second_skill_available(kind) {
+            format!(
+                "{} は選択不可（{} は第2スキルを持てません）",
+                row,
+                mhnx_core::charm::kind_name(kind).unwrap_or("?")
+            )
+        } else {
+            format!("{} {} はこのレア度では付けられません", row, name)
+        };
+        ui.colored_label(egui::Color32::from_rgb(235, 190, 90), why);
     }
 
     /// A points widget that prints the sign itself.
@@ -17538,6 +17624,133 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // The talisman skill pickers: the list is the kind's slot, not the name
+    // table, and the points range is the skill's own row of it.
+    // -----------------------------------------------------------------------
+
+    /// A 天 record whose first skill is over its per-skill row, and a 兵士 that
+    /// carries a second skill it cannot have.
+    fn write_charm_rules_save(app: &mut MhnxEditor, dir: &std::path::Path) {
+        let path = write_a_save_with_slots(dir, "system");
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.slot = 0;
+        let save = app.save.as_mut().expect("save");
+        let box_bytes = save.equipment_box_mut(0).expect("equipment box");
+        // Slot 0: 天, 聴覚保護 +9 - legal for the kind (+10) but not for the
+        // skill (3~7).
+        {
+            let at = 0usize;
+            let rec = &mut box_bytes[at..at + mhnx_core::charm::CHARM_RECORD];
+            rec.fill(0);
+            rec[0] = mhnx_core::charm::CHARM_TYPE;
+            rec[0x02] = 10;
+            rec[0x0C] = 5;
+            rec[0x0E] = 9;
+            rec[0x10] = 1;
+            rec[0x12] = 100;
+            rec[0x13] = 1;
+        }
+        // Slot 1: 兵士 with a second skill, which rarity 97 has no rows for.
+        {
+            let at = mhnx_core::charm::CHARM_RECORD;
+            let rec = &mut box_bytes[at..at + mhnx_core::charm::CHARM_RECORD];
+            rec.fill(0);
+            rec[0] = mhnx_core::charm::CHARM_TYPE;
+            rec[0x02] = 1;
+            rec[0x0C] = 1;
+            rec[0x0E] = 5;
+            rec[0x0D] = 2;
+            rec[0x0F] = 5;
+            rec[0x10] = 1;
+            rec[0x12] = 97;
+            rec[0x13] = 1;
+        }
+    }
+
+    #[test]
+    fn the_desktop_picker_lists_only_the_kinds_slot() {
+        use mhnx_core::charm;
+        // 天: 62 first skills, 94 second skills - the game's own row counts.
+        let first = MhnxEditor::skill_ids_matching(&charm::allowed_skill_ids(10, false), "");
+        let second = MhnxEditor::skill_ids_matching(&charm::allowed_skill_ids(10, true), "");
+        assert_eq!((first.len(), second.len()), (62, 94));
+        assert!(!first.contains(&18), "攻撃 is a second skill of a 天");
+        assert!(second.contains(&18));
+        assert!(first.contains(&5) && !second.contains(&1));
+        // The name filter runs over that pool only, so typing 攻撃 cannot
+        // bring 攻撃 itself back.
+        let typed = MhnxEditor::skill_ids_matching(&charm::allowed_skill_ids(10, false), "攻撃");
+        assert!(!typed.contains(&18), "{:?}", typed);
+        assert!(typed.contains(&32) && typed.contains(&33) && typed.contains(&88));
+        // A 兵士 has no second-skill pool at all, and a 騎士 has 74.
+        assert!(MhnxEditor::skill_ids_matching(&charm::allowed_skill_ids(1, true), "").is_empty());
+        assert_eq!(
+            MhnxEditor::skill_ids_matching(&charm::allowed_skill_ids(3, true), "").len(),
+            74
+        );
+    }
+
+    #[test]
+    fn the_desktop_points_range_is_the_per_skill_one() {
+        use mhnx_core::charm::{AllowedPoints, TalismanGrade};
+        // 聴覚保護 on a 天: 3~7, not the kind's +10.
+        assert_eq!(
+            MhnxEditor::charm_allowed(Some(TalismanGrade::Enduring), 10, 5, false),
+            Some(AllowedPoints { min: 3, max: 7 })
+        );
+        // 納刀 reaches the kind's +10.
+        assert_eq!(
+            MhnxEditor::charm_allowed(Some(TalismanGrade::Enduring), 10, 42, false),
+            Some(AllowedPoints { min: 5, max: 10 })
+        );
+        // 攻撃 is not a 天 first skill: the field is disabled by "0~0".
+        assert_eq!(
+            MhnxEditor::charm_allowed(Some(TalismanGrade::Enduring), 10, 18, false),
+            Some(AllowedPoints { min: 0, max: 0 })
+        );
+        // A 兵士's slot 2 is refused whatever the skill.
+        assert_eq!(
+            MhnxEditor::charm_allowed(Some(TalismanGrade::Mystery), 1, 5, true),
+            Some(AllowedPoints { min: 0, max: 0 })
+        );
+        // A weapon (no grade to bound against) keeps the wide open field.
+        assert_eq!(MhnxEditor::charm_allowed(None, 10, 5, false), None);
+        // No skill picked: nothing to bound either.
+        assert_eq!(
+            MhnxEditor::charm_allowed(Some(TalismanGrade::Enduring), 10, 0, false),
+            None
+        );
+    }
+
+    #[test]
+    fn the_desktop_talisman_tab_reports_the_per_skill_and_slot_two_rules() {
+        use mhnx_core::charm::TalismanGrade;
+        let dir = Scratch::new("charmrules");
+        let mut app = MhnxEditor::default();
+        write_charm_rules_save(&mut app, dir.path());
+
+        // Slot 0: the per-skill row, not the kind ceiling, is what the tab
+        // prints under the form.
+        app.charm_index = 0;
+        let lines = app.charm_warning_lines(0, TalismanGrade::Enduring);
+        assert!(
+            lines.iter().any(|l| l.contains("スキル1") && l.contains("3〜7")),
+            "the tab would print {:?}",
+            lines
+        );
+
+        // Slot 1: a 兵士 cannot hold a second skill, and the tab says so in
+        // those words rather than "outside the range".
+        app.charm_index = 1;
+        let lines = app.charm_warning_lines(1, TalismanGrade::Mystery);
+        assert!(
+            lines.iter().any(|l| l.contains("スキル2") && l.contains("第2スキルを持てません")),
+            "the tab would print {:?}",
+            lines
+        );
+    }
     /// The two refusals the guard makes, with the process table handed in so
     /// neither needs an emulator (or its absence) on the test machine.
     #[test]

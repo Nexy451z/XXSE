@@ -2914,50 +2914,54 @@ fn charm_warnings(
         if skill == 0 {
             continue;
         }
-        let cap = limits.and_then(|l| l.max_points(second));
-        let mut flagged = false;
-        match charm::allowed_points_rarity(grade.rarity(), skill, second) {
-            Some(r) if r.min == 0 && r.max == 0 => {
-                push_unique(&mut out, format!("{} は{}では付けられません", label, who));
-                flagged = true;
-            }
-            Some(r) => {
-                let high = match cap {
-                    Some(c) => r.max.min(c),
-                    None => r.max,
-                };
-                if pts < r.min || pts > high {
-                    push_unique(
-                        &mut out,
-                        format!("{} {} は {}〜{} の範囲外です", label, pts, r.min, high),
-                    );
-                    flagged = true;
-                }
-            }
-            None => {}
-        }
-        if flagged {
-            continue;
-        }
-        match cap {
-            Some(c) if pts > c => push_unique(
-                &mut out,
-                format!(
-                    "{} は {:+} ですが、{} の上限は {:+} です",
-                    label,
-                    pts,
-                    who,
-                    c
-                ),
-            ),
-            None => push_unique(
+        // A kind without a second slot says so before any table is consulted:
+        // rarity 97 has no slot-2 rows, so the row is 選択不可 and a value on it
+        // is a record the game would not write.
+        if second && !charm::second_skill_available(kind) {
+            push_unique(
                 &mut out,
                 format!(
                     "{} は{}に設定できません（この種類は第2スキルを持てません）",
                     label, who
                 ),
-            ),
-            _ => {}
+            );
+            continue;
+        }
+        // One line per value: the per-skill range already has the kind's own
+        // ceiling applied (charm::allowed_points_for_kind), so the two can
+        // never disagree about the same number.
+        let range = match limits {
+            Some(l) => charm::allowed_points_for_kind(l.kind, skill, second),
+            None => charm::allowed_points_rarity(grade.rarity(), skill, second),
+        };
+        match range {
+            Some(r) if r.min == 0 && r.max == 0 => {
+                push_unique(&mut out, format!("{} は{}では付けられません", label, who));
+            }
+            Some(r) => {
+                if pts < r.min || pts > r.max {
+                    push_unique(
+                        &mut out,
+                        format!(
+                            "{} {} は {}〜{} の範囲外です",
+                            label,
+                            pts,
+                            r.min,
+                            r.max
+                        ),
+                    );
+                }
+            }
+            None => {
+                // A skill id past the end of the talisman tables: the game can
+                // never roll it, so it is worth saying even though the value
+                // alone would look harmless. (This build always carries the
+                // gamedata tables - see switch/Cargo.toml.)
+                push_unique(
+                    &mut out,
+                    format!("{} のスキルID {} は護石の表にないため付けられません", label, skill),
+                );
+            }
         }
     }
     out
@@ -5259,11 +5263,11 @@ impl GuiState {
                 format!("{:03}", id),
             ));
         }
-        let hdr = if ed.skill_pick_filter.is_empty() {
-            String::from("スキル選択")
-        } else {
-            format!("スキル選択 (検索: {})", ed.skill_pick_filter)
-        };
+        // The heading names the slot and the kind and says how many ids the
+        // kind offers, so a short list explains itself: the pool is the game's
+        // own point table for that rarity and slot (62 for a 天's first skill,
+        // 0 for any 兵士 second skill), not the 306 entry name table.
+        let hdr = ed.skill_pick_heading();
         self.draw_adaptive_rows(
             c,
             ed,
