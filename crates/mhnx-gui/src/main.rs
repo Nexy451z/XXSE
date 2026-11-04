@@ -128,6 +128,11 @@ fn main() -> eframe::Result<()> {
             apply_theme(&cc.egui_ctx);
             let font = install_japanese_font(&cc.egui_ctx);
             let mut app = app::MhnxEditor::default();
+            // The language before the first frame: the 設定 window reads it,
+            // the item tab draws in it, and the game's tables are chosen by it.
+            // MHNXEDITOR_LANG overrides the stored choice for one run, which is
+            // what the screenshot harness uses.
+            app.lang = app::MhnxEditor::initial_language();
             match font {
                 Some(p) => app.status = format!("日本語フォント: {}", p),
                 None => app.status = "日本語フォントが見つかりません (英数字のみ表示されます)".to_owned(),

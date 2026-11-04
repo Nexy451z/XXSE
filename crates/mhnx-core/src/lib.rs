@@ -87,6 +87,8 @@ pub mod verify;
 /// Snapshot naming and rotation rules, shared by every build.
 pub mod snapshot;
 pub mod skills;
+/// The interface's own wording, keyed by language.
+pub mod strings;
 
 #[cfg(feature = "gamedata")]
 pub mod gamedata;

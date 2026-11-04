@@ -24,6 +24,7 @@ use mhnx_core::romfstables::{self, RequestRecord};
 use mhnx_core::safety;
 use mhnx_core::save::{Character, Save, SaveKind};
 use mhnx_core::snapshot;
+use mhnx_core::strings::{self, Lang};
 use mhnx_core::verify;
 
 /// Which of the two boxes a CSV file belongs to.
@@ -905,6 +906,13 @@ pub struct MhnxEditor {
     pub undo_steps: usize,
     /// Is the 設定 window open?
     pub show_settings: bool,
+    /// The language the interface draws in.
+    ///
+    /// The wording comes from mhnx_core::strings, keyed by tab; only the item
+    /// tab reads it so far, and every key it does not read stays Japanese. The
+    /// choice is written to the settings file (see [MhnxEditor::set_language])
+    /// and read back by [MhnxEditor::initial_language] before the first frame.
+    pub lang: Lang,
 
     // ---- guild card: the cards received from other hunters ----
     /// Which of the two lists (kept cards / courier inbox) is on screen.
@@ -1089,6 +1097,7 @@ impl Default for MhnxEditor {
             redo: Vec::new(),
             undo_steps: Self::DEFAULT_UNDO_STEPS,
             show_settings: false,
+            lang: Lang::DEFAULT,
             card_list: mhnx_core::guildcard::CardList::Stored,
             card_selected: None,
             scroll_to_cards: 0,
@@ -3596,7 +3605,10 @@ impl MhnxEditor {
             ui.horizontal_wrapped(|ui| {
                 for (tab, label) in [
                     (Tab::Save, "キャラ"),
-                    (Tab::Items, "アイテム"),
+                    // The first tab whose title comes from the catalogue: the
+                    // rest of the bar still spells its labels inline, which is
+                    // the next stretch of work, one tab at a time.
+                    (Tab::Items, strings::text(self.lang, "tab.items")),
                     (Tab::Quest, "クエスト"),
                     (Tab::Dlc, "DLC"),
                     (Tab::Charm, "お守り"),
@@ -3908,13 +3920,20 @@ impl MhnxEditor {
     ///
     /// Every option prints the memory the two stacks would take at that depth,
     /// so the choice is made with the number in view rather than after the
-    /// fact. The setting lives in this run; nothing is written to disk.
+    /// fact. The depth lives in this run and is not written to disk; the
+    /// language below it is the one preference that is, because it is the one a
+    /// user should not have to pick again every time.
     fn settings_window(&mut self, ctx: &egui::Context) {
         if !self.show_settings {
             return;
         }
         let mut open = self.show_settings;
         let mut pick: Option<usize> = None;
+        // The language the window is drawn in, and the one a click picked. The
+        // change is applied after the window closes: re-labelling the window
+        // halfway through drawing it would be one frame of both.
+        let lang = self.lang;
+        let mut language: Option<Lang> = None;
         egui::Window::new("設定")
             .open(&mut open)
             .resizable(false)
@@ -3958,11 +3977,142 @@ impl MhnxEditor {
                     .weak()
                     .small(),
                 );
+                ui.separator();
+                // The language is the one preference that changes the wording
+                // of everything else, so it sits apart from the history depth.
+                // Only the item tab is keyed so far; the hint says so rather
+                // than let a user think the switch did nothing.
+                ui.label(egui::RichText::new(strings::text(lang, "settings.language")).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for choice in mhnx_core::strings::LANGS {
+                        // A language is named in itself: an English reader has
+                        // to find "English" without reading Japanese.
+                        if ui
+                            .selectable_label(lang == *choice, choice.label())
+                            .clicked()
+                        {
+                            language = Some(*choice);
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(strings::text(lang, "settings.language_hint"))
+                        .weak()
+                        .small(),
+                );
             });
         self.show_settings = open;
         if let Some(steps) = pick {
             self.set_undo_steps(steps);
         }
+        if let Some(language) = language {
+            self.set_language(language);
+        }
+    }
+
+    // ------------------------------------------- language (the wording)
+
+    /// The file the language choice is remembered in.
+    ///
+    /// Not the game folder and not ~/.dsh: this is the editor's own preference,
+    /// one line, next to the other per-user settings a Windows program keeps in
+    /// APPDATA. The MHNXEDITOR_CONFIG_DIR variable moves it, which is what the
+    /// tests and the screenshot harness use so they never write into the user's
+    /// own files.
+    pub fn settings_path() -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("MHNXEDITOR_CONFIG_DIR") {
+            return Some(PathBuf::from(dir).join("settings.txt"));
+        }
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+        Some(base.join("XXSE").join("settings.txt"))
+    }
+
+    /// The language named in a settings file, or None when it names none this
+    /// build speaks.
+    ///
+    /// The format is one key=value per line and a leading # starts a comment,
+    /// so the file can be edited by hand. Anything unrecognised is skipped
+    /// rather than refused: a settings file from a newer build must not stop
+    /// the editor from opening, and a wrong language is not a reason to lose an
+    /// edit.
+    fn language_from_settings(text: &str) -> Option<Lang> {
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == "language" {
+                return Lang::from_code(value);
+            }
+        }
+        None
+    }
+
+    /// What the settings file holds: the value the reader above parses.
+    fn settings_file_text(lang: Lang) -> String {
+        format!(
+            "# XXSE (Monster Hunter XX save editor) settings.\n\
+             # language: ja or en. An unknown value opens the editor in Japanese.\n\
+             language={}\n",
+            lang.code()
+        )
+    }
+
+    /// Read the language out of a settings file, if it can be read.
+    fn load_language_file(path: &std::path::Path) -> Option<Lang> {
+        let text = std::fs::read_to_string(path).ok()?;
+        Self::language_from_settings(&text)
+    }
+
+    /// Write the language into a settings file, making its folder first.
+    fn save_language_file(path: &std::path::Path, lang: Lang) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(path, Self::settings_file_text(lang))
+    }
+
+    /// The language the editor opens in.
+    ///
+    /// The MHNXEDITOR_LANG variable wins when it is set and understood, so one
+    /// screenshot or one test can ask for English without touching the stored
+    /// choice. Then the settings file, then Japanese: the interface the tool
+    /// has always had is what a first run and a broken settings file both get.
+    pub fn initial_language() -> Lang {
+        if let Ok(raw) = std::env::var("MHNXEDITOR_LANG") {
+            if let Some(lang) = Lang::from_code(&raw) {
+                return lang;
+            }
+        }
+        Self::settings_path()
+            .and_then(|path| Self::load_language_file(&path))
+            .unwrap_or(Lang::DEFAULT)
+    }
+
+    /// Switch the interface language and remember the choice.
+    ///
+    /// A language that cannot be written is not an error the user has to deal
+    /// with: the switch still happens for this run, and the message says that
+    /// it will not be remembered rather than pretending it was saved.
+    pub fn set_language(&mut self, lang: Lang) {
+        if self.lang == lang {
+            return;
+        }
+        self.lang = lang;
+        let label = lang.label();
+        self.message = match Self::settings_path() {
+            Some(path) => match Self::save_language_file(&path, lang) {
+                Ok(()) => strings::textf(lang, "settings.language_saved", &[&label]),
+                Err(e) => strings::textf(lang, "settings.language_failed", &[&label, &e]),
+            },
+            None => strings::textf(lang, "settings.language_memory", &[&label]),
+        };
     }
 
     /// The timestamp part of a snapshot name (`system-20261104-012812.sav`).
@@ -4809,19 +4959,25 @@ impl MhnxEditor {
         }
     }
     fn tab_items(&mut self, ui: &mut egui::Ui) {
+        // Read once per frame: the closures below edit the editor's own
+        // fields, and a copied language cannot borrow against that.
+        let lang = self.lang;
         if self.items.is_empty() {
-            ui.centered_and_justified(|ui| ui.label("セーブを開くとアイテムボックスを表示します"));
+            ui.centered_and_justified(|ui| ui.label(strings::text(lang, "items.empty")));
             return;
         }
         // Wrapped, because the row is wider than the content area at the
         // default window size and the last buttons fell off the right edge.
         ui.horizontal_wrapped(|ui| {
-            ui.label("絞り込み");
+            ui.label(strings::text(lang, "items.filter"));
             Self::filter_edit(ui, &mut self.item_filter, 160.0, "", &mut self.focus_filter);
-            ui.checkbox(&mut self.item_show_empty, "空きスロットも表示");
+            ui.checkbox(&mut self.item_show_empty, strings::text(lang, "items.show_empty"));
             if ui
-                .add_enabled(!self.item_undo.is_empty(), egui::Button::new("元に戻す"))
-                .on_hover_text("直前のアイテム変更を取り消します")
+                .add_enabled(
+                    !self.item_undo.is_empty(),
+                    egui::Button::new(strings::text(lang, "items.undo")),
+                )
+                .on_hover_text(strings::text(lang, "items.undo_hint"))
                 .clicked()
             {
                 self.undo_item();
@@ -4836,8 +4992,8 @@ impl MhnxEditor {
             // triangle glyphs some fonts lack are not needed for that.
             let open = self.item_bulk_open;
             if ui
-                .add(egui::Button::new("まとめて追加").selected(open))
-                .on_hover_text("アイテム名と個数を決めて、空き枠へまとめて入れます")
+                .add(egui::Button::new(strings::text(lang, "items.bulk")).selected(open))
+                .on_hover_text(strings::text(lang, "items.bulk_hint"))
                 .clicked()
             {
                 self.item_bulk_open = !self.item_bulk_open;
@@ -4845,27 +5001,30 @@ impl MhnxEditor {
             // These three are not destructive on their own - each one asks
             // first - so they read as normal buttons. Colouring a row of them
             // red made every bulk action look like a delete.
-            if ui.button("全部99に")
-                .on_hover_text("使っている枠の個数をすべて 99 にします（確認あり）")
+            if ui
+                .button(strings::text(lang, "items.fill_all"))
+                .on_hover_text(strings::text(lang, "items.fill_all_hint"))
                 .clicked()
             {
                 self.ask_fill_all();
             }
-            if ui.button("重複を整理")
-                .on_hover_text("同じアイテムの 2 枠目以降を 1 枠にまとめます。99 を超える分は失います（確認あり）")
+            if ui
+                .button(strings::text(lang, "items.dedupe"))
+                .on_hover_text(strings::text(lang, "items.dedupe_hint"))
                 .clicked()
             {
                 self.ask_dedupe();
             }
             if ui
-                .button("空きを詰める")
-                .on_hover_text("空き枠を消して前へ詰めます。並び順が変わります（確認あり）")
+                .button(strings::text(lang, "items.compact"))
+                .on_hover_text(strings::text(lang, "items.compact_hint"))
                 .clicked()
             {
                 self.ask_compact();
             }
-            if ui.button("上限超えを丸める")
-                .on_hover_text("99 を超えた個数を 99 に戻します（確認あり）")
+            if ui
+                .button(strings::text(lang, "items.clamp"))
+                .on_hover_text(strings::text(lang, "items.clamp_hint"))
                 .clicked()
             {
                 self.ask_clamp();
@@ -4875,8 +5034,8 @@ impl MhnxEditor {
             // scroll to the end".
             let can_add = !self.items.is_empty() && self.items.iter().any(|s| s.id == 0);
             if ui
-                .add_enabled(can_add, egui::Button::new("アイテムを追加"))
-                .on_hover_text("空きスロットに回復薬を入れ、選択状態にします")
+                .add_enabled(can_add, egui::Button::new(strings::text(lang, "items.add")))
+                .on_hover_text(strings::text(lang, "items.add_hint"))
                 .clicked()
             {
                 self.add_item_to_box(9);
@@ -4886,39 +5045,41 @@ impl MhnxEditor {
         // through the same rfd file dialogs the rest of the window uses, so
         // there is no new dependency and no second way to pick a file.
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("CSV").strong()).on_hover_text(
-                "アイテムボックスを表として持ち出し、その表から書き戻せます（ID と個数だけの 3 列）",
-            );
+            ui.label(egui::RichText::new(strings::text(lang, "items.csv")).strong())
+                .on_hover_text(strings::text(lang, "items.csv_hint"));
             if ui
-                .button("CSV 書き出し")
-                .on_hover_text("このキャラのアイテムボックス 2300 枠を CSV にします（空き枠も 1 行ずつ）")
+                .button(strings::text(lang, "items.csv_export"))
+                .on_hover_text(strings::text(lang, "items.csv_export_hint"))
                 .clicked()
             {
                 let name = self.csv_suggested_name(CsvKind::Items);
                 if let Some(p) = rfd::FileDialog::new()
                     .set_file_name(name)
                     .add_filter("CSV", &["csv"])
-                    .set_title("アイテムボックスの CSV 書き出し")
+                    .set_title(strings::text(lang, "items.csv_export_title"))
                     .save_file()
                 {
                     self.csv_write(CsvKind::Items, &p);
                 }
             }
             if ui
-                .button("CSV 読み込み")
-                .on_hover_text("CSV の内容をこのキャラのボックスに書き戻します（内容を確認してから適用・確認あり）")
+                .button(strings::text(lang, "items.csv_import"))
+                .on_hover_text(strings::text(lang, "items.csv_import_hint"))
                 .clicked()
             {
                 if let Some(p) = rfd::FileDialog::new()
                     .add_filter("CSV", &["csv"])
-                    .set_title("アイテムボックスの CSV 読み込み")
+                    .set_title(strings::text(lang, "items.csv_import_title"))
                     .pick_file()
                 {
                     self.csv_stage(CsvKind::Items, p);
                 }
             }
+            // This line has no English text on purpose: it is the visible
+            // proof that an untranslated key falls back to Japanese, and the
+            // item tab's test reads it out of an English frame.
             ui.label(
-                egui::RichText::new("UTF-8 の CSV を読みます。適用の前に、何行が入るかを確認できます")
+                egui::RichText::new(strings::text(lang, "items.csv_note"))
                     .weak()
                     .small(),
             );
@@ -4948,7 +5109,7 @@ impl MhnxEditor {
             })
             .collect();
 
-        ui.label(format!("{} 件", rows.len()));
+        ui.label(strings::textf(lang, "items.count", &[&rows.len()]));
         let mut selected = self.item_selected;
         // Scroll once to a row that was just added: the new row sits at the
         // end of two thousand, so without this nothing appears to happen.
@@ -4971,16 +5132,16 @@ impl MhnxEditor {
         table
             .header(22.0, |mut h| {
                 h.col(|ui| {
-                    ui.strong("箱 #");
+                    ui.strong(strings::text(lang, "items.col_box"));
                 });
                 h.col(|ui| {
-                    ui.strong("ID");
+                    ui.strong(strings::text(lang, "items.col_id"));
                 });
                 h.col(|ui| {
-                    ui.strong("名前");
+                    ui.strong(strings::text(lang, "items.col_name"));
                 });
                 h.col(|ui| {
-                    ui.strong("個数");
+                    ui.strong(strings::text(lang, "items.col_count"));
                 });
             })
             .body(|body| {
@@ -5026,7 +5187,7 @@ impl MhnxEditor {
     /// Remember the box before a change so it can be undone.
     fn push_item_undo(&mut self) {
         // One whole-save step as well, so Ctrl+Z works here too.
-        self.push_undo("アイテムボックス");
+        self.push_undo(strings::text(self.lang, "items.undo_label"));
         self.item_undo.push(self.items.clone());
         if self.item_undo.len() > 32 {
             self.item_undo.remove(0);
@@ -5038,9 +5199,9 @@ impl MhnxEditor {
         if let Some(prev) = self.item_undo.pop() {
             self.items = prev;
             self.apply_to_save();
-            self.message = String::from("アイテムボックスを元に戻しました");
+            self.message = String::from(strings::text(self.lang, "items.undo_done"));
         } else {
-            self.message = String::from("戻せる変更がありません");
+            self.message = String::from(strings::text(self.lang, "items.undo_none"));
         }
     }
 
@@ -5050,14 +5211,15 @@ impl MhnxEditor {
     /// to the end of 2242 rows and typing an id: the box is append only in
     /// spirit, so the tool should do that for the user.
     pub fn add_item_to_box(&mut self, id: u16) {
+        let lang = self.lang;
         if self.items.is_empty() {
-            self.message = "先にセーブを開いてください".to_owned();
+            self.message = String::from(strings::text(lang, "items.no_open"));
             return;
         }
         let slot = match self.items.iter().position(|s| s.id == 0) {
             Some(i) => i,
             None => {
-                self.message = "アイテムボックスに空きがありません".to_owned();
+                self.message = String::from(strings::text(lang, "items.box_full"));
                 return;
             }
         };
@@ -5069,15 +5231,17 @@ impl MhnxEditor {
         // list jump nowhere and has no idea the item was added.
         self.scroll_to_item = Some(slot);
         self.apply_to_save();
-        self.message = format!("{} を箱 {} に追加しました", item_name(id), slot + 1);
+        let name = item_name(id);
+        self.message = strings::textf(lang, "items.added", &[&name, &(slot + 1)]);
     }
 
     // ------------------------------------------------------- bulk operations
 
     /// Ask before setting every used record to the cap.
     pub fn ask_fill_all(&mut self) {
+        let lang = self.lang;
         if self.items.is_empty() {
-            self.message = "先にセーブを開いてください".to_owned();
+            self.message = String::from(strings::text(lang, "items.no_open"));
             return;
         }
         let changed = self
@@ -5086,7 +5250,7 @@ impl MhnxEditor {
             .filter(|s| !s.is_blank() && s.count != MAX_COUNT as u8)
             .count();
         if changed == 0 {
-            self.message = "すべての枠が 99 個です（変わりません）".to_owned();
+            self.message = String::from(strings::text(lang, "items.fill_all_none"));
             return;
         }
         self.confirm = Confirm::ItemFillAll { changed };
@@ -5094,13 +5258,14 @@ impl MhnxEditor {
 
     /// Ask before merging stacks, saying what the merge would cost.
     pub fn ask_dedupe(&mut self) {
+        let lang = self.lang;
         if self.items.is_empty() {
-            self.message = "先にセーブを開いてください".to_owned();
+            self.message = String::from(strings::text(lang, "items.no_open"));
             return;
         }
         let preview = itembox::dedupe_preview(&self.items);
         if preview.freed == 0 {
-            self.message = "重複した枠はありません（変わりません）".to_owned();
+            self.message = String::from(strings::text(lang, "items.dedupe_none"));
             return;
         }
         self.confirm = Confirm::ItemDedupe {
@@ -5111,8 +5276,9 @@ impl MhnxEditor {
 
     /// Ask before moving the used records to the front.
     pub fn ask_compact(&mut self) {
+        let lang = self.lang;
         if self.items.is_empty() {
-            self.message = "先にセーブを開いてください".to_owned();
+            self.message = String::from(strings::text(lang, "items.no_open"));
             return;
         }
         // Counted on a copy: compact() is destructive and the number is what
@@ -5120,7 +5286,7 @@ impl MhnxEditor {
         let mut copy = self.items.clone();
         let moved = itembox::compact(&mut copy);
         if moved == 0 {
-            self.message = "空き枠は先頭に詰まっています（変わりません）".to_owned();
+            self.message = String::from(strings::text(lang, "items.compact_none"));
             return;
         }
         self.confirm = Confirm::ItemCompact { moved };
@@ -5128,8 +5294,9 @@ impl MhnxEditor {
 
     /// Ask before pulling counts over the cap back down.
     pub fn ask_clamp(&mut self) {
+        let lang = self.lang;
         if self.items.is_empty() {
-            self.message = "先にセーブを開いてください".to_owned();
+            self.message = String::from(strings::text(lang, "items.no_open"));
             return;
         }
         let changed = self
@@ -5138,7 +5305,7 @@ impl MhnxEditor {
             .filter(|s| !s.is_blank() && s.count > MAX_COUNT as u8)
             .count();
         if changed == 0 {
-            self.message = "99 を超えた個数はありません（変わりません）".to_owned();
+            self.message = String::from(strings::text(lang, "items.clamp_none"));
             return;
         }
         self.confirm = Confirm::ItemClamp { changed };
@@ -5160,20 +5327,14 @@ impl MhnxEditor {
     }
 
     /// What the status bar says after an add that did not fully fit.
-    fn bulk_add_message(name: &str, wanted: u16, added: u32) -> String {
+    fn bulk_add_message(name: &str, wanted: u16, added: u32, lang: Lang) -> String {
         let left = (wanted as u32).saturating_sub(added);
         if left == 0 {
-            format!("{} を {} 個追加しました", name, added)
+            strings::textf(lang, "items.added_count", &[&name, &added])
         } else if added == 0 {
-            format!(
-                "{} は入りませんでした（{} 個は入りきりませんでした）",
-                name, left
-            )
+            strings::textf(lang, "items.added_none", &[&name, &left])
         } else {
-            format!(
-                "{} を {} 個追加しました（{} 個は入りきりませんでした）",
-                name, added, left
-            )
+            strings::textf(lang, "items.added_part", &[&name, &added, &left])
         }
     }
 
@@ -5182,12 +5343,13 @@ impl MhnxEditor {
     /// Returns how many actually landed. A request that fits nowhere leaves
     /// the box, the undo list and the dirty flag alone.
     pub fn add_items_bulk(&mut self, id: u16, count: u16) -> u32 {
+        let lang = self.lang;
         if self.items.is_empty() {
-            self.message = "先にセーブを開いてください".to_owned();
+            self.message = String::from(strings::text(lang, "items.no_open"));
             return 0;
         }
         if id == 0 || count == 0 {
-            self.message = "アイテムと個数を指定してください".to_owned();
+            self.message = String::from(strings::text(lang, "items.count_required"));
             return 0;
         }
         // A trial run on a copy: an add that fits nothing must not leave an
@@ -5196,7 +5358,7 @@ impl MhnxEditor {
         let mut trial = self.items.clone();
         let added = itembox::add(&mut trial, id, count);
         if added == 0 {
-            self.message = Self::bulk_add_message(&item_name(id), count, 0);
+            self.message = Self::bulk_add_message(&item_name(id), count, 0, lang);
             return 0;
         }
         self.push_item_undo();
@@ -5207,7 +5369,7 @@ impl MhnxEditor {
             self.scroll_to_item = Some(slot);
         }
         self.apply_to_save();
-        self.message = Self::bulk_add_message(&item_name(id), count, added);
+        self.message = Self::bulk_add_message(&item_name(id), count, added, lang);
         added
     }
 
@@ -5219,7 +5381,7 @@ impl MhnxEditor {
         self.push_item_undo();
         let changed = itembox::fill_all(&mut self.items, MAX_COUNT);
         self.apply_to_save();
-        self.message = format!("{} 枠を 99 個にしました（元に戻せます）", changed);
+        self.message = strings::textf(self.lang, "items.fill_all_done", &[&changed]);
         changed
     }
 
@@ -5233,15 +5395,9 @@ impl MhnxEditor {
         let freed = itembox::dedupe(&mut self.items);
         self.apply_to_save();
         self.message = if preview.lost == 0 {
-            format!(
-                "{} 枠を解放しました（失ったアイテムはありません）／元に戻せます",
-                freed
-            )
+            strings::textf(self.lang, "items.dedupe_done", &[&freed])
         } else {
-            format!(
-                "{} 枠を解放し、{} 個を失いました／元に戻せます",
-                freed, preview.lost
-            )
+            strings::textf(self.lang, "items.dedupe_done_lost", &[&freed, &preview.lost])
         };
         DedupePreview {
             freed,
@@ -5258,7 +5414,7 @@ impl MhnxEditor {
         let moved = itembox::compact(&mut self.items);
         self.item_selected = None;
         self.apply_to_save();
-        self.message = format!("{} 枠を前に詰めました（元に戻せます）", moved);
+        self.message = strings::textf(self.lang, "items.compact_done", &[&moved]);
         moved
     }
 
@@ -5270,54 +5426,58 @@ impl MhnxEditor {
         self.push_item_undo();
         let changed = itembox::clamp_counts(&mut self.items, MAX_COUNT);
         self.apply_to_save();
-        self.message = format!("{} 枠の個数を 99 に丸めました（元に戻せます）", changed);
+        self.message = strings::textf(self.lang, "items.clamp_done", &[&changed]);
         changed
     }
 
     /// One row plus a picker, shown under the bulk buttons.
     fn item_bulk_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         ui.group(|ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("まとめて追加").strong());
+                ui.label(egui::RichText::new(strings::text(lang, "items.bulk")).strong());
                 ui.add(
                     egui::TextEdit::singleline(&mut self.item_bulk_filter)
-                        .hint_text("アイテム名で検索")
+                        .hint_text(strings::text(lang, "items.bulk_search_hint"))
                         .desired_width(200.0),
                 );
-                ui.label("ID");
+                ui.label(strings::text(lang, "items.col_id"));
                 ui.add(
                     egui::DragValue::new(&mut self.item_bulk_id)
                         .range(0..=(LAST_ITEM_ID as i32))
                         .prefix("#"),
                 );
-                ui.label("個数");
+                ui.label(strings::text(lang, "items.col_count"));
                 ui.add(
                     egui::DragValue::new(&mut self.item_bulk_count)
                         .speed(1.0)
                         .range(1..=MAX_COUNT),
                 );
                 let picked = if self.item_bulk_id == 0 {
-                    String::from("未選択")
+                    String::from(strings::text(lang, "items.bulk_none"))
                 } else {
                     item_name(self.item_bulk_id)
                 };
                 ui.label(picked);
                 if ui
-                    .add_enabled(self.item_bulk_id != 0, egui::Button::new("追加する"))
-                    .on_hover_text("入りきらなかった数はメッセージに出ます")
+                    .add_enabled(
+                        self.item_bulk_id != 0,
+                        egui::Button::new(strings::text(lang, "items.bulk_add")),
+                    )
+                    .on_hover_text(strings::text(lang, "items.bulk_add_hint"))
                     .clicked()
                 {
                     let (id, count) = (self.item_bulk_id, self.item_bulk_count);
                     self.add_items_bulk(id, count);
                 }
-                if ui.small_button("閉じる").clicked() {
+                if ui.small_button(strings::text(lang, "items.bulk_close")).clicked() {
                     self.item_bulk_open = false;
                 }
             });
             let needle = self.item_bulk_filter.trim().to_lowercase();
             if needle.is_empty() {
                 ui.label(
-                    egui::RichText::new("名前で絞り込むか、ID を直接入力してください")
+                    egui::RichText::new(strings::text(lang, "items.bulk_guide"))
                         .weak()
                         .small(),
                 );
@@ -5336,7 +5496,7 @@ impl MhnxEditor {
                 }
             }
             if hits.is_empty() {
-                ui.label(egui::RichText::new("一致するアイテムがありません").weak());
+                ui.label(egui::RichText::new(strings::text(lang, "items.no_match")).weak());
                 return;
             }
             egui::ScrollArea::vertical()
@@ -5360,8 +5520,11 @@ impl MhnxEditor {
         });
     }
     fn item_detail_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         let Some(i) = self.item_selected else {
-            ui.label(egui::RichText::new("行をクリックすると、ここで種類と個数を変更できます").weak());
+            ui.label(
+                egui::RichText::new(strings::text(lang, "items.detail_guide")).weak(),
+            );
             return;
         };
         if i >= self.items.len() {
@@ -5371,10 +5534,14 @@ impl MhnxEditor {
         // the save. Forgetting it made the edits look like they did nothing.
         let mut touched = false;
         ui.horizontal(|ui| {
-            ui.label(format!("選択中: 箱 #{} ", i + 1));
+            ui.label(strings::textf(lang, "items.detail_selected", &[&(i + 1)]));
             let mut id = self.items[i].id;
             if ui
-                .add(egui::DragValue::new(&mut id).range(0..=(LAST_ITEM_ID as i32)).prefix("ID "))
+                .add(
+                    egui::DragValue::new(&mut id)
+                        .range(0..=(LAST_ITEM_ID as i32))
+                        .prefix(strings::text(lang, "items.detail_id")),
+                )
                 .changed()
             {
                 self.items[i].id = id;
@@ -5382,13 +5549,17 @@ impl MhnxEditor {
             }
             let mut c = self.items[i].count;
             if ui
-                .add(egui::DragValue::new(&mut c).range(0..=99).prefix("個数 "))
+                .add(
+                    egui::DragValue::new(&mut c)
+                        .range(0..=99)
+                        .prefix(strings::text(lang, "items.detail_count")),
+                )
                 .changed()
             {
                 self.items[i].count = c;
                 touched = true;
             }
-            if Self::danger_button(ui, "空にする").clicked() {
+            if Self::danger_button(ui, strings::text(lang, "items.detail_clear")).clicked() {
                 self.push_item_undo();
                 self.items[i] = ItemSlot::default();
                 touched = true;
@@ -5397,17 +5568,23 @@ impl MhnxEditor {
 
         // Pick a different item by name instead of typing a number.
         ui.horizontal(|ui| {
-            ui.label("種類を変更");
+            ui.label(strings::text(lang, "items.detail_pick"));
             ui.add(
                 egui::TextEdit::singleline(&mut self.item_pick_filter)
-                    .hint_text("アイテム名で検索")
+                    .hint_text(strings::text(lang, "items.bulk_search_hint"))
                     .desired_width(200.0),
             );
-            if ui.small_button("クリア").clicked() {
+            if ui
+                .small_button(strings::text(lang, "items.detail_clear_filter"))
+                .clicked()
+            {
                 self.item_pick_filter.clear();
             }
-            ui.checkbox(&mut self.item_pick_keep_filter, "選んだあとも絞り込みを残す")
-                .on_hover_text("同じ名前のアイテムを続けて複数の枠へ入れやすくなります");
+            ui.checkbox(
+                &mut self.item_pick_keep_filter,
+                strings::text(lang, "items.detail_keep_filter"),
+            )
+            .on_hover_text(strings::text(lang, "items.detail_keep_filter_hint"));
         });
         let needle = self.item_pick_filter.trim().to_lowercase();
         if needle.is_empty() {
@@ -5431,7 +5608,7 @@ impl MhnxEditor {
             }
         }
         if hits.is_empty() {
-            ui.label(egui::RichText::new("一致するアイテムがありません").weak());
+            ui.label(egui::RichText::new(strings::text(lang, "items.no_match")).weak());
             if touched {
                 self.apply_to_save();
             }
@@ -5463,7 +5640,8 @@ impl MhnxEditor {
             });
         if touched {
             self.apply_to_save();
-            self.message = format!("箱 #{} を {} に変更しました", i + 1, item_name(self.items[i].id));
+            let changed = item_name(self.items[i].id);
+            self.message = strings::textf(lang, "items.detail_changed", &[&(i + 1), &changed]);
         }
     }
 
@@ -12216,6 +12394,14 @@ impl MhnxEditor {
 
 // ----------------------------------------------------- progress (進行状況)
 
+/// The language tags a table file of the game carries, at the end of its stem.
+///
+/// All eight are listed, not just the two the interface speaks: the ones this
+/// build cannot display are grouped with the table they belong to and counted,
+/// which is how the データベース tab can say "他言語 N" instead of listing the
+/// same table eight times.
+const TABLE_TAGS: &[&str] = &["jpn", "eng", "fra", "ger", "ita", "spa", "chn", "krn"];
+
 impl MhnxEditor {
     /// Resolve the launch-time hooks that main.rs does not know about.
     ///
@@ -12297,6 +12483,11 @@ impl MhnxEditor {
         if std::env::var("MHNXEDITOR_DATABASE").is_ok() {
             self.load_database();
         }
+        // The 設定 window, for the same reason: the language chooser lives in
+        // it, and no other hook can open it.
+        if std::env::var("MHNXEDITOR_SETTINGS").is_ok() {
+            self.show_settings = true;
+        }
     }
 
     /// Find the game tables under the folder the user named.
@@ -12308,7 +12499,11 @@ impl MhnxEditor {
     /// The two title tables ride along: the ギルド tab names a title with them,
     /// and a second romfs field just for that would be one more thing to get
     /// wrong.
-    fn find_romfs_tables(root: &std::path::Path) -> Option<RomfsTables> {
+    ///
+    /// A dump carries one copy of each table per language; the one matching
+    /// the interface language is the one read, so an English interface shows
+    /// the English names rather than the Japanese ones.
+    fn find_romfs_tables(root: &std::path::Path, lang: Lang) -> Option<RomfsTables> {
         // A file that was picked instead of a folder still names the folder its
         // neighbours live in.
         let root: PathBuf = if root.is_file() {
@@ -12360,35 +12555,65 @@ impl MhnxEditor {
                 best_score = score;
                 best = Some(RomfsTables {
                     dir: dir.clone(),
-                    award: Self::prefer_japanese(awards),
-                    names: Self::prefer_japanese(names),
-                    atd: Self::prefer_japanese(atd),
-                    title1: Self::prefer_japanese(titles1),
-                    title2: Self::prefer_japanese(titles2),
+                    award: Self::prefer_language(awards, lang),
+                    names: Self::prefer_language(names, lang),
+                    atd: Self::prefer_language(atd, lang),
+                    title1: Self::prefer_language(titles1, lang),
+                    title2: Self::prefer_language(titles2, lang),
                 });
             }
         }
         best
     }
 
-    /// The Japanese table when a folder holds several languages, else the first.
+    /// A table file's name without its language tag, and the tag it carried.
     ///
-    /// The interface is Japanese, and so is the dump every offset in this tool
-    /// was checked against: a folder holding GC_Medal_jpn.gmd next to
-    /// GC_Medal_eng.gmd must not show the English names.
-    fn prefer_japanese(mut files: Vec<PathBuf>) -> Option<PathBuf> {
+    /// A dump puts the language at the end of the stem (GC_Medal_jpn.gmd,
+    /// GC_Title_1_eng.gmd). All eight tags the game writes are recognised, not
+    /// just the two this build speaks: a French table is still the same table
+    /// as the English one, so it belongs to the same group and is counted as
+    /// another language rather than listed as a table of its own.
+    fn table_language(file: &str) -> (String, Option<&'static str>) {
+        let stem = match file.rfind('.') {
+            Some(at) => &file[..at],
+            None => file,
+        };
+        let lower = stem.to_ascii_lowercase();
+        for tag in TABLE_TAGS {
+            let marker = format!("_{}", tag);
+            if lower.ends_with(&marker) {
+                return (stem[..stem.len() - marker.len()].to_owned(), Some(*tag));
+            }
+        }
+        (stem.to_owned(), None)
+    }
+
+    /// The table of the interface language when a folder holds several, else
+    /// the first by name.
+    ///
+    /// A folder holding GC_Medal_jpn.gmd next to GC_Medal_eng.gmd holds one
+    /// table twice. The one read is the one the interface speaks, and only when
+    /// that language is not there does the first file win, so the choice cannot
+    /// depend on the order the folder was listed in.
+    fn prefer_language(mut files: Vec<PathBuf>, lang: Lang) -> Option<PathBuf> {
         files.sort();
-        let japanese = files
+        let tag = lang.romfs_tag();
+        let wanted = files
             .iter()
-            .find(|p| p.to_string_lossy().to_ascii_lowercase().contains("jpn"))
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|name| Self::table_language(name).1 == Some(tag))
+                    .unwrap_or(false)
+            })
             .cloned();
-        japanese.or_else(|| files.into_iter().next())
+        wanted.or_else(|| files.into_iter().next())
     }
 
 
     /// Read the tables under root, or None when nothing there looks like romfs.
-    fn read_romfs(root: &std::path::Path) -> Option<RomfsLoad> {
-        let tables = Self::find_romfs_tables(root)?;
+    fn read_romfs(root: &std::path::Path, lang: Lang) -> Option<RomfsLoad> {
+        let tables = Self::find_romfs_tables(root, lang)?;
         let award_names = tables
             .award
             .as_ref()
@@ -12477,7 +12702,7 @@ impl MhnxEditor {
             self.message = "romfs のフォルダを指定してください".to_owned();
             return;
         }
-        match Self::read_romfs(std::path::Path::new(&raw)) {
+        match Self::read_romfs(std::path::Path::new(&raw), self.lang) {
             Some(load) => {
                 self.romfs_dir = Some(load.dir);
                 self.romfs_status = load.report.clone();
@@ -12558,31 +12783,13 @@ impl MhnxEditor {
         best.map(|(_, dir)| dir)
     }
 
-    /// The language tag a table file carries, and whether it is Japanese.
-    ///
-    /// A dump holding `GC_Medal_jpn.gmd` next to `GC_Medal_eng.gmd` holds one
-    /// table twice. Listing both would claim twice the coverage the dump has,
-    /// and the interface is Japanese, so the Japanese one is the one kept.
-    fn table_language(file: &str) -> (String, bool) {
-        let stem = match file.rfind('.') {
-            Some(at) => &file[..at],
-            None => file,
-        };
-        let lower = stem.to_ascii_lowercase();
-        for tag in ["jpn", "eng", "fra", "ger", "ita", "spa", "chn", "krn"] {
-            let marker = format!("_{}", tag);
-            if lower.ends_with(&marker) {
-                return (stem[..stem.len() - marker.len()].to_owned(), tag == "jpn");
-            }
-        }
-        (stem.to_owned(), true)
-    }
-
     /// Read every table of a folder, skipping what this build cannot read.
     ///
     /// One file per table: the language variants are grouped first, so the list
-    /// the tab draws cannot show the same table twice.
-    fn read_database(dir: &std::path::Path) -> DatabaseLoad {
+    /// the tab draws cannot show the same table twice. Of a group the one in
+    /// the interface language is read; the rest are counted, so the report says
+    /// how much of the dump this build is not showing.
+    fn read_database(dir: &std::path::Path, lang: Lang) -> DatabaseLoad {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return DatabaseLoad {
                 dir: dir.to_path_buf(),
@@ -12590,8 +12797,9 @@ impl MhnxEditor {
                 report: format!("{} を開けません", dir.display()),
             };
         };
-        // Keyed by the stem with its language tag taken off.
-        let mut groups: std::collections::BTreeMap<String, Vec<(String, PathBuf, bool)>> =
+        // Keyed by the stem with its language tag taken off. The third field is
+        // the tag the file carried, which is what the language choice picks on.
+        let mut groups: std::collections::BTreeMap<String, Vec<(String, PathBuf, Option<&'static str>)>> =
             std::collections::BTreeMap::new();
         let mut unsupported = 0usize;
         for entry in entries.flatten() {
@@ -12608,7 +12816,7 @@ impl MhnxEditor {
                 unsupported += 1;
                 continue;
             }
-            let (base, japanese) = Self::table_language(name);
+            let (base, tag) = Self::table_language(name);
             // The extension is part of the key: a dump holds
             // activityData_jpn.gmd next to activityData.atd, which are two
             // tables with one name and not two languages of one table.
@@ -12617,14 +12825,17 @@ impl MhnxEditor {
             groups
                 .entry(key)
                 .or_default()
-                .push((name.to_owned(), path.clone(), japanese));
+                .push((name.to_owned(), path.clone(), tag));
         }
+        let preferred = lang.romfs_tag();
         let mut chosen: Vec<(String, PathBuf)> = Vec::new();
         let mut other_language = 0usize;
         for (_, mut files) in groups {
-            // Japanese first, then by name, so the choice cannot depend on the
-            // order the folder happened to be read in.
-            files.sort_by(|a, b| (!a.2, &a.0).cmp(&(!b.2, &b.0)));
+            // The interface language first, then by name, so the choice cannot
+            // depend on the order the folder happened to be read in.
+            files.sort_by(|a, b| {
+                (a.2 != Some(preferred), &a.0).cmp(&(b.2 != Some(preferred), &b.0))
+            });
             other_language += files.len().saturating_sub(1);
             let (name, path, _) = files.remove(0);
             chosen.push((name, path));
@@ -12704,7 +12915,7 @@ impl MhnxEditor {
             self.message = self.db_status.clone();
             return;
         };
-        let load = Self::read_database(&dir);
+        let load = Self::read_database(&dir, self.lang);
         self.db_status = load.report.clone();
         self.db_dir = Some(load.dir);
         self.db_tables = load.tables;
@@ -18060,8 +18271,8 @@ mod tests {
         out
     }
 
-    /// The データベース tab reads a folder: one file per table, the Japanese
-    /// table when a dump carries several languages, and a count of what this
+    /// The データベース tab reads a folder: one file per table, the table of the
+    /// interface language when a dump carries several, and a count of what this
     /// build could not read.
     #[test]
     fn the_database_reads_a_folder_and_keeps_one_language() {
@@ -18082,7 +18293,7 @@ mod tests {
             MhnxEditor::database_dir(dir.path()),
             Some(dir.path().to_path_buf())
         );
-        let load = MhnxEditor::read_database(dir.path());
+        let load = MhnxEditor::read_database(dir.path(), Lang::Ja);
         let names: Vec<&str> = load.tables.iter().map(|t| t.file.as_str()).collect();
         assert_eq!(names, ["GC_Medal_jpn.gmd", "MadeUp_jpn.gmd"]);
         // The Japanese medal table is the one kept, with its layout applied:
@@ -18097,20 +18308,35 @@ mod tests {
         assert!(load.report.contains("他言語 1"), "{}", load.report);
         assert!(load.report.contains("未対応 1"), "{}", load.report);
 
-        // The language tag is read off the stem, and a file without one counts
-        // as the only language there is.
+        // The language tag is read off the stem, and a file without one is the
+        // only language there is: None, not "Japanese".
         assert_eq!(
             MhnxEditor::table_language("GC_Medal_jpn.gmd"),
-            (String::from("GC_Medal"), true)
+            (String::from("GC_Medal"), Some("jpn"))
         );
         assert_eq!(
             MhnxEditor::table_language("GC_Medal_eng.gmd"),
-            (String::from("GC_Medal"), false)
+            (String::from("GC_Medal"), Some("eng"))
         );
         assert_eq!(
             MhnxEditor::table_language("activityData.atd"),
-            (String::from("activityData"), true)
+            (String::from("activityData"), None)
         );
+        // A tag this build cannot display is still a tag, so the table groups
+        // with its own translations instead of becoming one of its own.
+        assert_eq!(
+            MhnxEditor::table_language("GC_Title_1_fra.gmd"),
+            (String::from("GC_Title_1"), Some("fra"))
+        );
+        // Every tag the game writes is in the list, including the two the
+        // interface speaks.
+        for lang in mhnx_core::strings::LANGS {
+            assert!(
+                TABLE_TAGS.contains(&lang.romfs_tag()),
+                "{} is not a tag the dump writes",
+                lang.romfs_tag()
+            );
+        }
         // A folder with no table in it is None, not an empty list.
         let empty = Scratch::new("nodatabase");
         assert_eq!(MhnxEditor::database_dir(empty.path()), None);
@@ -18129,7 +18355,7 @@ mod tests {
             return;
         }
         let dir = MhnxEditor::database_dir(&table_dir).expect("the table folder");
-        let load = MhnxEditor::read_database(&dir);
+        let load = MhnxEditor::read_database(&dir, Lang::Ja);
         assert!(load.tables.len() >= 100, "{}", load.report);
         // Ordered by file name, so the list cannot shuffle between reads.
         let names: Vec<&str> = load.tables.iter().map(|t| t.file.as_str()).collect();
@@ -18225,6 +18451,274 @@ mod tests {
         });
         assert!(!output.shapes.is_empty(), "the empty filter drew nothing");
         assert_eq!(app.db_hits.as_ref().map(|(_, hits)| hits.len()), Some(0));
+    }
+
+    // ------------------------------------------------------- the language
+
+    /// Every string that reached the screen in one frame, in drawing order.
+    ///
+    /// egui keeps text as galleys inside the frame's shapes, so the words can
+    /// be read back without a window: this is how a test checks the language of
+    /// a frame instead of trusting that the same code path ran.
+    fn drawn_text(output: &egui::FullOutput) -> String {
+        fn walk(shape: &egui::Shape, out: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push_str(text.galley.text());
+                    out.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = String::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// A window-sized frame input for the drawing tests below.
+    fn frame_input() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        input
+    }
+
+    /// The language is stored in a settings file of the editor's own, one
+    /// language= line, and is read back by the next run. A value this build
+    /// does not speak opens in Japanese rather than not opening at all.
+    #[test]
+    fn the_language_choice_is_written_and_read_back() {
+        let dir = Scratch::new("language");
+        // The folder does not exist yet: saving makes it.
+        let path = dir.path().join("nested").join("settings.txt");
+        assert_eq!(MhnxEditor::load_language_file(&path), None);
+
+        MhnxEditor::save_language_file(&path, Lang::En).expect("write the setting");
+        assert_eq!(MhnxEditor::load_language_file(&path), Some(Lang::En));
+        let text = std::fs::read_to_string(&path).expect("the file");
+        assert!(text.contains("language=en"), "{}", text);
+
+        // The file is meant to be edited by a person, so the reader puts up
+        // with the shapes a person writes.
+        assert_eq!(
+            MhnxEditor::language_from_settings("language=ja\n"),
+            Some(Lang::Ja)
+        );
+        assert_eq!(
+            MhnxEditor::language_from_settings("# language=ja\nlanguage=ENG\n"),
+            Some(Lang::En)
+        );
+        assert_eq!(
+            MhnxEditor::language_from_settings("  language = en  \n"),
+            Some(Lang::En)
+        );
+        assert_eq!(
+            MhnxEditor::language_from_settings("language=fr\n"),
+            None,
+            "a language this build does not speak is not a language"
+        );
+        assert_eq!(MhnxEditor::language_from_settings(""), None);
+        assert_eq!(MhnxEditor::language_from_settings("other=1\n"), None);
+
+        // The reader the editor uses at startup: the environment beats the
+        // file, the file beats the default.
+        std::env::set_var("MHNXEDITOR_CONFIG_DIR", dir.path());
+        let stored = MhnxEditor::settings_path().expect("a settings path");
+        MhnxEditor::save_language_file(&stored, Lang::En).expect("write the stored choice");
+        assert_eq!(MhnxEditor::load_language_file(&stored), Some(Lang::En));
+        std::env::remove_var("MHNXEDITOR_LANG");
+        assert_eq!(MhnxEditor::initial_language(), Lang::En);
+        std::env::set_var("MHNXEDITOR_LANG", "ja");
+        assert_eq!(MhnxEditor::initial_language(), Lang::Ja);
+        // A language this build does not speak in the variable is ignored, so
+        // the stored choice still wins.
+        std::env::set_var("MHNXEDITOR_LANG", "fr");
+        assert_eq!(MhnxEditor::initial_language(), Lang::En);
+        std::env::remove_var("MHNXEDITOR_LANG");
+        std::env::remove_var("MHNXEDITOR_CONFIG_DIR");
+
+        // Switching is saved as it happens and announced in the new language;
+        // asking for the language already in use does nothing at all.
+        let dir = Scratch::new("setlanguage");
+        std::env::set_var("MHNXEDITOR_CONFIG_DIR", dir.path());
+        let mut app = MhnxEditor::default();
+        assert_eq!(app.lang, Lang::Ja);
+        assert!(app.message.is_empty());
+        app.set_language(Lang::En);
+        assert_eq!(app.lang, Lang::En);
+        assert!(app.message.contains("English"), "{}", app.message);
+        assert!(app.message.contains("next run"), "{}", app.message);
+        let stored = std::fs::read_to_string(dir.path().join("settings.txt")).expect("the file");
+        assert!(stored.contains("language=en"), "{}", stored);
+        let before = app.message.clone();
+        app.set_language(Lang::En);
+        assert_eq!(app.lang, Lang::En);
+        assert_eq!(app.message, before, "a no-op switch still said something");
+        app.set_language(Lang::Ja);
+        assert!(app.message.contains("日本語"), "{}", app.message);
+        let stored = std::fs::read_to_string(dir.path().join("settings.txt")).expect("the file");
+        assert!(stored.contains("language=ja"), "{}", stored);
+        std::env::remove_var("MHNXEDITOR_CONFIG_DIR");
+    }
+
+    /// The 設定 window offers both languages, each by its own name, and says
+    /// what the switch does and does not change.
+    #[test]
+    fn the_settings_window_offers_both_languages() {
+        let mut app = MhnxEditor {
+            show_settings: true,
+            ..MhnxEditor::default()
+        };
+        let ctx = egui::Context::default();
+        // A window measures its contents on one pass and draws them on the
+        // next, so the frame that is read is the second one.
+        let _ = ctx.run(frame_input(), |ctx| app.settings_window(ctx));
+        let output = ctx.run(frame_input(), |ctx| app.settings_window(ctx));
+        let text = drawn_text(&output);
+        for lang in mhnx_core::strings::LANGS {
+            assert!(
+                text.contains(lang.label()),
+                "{} is not offered: {}",
+                lang.label(),
+                text
+            );
+        }
+        assert!(
+            text.contains(strings::text(Lang::Ja, "settings.language")),
+            "the row has no label: {}",
+            text
+        );
+        assert!(
+            text.contains(strings::text(Lang::Ja, "settings.language_hint")),
+            "the hint is missing: {}",
+            text
+        );
+
+        // In English the same window is labelled in English.
+        app.lang = Lang::En;
+        let _ = ctx.run(frame_input(), |ctx| app.settings_window(ctx));
+        let output = ctx.run(frame_input(), |ctx| app.settings_window(ctx));
+        let text = drawn_text(&output);
+        assert!(text.contains("Language"), "{}", text);
+        assert!(
+            text.contains(strings::text(Lang::En, "settings.language_hint")),
+            "{}",
+            text
+        );
+    }
+
+    /// The item tab says what the language says, and one line with no English
+    /// text falls back to Japanese in the same frame: a half translated tab is
+    /// one screen, not an error and not a blank row.
+    #[test]
+    fn the_item_tab_draws_in_the_chosen_language() {
+        let dir = Scratch::new("itemlang");
+        // The slot bases have to be in the file: without them the item box
+        // reads as None and the tab would be the empty-state line.
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(!app.items.is_empty(), "the box did not load");
+
+        let ctx = egui::Context::default();
+        assert_eq!(app.lang, Lang::Ja);
+        let output = ctx.run(frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_items(ui));
+        });
+        let ja = drawn_text(&output);
+        assert!(ja.contains("絞り込み"), "{}", ja);
+        assert!(ja.contains("全部99に"), "{}", ja);
+        assert!(ja.contains("箱 #"), "{}", ja);
+        assert!(!ja.contains("All to 99"), "{}", ja);
+
+        // The same tab, same save, English wording.
+        app.lang = Lang::En;
+        let output = ctx.run(frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_items(ui));
+        });
+        let en = drawn_text(&output);
+        assert!(en.contains("Filter"), "{}", en);
+        assert!(en.contains("All to 99"), "{}", en);
+        assert!(en.contains("Box #"), "{}", en);
+        assert!(!en.contains("絞り込み"), "{}", en);
+        // The one key with no English text is still the Japanese sentence,
+        // because a missing translation falls back rather than vanishing.
+        assert!(
+            en.contains(strings::text(Lang::Ja, "items.csv_note")),
+            "the untranslated note did not fall back: {}",
+            en
+        );
+        assert!(
+            !en.contains(strings::MISSING),
+            "a key was missing from the catalogue: {}",
+            en
+        );
+        // The tab's title in the bar follows too.
+        assert_eq!(strings::text(Lang::En, "tab.items"), "Items");
+        assert_eq!(strings::text(Lang::Ja, "tab.items"), "アイテム");
+    }
+
+    /// The game's own tables follow the language too: the award names and the
+    /// データベース tab read the _eng copy when the interface is English, and
+    /// fall back to the only copy there is when the dump has no English one.
+    #[test]
+    fn the_game_tables_follow_the_language() {
+        let dir = Scratch::new("tablelang");
+        let jpn = synth_gmd("GC_Medal", &["ja one", "ja two", "d", "d2"]);
+        std::fs::write(dir.path().join("GC_Medal_jpn.gmd"), &jpn).expect("jpn");
+        let eng = synth_gmd("GC_Medal", &["en one", "en two", "d", "d2"]);
+        std::fs::write(dir.path().join("GC_Medal_eng.gmd"), eng).expect("eng");
+
+        // The medal table the 進行状況 tab names awards with.
+        let japanese = MhnxEditor::find_romfs_tables(dir.path(), Lang::Ja).expect("tables");
+        assert!(
+            japanese
+                .award
+                .as_ref()
+                .map(|p| p.ends_with("GC_Medal_jpn.gmd"))
+                == Some(true),
+            "{:?}",
+            japanese.award
+        );
+        let english = MhnxEditor::find_romfs_tables(dir.path(), Lang::En).expect("tables");
+        assert!(
+            english
+                .award
+                .as_ref()
+                .map(|p| p.ends_with("GC_Medal_eng.gmd"))
+                == Some(true),
+            "{:?}",
+            english.award
+        );
+
+        // The データベース tab reads the same choice, and still says how many
+        // tables it did not show.
+        let load = MhnxEditor::read_database(dir.path(), Lang::En);
+        assert_eq!(load.tables.len(), 1, "{}", load.report);
+        assert_eq!(load.tables[0].file, "GC_Medal_eng.gmd");
+        assert_eq!(load.tables[0].rows, ["en one", "en two"]);
+        assert!(load.report.contains("他言語 1"), "{}", load.report);
+        let load = MhnxEditor::read_database(dir.path(), Lang::Ja);
+        assert_eq!(load.tables[0].file, "GC_Medal_jpn.gmd");
+        assert_eq!(load.tables[0].rows, ["ja one", "ja two"]);
+
+        // A dump that only has Japanese is still readable in English: the
+        // fallback is the only copy there is, not an empty list.
+        std::fs::remove_file(dir.path().join("GC_Medal_eng.gmd")).expect("remove");
+        let load = MhnxEditor::read_database(dir.path(), Lang::En);
+        assert_eq!(load.tables.len(), 1, "{}", load.report);
+        assert_eq!(load.tables[0].file, "GC_Medal_jpn.gmd");
+        assert_eq!(load.tables[0].rows, ["ja one", "ja two"]);
     }
 }
 
