@@ -11436,14 +11436,33 @@ impl MhnxEditor {
                     None if is_blank => Some(self.charm_new_grade),
                     None => None,
                 };
-                let max_slots = bound.map(|g| g.max_slots()).unwrap_or(3);
+                // The kind on screen is what the game names the talisman, and
+                // its measured ceiling (charm::KIND_LIMITS) is part of the
+                // answer: 兵士 / 闘士 carry one slot and no second skill, 女王 /
+                // 王 / 龍 stop at +8 on the first skill, 天 reaches +10 / +13.
+                // An empty slot borrows the kind a new talisman would be made
+                // as, so the fields already say what is going to be legal.
+                let shown_kind = if cur_rec_ok {
+                    mhnx_core::charm::kind_of_record(&cur_rec)
+                } else {
+                    None
+                }
+                .unwrap_or(self.charm_new_kind);
+                let shown_limits = mhnx_core::charm::kind_limits(shown_kind);
+                let max_slots = bound
+                    .map(|g| {
+                        shown_limits
+                            .map(|l| l.max_slots.min(g.max_slots()))
+                            .unwrap_or_else(|| g.max_slots())
+                    })
+                    .unwrap_or(3);
                 ui.horizontal(|ui| {
                     ui.label("枠");
                     ui.add(egui::DragValue::new(&mut self.charm_index).range(0..=1999));
                     ui.label(egui::RichText::new("装飾スロット").weak());
-                    // Only the grades' own maximum is offered: 1 / 2 / 3 / 3.
-                    // A record can still hold more than its grade allows (the
-                    // game forbids writing it, not reading it), which is what
+                    // Only the kind's measured maximum is offered: 1 / 2 / 3 /
+                    // 3. A record can still hold more than that (the game
+                    // forbids writing it, not reading it), which is what
                     // grade_warnings below reports.
                     for n in 0..=max_slots {
                         if ui
@@ -11468,14 +11487,14 @@ impl MhnxEditor {
                     ui.label("スキル1");
                     Self::skill_combo(ui, "sk1", &mut self.charm_skill1, &mut self.skill_search1);
                     ui.label("ポイント");
-                    let allowed = Self::charm_allowed(bound, self.charm_skill1, false);
+                    let allowed = Self::charm_allowed(bound, shown_kind, self.charm_skill1, false);
                     Self::charm_points_field(ui, allowed, &mut self.charm_points1);
                 });
                 // Read after the row, so switching the skill in the combo above
                 // is explained on the same frame.
                 Self::charm_points_note(
                     ui,
-                    Self::charm_allowed(bound, self.charm_skill1, false),
+                    Self::charm_allowed(bound, shown_kind, self.charm_skill1, false),
                     self.charm_skill1,
                     "スキル1",
                 );
@@ -11483,12 +11502,12 @@ impl MhnxEditor {
                     ui.label("スキル2");
                     Self::skill_combo(ui, "sk2", &mut self.charm_skill2, &mut self.skill_search2);
                     ui.label("ポイント");
-                    let allowed = Self::charm_allowed(bound, self.charm_skill2, true);
+                    let allowed = Self::charm_allowed(bound, shown_kind, self.charm_skill2, true);
                     Self::charm_points_field(ui, allowed, &mut self.charm_points2);
                 });
                 Self::charm_points_note(
                     ui,
-                    Self::charm_allowed(bound, self.charm_skill2, true),
+                    Self::charm_allowed(bound, shown_kind, self.charm_skill2, true),
                     self.charm_skill2,
                     "スキル2",
                 );
@@ -11517,15 +11536,20 @@ impl MhnxEditor {
                         for (id, name) in mhnx_core::charm::TALISMAN_KINDS.iter().enumerate().skip(1) {
                             let id = id as u8;
                             let is_cur = cur_kind == Some(id);
-                            let grade = mhnx_core::charm::kind_rarity(id)
-                                .and_then(mhnx_core::charm::TalismanGrade::from_rarity);
+                            // The hover text is the kind's measured ceiling,
+                            // the same sentence the line under the selector
+                            // prints: 兵士 one slot and no second skill, 天
+                            // +10 / +13 / three slots.
+                            let hover = match mhnx_core::charm::kind_limits(id) {
+                                Some(l) => l.summary(),
+                                None => format!(
+                                    "レア度 {}",
+                                    mhnx_core::charm::kind_rarity(id).unwrap_or(0)
+                                ),
+                            };
                             let resp = ui
                                 .add(egui::Button::new(*name).selected(is_cur))
-                                .on_hover_text(format!(
-                                    "レア度 {} / 装飾スロットは最大 {} 個",
-                                    mhnx_core::charm::kind_rarity(id).unwrap_or(0),
-                                    grade.map(|g| g.max_slots()).unwrap_or(0)
-                                ));
+                                .on_hover_text(hover);
                             if resp.clicked() && !is_cur {
                                 apply_kind = Some(id);
                             }
@@ -11613,6 +11637,16 @@ impl MhnxEditor {
                             .small(),
                         );
                     });
+                    // What this kind can hold, measured from the game's own
+                    // tables (charm::KIND_LIMITS): the rarity-97 kinds carry
+                    // one slot and no second skill, the rarity-99 kinds stop at
+                    // +8 on the first skill, and 天 reaches +10 / +13 / 3.
+                    // Read from the box copy, not from the frame's snapshot:
+                    // a kind click above already rewrote the record, and the
+                    // line has to describe what is there now.
+                    if let Some(l) = mhnx_core::charm::kind_limits(ty) {
+                        ui.label(egui::RichText::new(l.summary()).weak().small());
+                    }
                     for (label, sid, pts, second) in [
                         ("スキル1", self.charm_skill1, self.charm_points1, false),
                         ("スキル2", self.charm_skill2, self.charm_points2, true),
@@ -11840,12 +11874,27 @@ impl MhnxEditor {
     /// tables say nothing about.
     fn charm_allowed(
         grade: Option<mhnx_core::charm::TalismanGrade>,
+        kind: u8,
         skill: u8,
         second: bool,
     ) -> Option<mhnx_core::charm::AllowedPoints> {
         match grade {
             Some(g) if skill != 0 => {
-                mhnx_core::charm::allowed_points_rarity(g.rarity(), skill, second)
+                let r = mhnx_core::charm::allowed_points_rarity(g.rarity(), skill, second)?;
+                // The kind's measured ceiling is the tighter of the two, so
+                // the field stops where the game stops. A "0〜0" cell stays
+                // "0〜0": that is the table saying the skill cannot go here at
+                // all, not a ceiling of zero.
+                if r.min == 0 && r.max == 0 {
+                    return Some(r);
+                }
+                match mhnx_core::charm::kind_limits(kind).and_then(|l| l.max_points(second)) {
+                    Some(c) if c < r.max => Some(mhnx_core::charm::AllowedPoints {
+                        min: r.min,
+                        max: c,
+                    }),
+                    _ => Some(r),
+                }
             }
             _ => None,
         }

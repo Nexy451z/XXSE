@@ -1307,6 +1307,60 @@ fn the_console_charm_editor_shows_the_allowed_range() {
     );
 }
 
+/// The console form prints the measured ceiling of the kind on its 種類 row,
+/// and turning the kind re-clamps the form against that kind (charm::KIND_LIMITS)
+/// rather than only against the rarity's table.
+#[test]
+fn the_console_charm_form_shows_the_kind_ceiling() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.screen = Screen::Charms;
+    ed.cursor = 0;
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::CharmEdit);
+    let kind = ed.charm_edit.expect("the form is open").kind;
+    let limits = mhnx_core::charm::kind_limits(kind).expect("a shipped kind");
+    let joined: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = joined.join("\n");
+    assert!(
+        joined.contains(limits.name()),
+        "the kind must be named:\n{}",
+        joined
+    );
+    assert!(
+        joined.contains(&limits.summary()),
+        "the kind's ceiling must be printed:\n{}",
+        joined
+    );
+
+    // Turning row 1 to 兵士 (the next kind after 天, which wraps) re-clamps the
+    // slots and the points against that kind: one slot, no second skill.
+    ed.input(Key::Up);
+    ed.input(Key::Up);
+    assert_eq!(ed.charm_edit.expect("open").field, 1, "row 1 is the kind");
+    ed.input(Key::Right);
+    let after = ed.charm_edit.expect("open");
+    let after_limits = mhnx_core::charm::kind_limits(after.kind).expect("a shipped kind");
+    assert!(after_limits.max_slots <= limits.max_slots);
+    assert!(
+        after.slots <= after_limits.max_slots,
+        "slots {} exceed the ceiling {} of {}",
+        after.slots,
+        after_limits.max_slots,
+        after_limits.name()
+    );
+    let joined: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
+    let joined = joined.join("\n");
+    assert!(
+        joined.contains(&after_limits.summary()),
+        "the ceiling line must follow the kind row:\n{}",
+        joined
+    );
+}
+
 #[test]
 fn an_illegal_skill_is_flagged_on_the_console() {
     if !real_save().exists() {

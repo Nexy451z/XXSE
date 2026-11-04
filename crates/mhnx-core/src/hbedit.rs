@@ -3437,7 +3437,17 @@ impl Editor {
                         ) {
                             e.grade = g;
                         }
-                        e.slots = e.slots.min(e.grade.max_slots());
+                        // The kind carries its own measured ceiling (see
+                        // charm::KIND_LIMITS): 兵士 / 闘士 stop at one slot
+                        // and cannot hold a second skill at all, and 女王 /
+                        // 王 / 龍 top out at +8 on the first skill. The form
+                        // re-clamps against that before the box is touched,
+                        // so the console never writes what the kind refuses.
+                        let limits = crate::charm::kind_limits(e.kind);
+                        let slot_cap = limits
+                            .map(|l| l.max_slots.min(e.grade.max_slots()))
+                            .unwrap_or_else(|| e.grade.max_slots());
+                        e.slots = e.slots.min(slot_cap);
                         for (skill, pts, second) in [
                             (e.skill1, &mut e.points1, false),
                             (e.skill2, &mut e.points2, true),
@@ -3445,11 +3455,21 @@ impl Editor {
                             if skill == 0 {
                                 continue;
                             }
+                            let cap = limits.and_then(|l| l.max_points(second));
                             match crate::charm::allowed_points_rarity(e.grade.rarity(), skill, second) {
                                 Some(r) if r.min == 0 && r.max == 0 => {
                                     *pts = 0;
                                 }
-                                Some(r) => *pts = (*pts).clamp(r.min, r.max),
+                                Some(r) => {
+                                    let high = match cap {
+                                        Some(c) => r.max.min(c),
+                                        None => r.max,
+                                    };
+                                    *pts = (*pts).clamp(r.min, high);
+                                }
+                                // The table knows nothing about this id, so
+                                // the form leaves the value alone (the same
+                                // answer it gave before the kind ceilings).
                                 None => {}
                             }
                         }
@@ -10406,12 +10426,23 @@ impl Editor {
                     (String::from("枠"), format!("{}", e.index)),
                     (
                         String::from("種類"),
-                        format!(
-                            "{}（レア度 {} / 最大 S{}）",
-                            crate::charm::kind_name(e.kind).unwrap_or("?"),
-                            e.grade.rarity(),
-                            e.grade.max_slots()
-                        ),
+                        match crate::charm::kind_limits(e.kind) {
+                            // The measured ceiling of this kind, not the
+                            // grade's: they agree, but the kind is what the
+                            // user just turned and what the screen names.
+                            Some(l) => format!(
+                                "{}（レア度 {} / {}）",
+                                l.name(),
+                                l.rarity,
+                                l.short()
+                            ),
+                            None => format!(
+                                "{}（レア度 {} / 最大 S{}）",
+                                crate::charm::kind_name(e.kind).unwrap_or("?"),
+                                e.grade.rarity(),
+                                e.grade.max_slots()
+                            ),
+                        },
                     ),
                     (String::from("装飾スロット"), format!("{}", e.slots)),
                     (
@@ -10440,6 +10471,12 @@ impl Editor {
                         true,
                         i == e.field,
                     );
+                }
+                // The measured ceiling of the kind on the form. It is a
+                // constant, so it is printed even when the gamedata tables are
+                // compiled out; the per-skill ranges below need the tables.
+                if let Some(l) = crate::charm::kind_limits(e.kind) {
+                    push(&mut out, format!("  {}", l.summary()), false, false);
                 }
                 // The published per-rarity range, same check the PC build
                 // shows: it is the difference between a talisman the game
@@ -10490,17 +10527,23 @@ impl Editor {
                             continue;
                         };
                         let name = crate::skills::skill_name(sid).unwrap_or("?");
+                        // The kind's own ceiling is the tighter of the two,
+                        // so it is what the "allowed" text reports.
+                        let high = crate::charm::kind_limits(e.kind)
+                            .and_then(|l| l.max_points(second))
+                            .map(|c| r.max.min(c))
+                            .unwrap_or(r.max);
                         let line = if r.min == 0 && r.max == 0 {
                             format!("  !! {} {} cannot go on this type", label, name)
-                        } else if pts < r.min || pts > r.max {
+                        } else if pts < r.min || pts > high {
                             format!(
                                 "  !! {} {} is {:+}, allowed {:+}..{:+}",
-                                label, name, pts, r.min, r.max
+                                label, name, pts, r.min, high
                             )
                         } else {
                             format!(
                                 "     {} {} allowed {:+}..{:+}",
-                                label, name, r.min, r.max
+                                label, name, r.min, high
                             )
                         };
                         push(&mut out, line, false, false);

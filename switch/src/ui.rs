@@ -1754,11 +1754,16 @@ impl GuiState {
             }
             UiAction::CharmLegalMax => {
                 if let Some(mut ce) = ed.charm_edit {
-                    // The ceiling now comes from the grade the form shows, not
+                    // The ceiling now comes from the kind the form shows, not
                     // from the type byte still stored in the box: those two
-                    // disagree the moment the rarity row is moved.
+                    // disagree the moment the kind row is moved. charm::KIND_LIMITS
+                    // is the measured one (兵士 stops at one slot and no second
+                    // skill; 女王/王/龍 stop at +8 on the first skill).
                     let grade = ce.grade;
-                    ce.slots = grade.max_slots();
+                    let limits = charm::kind_limits(ce.kind);
+                    ce.slots = limits
+                        .map(|l| l.max_slots.min(grade.max_slots()))
+                        .unwrap_or_else(|| grade.max_slots());
                     for (skill, pts, second) in [
                         (ce.skill1, &mut ce.points1, false),
                         (ce.skill2, &mut ce.points2, true),
@@ -1766,18 +1771,28 @@ impl GuiState {
                         if skill == 0 {
                             continue;
                         }
+                        let cap = limits.and_then(|l| l.max_points(second));
                         if let Some(r) = charm::allowed_points_rarity(grade.rarity(), skill, second)
                         {
                             if r.max > 0 {
-                                *pts = r.max;
+                                *pts = match cap {
+                                    Some(c) => r.max.min(c),
+                                    None => r.max,
+                                };
                             }
+                        } else if let Some(c) = cap {
+                            // No table for the grade, but the kind still has a
+                            // ceiling, so the button can still answer.
+                            *pts = c;
                         }
                     }
                     ed.charm_edit = Some(ce);
                     ed.message = format!(
                         "護石を合法最大値・スロ{}に設定しました（{}）",
                         ce.slots,
-                        grade.name()
+                        limits
+                            .map(|l| l.name())
+                            .unwrap_or_else(|| grade.name())
                     );
                 }
             }
@@ -1801,11 +1816,23 @@ impl GuiState {
                     ce.skill1 = find_skill(s1_name);
                     ce.skill2 = find_skill(s2_name);
                     // A preset asks for the strongest version of a build; the
-                    // grade still decides how many slots it may carry and how
-                    // high each of its two skills may go.
-                    ce.slots = grade.max_slots();
-                    ce.points1 = preset_points(grade, ce.skill1, p1, false);
-                    ce.points2 = preset_points(grade, ce.skill2, p2, true);
+                    // kind still decides how many slots it may carry and how
+                    // high each of its two skills may go, so a 兵士 preset
+                    // lands on S1 and no second skill at all.
+                    let limits = charm::kind_limits(ce.kind);
+                    ce.slots = limits
+                        .map(|l| l.max_slots.min(grade.max_slots()))
+                        .unwrap_or_else(|| grade.max_slots());
+                    ce.points1 = preset_points(grade, ce.kind, ce.skill1, p1, false);
+                    ce.points2 = preset_points(grade, ce.kind, ce.skill2, p2, true);
+                    // A kind with no slot-2 table (兵士 / 闘士) cannot hold the
+                    // second skill at all, so the preset drops it instead of
+                    // leaving a skill with zero points behind - a shape the
+                    // game never writes.
+                    if limits.map(|l| !l.has_second_skill()).unwrap_or(false) {
+                        ce.skill2 = 0;
+                        ce.points2 = 0;
+                    }
                     ed.charm_edit = Some(ce);
                     ed.message = format!(
                         "プリセット ({} {:+} / {} {:+} / S{}) を適用しました（{}）",
@@ -2886,11 +2913,18 @@ fn push_unique(out: &mut Vec<String>, s: String) {
 /// now, and the same questions are asked again about the values the form would
 /// write: picking a skill in the form does not touch the box until `[A]`, so
 /// the stored record alone would never flag a skill the grade cannot carry.
+///
+/// The kind is part of the answer now. The game has one point table per rarity
+/// and one slot table per rarity, not one per kind, so the ceiling of a kind is
+/// `charm::KIND_LIMITS`: 兵士 / 闘士 have one slot and no second skill, and
+/// 女王 / 王 / 龍 stop at +8 on the first skill. Both are reported here rather
+/// than on the box, because the form can hold a kind the box does not.
 #[allow(clippy::too_many_arguments)]
 fn charm_warnings(
     box_bytes: Option<&[u8]>,
     index: usize,
     grade: charm::TalismanGrade,
+    kind: u8,
     slots: u8,
     skill1: u8,
     points1: i8,
@@ -2903,16 +2937,17 @@ fn charm_warnings(
             push_unique(&mut out, w);
         }
     }
-    let max_slots = grade.max_slots();
+    let limits = charm::kind_limits(kind);
+    let who = limits
+        .map(|l| l.name())
+        .unwrap_or_else(|| grade.name());
+    let max_slots = limits
+        .map(|l| l.max_slots.min(grade.max_slots()))
+        .unwrap_or_else(|| grade.max_slots());
     if slots > max_slots {
         push_unique(
             &mut out,
-            format!(
-                "スロット{}個は{}の上限{}を超えています",
-                slots,
-                grade.name(),
-                max_slots
-            ),
+            format!("スロット{}個は{}の上限{}を超えています", slots, who, max_slots),
         );
     }
     for (skill, pts, second, label) in [
@@ -2922,22 +2957,50 @@ fn charm_warnings(
         if skill == 0 {
             continue;
         }
+        let cap = limits.and_then(|l| l.max_points(second));
+        let mut flagged = false;
         match charm::allowed_points_rarity(grade.rarity(), skill, second) {
             Some(r) if r.min == 0 && r.max == 0 => {
-                push_unique(
-                    &mut out,
-                    format!("{} は{}では付けられません", label, grade.name()),
-                );
+                push_unique(&mut out, format!("{} は{}では付けられません", label, who));
+                flagged = true;
             }
             Some(r) => {
-                if pts < r.min || pts > r.max {
+                let high = match cap {
+                    Some(c) => r.max.min(c),
+                    None => r.max,
+                };
+                if pts < r.min || pts > high {
                     push_unique(
                         &mut out,
-                        format!("{} {} は {}〜{} の範囲外です", label, pts, r.min, r.max),
+                        format!("{} {} は {}〜{} の範囲外です", label, pts, r.min, high),
                     );
+                    flagged = true;
                 }
             }
             None => {}
+        }
+        if flagged {
+            continue;
+        }
+        match cap {
+            Some(c) if pts > c => push_unique(
+                &mut out,
+                format!(
+                    "{} は {:+} ですが、{} の上限は {:+} です",
+                    label,
+                    pts,
+                    who,
+                    c
+                ),
+            ),
+            None => push_unique(
+                &mut out,
+                format!(
+                    "{} は{}に設定できません（この種類は第2スキルを持てません）",
+                    label, who
+                ),
+            ),
+            _ => {}
         }
     }
     out
@@ -2947,15 +3010,33 @@ fn charm_warnings(
 ///
 /// The four presets used to force `slots = 3` and their nominal `+6/+10`
 /// whatever the grade was, which is exactly the record the game would reject.
-fn preset_points(grade: charm::TalismanGrade, skill: u8, want: i8, second: bool) -> i8 {
+fn preset_points(
+    grade: charm::TalismanGrade,
+    kind: u8,
+    skill: u8,
+    want: i8,
+    second: bool,
+) -> i8 {
     if skill == 0 {
         return 0;
     }
+    // The preset is an explicit request, so it is clamped to both ceilings:
+    // the per-skill table of the grade and the measured one of the kind.
+    let cap = charm::kind_limits(kind).and_then(|l| l.max_points(second));
     match charm::allowed_points_rarity(grade.rarity(), skill, second) {
-        Some(r) if r.max > 0 => want.clamp(r.min, r.max),
+        Some(r) if r.max > 0 => {
+            let high = match cap {
+                Some(c) => r.max.min(c),
+                None => r.max,
+            };
+            want.clamp(r.min, high)
+        }
         // "0~0": the grade cannot carry this skill, so do not write points for it.
         Some(_) => 0,
-        None => want,
+        None => match cap {
+            Some(c) => want.clamp(-128, c),
+            None => want,
+        },
     }
 }
 
@@ -3150,7 +3231,17 @@ impl GuiState {
             }
             Screen::CharmEdit => {
                 // Slot ceiling follows the grade on screen, never a fixed S3.
-                let max_s = ed.charm_edit.map(|c| c.grade.max_slots()).unwrap_or(3);
+                // The ceiling of the kind on the form, not of the grade: the
+                // two agree, but charm::KIND_LIMITS is the measured one, so a
+                // 兵士 preset button says S1 rather than promising an S3.
+                let max_s = ed
+                    .charm_edit
+                    .map(|c| {
+                        charm::kind_limits(c.kind)
+                            .map(|l| l.max_slots.min(c.grade.max_slots()))
+                            .unwrap_or_else(|| c.grade.max_slots())
+                    })
+                    .unwrap_or(3);
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, "[Y] 合法最大値", t.accent_secondary, FontSize::Small);
@@ -4211,7 +4302,17 @@ impl GuiState {
                 // The slot count on these labels is whatever the current grade
                 // allows, so a preset can no longer promise an S3 the game
                 // refuses at rarity 97/98.
-                let max_s = ed.charm_edit.map(|c| c.grade.max_slots()).unwrap_or(3);
+                // The ceiling of the kind on the form, not of the grade: the
+                // two agree, but charm::KIND_LIMITS is the measured one, so a
+                // 兵士 preset button says S1 rather than promising an S3.
+                let max_s = ed
+                    .charm_edit
+                    .map(|c| {
+                        charm::kind_limits(c.kind)
+                            .map(|l| l.max_slots.min(c.grade.max_slots()))
+                            .unwrap_or_else(|| c.grade.max_slots())
+                    })
+                    .unwrap_or(3);
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
                 cur_y += 24;
                 let legal_lbl = format!("合法最大値 + スロ{}をセット", max_s);
@@ -5122,10 +5223,24 @@ impl GuiState {
                 .as_ref()
                 .and_then(|s| s.charm_kind_name(ed.slot, chm.index))
                 .unwrap_or("—");
+            // The measured ceiling of this kind, from charm::KIND_LIMITS. It
+            // is a constant, so the list can say what each row is allowed to
+            // hold without reading the romfs tables.
+            let limits = ed
+                .save
+                .as_ref()
+                .and_then(|s| mhnx_core::charm::charm_kind(s, ed.slot, chm.index))
+                .and_then(mhnx_core::charm::kind_limits);
             rows.push((
                 i,
                 format!("{} {}", kind, summary),
-                format!("装備BOX枠 #{:04}", chm.index),
+                format!(
+                    "装備BOX枠 #{:04} / {}",
+                    chm.index,
+                    limits
+                        .map(|l| l.short())
+                        .unwrap_or_else(|| String::from("上限 —"))
+                ),
                 slots_str,
                 format!("#{:02}", i + 1),
             ));
@@ -5148,16 +5263,26 @@ impl GuiState {
         };
         let s1 = mhnx_core::skills::skill_name(ce.skill1).unwrap_or("なし");
         let s2 = mhnx_core::skills::skill_name(ce.skill2).unwrap_or("なし");
-        // The allowed range follows the grade now, so it is read from the
-        // table instead of being printed as a fixed -10..+14 on every row.
+        // The kind on the form carries the measured ceiling of its row of
+        // charm::KIND_LIMITS. It is the tighter of the two answers, so the
+        // range column reports it: 女王 / 王 / 龍 stop at +8 on the first
+        // skill even though the rarity-99 table reaches +13 on the second.
+        let limits = mhnx_core::charm::kind_limits(ce.kind);
         let range_of = |skill: u8, second: bool| -> alloc::string::String {
             if skill == 0 {
                 return String::from("なし");
             }
+            let cap = limits.and_then(|l| l.max_points(second));
             match mhnx_core::charm::allowed_points_rarity(ce.grade.rarity(), skill, second) {
                 Some(r) if r.min == 0 && r.max == 0 => String::from("このレア度では不可"),
-                Some(r) => format!("{} 〜 {}", r.min, r.max),
-                None => String::from("—"),
+                Some(r) => match cap {
+                    Some(c) => format!("{} 〜 {}", r.min, r.max.min(c)),
+                    None => String::from("この種類は第2スキル不可"),
+                },
+                None => match cap {
+                    Some(c) => format!("上限 {}", c),
+                    None => String::from("—"),
+                },
             }
         };
         let rows = alloc::vec![
@@ -5172,13 +5297,18 @@ impl GuiState {
                 1,
                 String::from("種類"),
                 // The game's own name of the talisman is the value; the rarity
-                // and the slot ceiling live in the meta column because the
-                // value column has a 230px budget.
-                format!(
-                    "◀ ▶ で切替 / レア度 {} / 最大 S{}",
-                    ce.grade.rarity(),
-                    ce.grade.max_slots()
-                ),
+                // and the measured ceiling of this kind live in the meta
+                // column because the value column has a 230px budget.
+                match limits {
+                    // The full measured ceiling of this kind, on the row that
+                    // names it: 「R100 / スキル1+10 / スキル2+13 / S3」.
+                    Some(l) => format!("R{} / {}", l.rarity, l.compact()),
+                    None => format!(
+                        "◀ ▶ で切替 / レア度 {} / 最大 S{}",
+                        ce.grade.rarity(),
+                        ce.grade.max_slots()
+                    ),
+                },
                 alloc::string::String::from(
                     mhnx_core::charm::kind_name(ce.kind).unwrap_or("?"),
                 ),
@@ -5187,7 +5317,12 @@ impl GuiState {
             (
                 2,
                 String::from("スロット数"),
-                format!("0 〜 {}", ce.grade.max_slots()),
+                format!(
+                    "0 〜 {}",
+                    limits
+                        .map(|l| l.max_slots.min(ce.grade.max_slots()))
+                        .unwrap_or_else(|| ce.grade.max_slots())
+                ),
                 format!("S{} ({})", ce.slots, "◯".repeat(ce.slots.min(3) as usize)),
                 String::from("#03"),
             ),
@@ -5227,6 +5362,7 @@ impl GuiState {
             box_bytes,
             ce.index,
             ce.grade,
+            ce.kind,
             ce.slots,
             ce.skill1,
             ce.points1,

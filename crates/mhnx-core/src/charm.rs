@@ -60,6 +60,28 @@
 //! the same kind, so the shape the game wrote is preserved; only the pair is
 //! ever written on top, and only from the table above. Writing one over a
 //! weapon or a piece of armour is refused outright.
+//!
+//! # Each kind has its own ceiling
+//!
+//! How many points one skill may carry, and how many decoration slots a
+//! talisman may have, is not one number for all of them: the game ships four
+//! point tables and four slot tables and a kind selects one through its rarity
+//! (1-2 -> 97, 3-4 -> 98, 5-7 -> 99, 8-10 -> 100). [KIND_LIMITS] is that
+//! measurement unrolled per kind, and [KindLimits] documents where each number
+//! comes from. The short version:
+//!
+//! | kind | rarity | slot 1 | slot 2 | slots |
+//! |---|---|---|---|---|
+//! | 1 兵士 / 2 闘士 | 97 | +10 | 不可 | 1 |
+//! | 3 騎士 / 4 城塞 | 98 | +10 | +13 | 2 |
+//! | 5 女王 / 6 王 / 7 龍 | 99 | +8 | +13 | 3 |
+//! | 8 英雄 / 9 伝説 / 10 天 | 100 | +10 | +13 | 3 |
+//!
+//! Two consequences the editor has to respect: a 兵士 / 闘士 cannot carry a
+//! second skill at all, and a 女王 / 王 / 龍 tops out at +8 on the first skill
+//! while the 天 tops out at +10. Nothing here clamps a record on its own -
+//! [clamp_points] and [clamp_points_to_kind] only move a value when a caller
+//! asks, and [grade_warnings] reports instead of writing.
 
 use alloc::vec::Vec;
 
@@ -495,6 +517,185 @@ pub fn kind_rarity(kind: u8) -> Option<u8> {
     Some(KIND_RARITY[kind as usize])
 }
 
+// ---------------------------------------------------------------------------
+// The ceiling of each kind, measured from the game's tables
+// ---------------------------------------------------------------------------
+
+/// What one talisman kind can hold, measured from the game's own tables.
+///
+/// The game ships no table *per kind*: it ships four point tables and four
+/// slot-probability tables, and a kind picks one of the four through its
+/// rarity (1-2 -> 97, 3-4 -> 98, 5-7 -> 99, 8-10 -> 100, see [KIND_RARITY]).
+/// [KIND_LIMITS] unrolls that into the eleven rows a save can carry, so a
+/// screen can print the ceiling of a kind without walking a table.
+///
+/// # How the numbers were measured
+///
+/// `romfs/nativeNX/table`:
+///
+/// ```text
+/// amuletSkillData00..07.amskl   8 bytes of header, then rows of
+///                               u16 skill id, s8 min, s8 max
+///                               (pair 2N / 2N+1 = rarity N: skill 1 / skill 2)
+/// amuletSlotData00..03.amslt    8 bytes of header, then 21 rows of
+///                               u8 prob[4] = how often 0/1/2/3 slots roll
+/// ```
+///
+/// * `00/01` = rarity 97, `02/03` = 98, `04/05` = 99, `06/07` = 100. The
+///   pairing is not a guess: those eight files reproduce the four
+///   `gamedata::TALISMAN_*_SKILL` tables cell for cell (824 cells, 0
+///   mismatches), and the reference editor indexes them by rarity.
+/// * `max_first` / `max_second` are the largest `max` in each half. Rarity 97
+///   has *no rows at all* in its second half, so 兵士 / 闘士 cannot carry a
+///   second skill - the editor's table says `0~0` for every second cell there.
+/// * `first_skills` / `second_skills` count the rows, i.e. how many skill ids
+///   the kind can roll at all. 女王 / 王 / 龍 offer 56 in slot 1 and 105 in
+///   slot 2; 英雄 / 伝説 / 天 offer 62 and 94.
+/// * `max_slots` is the highest slot index whose probability is non-zero
+///   anywhere in the rarity's slot table: 1 / 2 / 3 / 3.
+///
+/// Cross-checks, all on real data:
+///
+/// * The sample save (`C:\anyWorkspace\nx\jksv_ready\system`, 650 talismans,
+///   1292 skill values on the 648 records that carry a kind): every value sits
+///   inside the row of the table its kind selects, and 609 of those records fit
+///   *only* that table - the other three reject them - so kind -> rarity ->
+///   table is the road the game really writes. (The two remaining records carry
+///   the 装備なし row with rarity 99; their single skill value also fits that
+///   table, which is why the total checked is 1294.)
+/// * The observed maxima agree: 天 (rarity 100) reaches +10 in slot 1 (skills
+///   42/43, exactly the rows `amuletSkillData06` caps at 10) and +13 in slot 2
+///   (skills 27..31, `amuletSkillData07`). 龍 (99) reaches +12 of its +13.
+/// * `../extract/god_talisman_report.md` records the binary's own fallbacks:
+///   聴覚保護 caps at +7 and 攻撃 at +10, which are the
+///   `amuletSkillData06/07` numbers for skill ids 5 and 18.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KindLimits {
+    /// The kind byte at +0x02, 1..=10.
+    pub kind: u8,
+    /// The rarity that kind is stored as.
+    pub rarity: u8,
+    /// Largest points value slot 1 can carry.
+    pub max_first: i8,
+    /// Largest points value slot 2 can carry. Only meaningful when
+    /// [KindLimits::second_skills] is not 0.
+    pub max_second: i8,
+    /// Most decoration slots this kind may carry.
+    pub max_slots: u8,
+    /// How many skill ids this kind can roll into slot 1.
+    pub first_skills: u16,
+    /// How many skill ids this kind can roll into slot 2 (0 = none).
+    pub second_skills: u16,
+}
+
+impl KindLimits {
+    /// The game's name of the kind.
+    pub fn name(self) -> &'static str {
+        kind_name(self.kind).unwrap_or("?")
+    }
+
+    /// Can this kind carry a second skill at all?
+    pub fn has_second_skill(self) -> bool {
+        self.second_skills > 0
+    }
+
+    /// The ceiling of one skill slot, or None when the kind has no such slot.
+    pub fn max_points(self, second: bool) -> Option<i8> {
+        if second {
+            if self.second_skills == 0 {
+                return None;
+            }
+            Some(self.max_second)
+        } else {
+            Some(self.max_first)
+        }
+    }
+
+    /// One line the two screens print, e.g.
+    /// 「天の護石: スキル1 最大 +10 / スキル2 最大 +13 / 装飾スロット 最大 3」.
+    pub fn summary(self) -> alloc::string::String {
+        use alloc::format;
+        match self.max_points(true) {
+            Some(second) => format!(
+                "{}: スキル1 最大 {:+} / スキル2 最大 {:+} / 装飾スロット 最大 {}",
+                self.name(),
+                self.max_first,
+                second,
+                self.max_slots
+            ),
+            None => format!(
+                "{}: スキル1 最大 {:+} / 第2スキルなし / 装飾スロット 最大 {}",
+                self.name(),
+                self.max_first,
+                self.max_slots
+            ),
+        }
+    }
+
+    /// The same thing squeezed for a narrow column: 「上限 +10・+13・S3」.
+    pub fn short(self) -> alloc::string::String {
+        use alloc::format;
+        match self.max_points(true) {
+            Some(second) => format!("上限 +{}・+{}・S{}", self.max_first, second, self.max_slots),
+            None => format!("上限 +{}・第2なし・S{}", self.max_first, self.max_slots),
+        }
+    }
+
+    /// The ceiling without a label, for a row that already names the kind:
+    /// 「スキル1+10 / スキル2+13 / S3」.
+    pub fn compact(self) -> alloc::string::String {
+        use alloc::format;
+        match self.max_points(true) {
+            Some(second) => format!(
+                "スキル1{:+} / スキル2{:+} / S{}",
+                self.max_first, second, self.max_slots
+            ),
+            None => format!(
+                "スキル1{:+} / 第2スキルなし / S{}",
+                self.max_first, self.max_slots
+            ),
+        }
+    }
+}
+
+/// The ceiling of each kind byte, measured as described on [KindLimits].
+///
+/// Row 0 is 装備なし and has no ceiling: a record that carries it is not one the
+/// game wrote, and [kind_limits] answers None for it.
+///
+/// The four groups are identical inside themselves on purpose - the game has
+/// one table per rarity, not one per kind - so 兵士 and 闘士 share a ceiling,
+/// as do 女王 / 王 / 龍 and 英雄 / 伝説 / 天.
+pub const KIND_LIMITS: [Option<KindLimits>; 11] = [
+    None,
+    Some(KindLimits { kind: 1, rarity: 97, max_first: 10, max_second: 0, max_slots: 1, first_skills: 59, second_skills: 0 }),
+    Some(KindLimits { kind: 2, rarity: 97, max_first: 10, max_second: 0, max_slots: 1, first_skills: 59, second_skills: 0 }),
+    Some(KindLimits { kind: 3, rarity: 98, max_first: 10, max_second: 13, max_slots: 2, first_skills: 71, second_skills: 74 }),
+    Some(KindLimits { kind: 4, rarity: 98, max_first: 10, max_second: 13, max_slots: 2, first_skills: 71, second_skills: 74 }),
+    Some(KindLimits { kind: 5, rarity: 99, max_first: 8, max_second: 13, max_slots: 3, first_skills: 56, second_skills: 105 }),
+    Some(KindLimits { kind: 6, rarity: 99, max_first: 8, max_second: 13, max_slots: 3, first_skills: 56, second_skills: 105 }),
+    Some(KindLimits { kind: 7, rarity: 99, max_first: 8, max_second: 13, max_slots: 3, first_skills: 56, second_skills: 105 }),
+    Some(KindLimits { kind: 8, rarity: 100, max_first: 10, max_second: 13, max_slots: 3, first_skills: 62, second_skills: 94 }),
+    Some(KindLimits { kind: 9, rarity: 100, max_first: 10, max_second: 13, max_slots: 3, first_skills: 62, second_skills: 94 }),
+    Some(KindLimits { kind: 10, rarity: 100, max_first: 10, max_second: 13, max_slots: 3, first_skills: 62, second_skills: 94 }),
+];
+
+/// The measured ceiling of a kind byte, or None for 装備なし / out of range.
+pub fn kind_limits(kind: u8) -> Option<KindLimits> {
+    KIND_LIMITS.get(kind as usize).copied().flatten()
+}
+
+/// The measured ceiling of a raw record's kind, or None when the record is not
+/// a talisman, or carries a kind byte the game does not ship.
+pub fn kind_limits_of_record(rec: &[u8]) -> Option<KindLimits> {
+    kind_limits(kind_of_record(rec)?)
+}
+
+/// The one-line ceiling of a kind, for the two screens that print it.
+pub fn kind_limit_line(kind: u8) -> Option<alloc::string::String> {
+    kind_limits(kind).map(|l| l.summary())
+}
+
 /// The kind the game uses as the face of a rarity, when a caller asks for a
 /// grade instead of a kind.
 ///
@@ -854,12 +1055,25 @@ pub fn grade_warnings(
     if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
         return out;
     }
-    if box_bytes[o + 0x10] > grade.max_slots() {
+    // The kind named at +0x02 is the finer answer and the one the game's box
+    // screen shows, so its measured ceiling is used when the byte is a kind
+    // the game ships (the four-rarity table is what lies behind it anyway).
+    // A record that carries 装備なし or an unknown byte falls back to the grade
+    // it was passed, which is how this function behaved before.
+    let limits = kind_limits_of_record(&box_bytes[o..o + CHARM_RECORD]);
+    let who = match limits {
+        Some(l) => l.name(),
+        None => grade.name(),
+    };
+    let slot_cap = limits
+        .map(|l| l.max_slots.min(grade.max_slots()))
+        .unwrap_or_else(|| grade.max_slots());
+    if box_bytes[o + 0x10] > slot_cap {
         out.push(format!(
             "スロット{}個は{}の上限{}を超えています",
             box_bytes[o + 0x10],
-            grade.name(),
-            grade.max_slots()
+            who,
+            slot_cap
         ));
     }
     for (skill_at, pts_at, second, label) in [
@@ -870,20 +1084,62 @@ pub fn grade_warnings(
         if skill == 0 {
             continue;
         }
+        let pts = box_bytes[o + pts_at] as i8;
+        // The per-skill table is the narrowest answer, so it speaks first; the
+        // kind's ceiling only speaks when the table had nothing to say (no
+        // gamedata feature, or a skill id past the end of it). Both lines for
+        // one value would be noise.
+        let mut flagged = false;
         match allowed_points_rarity(grade.rarity(), skill, second) {
             Some(r) if r.min == 0 && r.max == 0 => {
-                out.push(format!("{} は{}では付けられません", label, grade.name()));
+                out.push(format!("{} は{}では付けられません", label, who));
+                flagged = true;
             }
             Some(r) => {
-                let pts = box_bytes[o + pts_at] as i8;
                 if pts < r.min || pts > r.max {
                     out.push(format!(
                         "{} {} は {}〜{} の範囲外です",
                         label, pts, r.min, r.max
                     ));
+                    flagged = true;
                 }
             }
-            None => {}
+            None => {
+                // The table has nothing for this skill id. With the gamedata
+                // tables compiled in that means the id is past the end of the
+                // talisman table (the four tables stop at id 205, while the
+                // skill list runs to 306): a skill the game can never roll on a
+                // charm. Without the tables nothing is known, so the build
+                // stays quiet and the kind's ceiling speaks instead.
+                #[cfg(feature = "gamedata")]
+                if TalismanGrade::from_rarity(grade.rarity()).is_some() {
+                    out.push(format!(
+                        "{} のスキルID {} は護石の表に無いため付けられません",
+                        label, skill
+                    ));
+                    flagged = true;
+                }
+            }
+        }
+        if flagged {
+            continue;
+        }
+        let Some(l) = limits else { continue };
+        match l.max_points(second) {
+            Some(cap) if pts > cap => out.push(format!(
+                "{} {} は {:+} ですが、{} の上限は {:+} です",
+                label,
+                skill_label(skill),
+                pts,
+                l.name(),
+                cap
+            )),
+            None => out.push(format!(
+                "{} は{}に設定できません（この種類は第2スキルを持てません）",
+                label,
+                l.name()
+            )),
+            _ => {}
         }
     }
     out
@@ -997,7 +1253,12 @@ pub fn structure_warnings(
     structure_warnings_record(rec)
 }
 
-/// Clamp the decoration slots to what the grade allows.
+/// Clamp the decoration slots to what the record's kind allows.
+///
+/// The ceiling is the kind's own, read from [KIND_LIMITS] (1 / 2 / 3 / 3), and
+/// the grade passed in is kept as a second opinion: the two always agree
+/// because the kind decides the rarity, but a caller that hands in a lower
+/// grade must not be silently overruled.
 pub fn clamp_slots(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> bool {
     if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
         return false;
@@ -1006,7 +1267,9 @@ pub fn clamp_slots(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> 
     if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
         return false;
     }
-    let max = grade.max_slots();
+    let max = kind_limits_of_record(&box_bytes[o..o + CHARM_RECORD])
+        .map(|l| l.max_slots.min(grade.max_slots()))
+        .unwrap_or_else(|| grade.max_slots());
     if box_bytes[o + 0x10] > max {
         box_bytes[o + 0x10] = max;
         return true;
@@ -1044,10 +1307,15 @@ pub fn set_grade(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> bo
     true
 }
 
-/// Clamp both skill point values to what the grade allows.
+/// Clamp both skill point values to what the grade and the kind allow.
 ///
-/// Returns true when a value had to move. A skill the grade forbids outright
-/// is cleared rather than silently left illegal.
+/// Returns true when a value had to move. The ceiling of one slot is the
+/// smallest of the per-skill table and the kind's own maximum
+/// ([KindLimits::max_points]), so a record typed as a 兵士 can never end up
+/// holding a second skill's points even where the per-skill table has a row.
+///
+/// A skill the grade forbids outright is kept and left for [grade_warnings]:
+/// silently deleting a skill the user chose is worse than writing it.
 pub fn clamp_points(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> bool {
     if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
         return false;
@@ -1056,35 +1324,77 @@ pub fn clamp_points(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) ->
     if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
         return false;
     }
+    let limits = kind_limits_of_record(&box_bytes[o..o + CHARM_RECORD]);
     let mut moved = false;
     for (skill_at, pts_at, second) in [(0x0Cusize, 0x0Eusize, false), (0x0D, 0x0F, true)] {
         let skill = box_bytes[o + skill_at];
         if skill == 0 {
             continue;
         }
+        let cap = limits.and_then(|l| l.max_points(second));
         match allowed_points_rarity(grade.rarity(), skill, second) {
             // "0~0" means the grade does not carry this skill at all. The
             // record is left alone rather than quietly cleared: the reference
-            // editor warns about this and still writes, and silently deleting
-            // a skill the user chose is worse than writing it. grade_warnings
-            // is how the caller tells them.
+            // editor warns about this and still writes, and grade_warnings is
+            // how the caller tells them.
             Some(r) if r.min == 0 && r.max == 0 => {}
             Some(r) => {
+                let high = match cap {
+                    Some(c) => r.max.min(c),
+                    None => r.max,
+                };
                 let pts = box_bytes[o + pts_at] as i8;
                 if pts < r.min {
                     box_bytes[o + pts_at] = r.min as u8;
                     moved = true;
-                } else if pts > r.max {
-                    box_bytes[o + pts_at] = r.max as u8;
+                } else if pts > high {
+                    box_bytes[o + pts_at] = high as u8;
                     moved = true;
                 }
             }
             None => {
-                // The grade does not allow this skill at all.
+                // The table knows nothing about this skill id (it is past the
+                // end of its 206 rows), so the grade does not allow it at all.
+                // The kind's ceiling is a ceiling, not a permission: a value
+                // under it is still a skill the game cannot roll, so this case
+                // keeps the old answer and clears the slot. [clamp_points_to_kind]
+                // is the non-destructive, table-free clamp when that is wanted.
                 box_bytes[o + skill_at] = 0;
                 box_bytes[o + pts_at] = 0;
                 moved = true;
             }
+        }
+    }
+    moved
+}
+
+/// Clamp both point values to the ceiling of the record's own kind alone.
+///
+/// This is the half of [clamp_points] that needs no per-skill table at all, so
+/// it also answers on a build without the `gamedata` feature, and it is what a
+/// caller should use when only the kind is trusted. A second skill on a kind
+/// that has no second slot (兵士 / 闘士) is left where it is: the kind says it
+/// cannot be rolled, but removing it is the user's call, and
+/// [grade_warnings] is the line that says so.
+pub fn clamp_points_to_kind(box_bytes: &mut [u8], index: usize) -> bool {
+    if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
+        return false;
+    }
+    let o = index * CHARM_RECORD;
+    let Some(limits) = kind_limits_of_record(&box_bytes[o..o + CHARM_RECORD]) else {
+        return false;
+    };
+    let mut moved = false;
+    for (skill_at, pts_at, second) in [(0x0Cusize, 0x0Eusize, false), (0x0D, 0x0F, true)] {
+        if box_bytes[o + skill_at] == 0 {
+            continue;
+        }
+        let Some(cap) = limits.max_points(second) else {
+            continue;
+        };
+        if (box_bytes[o + pts_at] as i8) > cap {
+            box_bytes[o + pts_at] = cap as u8;
+            moved = true;
         }
     }
     moved
@@ -1318,5 +1628,156 @@ mod tests {
             crate::save::OFF_EQUIPMENT_BOX + CHARM_BOX_SIZE,
             crate::save::OFF_PALICO_EQUIPMENT
         );
+    }
+
+    // --- the per-kind ceilings (charm::KIND_LIMITS) -----------------------
+
+    /// A talisman of a chosen kind: the record shape the sample save holds,
+    /// retyped. The pair at +0x02 / +0x12 is written from the kind table.
+    fn record_of_kind(kind: u8) -> [u8; CHARM_RECORD] {
+        let mut r = rarity_99_record();
+        r[0x02] = kind;
+        r[0x12] = kind_rarity(kind).unwrap();
+        r[0x13] = 1;
+        r
+    }
+
+    #[test]
+    fn each_kind_carries_the_ceiling_measured_from_the_tables() {
+        // 1-2 -> rarity 97: one slot, no second skill at all.
+        for kind in [1u8, 2] {
+            let l = kind_limits(kind).expect("a shipped kind");
+            assert_eq!(l.rarity, 97);
+            assert_eq!(l.max_first, 10);
+            assert_eq!(l.max_slots, 1);
+            assert_eq!(l.max_points(true), None, "rarity 97 has no slot-2 table");
+            assert_eq!(l.second_skills, 0);
+            assert_eq!(l.first_skills, 59);
+        }
+        // 3-4 -> 98: two slots, +13 on the second skill.
+        for kind in [3u8, 4] {
+            let l = kind_limits(kind).unwrap();
+            assert_eq!(l.rarity, 98);
+            assert_eq!((l.max_first, l.max_second, l.max_slots), (10, 13, 2));
+            assert_eq!((l.first_skills, l.second_skills), (71, 74));
+        }
+        // 5-7 -> 99: the first skill stops at +8, the second reaches +13.
+        for kind in [5u8, 6, 7] {
+            let l = kind_limits(kind).unwrap();
+            assert_eq!(l.rarity, 99);
+            assert_eq!((l.max_first, l.max_second, l.max_slots), (8, 13, 3));
+            assert_eq!((l.first_skills, l.second_skills), (56, 105));
+        }
+        // 8-10 -> 100: the skyward talisman, +10 / +13 / three slots.
+        for kind in [8u8, 9, 10] {
+            let l = kind_limits(kind).unwrap();
+            assert_eq!(l.rarity, 100);
+            assert_eq!((l.max_first, l.max_second, l.max_slots), (10, 13, 3));
+            assert_eq!((l.first_skills, l.second_skills), (62, 94));
+        }
+        // Row 0 is 装備なし and past the table is not a kind.
+        assert!(kind_limits(0).is_none());
+        assert!(kind_limits(11).is_none());
+        // Every kind agrees with the rarity table it is stored as.
+        for kind in 1..=TALISMAN_KIND_COUNT {
+            assert_eq!(kind_limits(kind).unwrap().rarity, kind_rarity(kind).unwrap());
+        }
+    }
+
+    #[test]
+    fn the_kind_ceiling_line_names_the_kind_and_its_numbers() {
+        let line = kind_limit_line(10).expect("a shipped kind");
+        assert!(line.contains("天の護石"), "{}", line);
+        assert!(
+            line.contains("+10") && line.contains("+13") && line.contains('3'),
+            "{}",
+            line
+        );
+        let soldier = kind_limit_line(1).unwrap();
+        assert!(soldier.contains("兵士の護石"), "{}", soldier);
+        assert!(soldier.contains("第2スキルなし"), "{}", soldier);
+        assert!(kind_limit_line(0).is_none());
+    }
+
+    #[test]
+    fn clamping_to_the_kind_stops_a_sky_talisman_at_ten_and_thirteen() {
+        let mut b = alloc::vec![0u8; CHARM_BOX_SIZE];
+        let mut r = record_of_kind(10);
+        r[0x0C] = 42; // a slot-1 skill the rarity-100 table caps at +10
+        r[0x0E] = 12;
+        r[0x0D] = 27; // a slot-2 skill it caps at +13
+        r[0x0F] = 20;
+        r[0x10] = 3;
+        b[..CHARM_RECORD].copy_from_slice(&r);
+
+        assert!(clamp_points_to_kind(&mut b, 0));
+        assert_eq!(b[0x0E] as i8, 10);
+        assert_eq!(b[0x0F] as i8, 13);
+        // A value inside the ceiling is left alone, and the record is then
+        // ordinary for the kind it carries.
+        assert!(!clamp_points_to_kind(&mut b, 0));
+        assert!(grade_warnings(&b, 0, TalismanGrade::Enduring).is_empty());
+    }
+
+    #[test]
+    fn a_soldier_kind_has_one_slot_and_cannot_carry_a_second_skill() {
+        let mut b = alloc::vec![0u8; CHARM_BOX_SIZE];
+        let mut r = record_of_kind(1);
+        r[0x0C] = 1;
+        r[0x0E] = 5;
+        r[0x0D] = 2;
+        r[0x0F] = 5;
+        r[0x10] = 3;
+        b[..CHARM_RECORD].copy_from_slice(&r);
+
+        // The kind's ceiling never raises anything, and the second skill is
+        // kept: removing it is the user's call.
+        assert!(!clamp_points_to_kind(&mut b, 0));
+        assert_eq!(b[0x0D], 2);
+        assert_eq!(b[0x0F] as i8, 5);
+
+        assert!(clamp_slots(&mut b, 0, TalismanGrade::Mystery));
+        assert_eq!(b[0x10], 1, "a 兵士 carries one slot");
+
+        let w = grade_warnings(&b, 0, TalismanGrade::Mystery);
+        let joined = w.join(" / ");
+        assert!(joined.contains("兵士の護石"), "{}", joined);
+        assert!(joined.contains("スキル2"), "{}", joined);
+    }
+
+    #[test]
+    fn a_skill_id_past_the_talisman_table_is_reported() {
+        // The four point tables have 206 cells (0..=205) while the skill list
+        // runs to 306, so ids above 205 are real skills no talisman can carry.
+        let mut b = alloc::vec![0u8; CHARM_BOX_SIZE];
+        let mut r = record_of_kind(10);
+        r[0x0C] = 210;
+        r[0x0E] = 3;
+        r[0x0D] = 0;
+        r[0x0F] = 0;
+        r[0x10] = 1;
+        b[..CHARM_RECORD].copy_from_slice(&r);
+        let w = grade_warnings(&b, 0, TalismanGrade::Enduring);
+        assert!(
+            w.iter().any(|line| line.contains("スキルID 210")),
+            "{:?}",
+            w
+        );
+    }
+
+    #[test]
+    fn a_queen_talisman_stops_its_first_skill_at_eight() {
+        let mut b = alloc::vec![0u8; CHARM_BOX_SIZE];
+        let mut r = record_of_kind(5);
+        r[0x0C] = 16; // the only slot-1 skill amuletSkillData04 caps at 8
+        r[0x0E] = 11;
+        r[0x0D] = 27;
+        r[0x0F] = 13;
+        r[0x10] = 3;
+        b[..CHARM_RECORD].copy_from_slice(&r);
+
+        assert!(clamp_points_to_kind(&mut b, 0));
+        assert_eq!(b[0x0E] as i8, 8, "a 女王 stops at +8 on the first skill");
+        assert_eq!(b[0x0F] as i8, 13, "the second skill still reaches +13");
     }
 }
