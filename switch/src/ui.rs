@@ -371,7 +371,6 @@ pub struct GuiState {
     pub osk_result: Option<(usize, String)>,
     pub osk_cancelled: bool,
     pub pending_delete: Option<i32>,
-    pub pending_delete_charm: Option<usize>,
     pub sets_cursor: usize,
     pub sets_tab: usize,
     /// The snapshot a review is waiting on. Set by the [Y] press on the options
@@ -406,7 +405,6 @@ impl GuiState {
             osk_result: None,
             osk_cancelled: false,
             pending_delete: None,
-            pending_delete_charm: None,
             sets_cursor: 0,
             sets_tab: 0,
             pending_snapshot: None,
@@ -571,9 +569,12 @@ impl GuiState {
 
     fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
         self.pending_delete = None;
-        self.pending_delete_charm = None;
         self.close_set_form(ed);
         self.close_palico_panel(ed);
+        // The item bulk menu is a mode of the item box. A section jump changes
+        // the screen without going through that screen's keys, so without this
+        // the menu stayed open over the next screen and came back with it.
+        ed.dismiss_item_menu();
         if sec != MainSection::File && sec != MainSection::Quest && ed.save.is_none() {
             ed.message = String::from("先にセーブデータを開いてください");
             return;
@@ -781,7 +782,6 @@ impl GuiState {
 
     pub fn select_sub_tab(&mut self, ed: &mut Editor, idx: usize) {
         self.pending_delete = None;
-        self.pending_delete_charm = None;
         // The マイセット tab means the list, so a tab press also closes the
         // set editor; leaving the screen any other way does too.
         self.close_set_form(ed);
@@ -789,6 +789,9 @@ impl GuiState {
         ed.csv_armed = None;
         // Same rule for the palico equipment panel.
         self.close_palico_panel(ed);
+        // And for the item bulk menu: a page / tab move leaves the screen the
+        // menu belongs to, so the menu must not still be open on the way back.
+        ed.dismiss_item_menu();
 
         // On the progress screen the sub-tabs are its three views, so a tab
         // press (or a tap on the bar) switches the view, not the section.
@@ -1234,6 +1237,12 @@ impl GuiState {
                     ed.step = (ed.step + 1) % STEPS.len();
                     ed.message = format!("個数の刻み幅を ±{} に切り替えました", STEPS[ed.step]);
                 }
+                // [R] types the count of the selected slot. It used to open the
+                // same picker [A] opens, so nothing was lost by giving it to the
+                // one number on this screen a user would rather type than step.
+                Key::R => {
+                    ed.request_item_count_text();
+                }
                 // Minus is the bulk menu now; 元に戻す is one of its rows
                 // (and still L, as before).
                 other => ed.input(other),
@@ -1252,23 +1261,32 @@ impl GuiState {
                 other => ed.input(other),
             },
             Screen::Charms => match key {
-                Key::Up | Key::Down => {
-                    self.pending_delete_charm = None;
-                    ed.input(key);
-                }
-                Key::A => {
-                    // A safely opens the Charm Editor!
+                // Both presses of the delete are the state machine's
+                // (hbedit::Editor::charm_delete_armed); this layer only moves
+                // the cursor, and that goes through as well.
+                Key::Up | Key::Down => ed.input(key),
+                // [A] and [Y] both open the selected talisman's form; neither of
+                // them deletes. [A] used to create when the box was empty and
+                // [Y] deleted, which is how one screen ended up with two
+                // different meanings for "the button".
+                Key::A | Key::Y => {
                     if ed.charms().is_empty() {
                         ed.input(Key::L);
                     } else {
-                        ed.input(Key::Y);
+                        ed.input(Key::A);
                     }
                 }
-                Key::Y => {
-                    self.apply_action(ed, UiAction::DeleteCharmConfirm);
-                }
+                // [-] is the one destructive key on every screen, twice: the
+                // same key the equipment box, the sets and the palico panels
+                // use. Both presses are the state machine's
+                // (hbedit::Editor::charm_delete_armed), so a touch button and
+                // the pad cannot cost a different number of presses.
                 Key::Minus => {
-                    ed.input(Key::L); // Create new charm in free slot
+                    ed.input(Key::Minus);
+                }
+                Key::Plus => {
+                    ed.open_charms();
+                    ed.input(Key::L);
                 }
                 other => ed.input(other),
             },
@@ -1316,8 +1334,18 @@ impl GuiState {
                     ed.hunt_field = (ed.hunt_field + 1) % 4;
                 }
                 Key::A => {
-                    ed.step = (ed.step + 1) % STEPS.len();
-                    ed.message = format!("狩猟記録の刻み幅を {} に切り替えました", HUNT_STEPS[ed.step]);
+                    ed.step = (ed.step + 1) % HUNT_STEPS.len();
+                    ed.message = format!(
+                        "狩猟記録の刻み幅を {} に切り替えました",
+                        if HUNT_STEPS[ed.step] < 0 {
+                            String::from("反転（▶で減る）")
+                        } else {
+                            format!("±{}", HUNT_STEPS[ed.step])
+                        }
+                    );
+                }
+                Key::R => {
+                    ed.request_hunt_text();
                 }
                 other => ed.input(other),
             },
@@ -1795,7 +1823,7 @@ impl GuiState {
             UiAction::ItemOp(op) => {
                 ed.open_item_menu();
                 ed.item_menu_cursor = op.min(ITEM_OPS.len() - 1);
-                ed.item_dedupe_armed = false;
+                ed.item_armed = None;
                 ed.run_item_op(ed.item_menu_cursor);
             }
             // The talisman screen has no bulk action and no preset. The
@@ -1807,21 +1835,9 @@ impl GuiState {
                 ed.open_charms();
                 ed.input(Key::L);
             }
-            UiAction::DeleteCharmConfirm => {
-                let list = ed.charms();
-                if let Some(chm) = list.get(ed.cursor) {
-                    if self.pending_delete_charm == Some(chm.index) {
-                        self.pending_delete_charm = None;
-                        ed.input(Key::A);
-                    } else {
-                        self.pending_delete_charm = Some(chm.index);
-                        ed.message = format!(
-                            "枠 #{:04} を削除しますか？ もう一度 [Y] で削除確定",
-                            chm.index
-                        );
-                    }
-                }
-            }
+            // The touch path and the pad press the same key: one delete rule,
+            // one place that counts the presses.
+            UiAction::DeleteCharmConfirm => ed.input(Key::Minus),
             // One tap used to write every palico with no undo step behind it.
             // It asks twice now, and the write itself is one undo step
             // (Editor::maximize_all_palicos), so the bulk MAX can be taken back.
@@ -2495,7 +2511,7 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
                 // A tap on another row is a cursor move: the armed dedupe
                 // belongs to the row it was armed on.
                 ed.item_menu_cursor = clamped;
-                ed.item_dedupe_armed = false;
+                ed.item_armed = None;
             } else {
                 ed.cursor = clamped;
             }
@@ -2592,33 +2608,37 @@ fn scroll_active_cursor(ed: &mut Editor, delta: i32) {
 
 fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
     match ed.screen {
+        // The four screens that had no arm at all (狩猟記録 / ギルドカード /
+        // 所持オトモ / 環境設定 / 護石編集) answer from the state machine, so the
+        // numbers are the same ones the rows print and the tests can pin them.
         Screen::Char => {
-            let max_val = match idx {
-                1 => 9_999_999,
-                3 => 999,
-                4 => 99_999_999,
-                5..=9 => 9_999_999,
-                _ => return,
-            };
-            ed.set_char_value(idx, max_val);
-            ed.message = format!("{} を最大値 ({}) に設定しました", CHAR_FIELDS[idx].1, max_val);
+            ed.char_row_max(idx);
         }
         Screen::Items => {
-            let vis = ed.visible_items();
-            if let Some(&box_idx) = vis.get(idx) {
-                if let Some(mut items) = ed.save.as_ref().and_then(|s| s.read_item_box(ed.slot)) {
-                    if items[box_idx].id == 0 {
-                        ed.message = String::from("空きスロットです。[A] で先にアイテムを選んでください");
-                        return;
-                    }
-                    items[box_idx].count = 99;
-                    if let Some(s) = &mut ed.save {
-                        let _ = s.write_item_box(ed.slot, &items);
-                        ed.dirty = true;
-                        ed.message = format!("枠 #{} の個数を 99 に設定しました", box_idx + 1);
-                    }
-                }
+            ed.item_row_max(idx);
+        }
+        Screen::Hunts => {
+            ed.hunt_row_max(idx);
+        }
+        Screen::Guild => {
+            if ed.guild_view() == GUILD_TAB_ARENA {
+                ed.message =
+                    String::from("闘技大会の行に最大値はありません（[Y] で直接入力）");
+            } else {
+                ed.guild_row_max(idx);
             }
+        }
+        Screen::Roster => {
+            ed.roster_row_max(idx);
+        }
+        Screen::Options => {
+            ed.option_row_max(idx);
+        }
+        Screen::CharmEdit => {
+            ed.charm_row_max(idx);
+        }
+        Screen::Charms => {
+            ed.message = String::from("この一覧の行に最大値はありません（[A] で護石を開いてください）");
         }
         // The set form has no maximum: the rows name records, not numbers.
         // Taking a part out is [-], which asks for a second press, so MAX must
@@ -2721,9 +2741,17 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
             if ed.item_pick_mode == 3 && ed.item_pick_stage == 1 {
                 ed.item_pick_add_count = mhnx_core::itembox::MAX_COUNT;
                 ed.message = ed.item_add_message();
+            } else {
+                ed.message =
+                    String::from("この一覧に最大値はありません（[A] で決定してください）");
             }
         }
-        _ => {}
+        // Every other screen either does not draw the button (see
+        // max_is_available) or has nothing to jump to: it says so rather than
+        // swallowing the press.
+        _ => {
+            ed.message = String::from("この画面の、この行に最大値はありません");
+        }
     }
 }
 
@@ -2772,7 +2800,76 @@ fn apply_mib_preset(ed: &mut Editor, preset: u8) {
     }
 }
 
+/// The step table one screen really steps by, and the key that cycles it.
+///
+/// The inspector used to draw STEPS on every screen. The hunt screen steps by
+/// HUNT_STEPS (its fifth entry is a direction flip, not a size) and spends [Y]
+/// on the column, so the pills named a size the key never applied and a key
+/// the screen had already given away.
+fn step_table(ed: &Editor) -> (&'static [i64], &'static str) {
+    match ed.screen {
+        Screen::Hunts => (&HUNT_STEPS[..], "A"),
+        _ => (&STEPS[..], "Y"),
+    }
+}
+
+/// One step pill's label. -1 is "reversed", which is what the sign means.
+fn step_pill_label(step: i64) -> String {
+    if step < 0 {
+        String::from("反転")
+    } else {
+        format!("±{}", step)
+    }
+}
+
+/// Does the row under the cursor have a ceiling [MAX] can jump to?
+///
+/// False hides the button (the slot prints a dash instead): the five screens
+/// that answered "nothing" before, the candidate lists and the pickers have no
+/// ceiling to jump to, so drawing a live button there would be a lie.
+fn max_is_available(ed: &Editor, row: usize) -> bool {
+    match ed.screen {
+        // Row 0 is the name, which is text.
+        Screen::Char => row != 0,
+        // Both set forms edit a list of candidate records, not numbers.
+        Screen::Sets => false,
+        Screen::Items | Screen::Options | Screen::Roster | Screen::Hunts => true,
+        Screen::Guild => ed.guild_view() != GUILD_TAB_ARENA && row <= 1,
+        // 種類上限: slots and the two point rows. The kind row prints its
+        // ceiling instead of jumping to it, and the box-slot row names a slot.
+        Screen::CharmEdit => matches!(row, 2 | 4 | 6),
+        // The id row of the equipment form has no ceiling.
+        Screen::EquipEdit => row != 0,
+        Screen::QuestEquip => ed.qe_open,
+        Screen::Mib => questfields::MIB_FIELDS
+            .get(row)
+            .map(|f| f.key.starts_with("mob_slot["))
+            .unwrap_or(false),
+        Screen::EntryView => true,
+        Screen::ItemPick => ed.item_pick_mode == 3 && ed.item_pick_stage == 1,
+        _ => false,
+    }
+}
+
+/// Screens where [R] types a number instead of stepping it.
+fn supports_direct_input(ed: &Editor) -> bool {
+    match ed.screen {
+        Screen::Items | Screen::Hunts => true,
+        Screen::Guild => ed.guild_view() != GUILD_TAB_ARENA,
+        _ => false,
+    }
+}
+
 fn trigger_quick_save(ed: &mut Editor) {
+    // The item bulk menu owns [A]. [X] is the save key on every screen - the
+    // footer says so over the menu too - and this used to send [A], which ran
+    // the highlighted bulk edit and wrote nothing. The menu is put away first
+    // and then the ordinary save request goes out, so "保存したつもり" cannot
+    // happen.
+    if ed.item_menu_open {
+        ed.item_screen_save();
+        return;
+    }
     match ed.screen {
         Screen::CharmEdit => {
             ed.input(Key::A);
@@ -3165,7 +3262,7 @@ impl GuiState {
             Screen::Charms => {
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "新規護石作成", t.text_primary, FontSize::Small);
+                btn_text(c, 1108, sy, 158, sh, "[＋] 新規護石", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::NewCharm);
             }
             // The talisman form has no bulk chip and no preset chip any more:
@@ -3191,7 +3288,7 @@ impl GuiState {
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[-] 解除×2", t.accent_secondary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, "[-] 解除（2回）", t.accent_secondary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
@@ -3285,19 +3382,25 @@ impl GuiState {
             Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
             Screen::Char => "[◀/▶] 増減  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
             Screen::Items if ed.item_menu_open => {
-                "[▲/▼] 選択  [A] 実行  [-] 閉じる  [B] 戻る  [X] 保存"
+                "[▲/▼] 選択  [A] 実行（2回）  [-] 閉じる  [B] 戻る  [X] 保存"
             }
-            Screen::Items => "[A] 変更  [-] 一括操作  [◀/▶] 個数  [Y] 刻み  [L/R] ページ  [X] 保存",
+            Screen::Items => {
+                "[A] 変更  [-] 一括操作  [◀/▶] 個数  [Y] 刻み  [R] 数値入力  [X] 保存"
+            }
             Screen::ItemPick if ed.item_pick_mode == 3 && ed.item_pick_stage == 1 => {
                 "[◀/▶] 個数  [▲/▼] ±10  [A] この個数を追加  [B] 選び直す"
             }
             Screen::ItemPick | Screen::SkillPick => "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る",
-            Screen::Charms => "[A] 編集  [Y×2] 削除  [-] 新規  [L/R] サブタブ  [X] 保存",
+            // One delete key on every screen: [-] twice. Creation moved to
+            // [＋], the key the equipment box already uses for "new record".
+            Screen::Charms => {
+                "[A] 編集  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存"
+            }
             Screen::CharmEdit => charm_hint
                 .as_deref()
                 .unwrap_or("[A] 行ごとの操作  [▲/▼] 行  [◀/▶] 値  [X] 保存  [B] 戻る"),
             Screen::Equip => {
-                "[A] 編集  [▲/▼] 行  [Y] 絞る  [-] 削除×2  [＋] 新規  [X] 保存  [B] 戻る"
+                "[A] 編集  [▲/▼] 行  [Y] 絞る  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
             }
             Screen::EquipEdit => {
                 "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品  [X] 保存  [B] 戻る"
@@ -3308,10 +3411,10 @@ impl GuiState {
             // The set editors are modes of the my-sets screen, so the chips
             // change with them.
             Screen::Sets if ed.set_edit.is_some() => {
-                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-]×2 外す  [Y] 警告  [X] 保存  [B] 一覧"
+                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 外す（2回）  [Y] 警告  [X] 保存  [B] 一覧"
             }
             Screen::Sets if ed.item_set_edit.is_some() => {
-                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込×2  [-]×2 ポーチへ  [B] 一覧"
+                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込（2回）  [-] ポーチへ（2回）  [B] 一覧"
             }
             Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
             // The CSV screen: A applies twice, Y writes, Minus reads the folder.
@@ -3319,7 +3422,7 @@ impl GuiState {
                 "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [-] 再読込"
             }
             Screen::Csv => {
-                "[A] 適用(2回)  [Y] 書き出し  [-] 再読込  [▲/▼] 行  [L/R] タブ"
+                "[A] 適用（2回）  [Y] 書き出し  [-] 再読込  [▲/▼] 行  [L/R] タブ"
             }
             // Y opens the same review dialog a save write uses and only the
             // second [A] puts the snapshot back, so the chip says so.
@@ -3327,7 +3430,7 @@ impl GuiState {
             // The equipment panel is a mode of both palico screens: its chips
             // replace theirs while it is open.
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
-                "[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-×2] 解除  [B] 一覧  [X] 保存"
+                "[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-] 解除（2回）  [B] 一覧  [X] 保存"
             }
             Screen::Roster if ed.palico_skill_open() => {
                 "[▲/▼] 枠  [◀/▶] 候補  [L/R] ±10  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
@@ -3336,7 +3439,9 @@ impl GuiState {
                 "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [+] スキル  [L/R] タブ  [X] 保存"
             }
             Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
-            Screen::Hunts => "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [L/R] サブタブ  [X] 保存",
+            Screen::Hunts => {
+                "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [R] 数値入力  [L/R] サブタブ  [X] 保存"
+            }
             // The three views of the progress screen, one line each: Y is the
             // second bit on the quest view and the tab key on the other two.
             Screen::Progress if ed.progress_view() == PROGRESS_QUESTS => {
@@ -3360,12 +3465,21 @@ impl GuiState {
                 "[▲/▼] アリーナ  [◀/▶] 順位  [A] 編集  [Y] 直接入力  [X] 保存  [B] カードへ"
             }
             Screen::Guild => {
-                "[▼] 項目  [◀/▶] 増減  [A] コメント  [-] 進行状況  [L/R] タブ  [X] 保存"
+                "[▼] 項目  [◀/▶] 増減  [R] 数値入力  [A] コメント  [-] 進行状況  [L/R] タブ  [X] 保存"
             }
             _ => "[A] 決定  [◀/▶] 調整  [L/R] サブタブ  [ZL/ZR] セクション  [X] 保存",
         };
-        let hint_w = c.text_width_sized(hint, FontSize::Small);
-        c.text_right(1262, FOOTER_Y + 9, hint, t.text_secondary, FontSize::Small);
+        // [＋] quits on every screen where it is not a screen tool, and the
+        // footer says so: it was the one key that could throw the session away
+        // and the one key nothing named.
+        let plus_is_a_tool = matches!(ed.screen, Screen::Equip | Screen::Charms)
+            || (ed.screen == Screen::Roster && !ed.palico_skill_open());
+        let hint = if plus_is_a_tool {
+            hint.to_string()
+        } else {
+            format!("{}  [＋] 終了", hint)
+        };
+        c.text_right(1262, FOOTER_Y + 9, &hint, t.text_secondary, FontSize::Small);
 
         // Left, top row: the whole-save undo. Both numbers the audit asked for
         // are on screen at all times - how many steps are left of four and what
@@ -3392,7 +3506,13 @@ impl GuiState {
         } else {
             &ed.message
         };
-        let max_msg_w = (1262 - hint_w - 60).max(160);
+        // Touch has one rule that is invisible until it bites: the first tap
+        // only selects a row, the second one runs it. It is printed here rather
+        // than in a help screen nobody opens.
+        let tap_note = "[タップ] 1回目=選択 / 2回目=決定（ドラッグでスクロール）";
+        let tap_w = c.text_width_sized(tap_note, FontSize::Small);
+        c.text_right(1262, FOOTER_Y + 30, tap_note, t.text_muted, FontSize::Small);
+        let max_msg_w = (1262 - tap_w - 60).max(160);
         c.circle(22, FOOTER_Y + 38, 4, if ed.dirty { t.accent_warn } else { t.accent_primary });
         c.text_clipped(36, FOOTER_Y + 30, max_msg_w, msg, t.text_primary, FontSize::Small);
     }
@@ -4109,8 +4229,9 @@ impl GuiState {
             btn_text(c, bx2, cur_y, bw, 38, "+ ▶", t.text_primary, FontSize::Small);
             self.add_hit(bx2, cur_y, bw, 38, UiAction::AdjustRow(row_idx, Key::Right));
 
-            // [MAX]
-            let bx3 = bx2 + bw + 8;
+            // [MAX] is drawn only where the row under the cursor really has a
+            // ceiling. A button that only ever answers "no" is the shape of
+            // bug this review opened with (five screens, no arm, no message).
             let max_lbl = if ed.screen == Screen::EntryView
                 && ed
                     .arc
@@ -4123,30 +4244,58 @@ impl GuiState {
             } else {
                 "MAX"
             };
-            c.round_rect(bx3, cur_y, bw, 38, 5, t.bg_btn_primary);
-            c.round_rect_border(bx3, cur_y, bw, 38, 5, 1, t.accent_primary);
-            btn_text(c, bx3, cur_y, bw, 38, max_lbl, t.text_primary, FontSize::Small);
-            self.add_hit(bx3, cur_y, bw, 38, UiAction::SetRowMax(row_idx));
+            let bx3 = bx2 + bw + 8;
+            if max_is_available(ed, row_idx) {
+                c.round_rect(bx3, cur_y, bw, 38, 5, t.bg_btn_primary);
+                c.round_rect_border(bx3, cur_y, bw, 38, 5, 1, t.accent_primary);
+                btn_text(c, bx3, cur_y, bw, 38, max_lbl, t.text_primary, FontSize::Small);
+                self.add_hit(bx3, cur_y, bw, 38, UiAction::SetRowMax(row_idx));
+            } else {
+                c.round_rect(bx3, cur_y, bw, 38, 5, t.bg_btn);
+                c.round_rect_border(bx3, cur_y, bw, 38, 5, 1, t.border_subtle);
+                btn_text(c, bx3, cur_y, bw, 38, "—", t.text_muted, FontSize::Small);
+            }
 
             cur_y += 46; // iy + 266
 
-            // Step size selector pills [Y]
-            c.text_sized(ix + 20, cur_y + 6, "刻み [Y]", t.text_secondary, FontSize::Small);
-            let mut sx = ix + 104;
-            let sw = 72i32;
-            for (s_idx, &step_val) in STEPS.iter().enumerate() {
+            // Step size selector pills. The table is the one this screen really
+            // steps by (the hunt screen's fifth entry is a direction flip, not
+            // a size) and the key named beside it is the key that cycles it.
+            let (steps, step_key) = step_table(ed);
+            let step_lbl = format!("刻み [{}]", step_key);
+            c.text_sized(ix + 20, cur_y + 4, &step_lbl, t.text_secondary, FontSize::Small);
+            // [R] 数値入力: the three screens that hold a number a user would
+            // rather type than step (個数 / HR / 時間 / 狩猟数).
+            if supports_direct_input(ed) {
+                let rw = 116i32;
+                let rx = ix + iw - 20 - rw;
+                c.round_rect(rx, cur_y, rw, 24, 4, t.bg_btn);
+                c.round_rect_border(rx, cur_y, rw, 24, 4, 1, t.border_subtle);
+                btn_text(c, rx, cur_y, rw, 24, "[R] 数値入力", t.text_primary, FontSize::Small);
+                self.add_hit(rx, cur_y, rw, 24, UiAction::Key(Key::R));
+            }
+            // Two short lines (label, then pills) so all five pills fit inside
+            // the panel, and 24 + 34 in total: the tool deck below still ends
+            // above the panel's bottom edge on every screen that draws it.
+            cur_y += 26;
+            // Five pills, inside the panel: (428 - 40 of side margin - 4 gaps of
+            // 6) / 5 = 72 wide, so the last one ends at ix+404 of ix+428.
+            let gap = 6i32;
+            let sw = ((iw - 40 - gap * 4) / 5).max(40);
+            let mut sx = ix + 20;
+            for (s_idx, &step_val) in steps.iter().enumerate() {
                 let is_s = ed.step == s_idx;
                 let sbg = if is_s { t.bg_selected } else { t.bg_btn };
                 let sbd = if is_s { t.accent_primary } else { t.border_subtle };
                 let sfg = if is_s { t.accent_primary } else { t.text_secondary };
                 c.round_rect(sx, cur_y, sw, 30, 4, sbg);
                 c.round_rect_border(sx, cur_y, sw, 30, 4, 1, sbd);
-                let slbl = format!("±{}", step_val);
+                let slbl = step_pill_label(step_val);
                 btn_text(c, sx, cur_y, sw, 30, &slbl, sfg, FontSize::Small);
                 self.add_hit(sx, cur_y, sw, 30, UiAction::SetStep(s_idx));
-                sx += sw + 6;
+                sx += sw + gap;
             }
-            cur_y += 40; // iy + 306
+            cur_y += 34;
         }
 
         // Slot 7: Clean Tool Actions (No `★`, concise labels)
@@ -4182,28 +4331,42 @@ impl GuiState {
             }
             Screen::Items => {
                 if ed.item_menu_open {
-                    // In the menu the panel explains the highlighted row: the
-                    // dedupe row's numbers are the ones a second press needs.
+                    // In the menu the panel explains the highlighted row. The
+                    // four rows that rewrite the box print the price of their
+                    // second press here, and say how many presses are left.
                     c.text_sized(ix + 20, cur_y, "一括操作メニュー", t.text_muted, FontSize::Small);
                     cur_y += 24;
-                    if ed.item_menu_cursor == ITEM_OP_DEDUPE {
-                        let p = ed.item_menu_stats().dedupe;
-                        // Two short lines: a single line with the "press again"
-                        // tail would be clipped inside this 388px panel.
-                        let warn = format!("解放 {} 枠 / 消失 {} 個", p.freed, p.lost);
-                        c.text_clipped(ix + 20, cur_y, full_w, &warn, t.accent_warn, FontSize::Small);
+                    if ed.item_armed == Some(ed.item_menu_cursor) {
+                        let preview = ed.item_op_arm_preview(ed.item_menu_cursor);
+                        c.text_clipped(
+                            ix + 20,
+                            cur_y,
+                            full_w,
+                            &preview,
+                            t.accent_warn,
+                            FontSize::Small,
+                        );
                         cur_y += 26;
-                        if ed.item_dedupe_armed {
-                            c.text_clipped(
-                                ix + 20,
-                                cur_y,
-                                full_w,
-                                "もう一度 [A] で実行",
-                                t.accent_warn,
-                                FontSize::Small,
-                            );
-                            cur_y += 26;
-                        }
+                        c.text_clipped(
+                            ix + 20,
+                            cur_y,
+                            full_w,
+                            "もう一度 [A] で実行（2回）",
+                            t.accent_warn,
+                            FontSize::Small,
+                        );
+                        cur_y += 26;
+                    }
+                    if !max_is_available(ed, ed.item_menu_cursor) {
+                        c.text_clipped(
+                            ix + 20,
+                            cur_y,
+                            full_w,
+                            "この画面では [X] が保存、[A] が実行です",
+                            t.text_muted,
+                            FontSize::Small,
+                        );
+                        cur_y += 26;
                     }
                     self.draw_tool_button(
                         c,
@@ -4872,36 +5035,53 @@ impl GuiState {
                 0,
                 String::from("画面の明るさ"),
                 String::from("Brightness"),
-                format!("{}", o.brightness),
+                format!(
+                    "{}（上限 {}）",
+                    o.brightness,
+                    mhnx_core::hbedit::OPTION_BRIGHTNESS_MAX
+                ),
                 String::from("#01"),
             ),
             (
                 1,
                 String::from("振動設定"),
                 String::from("Rumble"),
-                String::from(if o.rumble != 0 { "ON" } else { "OFF" }),
+                format!(
+                    "{}（上限 1）",
+                    if o.rumble != 0 { "ON" } else { "OFF" }
+                ),
                 String::from("#02"),
             ),
             (
                 2,
                 String::from("3D表示無効"),
                 String::from("3DS Flag"),
-                String::from(if o.disable_3d != 0 { "YES" } else { "NO" }),
+                format!(
+                    "{}（上限 1）",
+                    if o.disable_3d != 0 { "YES" } else { "NO" }
+                ),
                 String::from("#03"),
             ),
             (
                 3,
                 String::from("拡張スライドパッド"),
                 String::from("3DS Flag"),
-                String::from(if o.circle_pad_pro != 0 { "ON" } else { "OFF" }),
+                format!(
+                    "{}（上限 1）",
+                    if o.circle_pad_pro != 0 { "ON" } else { "OFF" }
+                ),
                 String::from("#04"),
             ),
         ];
+        let sub = format!(
+            "明るさ 0〜{} / フラグは 0〜1",
+            mhnx_core::hbedit::OPTION_BRIGHTNESS_MAX
+        );
         self.draw_adaptive_rows(
             c,
             ed,
             "環境設定",
-            "",
+            &sub,
             &rows,
             ed.option_cursor.min(3),
             true,
@@ -4936,15 +5116,20 @@ impl GuiState {
                     _ => format!("{}", raw_v),
                 }
             };
+            // The ceilings are the ones the state machine clamps to
+            // (hbedit::clamp_char and the *_MAX constants), so the row cannot
+            // advertise a number the writer refuses. The name is 31 **bytes**
+            // (ten wide glyphs), not the 12 the row used to claim.
             let meta = match f {
-                0 => "最大 12 Byte",
-                1 => "上限 9,999,999",
-                2 => "秒単位",
-                3 => "上限 999",
-                4 => "上限 99,999,999",
-                5..=9 => "上限 9,999,999",
-                13 => "0: 男性 / 1: 女性",
-                _ => "外見パラメータ",
+                0 => format!("上限 {} バイト（全角10文字）", mhnx_core::hbedit::CHAR_NAME_MAX_BYTES),
+                1 => format!("上限 {}", mhnx_core::hbedit::CHAR_FUNDS_MAX),
+                2 => String::from("秒単位"),
+                3 => format!("上限 {}", mhnx_core::hbedit::CHAR_HR_MAX),
+                4 => format!("上限 {}", mhnx_core::hbedit::CHAR_HRP_MAX),
+                5..=9 => format!("上限 {}", mhnx_core::hbedit::CHAR_POINT_MAX),
+                13 => String::from("0: 男性 / 1: 女性"),
+                10..=16 => format!("上限 {}", mhnx_core::hbedit::CHAR_LOOK_MAX),
+                _ => String::from("外見パラメータ"),
             };
             let badge = format!("#{:02}", f + 1);
             rows.push((f, label, meta.to_string(), val, badge));
@@ -4990,7 +5175,7 @@ impl GuiState {
             let val = if id == 0 {
                 String::from("-")
             } else {
-                format!("×{}", cnt)
+                format!("×{}（上限 {}）", cnt, mhnx_core::itembox::MAX_COUNT)
             };
             rows.push((
                 list_idx,
@@ -5028,10 +5213,13 @@ impl GuiState {
         let mut rows = Vec::with_capacity(ITEM_OPS.len());
         for (i, (label, note)) in ITEM_OPS.iter().enumerate() {
             let value = stats.value(i);
-            let armed_row = i == ITEM_OP_DEDUPE && ed.item_dedupe_armed;
-            // "2回" says a second press is wanted without pushing the value
-            // column past its 230px ceiling.
+            let armed_row = ed.item_armed == Some(i);
+            // "2回" says a second press is wanted before it is asked for, and
+            // the armed row says which press is left. Short enough not to push
+            // the value column past its 230px ceiling.
             let badge = if armed_row {
+                "2回目"
+            } else if Editor::item_op_needs_second(i) {
                 "2回"
             } else if i == ITEM_OP_UNDO {
                 "-"
@@ -5046,7 +5234,7 @@ impl GuiState {
                 String::from(badge),
             ));
         }
-        let armed = ed.item_dedupe_armed && ed.item_menu_cursor == ITEM_OP_DEDUPE;
+        let armed = ed.item_armed == Some(ed.item_menu_cursor);
         let hdr = if armed {
             String::from("アイテム一括操作 — もう一度 [A] で実行（[B] 中止）")
         } else {
@@ -5058,6 +5246,8 @@ impl GuiState {
         };
         let a_lbl = if armed {
             "実行する"
+        } else if Editor::item_op_needs_second(ed.item_menu_cursor) {
+            "確認（2回）"
         } else if ed.item_menu_cursor == ITEM_OP_ADD {
             "選ぶ"
         } else {
@@ -5162,7 +5352,6 @@ impl GuiState {
             } else {
                 format!("{} {:+}", s1, chm.points1)
             };
-            let slots_str = format!("S{}", chm.slots);
             // The kind is what the game calls the talisman, so it opens the
             // row: 「龍の護石 攻撃 +10」 reads like the box screen.
             let kind = ed
@@ -5178,6 +5367,12 @@ impl GuiState {
                 .as_ref()
                 .and_then(|s| mhnx_core::charm::charm_kind(s, ed.slot, chm.index))
                 .and_then(mhnx_core::charm::kind_limits);
+            // The kind's slot ceiling goes on the row itself: the meta line is
+            // the inspector's and only the selected row is on screen there.
+            let slots_str = match limits {
+                Some(l) => format!("S{}（上限 S{}）", chm.slots, l.max_slots),
+                None => format!("S{}（上限 —）", chm.slots),
+            };
             rows.push((
                 i,
                 format!("{} {}", kind, summary),
@@ -5633,7 +5828,11 @@ impl GuiState {
             "",
             &rows,
             e.field.min(rows.len().saturating_sub(1)),
-            e.field != SET_ROW_NAME,
+            // No numeric stepper: a row names an equipment record, and the
+            // candidate walk is in this form's own tool deck below. That also
+            // means no [MAX] here, which is the truth - the row has no ceiling
+            // to jump to.
+            false,
             if e.field == SET_ROW_NAME {
                 "名前入力"
             } else {
@@ -5872,9 +6071,13 @@ impl GuiState {
         let mut rows = Vec::with_capacity(list.len());
         for (i, p) in list.iter().enumerate() {
             let val = match ed.roster_field {
-                0 => format!("Lv {}", p.level),
-                1 => format!("なつき {}", p.enthusiasm),
-                _ => format!("EXP {}", p.exp),
+                0 => format!("Lv {}（上限 {}）", p.level, mhnx_core::hbedit::PALICO_LEVEL_MAX),
+                1 => format!(
+                    "なつき {}（上限 {}）",
+                    p.enthusiasm,
+                    mhnx_core::hbedit::PALICO_ENTHUSIASM_MAX
+                ),
+                _ => format!("EXP {}（上限 {}）", p.exp, mhnx_core::hbedit::PALICO_EXP_MAX),
             };
             rows.push((
                 i,
@@ -5885,11 +6088,17 @@ impl GuiState {
             ));
         }
         let hdr = format!("所持オトモ (編集列: {})", target_col);
+        let sub = format!(
+            "Lv {} / なつき {} / EXP {} が上限",
+            mhnx_core::hbedit::PALICO_LEVEL_MAX,
+            mhnx_core::hbedit::PALICO_ENTHUSIASM_MAX,
+            mhnx_core::hbedit::PALICO_EXP_MAX
+        );
         self.draw_adaptive_rows(
             c,
             ed,
             &hdr,
-            "",
+            &sub,
             &rows,
             ed.roster_cursor.min(rows.len().saturating_sub(1)),
             true,
@@ -5940,14 +6149,19 @@ impl GuiState {
             2 => "最小サイズ",
             _ => "最大サイズ",
         };
+        // The count cap and the size window are printed on every row: the
+        // counters stop at 9999 in the game itself and a size record is a
+        // percentage between 20 and 300 (the verified save spans exactly that).
+        let count_cap = mhnx_core::hbedit::HUNT_COUNT_MAX;
+        let size_cap = mhnx_core::hbedit::HUNT_SIZE_MAX;
         let mut rows = Vec::with_capacity(hunt_list.len());
         for (i, &(id, slay, cap, lo, hi)) in hunt_list.iter().enumerate() {
             let mname = monster_name(id);
             let val = match ed.hunt_field {
-                0 => format!("討伐 {}", slay),
-                1 => format!("捕獲 {}", cap),
-                2 => format!("最小 {}%", lo),
-                _ => format!("最大 {}%", hi),
+                0 => format!("討伐 {}（上限 {}）", slay, count_cap),
+                1 => format!("捕獲 {}（上限 {}）", cap, count_cap),
+                2 => format!("最小 {}%（上限 {}%）", lo, size_cap),
+                _ => format!("最大 {}%（上限 {}%）", hi, size_cap),
             };
             rows.push((
                 i,
@@ -5958,11 +6172,17 @@ impl GuiState {
             ));
         }
         let hdr = format!("狩猟記録 (編集列: {})", col_name);
+        let sub = format!(
+            "討伐・捕獲の上限 {} / サイズ {}〜{}%",
+            count_cap,
+            20,
+            size_cap
+        );
         self.draw_adaptive_rows(
             c,
             ed,
             &hdr,
-            "",
+            &sub,
             &rows,
             ed.hunt_cursor.min(rows.len().saturating_sub(1)),
             true,
@@ -5982,14 +6202,19 @@ impl GuiState {
                 0,
                 String::from("ギルドカード HR"),
                 String::from("Hunter Rank"),
-                format!("HR {}", hr),
+                format!("HR {}（上限 {}）", hr, mhnx_core::hbedit::GUILD_HR_MAX),
                 String::from("#01"),
             ),
             (
                 1,
                 String::from("プレイ時間"),
                 String::from("Play Time"),
-                format!("{}h {:02}m", time / 3600, (time % 3600) / 60),
+                format!(
+                    "{}h {:02}m（上限 {}h）",
+                    time / 3600,
+                    (time % 3600) / 60,
+                    mhnx_core::hbedit::GUILD_TIME_MAX / 3600
+                ),
                 String::from("#02"),
             ),
             (
@@ -6004,12 +6229,19 @@ impl GuiState {
         // view is: the user reported the log as missing, and a tab that is only
         // in the bar is the kind of thing that stays missing.
         let mut warnings: Vec<String> = Vec::new();
-        warnings.push(String::from("[L/R] 闘技大会タブ: アリーナ 17 × 順位 5 のタイムを編集"));
+        warnings.push(String::from(
+            "[L/R] 闘技大会タブ: アリーナ 17 × 順位 5 のタイムを編集（[R] で数値入力）",
+        ));
+        let sub = format!(
+            "HR 上限 {} / 時間 上限 {}h",
+            mhnx_core::hbedit::GUILD_HR_MAX,
+            mhnx_core::hbedit::GUILD_TIME_MAX / 3600
+        );
         self.draw_adaptive_rows_warn(
             c,
             ed,
             "ギルドカード",
-            "",
+            &sub,
             &rows,
             ed.guild_field.min(2),
             true,

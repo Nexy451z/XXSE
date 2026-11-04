@@ -594,9 +594,21 @@ fn charm_screen_creates_and_deletes() {
         other => panic!("expected a write, got {:?}", other),
     }
 
-    // A on the list deletes whatever the cursor points at.
+    // [-] on the list deletes whatever the cursor points at, on the second
+    // press; [A] opens the form and deletes nothing.
     let n = ed.save.as_ref().unwrap().charms(0).unwrap().len();
     ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::CharmEdit, "[A] edits");
+    assert_eq!(ed.save.as_ref().unwrap().charms(0).unwrap().len(), n);
+    ed.input(Key::B);
+    ed.input(Key::Minus);
+    assert_eq!(
+        ed.save.as_ref().unwrap().charms(0).unwrap().len(),
+        n,
+        "the first press only asks"
+    );
+    assert!(ed.message.contains("2回"), "{}", ed.message);
+    ed.input(Key::Minus);
     assert_eq!(ed.save.as_ref().unwrap().charms(0).unwrap().len(), n - 1);
 }
 

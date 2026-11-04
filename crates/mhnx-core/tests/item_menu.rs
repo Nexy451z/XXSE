@@ -87,7 +87,19 @@ fn used(items: &[ItemSlot]) -> usize {
 
 fn select(ed: &mut Editor, op: usize) {
     ed.item_menu_cursor = op;
-    ed.item_dedupe_armed = false;
+    ed.item_armed = None;
+}
+
+/// Press [A] twice: the first press only arms a destructive row, the second
+/// one is the edit. Both presses are the same key, which is the whole point.
+fn press_twice(ed: &mut Editor) {
+    ed.input(Key::A);
+    assert!(
+        ed.item_armed == Some(ed.item_menu_cursor),
+        "the first press must only arm the row: {}",
+        ed.message
+    );
+    ed.input(Key::A);
 }
 
 #[test]
@@ -140,7 +152,11 @@ fn the_dedupe_row_shows_the_loss_and_needs_a_second_press() {
 
     select(&mut ed, ITEM_OP_DEDUPE);
     ed.input(Key::A);
-    assert!(ed.item_dedupe_armed, "the first press only arms the merge");
+    assert_eq!(
+        ed.item_armed,
+        Some(ITEM_OP_DEDUPE),
+        "the first press only arms the merge"
+    );
     assert_eq!(box_of(&ed), before, "the first press must not touch the box");
     assert!(!ed.dirty);
     assert!(
@@ -158,15 +174,15 @@ fn the_dedupe_row_shows_the_loss_and_needs_a_second_press() {
     // Moving off the row drops the arm: a press must never land on a row the
     // user has stopped looking at.
     ed.input(Key::Down);
-    assert!(!ed.item_dedupe_armed);
+    assert_eq!(ed.item_armed, None, "moving off the row drops the arm");
     ed.input(Key::Up);
     assert_eq!(ed.item_menu_cursor, ITEM_OP_DEDUPE);
-    assert!(!ed.item_dedupe_armed);
+    assert_eq!(ed.item_armed, None);
 
     ed.input(Key::A);
-    assert!(ed.item_dedupe_armed);
+    assert_eq!(ed.item_armed, Some(ITEM_OP_DEDUPE));
     ed.input(Key::A);
-    assert!(!ed.item_dedupe_armed, "the merge ran");
+    assert_eq!(ed.item_armed, None, "the merge ran");
 
     let after = box_of(&ed);
     let lost = total(&before).saturating_sub(total(&after));
@@ -204,7 +220,7 @@ fn the_bulk_rows_fill_clamp_and_pack_the_box() {
 
     // すべて 99 に: every used record reaches the cap, blanks are left alone.
     select(&mut ed, ITEM_OP_FILL);
-    ed.input(Key::A);
+    press_twice(&mut ed);
     let filled = box_of(&ed);
     assert!(filled
         .iter()
@@ -229,7 +245,7 @@ fn the_bulk_rows_fill_clamp_and_pack_the_box() {
         .write_item_box(ed.slot, &over)
         .expect("the box encodes");
     select(&mut ed, ITEM_OP_CLAMP);
-    ed.input(Key::A);
+    press_twice(&mut ed);
     let clamped = box_of(&ed);
     assert!(clamped
         .iter()
@@ -255,7 +271,7 @@ fn the_bulk_rows_fill_clamp_and_pack_the_box() {
         .expect("the box encodes");
     let used_before: Vec<ItemSlot> = holed.iter().filter(|s| !s.is_blank()).copied().collect();
     select(&mut ed, ITEM_OP_COMPACT);
-    ed.input(Key::A);
+    press_twice(&mut ed);
     let packed = box_of(&ed);
     let used_after: Vec<ItemSlot> = packed.iter().filter(|s| !s.is_blank()).copied().collect();
     assert_eq!(used_after, used_before, "order and stacks are kept");
@@ -391,5 +407,73 @@ fn looking_at_the_menu_writes_nothing() {
     if let Some(src) = real_save_path() {
         assert_ne!(src, copy);
     }
+    cleanup(&dir);
+}
+
+/// [X] over the bulk menu is the save key, not the [A] key.
+///
+/// The footer promised "[X] 保存" while the menu was open, and pressing it sent
+/// [A] to the menu instead: the highlighted bulk row ran and no file was
+/// written, so a user who saved and quit lost every edit. The menu is put away
+/// first now and the ordinary write request goes out, with the box untouched.
+#[test]
+fn the_save_key_over_the_menu_saves_and_runs_no_bulk_row() {
+    let Some((dir, copy)) = copy_of_the_real_save("menu_save_key") else {
+        return;
+    };
+    let mut ed = Editor::new();
+    open(&mut ed, &copy);
+    open_items(&mut ed);
+    open_menu(&mut ed);
+    // Arm the one row that would be the most expensive mistake ("すべて 99 に").
+    select(&mut ed, ITEM_OP_FILL);
+    ed.input(Key::A);
+    assert_eq!(ed.item_armed, Some(ITEM_OP_FILL));
+    let armed = box_of(&ed);
+
+    // This is the whole press the console layer does for [X].
+    assert!(
+        ed.item_screen_save(),
+        "the save key must queue a write: {}",
+        ed.message
+    );
+    assert!(!ed.item_menu_open, "the menu is put away by the save key");
+    assert_eq!(ed.item_armed, None, "and the armed row is dropped");
+    assert_eq!(box_of(&ed), armed, "no bulk row may run on the save key");
+    assert!(!ed.dirty, "nothing was edited, so nothing is unsaved");
+    let write = ed.take_write().expect("a save write was queued");
+    let mhnx_core::hbedit::Write::File { path, bytes } = write;
+    assert_eq!(path, copy.to_string_lossy(), "the open save is the target");
+    assert_eq!(
+        bytes,
+        std::fs::read(&copy).unwrap(),
+        "the bytes written are the bytes on the card"
+    );
+    cleanup(&dir);
+}
+
+/// A section / sub-tab jump cannot leave the menu open behind it.
+#[test]
+fn leaving_the_item_screen_puts_the_menu_away() {
+    let Some((dir, copy)) = copy_of_the_real_save("menu_leaves") else {
+        return;
+    };
+    let mut ed = Editor::new();
+    open(&mut ed, &copy);
+    open_items(&mut ed);
+    open_menu(&mut ed);
+
+    // The console calls this on every key; a screen change without it is what
+    // used to bring the menu back open on the next visit.
+    ed.screen = Screen::Hunts;
+    ed.input(Key::Down);
+    assert!(!ed.item_menu_open, "the menu belongs to the item box alone");
+
+    ed.screen = Screen::Items;
+    assert!(
+        !ed.item_menu_open,
+        "and coming back shows the list, not the menu"
+    );
+    assert_eq!(ed.item_armed, None);
     cleanup(&dir);
 }

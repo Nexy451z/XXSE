@@ -143,21 +143,28 @@ fn the_roster_bulk_max_is_one_undo_step_that_can_be_taken_back() {
 }
 
 #[test]
-fn an_empty_talisman_box_points_at_minus_and_not_at_the_delete_key() {
+fn an_empty_talisman_box_points_at_plus_and_never_at_the_delete_key() {
     let mut ed = Editor::new();
     ed.slot = 0;
     ed.save = Some(save::empty_switch_save());
     ed.open_charms();
     assert_eq!(ed.screen, Screen::Charms);
     assert!(ed.charms().is_empty());
+    // [-] is the one destructive key on every screen now, so create cannot be
+    // [-]: the line names [＋] (and [A], which opens the same form).
     assert!(
-        ed.message.contains("[-] で作成"),
-        "the create key is minus: {}",
+        ed.message.contains("[＋] で作成"),
+        "the create key is plus: {}",
+        ed.message
+    );
+    assert!(
+        !ed.message.contains("[-] で作成"),
+        "minus deletes a talisman on this screen: {}",
         ed.message
     );
     assert!(
         !ed.message.contains("Y で作成"),
-        "Y deletes a talisman on this screen: {}",
+        "Y edits a talisman on this screen: {}",
         ed.message
     );
 }

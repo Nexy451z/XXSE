@@ -1059,6 +1059,14 @@ pub const TEXT_SET_NAME: usize = usize::MAX - 1_001;
 /// reads one contiguous range as palico names, so a sentinel above it would be
 /// answered as a palico that does not exist.
 pub const TEXT_ARENA_TIME: usize = usize::MAX - 1_002;
+/// Sentinel id for "ask for the item count of the selected slot".
+pub const TEXT_ITEM_COUNT: usize = usize::MAX - 1_003;
+/// Sentinel id for "ask for the guild card's hunter rank".
+pub const TEXT_GUILD_HR: usize = usize::MAX - 1_004;
+/// Sentinel id for "ask for the guild card's play time as H:MM".
+pub const TEXT_GUILD_TIME: usize = usize::MAX - 1_005;
+/// Sentinel id for "ask for the hunt count of the selected monster".
+pub const TEXT_HUNT_COUNT: usize = usize::MAX - 1_006;
 
 // ---------------------------------------------------------------------------
 // 闘技大会 (the arena log): the guild screen's second view
@@ -1434,6 +1442,108 @@ pub const STEPS: [i64; 5] = [1, 10, 100, 1_000, 10_000];
 
 /// Steps the hunt screen cycles through: counts are small, so 10000 is useless.
 const HUNT_STEPS: [i64; 5] = [1, 10, 100, 1000, -1];
+
+// ---------------------------------------------------------------------------
+// The ceilings every [MAX] jumps to
+//
+// One name per row a screen draws, so the value a press writes, the number the
+// row prints next to it and the test that pins it are the same number.
+// ---------------------------------------------------------------------------
+
+/// Highest hunt / capture count the game itself stops at (hunts::MAX_COUNT).
+pub const HUNT_COUNT_MAX: u16 = crate::hunts::MAX_COUNT;
+/// Widest size percentage a record holds; the verified save spans 20..=300.
+pub const HUNT_SIZE_MAX: u16 = 300;
+/// Hunter rank ceiling (the game's own display stops at 999).
+pub const GUILD_HR_MAX: u16 = 999;
+/// The guild card's clock ceiling: the 4-digit hour field's last second.
+pub const GUILD_TIME_MAX: u32 = 9999 * 3600 + 59 * 60 + 59;
+/// Palico level ceiling.
+pub const PALICO_LEVEL_MAX: u16 = 99;
+/// Palico なつき度 ceiling.
+pub const PALICO_ENTHUSIASM_MAX: u8 = 100;
+/// Palico EXP ceiling, the number the bulk MAX writes.
+pub const PALICO_EXP_MAX: u32 = 999_999;
+/// Brightness byte ceiling.
+pub const OPTION_BRIGHTNESS_MAX: u8 = 255;
+/// Funds ceiling (also what the bulk MAX writes).
+pub const CHAR_FUNDS_MAX: i64 = 9_999_999;
+/// HRP ceiling.
+pub const CHAR_HRP_MAX: i64 = 99_999_999;
+/// Play-time ceiling in seconds, as save::clamp_char allows.
+pub const CHAR_PLAYTIME_MAX: i64 = 100_000_000;
+/// Hunter rank ceiling as a character field.
+pub const CHAR_HR_MAX: i64 = 999;
+/// Academy / village point ceiling.
+pub const CHAR_POINT_MAX: i64 = 9_999_999;
+/// Voice / look byte ceiling.
+pub const CHAR_LOOK_MAX: i64 = 255;
+/// The character name field is 31 bytes (the game writes up to 10 wide glyphs).
+pub const CHAR_NAME_MAX_BYTES: usize = 31;
+
+/// The unit a character row prints after its value.
+fn char_unit(field: usize) -> &'static str {
+    match field {
+        1 => "z",
+        2 => "秒",
+        3 => "HR",
+        4 | 5..=9 => "pts",
+        _ => "",
+    }
+}
+
+/// The first run of digits in `text`, or None.
+fn parse_leading_u32(text: &str) -> Option<u32> {
+    let digits: alloc::string::String = text
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse::<u32>().ok()
+}
+
+/// `H:MM` (or a plain second count) as seconds.
+///
+/// The keyboard answers a time row in the same shape the card prints it, so
+/// both `123:45` and `7425` mean the same clock; a value that is not one of the
+/// two is refused rather than guessed at.
+fn parse_hours_minutes(text: &str) -> Option<u32> {
+    let t = text.trim();
+    if let Some((h, m)) = t.split_once(':') {
+        let hours = parse_leading_u32(h)?;
+        let mins = parse_leading_u32(m)?;
+        if mins >= 60 {
+            return None;
+        }
+        return Some(hours.saturating_mul(3600).saturating_add(mins * 60));
+    }
+    parse_leading_u32(t)
+}
+
+/// The highest point value the talisman form allows on one skill row.
+///
+/// The grade's table gives the range and the kind's ceiling tightens it, the
+/// same two numbers `charm_form_rows` prints. None means the row cannot hold a
+/// value at all (no skill picked, or the kind refuses the second skill).
+pub fn charm_points_ceiling(e: &CharmEdit, second: bool) -> Option<i8> {
+    let skill = if second { e.skill2 } else { e.skill1 };
+    if skill == 0 {
+        return None;
+    }
+    let limits = charm::kind_limits(e.kind);
+    let kind_cap = limits.and_then(|l| l.max_points(second));
+    match charm::allowed_points_rarity(e.grade.rarity(), skill, second) {
+        Some(r) if r.min == 0 && r.max == 0 => None,
+        Some(r) => Some(match kind_cap {
+            Some(c) => r.max.min(c),
+            None => r.max,
+        }),
+        None => kind_cap,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Item box bulk operations
@@ -2676,8 +2786,29 @@ pub struct Editor {
     pub item_menu_open: bool,
     /// Which row of that menu is highlighted.
     pub item_menu_cursor: usize,
-    /// Has the dedupe preview been shown and its second press not arrived yet?
-    pub item_dedupe_armed: bool,
+    /// The operation menu row whose second press has not arrived yet.
+    ///
+    /// The four rows that change the whole box (すべて99 / 重複整理 / 空きを詰める
+    /// / 上限を丸める) never run on the first press: it only says what would
+    /// change. Any cursor move, any other key, or closing the menu drops it, so
+    /// the second press cannot land on a row the user has stopped looking at.
+    pub item_armed: Option<usize>,
+    /// Is the pad auto-repeating a direction key this frame?
+    ///
+    /// Held Left / Right steps a value every few frames. Each step pushed its
+    /// own whole-save undo, so one gesture spent the four steps the heap
+    /// affords. While this is set the steps fold into the one the gesture
+    /// opened, and the console clears it on the frame the key is released.
+    pub repeat_open: bool,
+    /// Is a [＋] quit waiting for its second press (because the save is dirty)?
+    pub quit_armed: bool,
+    /// The talisman whose [-] delete is waiting for its second press.
+    ///
+    /// One delete key on every screen means one delete rule: the first press
+    /// names the record, the second one removes it. It lives here (not in the
+    /// console layer) so the pad, a touch button and the console model cannot
+    /// disagree about how many presses a delete costs.
+    pub charm_delete_armed: Option<usize>,
     /// The equipment set being edited, if the set editor is open.
     ///
     /// A mode of the my-sets screen, like `item_menu_open` is a mode of the
@@ -2860,7 +2991,10 @@ impl Editor {
             item_pick_add_count: 1,
             item_menu_open: false,
             item_menu_cursor: 0,
-            item_dedupe_armed: false,
+            item_armed: None,
+            repeat_open: false,
+            quit_armed: false,
+            charm_delete_armed: None,
             set_edit: None,
             set_clear_armed: None,
             set_warnings: Vec::new(),
@@ -3244,6 +3378,9 @@ impl Editor {
             // Minus on the guild card opens the progress screen for the same
             // reason: the rescan would fire on the same press.
             Screen::Guild => true,
+            // The talisman list deletes on Minus (the one destructive key on
+            // every screen), so a rescan must not fire on the same press.
+            Screen::Charms => true,
             _ => false,
         }
     }
@@ -3444,6 +3581,515 @@ impl Editor {
         cnt
     }
 
+    // ------------------------------------------------------- [MAX] ceilings
+    //
+    // [MAX] on the inspector is one answer per row, and every screen that draws
+    // the button has to have one: it used to be a no-op on five screens, which
+    // read as a broken button. The ceilings are named here (not in the console
+    // layout) so the host tests can pin them, and every arm that cannot jump
+    // anywhere says so in the status line instead of doing nothing.
+
+    /// [MAX] on the hunt records: the count of the highlighted monster, or the
+    /// size end the hunt screen is editing, moved to its ceiling.
+    pub fn hunt_row_max(&mut self, list_row: usize) -> bool {
+        let Some(&(monster, _, _, lo, hi)) = self.hunt_rows().get(list_row) else {
+            self.message = String::from("最大値を入れる行がありません");
+            return false;
+        };
+        let field = self.hunt_field;
+        self.push_undo("狩猟記録");
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        let ok = match field {
+            0 => save.set_hunt_count(slot, monster, HUNT_COUNT_MAX),
+            1 => save.set_capture_count(slot, monster, HUNT_COUNT_MAX),
+            _ => {
+                // The pair keeps its order: the edited end goes to the ceiling
+                // and the other end is pulled along when it would sit above it.
+                let (mut a, mut b) = (lo, hi);
+                if field == 2 {
+                    a = HUNT_SIZE_MAX;
+                } else {
+                    b = HUNT_SIZE_MAX;
+                }
+                if a > b {
+                    core::mem::swap(&mut a, &mut b);
+                }
+                // Through the module, not the raw setter: a record is a whole,
+                // ordered pair, and one end at 0 means "the only specimen".
+                crate::hunts::set_size_range(save, slot, monster, (a, b))
+            }
+        };
+        if ok {
+            self.dirty = true;
+            self.message = match field {
+                0 => alloc::format!(
+                    "討伐数を {} にしました（上限 {}）",
+                    HUNT_COUNT_MAX, HUNT_COUNT_MAX
+                ),
+                1 => alloc::format!(
+                    "捕獲数を {} にしました（上限 {}）",
+                    HUNT_COUNT_MAX, HUNT_COUNT_MAX
+                ),
+                2 => alloc::format!("最小サイズを {}% にしました（上限 {}%）", HUNT_SIZE_MAX, HUNT_SIZE_MAX),
+                _ => alloc::format!("最大サイズを {}% にしました（上限 {}%）", HUNT_SIZE_MAX, HUNT_SIZE_MAX),
+            };
+        } else {
+            self.message = String::from("この記録は書き換えられません");
+        }
+        ok
+    }
+
+    /// [MAX] on the guild card: HR 999, or the clock at its 4-digit ceiling.
+    pub fn guild_row_max(&mut self, field: usize) -> bool {
+        match field {
+            0 => {
+                self.push_undo("ギルドカード");
+                let slot = self.slot;
+                let Some(save) = &mut self.save else { return false };
+                let ok = crate::guildcard::set_hunter_rank(save, slot, GUILD_HR_MAX);
+                if ok {
+                    self.dirty = true;
+                    self.message = alloc::format!("HR を {} にしました（上限 {}）", GUILD_HR_MAX, GUILD_HR_MAX);
+                }
+                ok
+            }
+            1 => {
+                self.push_undo("ギルドカード");
+                let slot = self.slot;
+                let Some(save) = &mut self.save else { return false };
+                let ok = crate::guildcard::set_play_time(save, slot, GUILD_TIME_MAX);
+                if ok {
+                    self.dirty = true;
+                    self.message = alloc::format!(
+                        "プレイ時間を {}h {:02}m にしました（上限）",
+                        GUILD_TIME_MAX / 3600,
+                        (GUILD_TIME_MAX % 3600) / 60
+                    );
+                }
+                ok
+            }
+            _ => {
+                self.message = String::from("コメント行に最大値はありません（[A] でテキスト入力）");
+                false
+            }
+        }
+    }
+
+    /// [MAX] on the roster: Lv 99, なつき 100, or the EXP ceiling.
+    pub fn roster_row_max(&mut self, list_row: usize) -> bool {
+        let Some(p) = self.palicos().get(list_row).cloned() else {
+            self.message = String::from("最大値を入れる行がありません");
+            return false;
+        };
+        let field = self.roster_field;
+        let slot = self.slot;
+        self.push_undo("オトモ");
+        let Some(save) = &mut self.save else { return false };
+        let ok = match field {
+            0 => crate::palico::set_level(save, slot, p.index, PALICO_LEVEL_MAX),
+            1 => crate::palico::set_enthusiasm(save, slot, p.index, PALICO_ENTHUSIASM_MAX),
+            _ => crate::palico::set_exp(save, slot, p.index, PALICO_EXP_MAX),
+        };
+        if ok {
+            self.dirty = true;
+            self.message = match field {
+                0 => alloc::format!("{} の Lv を {} にしました（上限 {}）", p.name, PALICO_LEVEL_MAX, PALICO_LEVEL_MAX),
+                1 => alloc::format!(
+                    "{} のなつき度を {} にしました（上限 {}）",
+                    p.name, PALICO_ENTHUSIASM_MAX, PALICO_ENTHUSIASM_MAX
+                ),
+                _ => alloc::format!("{} の EXP を {} にしました（上限）", p.name, PALICO_EXP_MAX),
+            };
+        } else {
+            self.message = String::from("オトモの値を書き換えられません");
+        }
+        ok
+    }
+
+    /// [MAX] on the options screen: the brightness byte, or an ON flag.
+    pub fn option_row_max(&mut self, row: usize) -> bool {
+        self.push_undo("設定");
+        let row = row.min(3);
+        let slot_free = self.save.is_some();
+        if !slot_free {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let Some(s) = &mut self.save else { return false };
+        let mut o = s.options();
+        match row {
+            0 => o.brightness = OPTION_BRIGHTNESS_MAX,
+            1 => o.rumble = 1,
+            2 => o.disable_3d = 1,
+            _ => o.circle_pad_pro = 1,
+        }
+        s.set_options(&o);
+        self.dirty = true;
+        self.message = match row {
+            0 => alloc::format!("明るさを {} にしました（上限 {}）", OPTION_BRIGHTNESS_MAX, OPTION_BRIGHTNESS_MAX),
+            1 => String::from("振動を ON (1) にしました（上限 1）"),
+            2 => String::from("3D表示無効を YES (1) にしました（上限 1）"),
+            _ => String::from("拡張スライドパッドを ON (1) にしました（上限 1）"),
+        };
+        true
+    }
+
+    /// [MAX] on the talisman form: the kind's own ceiling, not the byte's.
+    ///
+    /// The slot row jumps to the tighter of the kind's slots and the grade's,
+    /// and the two point rows to the top of the range the grade allows after
+    /// the kind's cap - the same two numbers the form's meta line prints.
+    pub fn charm_row_max(&mut self, row: usize) -> bool {
+        let Some(mut e) = self.charm_edit else {
+            self.message = String::from("護石の編集画面が開いていません");
+            return false;
+        };
+        let limits = charm::kind_limits(e.kind);
+        match row {
+            2 => {
+                let cap = limits
+                    .map(|l| l.max_slots.min(e.grade.max_slots()))
+                    .unwrap_or_else(|| e.grade.max_slots());
+                e.slots = cap;
+                self.charm_edit = Some(e);
+                self.message = alloc::format!("スロット数を S{} にしました（この種類の上限）", cap);
+                true
+            }
+            4 | 6 => {
+                let second = row == 6;
+                let skill = if second { e.skill2 } else { e.skill1 };
+                if skill == 0 {
+                    self.message = String::from("スキルを選んでから [MAX] を押してください");
+                    return false;
+                }
+                let Some(cap) = charm_points_ceiling(&e, second) else {
+                    self.message = String::from("この種類ではこのスキルに最大値を置けません");
+                    return false;
+                };
+                if second {
+                    e.points2 = cap;
+                } else {
+                    e.points1 = cap;
+                }
+                self.charm_edit = Some(e);
+                self.message = alloc::format!(
+                    "スキル{}値を {:+} にしました（この種類の上限）",
+                    if second { 2 } else { 1 },
+                    cap
+                );
+                true
+            }
+            1 => {
+                self.message = match limits {
+                    Some(l) => alloc::format!(
+                        "{} の上限は {} です（種類を変えると上限も変わります）",
+                        charm::kind_name(e.kind).unwrap_or("?"),
+                        l.compact()
+                    ),
+                    None => String::from("この行に最大値はありません"),
+                };
+                false
+            }
+            _ => {
+                self.message = String::from("この行に最大値はありません");
+                false
+            }
+        }
+    }
+
+    /// [MAX] on the item box: the highlighted slot to a full stack, as one undo
+    /// step. The slot row of the bulk menu is not this: it is one press.
+    pub fn item_row_max(&mut self, list_row: usize) -> bool {
+        let Some(&box_idx) = self.visible_items().get(list_row) else {
+            self.message = String::from("空きスロットです。[A] で先にアイテムを選んでください");
+            return false;
+        };
+        let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return false;
+        };
+        if items[box_idx].id == 0 {
+            self.message = String::from("空きスロットです。[A] で先にアイテムを選んでください");
+            return false;
+        }
+        self.push_undo("アイテム個数");
+        items[box_idx].count = MAX_COUNT as u8;
+        if let Some(s) = &mut self.save {
+            let _ = s.write_item_box(self.slot, &items);
+            self.dirty = true;
+            self.message = alloc::format!(
+                "枠 #{} の個数を ×{} にしました（上限 {}）",
+                box_idx + 1,
+                MAX_COUNT,
+                MAX_COUNT
+            );
+            return true;
+        }
+        false
+    }
+
+    /// [MAX] on the character screen: the field's own ceiling, or one line
+    /// saying why the row has none (the name is text, the look rows are bytes).
+    pub fn char_row_max(&mut self, field: usize) -> bool {
+        let max = match field {
+            0 => {
+                self.message =
+                    String::from("名前は [A] でテキスト入力してください（上限 31 バイト）");
+                return false;
+            }
+            1 => CHAR_FUNDS_MAX,
+            2 => CHAR_PLAYTIME_MAX,
+            3 => CHAR_HR_MAX,
+            4 => CHAR_HRP_MAX,
+            5..=9 => CHAR_POINT_MAX,
+            10..=16 => CHAR_LOOK_MAX,
+            _ => {
+                self.message = String::from("この行に最大値はありません");
+                return false;
+            }
+        };
+        self.set_char_value(field, max);
+        self.message = alloc::format!(
+            "{} を最大値 ({} {} ) に設定しました",
+            CHAR_FIELDS.get(field).map(|f| f.1).unwrap_or("-"),
+            max,
+            char_unit(field)
+        );
+        true
+    }
+
+    /// Delete the talisman under the cursor, as one undo step.
+    ///
+    /// The console asks twice before it calls this; the console model calls it
+    /// directly on [-]. Both go through here, so the undo step and the message
+    /// cannot differ between the two paths.
+    pub fn delete_charm_under_cursor(&mut self) -> bool {
+        let list = self.charms();
+        let n = list.len();
+        let Some(c) = list.get(self.cursor).copied() else {
+            self.message = String::from("削除するお守りを選んでください");
+            return false;
+        };
+        let idx = c.index;
+        let slot = self.slot;
+        self.push_undo("お守りの削除");
+        let ok = match &mut self.save {
+            Some(s) => s.clear_charm(slot, idx),
+            None => false,
+        };
+        if ok {
+            self.dirty = true;
+            if self.cursor > 0 && self.cursor >= n - 1 {
+                self.cursor = n.saturating_sub(2);
+            }
+            self.message = alloc::format!("お守り (枠 #{:04}) を削除しました", idx);
+        } else {
+            self.message = alloc::format!(
+                "枠 #{:04} は削除できません（護石ではない記録です）",
+                idx
+            );
+        }
+        ok
+    }
+
+    // ------------------------------------------------ direct numeric entry
+
+    /// Apply a typed item count to the slot under the cursor.
+    pub fn apply_item_count_text(&mut self, text: &str) -> bool {
+        let Some(n) = parse_leading_u32(text) else {
+            self.message = String::from("個数を数字で入力してください（0〜99）");
+            return false;
+        };
+        let Some(box_idx) = self.visible_items().get(self.cursor).copied() else {
+            self.message = String::from("個数を入れる枠がありません");
+            return false;
+        };
+        let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return false;
+        };
+        if items[box_idx].id == 0 {
+            self.message = String::from("空きスロットです。[A] で先にアイテムを選んでください");
+            return false;
+        }
+        self.push_undo("アイテム個数");
+        items[box_idx].count = n.min(MAX_COUNT as u32) as u8;
+        if let Some(s) = &mut self.save {
+            let _ = s.write_item_box(self.slot, &items);
+            self.dirty = true;
+            self.message = alloc::format!(
+                "枠 #{} の個数を ×{} にしました（上限 {}）",
+                box_idx + 1,
+                items[box_idx].count,
+                MAX_COUNT
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Apply a typed hunter rank to the guild card.
+    pub fn apply_guild_hr_text(&mut self, text: &str) -> bool {
+        let Some(n) = parse_leading_u32(text) else {
+            self.message = String::from("HR を数字で入力してください（0〜999）");
+            return false;
+        };
+        let slot = self.slot;
+        self.push_undo("ギルドカード");
+        let Some(save) = &mut self.save else { return false };
+        let v = n.min(GUILD_HR_MAX as u32) as u16;
+        if crate::guildcard::set_hunter_rank(save, slot, v) {
+            self.dirty = true;
+            self.message = alloc::format!("HR を {} にしました（上限 {}）", v, GUILD_HR_MAX);
+            true
+        } else {
+            self.message = String::from("HR を書き換えられません");
+            false
+        }
+    }
+
+    /// Apply a typed play time to the guild card.
+    ///
+    /// Accepts `H:MM` (the form the card prints) and a plain second count, so
+    /// the keyboard can be used either way; anything it cannot read leaves the
+    /// card alone and says so.
+    pub fn apply_guild_time_text(&mut self, text: &str) -> bool {
+        let t = text.trim();
+        let Some(secs) = parse_hours_minutes(t) else {
+            self.message = String::from("プレイ時間を H:MM か秒で入力してください");
+            return false;
+        };
+        let slot = self.slot;
+        self.push_undo("ギルドカード");
+        let Some(save) = &mut self.save else { return false };
+        let v = secs.min(GUILD_TIME_MAX);
+        if crate::guildcard::set_play_time(save, slot, v) {
+            self.dirty = true;
+            self.message = alloc::format!(
+                "プレイ時間を {}h {:02}m にしました",
+                v / 3600,
+                (v % 3600) / 60
+            );
+            true
+        } else {
+            self.message = String::from("プレイ時間を書き換えられません");
+            false
+        }
+    }
+
+    /// Apply a typed hunt count to the monster and column the screen is on.
+    ///
+    /// The size columns are percentages, and the pair keeps its order, so this
+    /// accepts the same 0..=300 the arrow keys step through.
+    pub fn apply_hunt_count_text(&mut self, text: &str) -> bool {
+        let Some(n) = parse_leading_u32(text) else {
+            self.message = String::from("数値を入力してください（例: 12）");
+            return false;
+        };
+        let rows = self.hunt_rows();
+        let Some(&(monster, _, _, lo, hi)) = rows.get(self.hunt_cursor) else {
+            self.message = String::from("値を入れる行がありません");
+            return false;
+        };
+        let field = self.hunt_field;
+        let slot = self.slot;
+        self.push_undo("狩猟記録");
+        let Some(save) = &mut self.save else { return false };
+        let ok = match field {
+            0 => save.set_hunt_count(slot, monster, n.min(HUNT_COUNT_MAX as u32) as u16),
+            1 => save.set_capture_count(slot, monster, n.min(HUNT_COUNT_MAX as u32) as u16),
+            _ => {
+                let (mut a, mut b) = (lo, hi);
+                let v = n.min(HUNT_SIZE_MAX as u32) as u16;
+                if field == 2 {
+                    a = v;
+                } else {
+                    b = v;
+                }
+                if a > b {
+                    core::mem::swap(&mut a, &mut b);
+                }
+                crate::hunts::set_size_range(save, slot, monster, (a, b))
+            }
+        };
+        if ok {
+            self.dirty = true;
+            self.message = alloc::format!("狩猟記録 {} 番の値を {} にしました", monster + 1, n);
+        }
+        ok
+    }
+
+    /// Ask the platform layer for a number: the item count of the selected
+    /// slot on the item box.
+    ///
+    /// The console had no way to type a count - only the arrow keys - so a
+    /// stack that wanted "×87" took four steps and three presses. Returns
+    /// whether a request went out.
+    pub fn request_item_count_text(&mut self) -> bool {
+        let Some(&idx) = self.visible_items().get(self.cursor) else {
+            self.message = String::from("個数を入れる枠がありません");
+            return false;
+        };
+        let Some(items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
+            return false;
+        };
+        if items.get(idx).map(|s| s.id).unwrap_or(0) == 0 {
+            self.message = String::from("空きスロットです。[A] で先にアイテムを選んでください");
+            return false;
+        }
+        let cur = items[idx].count;
+        self.pending_text = Some((TEXT_ITEM_COUNT, alloc::format!("{}", cur)));
+        true
+    }
+
+    /// Ask for the guild card's HR or play time, whichever row is selected.
+    pub fn request_guild_text(&mut self) -> bool {
+        let slot = self.slot;
+        let Some(save) = self.save.as_ref() else {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        };
+        match self.guild_field {
+            0 => {
+                let hr = crate::guildcard::hunter_rank(save, slot).unwrap_or(0);
+                self.pending_text = Some((TEXT_GUILD_HR, alloc::format!("{}", hr)));
+                true
+            }
+            1 => {
+                let t = crate::guildcard::play_time(save, slot).unwrap_or(0);
+                self.pending_text = Some((
+                    TEXT_GUILD_TIME,
+                    alloc::format!("{}:{:02}", t / 3600, (t % 3600) / 60),
+                ));
+                true
+            }
+            _ => {
+                // The comment is text too, and [A] already opens it: asking
+                // here as well would be the same key twice.
+                self.message = String::from("コメントは [A] で入力します（この行の数値はありません）");
+                false
+            }
+        }
+    }
+
+    /// Ask for the hunt count (or size percentage) of the selected row.
+    pub fn request_hunt_text(&mut self) -> bool {
+        let rows = self.hunt_rows();
+        let Some(&(_, slay, cap, lo, hi)) = rows.get(self.hunt_cursor) else {
+            self.message = String::from("値を入れる行がありません");
+            return false;
+        };
+        let cur = match self.hunt_field {
+            0 => slay,
+            1 => cap,
+            2 => lo,
+            _ => hi,
+        };
+        self.pending_text = Some((TEXT_HUNT_COUNT, alloc::format!("{}", cur)));
+        true
+    }
+
     /// Indices of the item slots currently visible.
     pub fn visible_items(&self) -> Vec<usize> {
         let Some(items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
@@ -3460,7 +4106,23 @@ impl Editor {
     // ------------------------------------------------------------- input
 
     /// Feed one button press.
+    ///
+    /// Two rules live here rather than in every screen:
+    ///
+    /// * The item bulk menu is a mode of the item box and cannot outlive the
+    ///   screen it belongs to. A section or sub-tab jump changes `screen`
+    ///   without going through the item screen's own keys, so without this the
+    ///   menu came back open on the next visit, frozen over a list the user had
+    ///   never opened it on.
+    /// * A [＋] quit offer is good for one press: any other key takes it back,
+    ///   so the discard is always the very next thing the user does.
     pub fn input(&mut self, key: Key) {
+        if self.item_menu_open && self.screen != Screen::Items {
+            self.dismiss_item_menu();
+        }
+        if key != Key::Plus {
+            self.quit_armed = false;
+        }
         match self.screen {
             Screen::SaveList => self.input_save_list(key),
             Screen::Slots => self.input_slots(key),
@@ -3519,7 +4181,9 @@ impl Editor {
                 // X was advertised on this screen but had no arm, so pressing
                 // it did nothing at all.
                 Key::X => self.request_write_arc(),
-                Key::Plus => self.quit = true,
+                Key::Plus => {
+                self.press_quit();
+            }
                 _ => {}
             },
             Screen::ArcEntries => self.input_arc_entries(key),
@@ -3538,13 +4202,15 @@ impl Editor {
     pub fn open_charms(&mut self) {
         self.charm_cursor = 0;
         self.charm_edit = None;
+        self.charm_delete_armed = None;
         self.screen = Screen::Charms;
         self.cursor = 0;
         if self.charms().is_empty() {
-            // Y is the delete key on this screen, so pointing at it for "create"
-        // sent the user straight at the button that removes a talisman. Minus
-        // is what makes a new one.
-        self.message = String::from("お守りがありません（[-] で作成）");
+            // One delete key on every screen ([-], twice) means create cannot
+            // be [-]: it is [＋] now, and the line names it so the empty box
+            // cannot send the user at the key that removes a talisman.
+            self.message =
+                String::from("お守りがありません（[＋] で作成 / [A] でも作成できます）");
         }
     }
 
@@ -3647,40 +4313,58 @@ impl Editor {
         let list = self.charms();
         let n = list.len();
         match key {
-            Key::Up => self.move_cursor(n, -1),
-            Key::Down => self.move_cursor(n, 1),
-            Key::A => {
-                if let Some(c) = list.get(self.cursor) {
-                    let idx = c.index;
-                    let slot = self.slot;
-                    self.push_undo("お守りの削除");
-                    let ok = match &mut self.save {
-                        Some(s) => s.clear_charm(slot, idx),
-                        None => false,
-                    };
-                    if ok {
-                        self.dirty = true;
-                        if self.cursor > 0 && self.cursor >= n - 1 {
-                            self.cursor = n.saturating_sub(2);
-                        }
-                        self.message = format!("deleted charm {}", idx);
-                    } else {
-                        self.message =
-                            format!("could not delete {} - only a talisman can be removed", idx);
+            // Moving off a row takes the delete offer away: the second press
+            // must never land on a talisman the user has stopped looking at.
+            Key::Up => {
+                self.charm_delete_armed = None;
+                self.move_cursor(n, -1);
+            }
+            Key::Down => {
+                self.charm_delete_armed = None;
+                self.move_cursor(n, 1);
+            }
+            // [A] and [Y] both open the selected talisman's form: [A] is the
+            // button the list advertises and [Y] is the key this screen always
+            // had. Neither of them deletes any more - [A] used to be the
+            // delete key in the console model while [Y] deleted on the console,
+            // which is how the two paths ended up disagreeing.
+            Key::A | Key::Y => {
+                self.charm_delete_armed = None;
+                self.open_charm_editor(false);
+            }
+            // [-] is the one destructive key on every screen, twice. The
+            // first press only names the talisman; the second one removes it.
+            Key::Minus => {
+                let idx = list.get(self.cursor).map(|c| c.index);
+                match (idx, self.charm_delete_armed) {
+                    (Some(i), Some(armed)) if armed == i => {
+                        self.charm_delete_armed = None;
+                        self.delete_charm_under_cursor();
+                    }
+                    (Some(i), _) => {
+                        self.charm_delete_armed = Some(i);
+                        self.message = alloc::format!(
+                            "お守りの枠 #{:04} を削除しますか？ もう一度 [-] で削除（2回）",
+                            i
+                        );
+                    }
+                    (None, _) => {
+                        self.charm_delete_armed = None;
+                        self.message = String::from("削除するお守りを選んでください");
                     }
                 }
             }
-            // Y edits the charm under the cursor, L starts a brand new one in
-            // the first free slot. The form itself can also move the slot
-            // number, so both roads lead to the same place.
-            Key::Y => self.open_charm_editor(false),
-            Key::L => self.open_charm_editor(true),
+            // [＋] starts a brand new one in the first free slot; L keeps doing
+            // it too, because L is what the pad and the older tests use.
+            Key::L | Key::Plus => {
+                self.charm_delete_armed = None;
+                self.open_charm_editor(true);
+            }
             Key::X => self.request_write_save(),
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
             _ => {}
         }
     }
@@ -3806,7 +4490,9 @@ impl Editor {
                 self.charm_edit = Some(e);
                 self.screen = Screen::Charms;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
         self.charm_edit = Some(e);
@@ -3885,7 +4571,9 @@ impl Editor {
                 self.screen = Screen::Slots;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -3955,7 +4643,9 @@ impl Editor {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -4066,7 +4756,9 @@ impl Editor {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -4288,7 +4980,9 @@ impl Editor {
                 self.screen = Screen::ArcEntries;
                 self.cursor = self.entry;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -4311,6 +5005,12 @@ impl Editor {
     /// affords (see [UNDO_STEPS]), and the newest step is the one a user reaches
     /// for.
     pub fn push_undo(&mut self, label: impl Into<String>) {
+        // A held direction key steps a value every few frames. The step the
+        // gesture opened is the one that matters; the repeats that follow would
+        // fill all four slots with the same edit, so they fold into it.
+        if self.repeat_open {
+            return;
+        }
         let Some(save) = self.save.clone() else {
             return;
         };
@@ -4322,6 +5022,43 @@ impl Editor {
         while self.undo.len() > UNDO_STEPS {
             self.undo.remove(0);
         }
+    }
+
+    /// Tell the editor that the pad is auto-repeating a direction key.
+    ///
+    /// Called on every frame of the console loop: true while a held direction
+    /// key keeps re-sending itself, false on the frame it is released. Only the
+    /// first press of the gesture opens an undo step; see [Editor::push_undo].
+    pub fn set_repeating(&mut self, repeating: bool) {
+        self.repeat_open = repeating;
+    }
+
+    /// Ask to leave: the [＋] key.
+    ///
+    /// Returns whether the loop should stop. A dirty save is never discarded on
+    /// one press: the first one only says what would be lost, and the second one
+    /// quits. An unmodified editor quits at once, the way it always did.
+    pub fn press_quit(&mut self) -> bool {
+        if !self.dirty || self.quit_armed {
+            self.quit_armed = false;
+            self.quit = true;
+            return true;
+        }
+        self.quit_armed = true;
+        self.message = String::from(
+            "未保存の変更があります。もう一度 [＋] で終了します（2回・変更は破棄されます）",
+        );
+        false
+    }
+
+    /// Is a [＋] quit waiting for its second press?
+    pub fn quit_armed(&self) -> bool {
+        self.quit_armed
+    }
+
+    /// Take the [＋] offer back (a key the screens do not see was pressed).
+    pub fn clear_quit_arm(&mut self) {
+        self.quit_armed = false;
     }
 
     /// How many steps are on the stack right now.
@@ -4401,8 +5138,9 @@ impl Editor {
         self.item_set_edit = None;
         self.item_set_armed = None;
         self.item_set_warnings.clear();
-        self.item_dedupe_armed = false;
+        self.item_armed = None;
         self.item_menu_open = false;
+        self.charm_delete_armed = None;
         self.csv_armed = None;
         self.review = None;
         self.item_undo.clear();
@@ -4545,7 +5283,9 @@ impl Editor {
                 self.screen = Screen::Convert;
                 self.message = String::from("3DS <-> Switch");
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -4592,7 +5332,9 @@ impl Editor {
                 self.cursor = 0;
                 self.message = String::from("クエスト編集");
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -4635,7 +5377,9 @@ impl Editor {
                 self.screen = Screen::Slots;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -4702,7 +5446,9 @@ impl Editor {
                 self.screen = Screen::Slots;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -4723,37 +5469,78 @@ impl Editor {
         if self.item_menu_cursor >= ITEM_OPS.len() {
             self.item_menu_cursor = 0;
         }
-        self.item_dedupe_armed = false;
+        self.item_armed = None;
         self.message = self.item_op_hint();
+    }
+
+    /// Put the menu away without a word to the status line.
+    ///
+    /// Used where the caller sets its own message (a section jump) and by
+    /// [Editor::close_item_menu], which adds the "back to the list" line.
+    /// Returns whether the menu was open.
+    pub fn dismiss_item_menu(&mut self) -> bool {
+        let was = self.item_menu_open;
+        self.item_menu_open = false;
+        self.item_armed = None;
+        was
     }
 
     /// Close the menu and go back to the item list.
     pub fn close_item_menu(&mut self) {
-        self.item_menu_open = false;
-        self.item_dedupe_armed = false;
-        self.message = String::from("アイテム一覧に戻りました");
+        if self.dismiss_item_menu() {
+            self.message = String::from("アイテム一覧に戻りました");
+        }
+    }
+
+    /// The [X] save key on the item box.
+    ///
+    /// The footer promises [X] 保存 on every screen, including over the bulk
+    /// menu - and [A] is what runs a menu row. Sending [A] for the save key
+    /// therefore ran the highlighted bulk edit and wrote nothing, which is the
+    /// bug this exists to make impossible: the menu is put away first, and only
+    /// then does the ordinary save request go out.
+    pub fn item_screen_save(&mut self) -> bool {
+        self.dismiss_item_menu();
+        self.request_write_save();
+        self.pending_write.is_some()
     }
 
     fn input_item_menu(&mut self, key: Key) {
         let n = ITEM_OPS.len();
         match key {
-            // Moving off a row cancels a pending dedupe: the second press must
-            // never land on a row the user has stopped looking at.
+            // Moving off a row cancels a pending second press: it must never
+            // land on a row the user has stopped looking at.
             Key::Up => {
                 self.item_menu_cursor = (self.item_menu_cursor + n - 1) % n;
-                self.item_dedupe_armed = false;
+                self.item_armed = None;
                 self.message = self.item_op_hint();
             }
             Key::Down => {
                 self.item_menu_cursor = (self.item_menu_cursor + 1) % n;
-                self.item_dedupe_armed = false;
+                self.item_armed = None;
                 self.message = self.item_op_hint();
             }
-            Key::A | Key::Right => self.run_item_op(self.item_menu_cursor),
+            // [A] is the only key that runs a row: a direction key must never
+            // be able to rewrite the whole box, however it was pressed.
+            Key::A => self.run_item_op(self.item_menu_cursor),
             Key::B | Key::Minus => self.close_item_menu(),
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
+    }
+
+    /// Does this row need a second [A] before it edits the box?
+    ///
+    /// The four rows that rewrite the box ask twice; the picker and the undo
+    /// run at once. The console's badge and the tests both read this, so a row
+    /// cannot silently become a one-press destroy again.
+    pub fn item_op_needs_second(op: usize) -> bool {
+        matches!(
+            op,
+            ITEM_OP_FILL | ITEM_OP_DEDUPE | ITEM_OP_COMPACT | ITEM_OP_CLAMP
+        )
     }
 
     /// The label and the one-line explanation of a menu row.
@@ -4786,16 +5573,42 @@ impl Editor {
     }
 
     /// One line about the highlighted row, shown in the footer.
+    ///
+    /// An armed row says what the second press would do to the box, with the
+    /// numbers read from the box itself, so "2回" is never a promise without a
+    /// price next to it.
     pub fn item_op_hint(&self) -> String {
         let (label, note) = Self::item_op_label(self.item_menu_cursor);
-        if self.item_dedupe_armed && self.item_menu_cursor == ITEM_OP_DEDUPE {
-            let p = self.item_menu_stats().dedupe;
+        if self.item_armed == Some(self.item_menu_cursor) {
             return format!(
-                "{}: {} 枠解放 / {} 個消失します。もう一度 [A] で実行、[B] で中止",
-                label, p.freed, p.lost
+                "{}: {} もう一度 [A] で実行、[B] で中止（2回）",
+                label,
+                self.item_op_arm_preview(self.item_menu_cursor)
             );
         }
         format!("{}: {}", label, note)
+    }
+
+    /// What the second press of one row would do, in one clause.
+    ///
+    /// Public because the inspector prints it beside the armed row: the price
+    /// of the press has to be readable before it is paid, not after.
+    pub fn item_op_arm_preview(&self, op: usize) -> String {
+        let stats = self.item_menu_stats();
+        match op {
+            ITEM_OP_FILL => format!("{} 枠を ×{} にそろえます。", stats.fill, MAX_COUNT),
+            ITEM_OP_DEDUPE => format!(
+                "{} 枠解放 / {} 個消失します。",
+                stats.dedupe.freed, stats.dedupe.lost
+            ),
+            ITEM_OP_COMPACT => format!(
+                "{} 個を前へ詰め、空きを {} 枠にします。",
+                TOTAL_ITEM_SLOTS - stats.holes,
+                stats.holes
+            ),
+            ITEM_OP_CLAMP => format!("{} 枠を {} に戻します。", stats.over, MAX_COUNT),
+            _ => String::from("この行を実行します。"),
+        }
     }
 
     /// Run one row of the operation menu.
@@ -4808,15 +5621,41 @@ impl Editor {
             self.message = String::from("先にセーブを開いてください");
             return;
         }
+        // Every row that rewrites the box asks twice; the two that do not
+        // (adding through the picker, taking the last edit back) run at once.
+        // The arm is per row, so a row's own check ("nothing to do") can
+        // refuse before it arms anything.
         match op {
             ITEM_OP_FILL => self.item_op_fill(),
             ITEM_OP_DEDUPE => self.item_op_dedupe(),
             ITEM_OP_COMPACT => self.item_op_compact(),
             ITEM_OP_CLAMP => self.item_op_clamp(),
-            ITEM_OP_ADD => self.open_item_add(),
-            ITEM_OP_UNDO => self.undo_item(),
-            _ => {}
+            ITEM_OP_ADD => {
+                self.item_armed = None;
+                self.open_item_add();
+            }
+            ITEM_OP_UNDO => {
+                self.item_armed = None;
+                self.undo_item();
+            }
+            _ => {
+                self.message = alloc::format!("{}. この行に操作はありません（[-] で閉じる）", op);
+            }
         }
+    }
+
+    /// Arm a destructive row, or run it when its second press arrives.
+    ///
+    /// Returns false when the row should stop here (nothing to do, or the arm
+    /// was just set). Callers print the message either way.
+    fn item_op_second_press(&mut self, op: usize, preview: String) -> bool {
+        if self.item_armed == Some(op) {
+            self.item_armed = None;
+            return true;
+        }
+        self.item_armed = Some(op);
+        self.message = format!("{} もう一度 [A] で実行（2回）、[B] で中止", preview);
+        false
     }
 
     /// Write an edited box back and mark the save dirty.
@@ -4828,10 +5667,21 @@ impl Editor {
         }
     }
 
-    /// すべて 99 に: raise every used record to the cap.
+    /// すべて 99 に: raise every used record to the cap, on the second press.
     fn item_op_fill(&mut self) {
-        if self.item_menu_stats().fill == 0 {
-            self.message = String::from("所持している枠はすでにすべて 99 です");
+        let stats = self.item_menu_stats();
+        if stats.fill == 0 {
+            self.item_armed = None;
+            self.message = alloc::format!(
+                "所持している枠はすでにすべて ×{} です（変わる枠がありません）",
+                MAX_COUNT
+            );
+            return;
+        }
+        if !self.item_op_second_press(
+            ITEM_OP_FILL,
+            alloc::format!("{} 枠を ×{} にそろえます。", stats.fill, MAX_COUNT),
+        ) {
             return;
         }
         let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
@@ -4855,19 +5705,19 @@ impl Editor {
         };
         let preview = itembox::dedupe_preview(&items);
         if preview.freed == 0 && preview.lost == 0 {
-            self.item_dedupe_armed = false;
+            self.item_armed = None;
             self.message = String::from("重複はありません（まとめても枠は空きません）");
             return;
         }
-        if !self.item_dedupe_armed {
-            self.item_dedupe_armed = true;
-            self.message = format!(
-                "重複整理: {} 枠解放 / {} 個消失します。もう一度 [A] で実行、[B] で中止",
+        if !self.item_op_second_press(
+            ITEM_OP_DEDUPE,
+            alloc::format!(
+                "重複整理: {} 枠解放 / {} 個消失します。",
                 preview.freed, preview.lost
-            );
+            ),
+        ) {
             return;
         }
-        self.item_dedupe_armed = false;
         let before = box_total(&items);
         let mut items = items;
         self.push_item_undo();
@@ -4883,7 +5733,14 @@ impl Editor {
             return;
         };
         if items.iter().all(|s| !s.is_blank()) {
+            self.item_armed = None;
             self.message = String::from("空き枠はありません（すべて使用中）");
+            return;
+        }
+        if !self.item_op_second_press(
+            ITEM_OP_COMPACT,
+            String::from("空きを前へ詰め、空き枠を後ろへ寄せます。"),
+        ) {
             return;
         }
         self.push_item_undo();
@@ -4897,7 +5754,14 @@ impl Editor {
     fn item_op_clamp(&mut self) {
         let over = self.item_menu_stats().over;
         if over == 0 {
-            self.message = String::from("99 を超えている個数はありません");
+            self.item_armed = None;
+            self.message = alloc::format!("{} を超えている個数はありません", MAX_COUNT);
+            return;
+        }
+        if !self.item_op_second_press(
+            ITEM_OP_CLAMP,
+            alloc::format!("{} 枠を {} に戻します。", over, MAX_COUNT),
+        ) {
             return;
         }
         let Some(mut items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
@@ -4969,7 +5833,7 @@ impl Editor {
         self.screen = Screen::Items;
         self.item_menu_open = true;
         self.item_menu_cursor = ITEM_OP_ADD;
-        self.item_dedupe_armed = false;
+        self.item_armed = None;
     }
 
     /// Item ids whose name matches the current filter, in id order.
@@ -5294,7 +6158,7 @@ impl Editor {
                         if a > b {
                             core::mem::swap(&mut a, &mut b);
                         }
-                        save.set_monster_size(slot, monster, a, b)
+                        crate::hunts::set_size_range(save, slot, monster, (a, b))
                     }
                 };
                 if ok {
@@ -5316,7 +6180,9 @@ impl Editor {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -5365,6 +6231,12 @@ impl Editor {
                     self.dirty = true;
                 }
             }
+            // [R] answers a numeric row with the keyboard. [Y] stays the step
+            // key (the pills are touch only, so the pad needs it), [A] is the
+            // comment, so R is the one key left for typing.
+            Key::R => {
+                self.request_guild_text();
+            }
             // The comment is text, so it needs the keyboard.
             Key::A => {
                 if self.guild_field == 2 {
@@ -5384,7 +6256,9 @@ impl Editor {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -5432,7 +6306,9 @@ impl Editor {
                     self.arena_edit = false;
                     self.open_progress();
                 }
-                Key::Plus => self.quit = true,
+                Key::Plus => {
+                self.press_quit();
+            }
                 _ => {}
             }
             return;
@@ -5483,7 +6359,9 @@ impl Editor {
                 // slot list.
                 self.set_guild_view(GUILD_TAB_CARD);
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -5781,7 +6659,9 @@ impl Editor {
             Key::B => {
                 self.screen = Screen::Guild;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -6112,7 +6992,7 @@ impl Editor {
             clear_armed: None,
         });
         self.message = format!(
-            "{} の装備を割り当てます（[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-]×2 解除）",
+            "{} の装備を割り当てます（[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-] 解除（2回））",
             record.name
         );
         true
@@ -6309,7 +7189,9 @@ impl Editor {
                 self.palico_equip = Some(state);
                 self.message = String::from(PALICO_EQUIP_NAME_NOTE);
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             // L / R would jump to another sub-tab and Z is ZR on the pad; both
             // are swallowed while the panel owns the screen.
             Key::L | Key::R | Key::Z => {
@@ -6726,7 +7608,9 @@ impl Editor {
             }
             // Plus is the quit key again while the panel is open: on the list it
             // is what opens the panel, here it has no other job.
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             // [-] is the equipment panel's key on the list under this one, so it
             // must not reach it while the skill panel is open; Z is ZR, which the
             // pad spends on the section bar and the PC build on the arc list.
@@ -6862,7 +7746,9 @@ impl Editor {
                     self.cursor = 0;
                 }
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -7089,7 +7975,9 @@ impl Editor {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -7152,7 +8040,9 @@ impl Editor {
                 self.close_set_editor();
                 return;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
         self.set_edit = Some(e);
@@ -7746,7 +8636,9 @@ impl Editor {
                 self.close_item_set_editor();
                 return;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
         self.item_set_edit = Some(e);
@@ -8083,7 +8975,9 @@ impl Editor {
                 self.screen = Screen::Equip;
                 return;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
         self.equip_edit = Some(e);
@@ -8289,7 +9183,9 @@ impl Editor {
                 self.screen = Screen::EquipEdit;
             }
             Key::B => self.screen = Screen::EquipEdit,
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -8305,7 +9201,9 @@ impl Editor {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -8347,7 +9245,9 @@ impl Editor {
                 self.screen = Screen::CharmEdit;
             }
             Key::B => self.screen = Screen::CharmEdit,
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -8379,7 +9279,9 @@ impl Editor {
                     self.item_pick_stage = 0;
                     self.message = String::from("追加するアイテムを選び直してください");
                 }
-                Key::Plus => self.quit = true,
+                Key::Plus => {
+                self.press_quit();
+            }
                 _ => {}
             }
             return;
@@ -8503,7 +9405,9 @@ impl Editor {
                     self.cursor = 0;
                 }
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -8539,7 +9443,9 @@ impl Editor {
             // Z installs the highlighted archive into the save: the one action
             // the console could not do at all before.
             Key::Z => self.install_selected_arc(),
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -8873,7 +9779,9 @@ impl Editor {
                 self.screen = Screen::ArcList;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -8940,7 +9848,9 @@ impl Editor {
                 self.screen = Screen::ArcList;
                 self.cursor = 0;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -9039,7 +9949,9 @@ impl Editor {
                 self.screen = Screen::ArcEntries;
                 self.cursor = self.entry;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -9067,7 +9979,9 @@ impl Editor {
                 self.screen = Screen::ArcEntries;
                 self.cursor = self.entry;
             }
-            Key::Plus => self.quit = true,
+            Key::Plus => {
+                self.press_quit();
+            }
             _ => {}
         }
     }
@@ -9346,7 +10260,7 @@ impl Editor {
                         false,
                     );
                     for (i, (label, note)) in ITEM_OPS.iter().enumerate() {
-                        let armed = i == ITEM_OP_DEDUPE && self.item_dedupe_armed;
+                        let armed = self.item_armed == Some(i);
                         push(
                             &mut out,
                             format!(
@@ -9890,7 +10804,9 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A delete  Y edit  L new  X write save  B back"),
+                    String::from(
+                        "  - delete(2)  A/Y edit  L/+ new  X write save  B back",
+                    ),
                     false,
                     false,
                 );
@@ -9947,9 +10863,14 @@ impl Editor {
                 push(
                     &mut out,
                     alloc::format!(
-                        "  変更中: {}   刻み {}",
+                        "  変更中: {}   刻み {}   R 直接入力   上限 {}",
                         ["討伐数", "捕獲数", "最小サイズ", "最大サイズ"][self.hunt_field.min(3)],
-                        HUNT_STEPS[self.step]
+                        HUNT_STEPS[self.step],
+                        if self.hunt_field <= 1 {
+                            alloc::format!("{}", HUNT_COUNT_MAX)
+                        } else {
+                            alloc::format!("{}%", HUNT_SIZE_MAX)
+                        }
                     ),
                     false,
                     false,
@@ -10054,7 +10975,7 @@ impl Editor {
                 let cl = |f: usize| if self.guild_field == f { "]" } else { " " };
                 push(
                     &mut out,
-                    alloc::format!("  rank    : {}{:>3}{}", mk(0), hr, cl(0)),
+                    alloc::format!("  rank    : {}{:>3}{}   (上限 {})", mk(0), hr, cl(0), GUILD_HR_MAX),
                     false,
                     false,
                 );
@@ -10069,6 +10990,18 @@ impl Editor {
                         cl(1),
                         STEPS[self.step]
                     ),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    String::from("  R で HR / プレイ時間を直接入力"),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    alloc::format!("  (プレイ時間の上限 {}h)", GUILD_TIME_MAX / 3600),
                     false,
                     false,
                 );
@@ -10167,7 +11100,7 @@ impl Editor {
                     push(
                         &mut out,
                         String::from(
-                            "  Up/Down 行  Left/Right 装備  A 決定  - 外す×2  Y 警告  B 一覧",
+                            "  Up/Down 行  Left/Right 装備  A 決定  - 外す(2回)  Y 警告  B 一覧",
                         ),
                         false,
                         false,
@@ -10237,7 +11170,7 @@ impl Editor {
                     push(
                         &mut out,
                         String::from(
-                            "  Up/Down 枠  Left/Right アイテム  A 決定  Y ポーチから取込×2  - ポーチへ適用×2  B 一覧",
+                            "  Up/Down 枠  Left/Right アイテム  A 決定  Y 取込(2回)  - ポーチへ(2回)  B 一覧",
                         ),
                         false,
                         false,
@@ -12397,6 +13330,10 @@ mod tests {
             .expect("the box takes a record");
         ed.screen = Screen::Items;
         ed.open_item_menu();
+        // The first press only arms the bulk row; the second one is the edit.
+        let depth = ed.undo_depth();
+        ed.run_item_op(ITEM_OP_FILL);
+        assert_eq!(ed.undo_depth(), depth, "arming is not a step: {}", ed.message);
         ed.run_item_op(ITEM_OP_FILL);
         assert_eq!(ed.undo_label(), Some("アイテムボックス"), "{}", ed.message);
 

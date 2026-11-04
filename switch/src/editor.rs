@@ -1283,6 +1283,16 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         // The parser in the core owns the format (and the message a bad one
         // gets), so the layer only hands the text over.
         ed.apply_arena_time(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_ITEM_COUNT {
+        // The four "type it instead of stepping it" rows. Each one clamps to
+        // the same ceiling its row prints and pushes its own undo step.
+        ed.apply_item_count_text(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_GUILD_HR {
+        ed.apply_guild_hr_text(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_GUILD_TIME {
+        ed.apply_guild_time_text(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
+        ed.apply_hunt_count_text(&s);
     } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME {
         let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
         let clipped: String = s.chars().take(20).collect();
@@ -1490,6 +1500,14 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             // m:ss.cc is at most "10:55.35" (8 bytes); the keyboard still
             // allows the raw hundredths form the parser accepts.
             ("闘技大会のタイム (m:ss.cc 例 9:35.44 / 0:00.00 で消去)", 12)
+        } else if idx == mhnx_core::hbedit::TEXT_ITEM_COUNT {
+            ("アイテムの個数 (0〜99)", 4)
+        } else if idx == mhnx_core::hbedit::TEXT_GUILD_HR {
+            ("ハンターランク (0〜999)", 4)
+        } else if idx == mhnx_core::hbedit::TEXT_GUILD_TIME {
+            ("プレイ時間 (H:MM または秒)", 12)
+        } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
+            ("狩猟数 (0〜9999) / サイズ % (0〜300)", 6)
         } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME
             && idx < mhnx_core::hbedit::TEXT_GUILD_COMMENT
         {
@@ -1577,6 +1595,7 @@ pub fn run() -> i32 {
             // Action buttons are edge-triggered; only directional movement repeats when held.
             let mut key: Option<Key> = key_from(down);
             let cur_dir = cur & BTN_REPEATABLE;
+            let mut repeated = false;
             if cur_dir != held {
                 hold_frames = 0;
                 held = cur_dir;
@@ -1589,8 +1608,13 @@ pub fn run() -> i32 {
                         REPEAT_DELAY - 4
                     };
                     key = key_from(cur_dir);
+                    repeated = true;
                 }
             }
+            // One gesture, one undo step: the first press opens it, the repeats
+            // this flag marks fold into it (Editor::push_undo), and the release
+            // closes it again.
+            ed.set_repeating(repeated);
 
             if painter.gui.osk.is_some() {
                 // L answers the keyboard here, not the list: drop the deferred
@@ -1652,9 +1676,22 @@ pub fn run() -> i32 {
                 // the roster opens the skill panel. While that panel is open Plus
                 // is the quit key again, like the equipment panel above it.
                 let plus_is_a_tool = ed.screen == mhnx_core::hbedit::Screen::Equip
+                    || ed.screen == mhnx_core::hbedit::Screen::Charms
                     || (ed.screen == mhnx_core::hbedit::Screen::Roster && !ed.palico_skill_open());
                 if down & BTN_PLUS != 0 && !plus_is_a_tool {
-                    break;
+                    // A dirty save is not thrown away on one press: the first
+                    // [＋] only says what would be lost, the second one quits.
+                    if ed.press_quit() {
+                        break;
+                    }
+                    need_draw = true;
+                }
+
+                // Any other button takes the [＋] offer back, including the
+                // ones this loop answers itself (the sidebar and the touch
+                // screen never reach Editor::input).
+                if down != 0 && down & BTN_PLUS == 0 {
+                    ed.clear_quit_arm();
                 }
 
                 // ZL / ZR intuitively moves up / down through the left sidebar tabs!
