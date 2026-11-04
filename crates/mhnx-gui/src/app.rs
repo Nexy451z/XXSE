@@ -126,10 +126,48 @@ pub enum Tab {
     Palico,
     Sets,
     Extras,
+    /// セーブマップ: every named stretch of the save, listed and dumped as hex.
+    /// Read-only - it names and shows bytes, it never writes them.
+    SaveMap,
     /// The 変更一覧: every value that differs from the file on disk, one line
     /// each, with the one-item undo the audit found missing.
     Review,
     About,
+}
+
+/// One row of the セーブマップ list, with the text the table draws already
+/// copied out of the save.
+///
+/// The field is borrowed from the crate's `&'static` table, so a frame copies
+/// only the value string and the row loop needs nothing from the editor but the
+/// selection.
+struct SaveMapRow {
+    /// Index into [mhnx_core::savemap::fields].
+    index: usize,
+    /// 本体, DLC セクション or スロットN.
+    region: &'static str,
+    /// Where the row sits in this save.
+    offset: usize,
+    /// Length with thousands separators, for the 長さ column.
+    len_text: String,
+    /// The row itself.
+    field: &'static mhnx_core::savemap::Field,
+    /// The 現在値 column: [mhnx_core::savemap::value_text], or why there is
+    /// none for this save.
+    value: String,
+}
+
+/// `n` with thousands separators, for the save map's 長さ column.
+fn with_commas(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The whole application.
@@ -896,6 +934,12 @@ pub struct MhnxEditor {
     pub quest_filter: String,
     /// Show only quests that are not cleared.
     pub quest_missing_only: bool,
+
+    // ---- save map (セーブマップ) ----
+    /// Text filter of the save map list: a name, a region or an offset.
+    pub savemap_filter: String,
+    /// Row of the save map whose bytes the dump under the list shows.
+    pub savemap_selected: Option<usize>,
     /// Set once the launch-time hooks this file owns have been applied, so a
     /// later frame cannot run them again.
     pub launch_env_done: bool,
@@ -1027,6 +1071,8 @@ impl Default for MhnxEditor {
             request_filter: String::new(),
             quest_filter: String::new(),
             quest_missing_only: false,
+            savemap_filter: String::new(),
+            savemap_selected: None,
             launch_env_done: false,
             screenshot_path: None,
             screenshot_frames: 0,
@@ -3165,6 +3211,7 @@ impl MhnxEditor {
             Tab::Palico => self.tab_palico_detail(ui),
             Tab::Sets => self.tab_sets(ui),
             Tab::Extras => self.tab_extras(ui),
+            Tab::SaveMap => self.tab_save_map(ui),
             Tab::Review => self.tab_review(ui),
             Tab::About => self.tab_about(ui),
         }
@@ -3242,6 +3289,7 @@ impl MhnxEditor {
                 | Tab::Hunts
                 | Tab::Progress
                 | Tab::Palico
+                | Tab::SaveMap
         )
     }
 
@@ -3516,6 +3564,7 @@ impl MhnxEditor {
                     (Tab::Palico, "オトモ"),
                     (Tab::Sets, "マイセット"),
                     (Tab::Extras, "設定/オトモ"),
+                    (Tab::SaveMap, "セーブマップ"),
                     (Tab::Review, "変更一覧"),
                     (Tab::About, "情報"),
                 ] {
@@ -11425,6 +11474,220 @@ impl MhnxEditor {
         }
     }
 
+    // ------------------------------------------------- save map (セーブマップ)
+
+    /// セーブマップ: every named stretch of the save, listed, with a hex dump of
+    /// the selected one.
+    ///
+    /// Read-only by construction: nothing here reaches a writer, the line under
+    /// the heading says so, and the rows are the core crate's own table
+    /// ([mhnx_core::savemap::fields]), so the list cannot name bytes the other
+    /// tabs do not edit.
+    fn tab_save_map(&mut self, ui: &mut egui::Ui) {
+        ui.heading("セーブマップ");
+        ui.label(
+            egui::RichText::new(
+                "読み取り専用です。ここは一覧と 16 進ダンプだけで、値は書き換えません。",
+            )
+            .weak()
+            .small(),
+        );
+        if self.save.is_none() {
+            ui.add_space(6.0);
+            ui.label(
+                "セーブを開くと、セーブの全フィールドを 名前・オフセット・長さ・現在値 で一覧します",
+            );
+            return;
+        }
+        // The filter box first: it mutates editor state, and the rows below
+        // need the save borrowed for their values.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} 項目", mhnx_core::savemap::fields().len()));
+            ui.label("絞り込み");
+            Self::filter_edit(
+                ui,
+                &mut self.savemap_filter,
+                220.0,
+                "名前・領域・オフセット (0x…)",
+                &mut self.focus_filter,
+            );
+            if ui.small_button("クリア").clicked() {
+                self.savemap_filter.clear();
+            }
+        });
+        let Some(save) = self.save.as_ref() else {
+            return;
+        };
+        let rows = Self::save_map_rows(&self.savemap_filter, save);
+        ui.label(
+            egui::RichText::new(format!("{} 件を表示", rows.len()))
+                .weak()
+                .small(),
+        );
+        // Land on something the first time the tab is opened: an empty dump
+        // under the list looks like the tab has nothing to show.
+        if self.savemap_selected.is_none() {
+            self.savemap_selected = rows.first().map(|r| r.index);
+        }
+        let selected = self.savemap_selected;
+        let mut pick: Option<usize> = None;
+        // The dump sits under the list, not beside it: the names are long, and
+        // a side panel narrow enough to leave the table readable would push the
+        // dump's own 16 byte lines into a horizontal scroll.
+        const DUMP_H: f32 = 250.0;
+        let table_h = (ui.available_height() - DUMP_H).max(140.0);
+        ui.vertical(|ui| {
+            ui.set_height(table_h);
+            // Only the rows on screen are laid out: the map is 183 rows now
+            // and grows with every constant that is added.
+            TableBuilder::new(ui)
+                .id_salt("savemaplist")
+                .striped(true)
+                .sense(egui::Sense::click())
+                .column(Column::exact(92.0))
+                .column(Column::exact(84.0))
+                .column(Column::exact(88.0))
+                .column(Column::initial(300.0).clip(true))
+                .column(Column::remainder().clip(true))
+                .header(22.0, |mut h| {
+                    for t in ["領域", "オフセット", "長さ", "名前", "現在値"] {
+                        h.col(|ui| {
+                            ui.strong(t);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(20.0, rows.len(), |mut row| {
+                        let r = &rows[row.index()];
+                        row.set_selected(selected == Some(r.index));
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(r.region).small());
+                        });
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("0x{:06X}", r.offset))
+                                    .monospace()
+                                    .small(),
+                            );
+                        });
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(&r.len_text).small());
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&r.field.name).small())
+                                    .truncate(),
+                            )
+                            .on_hover_text(&r.field.name);
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&r.value).small())
+                                    .truncate(),
+                            )
+                            .on_hover_text(&r.value);
+                        });
+                        if row.response().clicked() {
+                            pick = Some(r.index);
+                        }
+                    });
+                });
+        });
+        if let Some(p) = pick {
+            self.savemap_selected = Some(p);
+        }
+        let selected = self.savemap_selected;
+        ui.separator();
+        let Some(index) = selected else {
+            ui.label(
+                egui::RichText::new(
+                    "行をクリックすると、その範囲の 16 進ダンプを表示します（読み取り専用）",
+                )
+                .weak(),
+            );
+            return;
+        };
+        let Some(field) = mhnx_core::savemap::fields().get(index) else {
+            return;
+        };
+        let offset = mhnx_core::savemap::offset_in(save, index).unwrap_or(field.offset);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(&field.name).strong());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} · 0x{:06X} · {} バイト · {}",
+                    mhnx_core::savemap::region(index),
+                    offset,
+                    with_commas(field.len),
+                    field.kind.label()
+                ))
+                .weak()
+                .small(),
+            );
+            if let Some(value) = mhnx_core::savemap::value_text(save, index) {
+                ui.label(egui::RichText::new(format!("現在値: {}", value)).small());
+            }
+        });
+        match mhnx_core::savemap::dump_for(save, index) {
+            Some(lines) => {
+                let mut text = String::with_capacity(lines.len() * 56);
+                for line in &lines {
+                    text.push_str(line);
+                    text.push('\n');
+                }
+                let height = ui.available_height().max(80.0);
+                egui::ScrollArea::both()
+                    .id_salt("savemapdump")
+                    .max_height(height)
+                    .show(ui, |ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(text).monospace().small(),
+                        ));
+                    });
+            }
+            None => {
+                ui.label(egui::RichText::new("このセーブにはこの範囲がありません").weak());
+            }
+        }
+    }
+
+    /// The rows of the セーブマップ list the filter lets through.
+    ///
+    /// Its own method rather than a closure inside the tab so the filter can be
+    /// tested without a window: the table needs a frame to draw and the harness
+    /// has no way to type into it.
+    fn save_map_rows(needle: &str, save: &Save) -> Vec<SaveMapRow> {
+        let needle = needle.trim().to_lowercase();
+        let hex = needle.trim_start_matches("0x").to_string();
+        let mut out = Vec::new();
+        for (index, field) in mhnx_core::savemap::fields().iter().enumerate() {
+            let region = mhnx_core::savemap::region(index);
+            // A row the save does not hold (a missing slot) still has a name:
+            // it is listed at the offset the layout gives it, with the value
+            // column saying it is not there.
+            let offset = mhnx_core::savemap::offset_in(save, index).unwrap_or(field.offset);
+            let address = format!("{:06X}", offset).to_lowercase();
+            let hit = needle.is_empty()
+                || field.name.to_lowercase().contains(&needle)
+                || region.to_lowercase().contains(&needle)
+                || (!hex.is_empty()
+                    && (address.contains(&hex) || format!("0x{}", address).contains(&needle)));
+            if !hit {
+                continue;
+            }
+            out.push(SaveMapRow {
+                index,
+                region,
+                offset,
+                len_text: format!("{} B", with_commas(field.len)),
+                field,
+                value: mhnx_core::savemap::value_text(save, index)
+                    .unwrap_or_else(|| String::from("（このセーブにはありません）")),
+            });
+        }
+        out
+    }
+
     /// 変更一覧: what the open save differs from the file on disk in, one line
     /// per value, each line restorable on its own.
     ///
@@ -11653,6 +11916,19 @@ impl MhnxEditor {
             if t.trim().eq_ignore_ascii_case("progress") {
                 self.tab = Tab::Progress;
             }
+            if t.trim().eq_ignore_ascii_case("savemap") {
+                self.tab = Tab::SaveMap;
+            }
+        }
+        // The save map's row selection, for the screenshot harness: the table
+        // needs a click and the harness has none.
+        if let Ok(s) = std::env::var("MHNXEDITOR_SAVEMAP_SELECT") {
+            if let Ok(index) = s.trim().parse::<usize>() {
+                self.savemap_selected = Some(index);
+            }
+        }
+        if let Ok(s) = std::env::var("MHNXEDITOR_SAVEMAP_FILTER") {
+            self.savemap_filter = s;
         }
         if let Ok(s) = std::env::var("MHNXEDITOR_PROGRESS_SECTION") {
             self.progress_section = match s.trim() {
@@ -16940,6 +17216,85 @@ mod tests {
             app.settings_window(ctx);
         });
         assert!(!output.shapes.is_empty(), "the 設定 window drew nothing");
+    }
+
+    /// The セーブマップ lists the crate's whole table, and its filter finds a
+    /// row by name, by region and by the offset the list prints.
+    #[test]
+    fn the_save_map_lists_the_whole_table() {
+        let dir = Scratch::new("savemaprows");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let save = app.save.as_ref().expect("a save");
+        let all = MhnxEditor::save_map_rows("", save);
+        assert!(
+            all.len() >= 80,
+            "the save map listed only {} rows",
+            all.len()
+        );
+        assert_eq!(all.len(), mhnx_core::savemap::fields().len());
+        // Every row of a well formed save reads: no "not in this save" cell.
+        assert!(all
+            .iter()
+            .all(|r| !r.value.starts_with("（このセーブには")));
+
+        // A name filter keeps the rows that carry it, and only those.
+        let equipment = MhnxEditor::save_map_rows("装備ボックス", save);
+        assert!(!equipment.is_empty() && equipment.len() < all.len());
+        assert!(equipment
+            .iter()
+            .all(|r| r.field.name.contains("装備ボックス")));
+
+        // The offset the list prints can be typed back in, 0x and all.
+        let (index, offset) = (equipment[0].index, equipment[0].offset);
+        let by_offset = MhnxEditor::save_map_rows(&format!("0x{:06X}", offset), save);
+        assert!(by_offset.iter().any(|r| r.index == index));
+        // The region column is searchable too.
+        let third = MhnxEditor::save_map_rows("スロット3", save);
+        assert_eq!(
+            third.len(),
+            all.iter().filter(|r| r.field.slot == Some(2)).count()
+        );
+    }
+
+    /// The セーブマップ tab draws a frame with a save and without one: a
+    /// duplicate table id, or a row the layout cannot fit, would panic here.
+    #[test]
+    fn the_save_map_tab_draws_a_frame() {
+        let mut app = MhnxEditor::default();
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        // With no save open the tab is a line of text ...
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the empty tab drew nothing");
+
+        // ... and with one, a list and the dump of the row it lands on.
+        let dir = Scratch::new("drawsavemap");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the table drew nothing");
+        assert!(
+            app.savemap_selected.is_some(),
+            "the tab did not land on a row"
+        );
+        // A filter that matches nothing leaves the table empty but still draws.
+        app.savemap_filter = String::from("そんな名前はない");
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the empty filter drew nothing");
     }
 }
 
