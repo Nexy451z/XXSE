@@ -132,6 +132,12 @@ pub enum Tab {
     /// The 変更一覧: every value that differs from the file on disk, one line
     /// each, with the one-item undo the audit found missing.
     Review,
+    /// データベース: the game's own tables, listed and previewed.
+    ///
+    /// Read from the user's romfs at run time, like the award and request
+    /// names: nothing on this page is in this repository, and nothing on it
+    /// needs a save to be open.
+    Database,
     About,
 }
 
@@ -677,6 +683,19 @@ struct RomfsLoad {
     titles: mhnx_core::guildcard::TitleTable,
 }
 
+/// What one 読み込む of the データベース tab found.
+///
+/// The tables are the user's game data, read into memory and never written
+/// anywhere; the report names the folder they came from and what was left out.
+struct DatabaseLoad {
+    /// Folder the tables were found in.
+    dir: PathBuf,
+    /// The tables that read, in file name order.
+    tables: Vec<mhnx_core::database::Table>,
+    /// The line under the path field.
+    report: String,
+}
+
 pub struct MhnxEditor {
     pub tab: Tab,
     pub status: String,
@@ -940,6 +959,22 @@ pub struct MhnxEditor {
     pub savemap_filter: String,
     /// Row of the save map whose bytes the dump under the list shows.
     pub savemap_selected: Option<usize>,
+
+    // ---- database (データベース) ----
+    /// The tables last read out of the romfs folder, in file name order.
+    pub db_tables: Vec<mhnx_core::database::Table>,
+    /// Which table the preview under the list shows.
+    pub db_selected: Option<usize>,
+    /// Text filter of the table list and of the preview.
+    pub db_filter: String,
+    /// The needle the cached list was built for, and the tables that answered
+    /// it. Rebuilt only when the needle changes: answering a needle reads every
+    /// row of every table, which is not something to do sixty times a second.
+    pub db_hits: Option<(String, Vec<usize>)>,
+    /// Folder the tables were read from; None when nothing is loaded.
+    pub db_dir: Option<PathBuf>,
+    /// What the last 読み込む found, shown under the path field.
+    pub db_status: String,
     /// Set once the launch-time hooks this file owns have been applied, so a
     /// later frame cannot run them again.
     pub launch_env_done: bool,
@@ -1073,6 +1108,12 @@ impl Default for MhnxEditor {
             quest_missing_only: false,
             savemap_filter: String::new(),
             savemap_selected: None,
+            db_tables: Vec::new(),
+            db_selected: None,
+            db_filter: String::new(),
+            db_hits: None,
+            db_dir: None,
+            db_status: String::new(),
             launch_env_done: false,
             screenshot_path: None,
             screenshot_frames: 0,
@@ -3213,6 +3254,7 @@ impl MhnxEditor {
             Tab::Extras => self.tab_extras(ui),
             Tab::SaveMap => self.tab_save_map(ui),
             Tab::Review => self.tab_review(ui),
+            Tab::Database => self.tab_database(ui),
             Tab::About => self.tab_about(ui),
         }
     }
@@ -3290,6 +3332,7 @@ impl MhnxEditor {
                 | Tab::Progress
                 | Tab::Palico
                 | Tab::SaveMap
+                | Tab::Database
         )
     }
 
@@ -3566,11 +3609,15 @@ impl MhnxEditor {
                     (Tab::Extras, "設定/オトモ"),
                     (Tab::SaveMap, "セーブマップ"),
                     (Tab::Review, "変更一覧"),
+                    (Tab::Database, "データベース"),
                     (Tab::About, "情報"),
                 ] {
                     // A save has to be open before a tab can be anything but a
                     // dead end: eleven of them were just a line of text.
-                    let enabled = self.save.is_some() || matches!(tab, Tab::Save | Tab::About);
+                    // データベース is the second tab that does not need a save:
+                    // it lists the tables of a romfs folder, not of a save.
+                    let enabled = self.save.is_some()
+                        || matches!(tab, Tab::Save | Tab::About | Tab::Database);
                     ui.add_enabled_ui(enabled, |ui| {
                         ui.selectable_value(&mut self.tab, tab, label);
                     });
@@ -11474,6 +11521,243 @@ impl MhnxEditor {
         }
     }
 
+    // ------------------------------------------------ database (データベース)
+
+    /// データベース: the game's own tables, listed and previewed.
+    ///
+    /// Read-only by construction: nothing here reaches a writer, the line under
+    /// the heading says so, and every row comes from the user's own romfs.
+    fn tab_database(&mut self, ui: &mut egui::Ui) {
+        ui.heading("データベース");
+        ui.label(
+            egui::RichText::new(
+                "ゲームのテキストを、あなたの romfs から実行時に読んで一覧します。読み取り専用で、値は書き換えません。このアプリにはゲームのデータを同梱していません。",
+            )
+            .weak()
+            .small(),
+        );
+        self.database_bar(ui);
+        ui.separator();
+        if self.db_tables.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                "romfs の nativeNX/table を指定して「読み込む」を押すと、読めるテーブル（.gmd / .atd）を一覧します",
+            );
+            return;
+        }
+        // The filter box first: it mutates editor state, and the rows below need
+        // the table list borrowed.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("{} テーブル", self.db_tables.len()));
+            ui.label("絞り込み");
+            Self::filter_edit(
+                ui,
+                &mut self.db_filter,
+                240.0,
+                "テーブル名・ファイル名・中身",
+                &mut self.focus_filter,
+            );
+            if ui.small_button("クリア").clicked() {
+                self.db_filter.clear();
+            }
+        });
+        // The list of tables that answer the needle. Rebuilt only when the
+        // needle changes: answering one reads every row of every table, which is
+        // not something to do on every frame.
+        let needle = mhnx_core::database::normalise(&self.db_filter);
+        if self
+            .db_hits
+            .as_ref()
+            .map(|(cached, _)| cached != &needle)
+            .unwrap_or(true)
+        {
+            let hits = Self::database_rows(&self.db_tables, &needle);
+            self.db_hits = Some((needle, hits));
+        }
+        let hits: Vec<usize> = match self.db_hits.as_ref() {
+            Some((_, hits)) => hits.clone(),
+            None => Vec::new(),
+        };
+        if !self.db_filter.trim().is_empty() {
+            ui.label(
+                egui::RichText::new(format!("{} テーブルを表示", hits.len()))
+                    .weak()
+                    .small(),
+            );
+        }
+        let selected = self.db_selected;
+        let mut pick: Option<usize> = None;
+        // The list gets most of the panel and the preview a fixed slice under
+        // it, the way the セーブマップ puts its dump under its table: a side by
+        // side split leaves neither half readable at 1180 px.
+        const PREVIEW_H: f32 = 240.0;
+        let table_h = (ui.available_height() - PREVIEW_H).max(120.0);
+        ui.vertical(|ui| {
+            ui.set_height(table_h);
+            TableBuilder::new(ui)
+                .id_salt("databaselist")
+                .striped(true)
+                .sense(egui::Sense::click())
+                .column(Column::initial(200.0).clip(true))
+                .column(Column::exact(64.0))
+                .column(Column::exact(64.0))
+                .column(Column::exact(120.0))
+                .column(Column::remainder().clip(true))
+                .header(22.0, |mut h| {
+                    for title in ["名前", "件数", "文字列", "形式", "ファイル"] {
+                        h.col(|ui| {
+                            ui.strong(title);
+                        });
+                    }
+                })
+                .body(|body| {
+                    body.rows(20.0, hits.len(), |mut row| {
+                        let index = hits[row.index()];
+                        let Some(table) = self.db_tables.get(index) else {
+                            return;
+                        };
+                        row.set_selected(selected == Some(index));
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&table.title).small())
+                                    .truncate(),
+                            )
+                            .on_hover_text(&table.title);
+                        });
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(table.count().to_string()).small());
+                        });
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(table.strings.to_string()).small());
+                        });
+                        row.col(|ui| {
+                            ui.label(egui::RichText::new(table.layout.describe()).small());
+                        });
+                        row.col(|ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&table.file).small())
+                                    .truncate(),
+                            )
+                            .on_hover_text(&table.file);
+                        });
+                        if row.response().clicked() {
+                            pick = Some(index);
+                        }
+                    });
+                });
+        });
+        if let Some(p) = pick {
+            self.db_selected = Some(p);
+        }
+        ui.separator();
+        let Some(index) = self.db_selected else {
+            ui.label(egui::RichText::new("行をクリックすると、そのテーブルの中身を表示します").weak());
+            return;
+        };
+        let Some(table) = self.db_tables.get(index) else {
+            return;
+        };
+        let path = match &self.db_dir {
+            Some(dir) => dir.join(&table.file).display().to_string(),
+            None => table.file.clone(),
+        };
+        let matches = table.matching(&self.db_filter);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(&table.title).strong());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} 件 · {} · {} · 文字列 {}",
+                    table.count(),
+                    table.layout.describe(),
+                    Self::human_size(table.bytes as u64),
+                    table.strings
+                ))
+                .weak()
+                .small(),
+            );
+            // The file name is what fits; the folder it was read from is in the
+            // hover text, so the row can still answer "which dump is this".
+            ui.add(egui::Label::new(egui::RichText::new(&table.file).small()).truncate())
+                .on_hover_text(&path);
+            if !self.db_filter.trim().is_empty() {
+                ui.label(egui::RichText::new(format!("一致 {} 件", matches.len())).small());
+            }
+        });
+        // The preview: the first PREVIEW entries, each with the position it has
+        // in the file, so a row can be found by its number and not only by its
+        // text.
+        let shown = matches.len().min(mhnx_core::database::PREVIEW);
+        let mut text = String::with_capacity(shown * 40);
+        for (position, row) in matches.iter().take(shown) {
+            text.push_str(&format!("{:>5}  {}\n", position + 1, row));
+        }
+        if matches.is_empty() {
+            ui.label(egui::RichText::new("この絞り込みに一致する行はありません").weak());
+            return;
+        }
+        if matches.len() > shown {
+            ui.label(
+                egui::RichText::new(format!("先頭 {} 件を表示（一致 {} 件）", shown, matches.len()))
+                    .weak()
+                    .small(),
+            );
+        }
+        egui::ScrollArea::vertical()
+            .id_salt("databasepreview")
+            .max_height(ui.available_height().max(80.0))
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(text).monospace().small()));
+            });
+    }
+
+    /// The romfs row of the データベース tab: the path, a picker, and 読み込む.
+    ///
+    /// The path field is the one the 進行状況 tab uses: one dump per session is
+    /// the case worth optimising for, and a second field is a second thing to
+    /// get wrong.
+    fn database_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("romfs");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.romfs_path)
+                    .hint_text(r"C:\...\romfs（nativeNX/table があるフォルダ）")
+                    .desired_width(360.0),
+            );
+            if ui
+                .button("フォルダを選ぶ")
+                .on_hover_text("romfs のフォルダを選ぶと、そのまま読み込みます")
+                .clicked()
+            {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("romfs のフォルダを選択")
+                    .pick_folder()
+                {
+                    self.romfs_path = dir.display().to_string();
+                    self.load_database();
+                }
+            }
+            if ui.button("読み込む").clicked() {
+                self.load_database();
+            }
+            if !self.db_tables.is_empty()
+                && ui
+                    .small_button("解除")
+                    .on_hover_text("読み込んだテーブルを捨てます（セーブは変わりません）")
+                    .clicked()
+            {
+                self.clear_database();
+            }
+        });
+        let status = if self.db_status.is_empty() {
+            String::from(
+                "ゲームのテキストは romfs にしかありません。読み込んだ内容はメモリ上だけで使い、セーブにもファイルにも書きません。",
+            )
+        } else {
+            self.db_status.clone()
+        };
+        ui.label(egui::RichText::new(status).weak().small());
+    }
+
     // ------------------------------------------------- save map (セーブマップ)
 
     /// セーブマップ: every named stretch of the save, listed, with a hex dump of
@@ -11919,6 +12203,9 @@ impl MhnxEditor {
             if t.trim().eq_ignore_ascii_case("savemap") {
                 self.tab = Tab::SaveMap;
             }
+            if t.trim().eq_ignore_ascii_case("database") {
+                self.tab = Tab::Database;
+            }
         }
         // The save map's row selection, for the screenshot harness: the table
         // needs a click and the harness has none.
@@ -11971,6 +12258,11 @@ impl MhnxEditor {
             if !opened_with.is_empty() {
                 self.message = opened_with;
             }
+        }
+        // The データベース tab's list, for the screenshot harness: the tab is a
+        // button press away otherwise, and the harness has no click.
+        if std::env::var("MHNXEDITOR_DATABASE").is_ok() {
+            self.load_database();
         }
     }
 
@@ -12189,6 +12481,223 @@ impl MhnxEditor {
         self.romfs_dir = None;
         self.romfs_status = String::from("romfs を読み込んでいません");
         self.message = "romfs の読み込みを解除しました".to_owned();
+    }
+
+    // ------------------------------------------- database (データベース)
+
+    /// The folder the game tables live in, under the folder the user named.
+    ///
+    /// The same five spellings `find_romfs_tables` tries, so the path field on
+    /// the 進行状況 tab works for this one too: a user who picks the romfs root
+    /// gets `nativeNX/table` without being told which folder to pick. The folder
+    /// holding the most readable tables wins.
+    fn database_dir(root: &std::path::Path) -> Option<PathBuf> {
+        let root: PathBuf = if root.is_file() {
+            root.parent()?.to_path_buf()
+        } else {
+            root.to_path_buf()
+        };
+        let mut best: Option<(usize, PathBuf)> = None;
+        for dir in [
+            root.clone(),
+            root.join("romfs"),
+            root.join("nativeNX").join("table"),
+            root.join("romfs").join("nativeNX").join("table"),
+            root.join("table"),
+        ] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let readable = entries
+                .flatten()
+                .filter(|e| e.path().is_file())
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .map(mhnx_core::database::can_read)
+                        .unwrap_or(false)
+                })
+                .count();
+            if readable > 0 && best.as_ref().map(|(n, _)| readable > *n).unwrap_or(true) {
+                best = Some((readable, dir));
+            }
+        }
+        best.map(|(_, dir)| dir)
+    }
+
+    /// The language tag a table file carries, and whether it is Japanese.
+    ///
+    /// A dump holding `GC_Medal_jpn.gmd` next to `GC_Medal_eng.gmd` holds one
+    /// table twice. Listing both would claim twice the coverage the dump has,
+    /// and the interface is Japanese, so the Japanese one is the one kept.
+    fn table_language(file: &str) -> (String, bool) {
+        let stem = match file.rfind('.') {
+            Some(at) => &file[..at],
+            None => file,
+        };
+        let lower = stem.to_ascii_lowercase();
+        for tag in ["jpn", "eng", "fra", "ger", "ita", "spa", "chn", "krn"] {
+            let marker = format!("_{}", tag);
+            if lower.ends_with(&marker) {
+                return (stem[..stem.len() - marker.len()].to_owned(), tag == "jpn");
+            }
+        }
+        (stem.to_owned(), true)
+    }
+
+    /// Read every table of a folder, skipping what this build cannot read.
+    ///
+    /// One file per table: the language variants are grouped first, so the list
+    /// the tab draws cannot show the same table twice.
+    fn read_database(dir: &std::path::Path) -> DatabaseLoad {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return DatabaseLoad {
+                dir: dir.to_path_buf(),
+                tables: Vec::new(),
+                report: format!("{} を開けません", dir.display()),
+            };
+        };
+        // Keyed by the stem with its language tag taken off.
+        let mut groups: std::collections::BTreeMap<String, Vec<(String, PathBuf, bool)>> =
+            std::collections::BTreeMap::new();
+        let mut unsupported = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !mhnx_core::database::can_read(name) {
+                // .ots, .ntd, .w00d, .skd ... : binary tables with no parser in
+                // this crate. Counted, not listed.
+                unsupported += 1;
+                continue;
+            }
+            let (base, japanese) = Self::table_language(name);
+            // The extension is part of the key: a dump holds
+            // activityData_jpn.gmd next to activityData.atd, which are two
+            // tables with one name and not two languages of one table.
+            let ext = name.rsplit('.').next().unwrap_or("");
+            let key = format!("{}.{}", base.to_ascii_lowercase(), ext.to_ascii_lowercase());
+            groups
+                .entry(key)
+                .or_default()
+                .push((name.to_owned(), path.clone(), japanese));
+        }
+        let mut chosen: Vec<(String, PathBuf)> = Vec::new();
+        let mut other_language = 0usize;
+        for (_, mut files) in groups {
+            // Japanese first, then by name, so the choice cannot depend on the
+            // order the folder happened to be read in.
+            files.sort_by(|a, b| (!a.2, &a.0).cmp(&(!b.2, &b.0)));
+            other_language += files.len().saturating_sub(1);
+            let (name, path, _) = files.remove(0);
+            chosen.push((name, path));
+        }
+        chosen.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut tables = Vec::new();
+        let mut failed = 0usize;
+        for (name, path) in &chosen {
+            let read = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| mhnx_core::database::read(name, &bytes));
+            match read {
+                Some(table) => tables.push(table),
+                None => failed += 1,
+            }
+        }
+        let mut parts: Vec<String> = vec![
+            format!("{} テーブル", tables.len()),
+            format!("{} 件", tables.iter().map(|t| t.count()).sum::<usize>()),
+        ];
+        if other_language > 0 {
+            parts.push(format!("他言語 {}", other_language));
+        }
+        if failed > 0 {
+            parts.push(format!("読めません {}", failed));
+        }
+        if unsupported > 0 {
+            parts.push(format!("未対応 {} ファイル", unsupported));
+        }
+        DatabaseLoad {
+            dir: dir.to_path_buf(),
+            tables,
+            report: format!(
+                "{} から読み込みました: {}",
+                dir.display(),
+                parts.join(" / ")
+            ),
+        }
+    }
+
+    /// The tables the filter lets through, in list order.
+    ///
+    /// Its own function so the filter can be tested without a window, and so
+    /// the answer is cached in `db_hits` in exactly one place.
+    fn database_rows(tables: &[mhnx_core::database::Table], needle: &str) -> Vec<usize> {
+        tables
+            .iter()
+            .enumerate()
+            .filter(|(_, table)| table.answered_by(needle))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// Read every table of the romfs folder that is in the field.
+    ///
+    /// None of this is data of this repository's: the tables come from the
+    /// user's own dump, are held in memory only, and are never written into a
+    /// save or any other file.
+    pub fn load_database(&mut self) {
+        let raw = self.romfs_path.trim().to_owned();
+        self.db_hits = None;
+        if raw.is_empty() {
+            self.db_status = String::from("romfs のフォルダを指定してください");
+            self.message = self.db_status.clone();
+            return;
+        }
+        let Some(dir) = Self::database_dir(std::path::Path::new(&raw)) else {
+            // The tables of another folder must not stay on screen under this
+            // path: the list would name one dump's files beside another's.
+            self.db_tables.clear();
+            self.db_selected = None;
+            self.db_dir = None;
+            self.db_status = format!(
+                "{} にテーブルが見つかりません（nativeNX/table を探しました）",
+                raw
+            );
+            self.message = self.db_status.clone();
+            return;
+        };
+        let load = Self::read_database(&dir);
+        self.db_status = load.report.clone();
+        self.db_dir = Some(load.dir);
+        self.db_tables = load.tables;
+        // Land on a table the catalogue names. The alphabetically first file of
+        // a dump is a message table, and opening on one says less about what the
+        // dump holds than opening on the award table does.
+        self.db_selected = if self.db_tables.is_empty() {
+            None
+        } else {
+            let named = self
+                .db_tables
+                .iter()
+                .position(|t| !matches!(t.layout, mhnx_core::database::Layout::Each));
+            Some(named.unwrap_or(0))
+        };
+        self.message = load.report;
+    }
+
+    /// Drop the tables that were read, keeping the path so it can be retried.
+    pub fn clear_database(&mut self) {
+        self.db_tables.clear();
+        self.db_selected = None;
+        self.db_hits = None;
+        self.db_dir = None;
+        self.db_status = String::from("テーブルを読み込んでいません");
+        self.message = "データベースの読み込みを解除しました".to_owned();
     }
 
     /// One award bit, false when the slot holds no character.
@@ -17353,6 +17862,200 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
         });
         assert!(!output.shapes.is_empty(), "the empty filter drew nothing");
+    }
+
+    /// A minimal well formed .gmd, built here so the データベース tab can be fed
+    /// a table without any game data. The layout is the one `romfstables`
+    /// documents.
+    fn synth_gmd(key: &str, strings: &[&str]) -> Vec<u8> {
+        let mut text: Vec<u8> = Vec::new();
+        for s in strings {
+            text.extend_from_slice(s.as_bytes());
+            text.push(0);
+        }
+        let count = strings.len() as u32;
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"GMD\0");
+        out.extend_from_slice(&0x0001_0302u32.to_le_bytes()); // +0x04 version
+        out.extend_from_slice(&0u32.to_le_bytes()); // +0x08
+        out.extend_from_slice(&0x42D3_1A32u32.to_le_bytes()); // +0x0C tag
+        out.extend_from_slice(&0u32.to_le_bytes()); // +0x10
+        out.extend_from_slice(&count.to_le_bytes()); // +0x14
+        out.extend_from_slice(&count.to_le_bytes()); // +0x18
+        out.extend_from_slice(&0u32.to_le_bytes()); // +0x1C
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes()); // +0x20
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes()); // +0x24
+        out.extend_from_slice(key.as_bytes());
+        out.push(0);
+        out.extend_from_slice(&text);
+        out
+    }
+
+    /// The データベース tab reads a folder: one file per table, the Japanese
+    /// table when a dump carries several languages, and a count of what this
+    /// build could not read.
+    #[test]
+    fn the_database_reads_a_folder_and_keeps_one_language() {
+        let dir = Scratch::new("database");
+        // Two languages of one table, one table with no language tag, and a
+        // binary table this crate has no parser for.
+        let medal = synth_gmd("GC_Medal", &["ja medal", "ja medal 2", "desc", "desc 2"]);
+        std::fs::write(dir.path().join("GC_Medal_jpn.gmd"), &medal).expect("jpn table");
+        let english = synth_gmd("GC_Medal", &["en medal", "en 2", "d", "d2"]);
+        std::fs::write(dir.path().join("GC_Medal_eng.gmd"), english).expect("eng table");
+        let plain = synth_gmd("key", &["a", "b"]);
+        std::fs::write(dir.path().join("MadeUp_jpn.gmd"), plain).expect("untagged table");
+        std::fs::write(dir.path().join("itemData.itm"), b"not a table").expect("binary");
+
+        // The folder is found from itself: the path field takes the table
+        // folder as readily as the romfs root.
+        assert_eq!(
+            MhnxEditor::database_dir(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+        let load = MhnxEditor::read_database(dir.path());
+        let names: Vec<&str> = load.tables.iter().map(|t| t.file.as_str()).collect();
+        assert_eq!(names, ["GC_Medal_jpn.gmd", "MadeUp_jpn.gmd"]);
+        // The Japanese medal table is the one kept, with its layout applied:
+        // the four strings name two awards and describe them.
+        assert_eq!(load.tables[0].title, "勲章名");
+        assert_eq!(load.tables[0].rows, ["ja medal", "ja medal 2"]);
+        // An untagged file is its own table, under its own stem.
+        assert_eq!(load.tables[1].rows, ["a", "b"]);
+        assert_eq!(load.tables[1].title, "MadeUp_jpn");
+        // What was left out is counted, not silently dropped.
+        assert!(load.report.contains("2 テーブル"), "{}", load.report);
+        assert!(load.report.contains("他言語 1"), "{}", load.report);
+        assert!(load.report.contains("未対応 1"), "{}", load.report);
+
+        // The language tag is read off the stem, and a file without one counts
+        // as the only language there is.
+        assert_eq!(
+            MhnxEditor::table_language("GC_Medal_jpn.gmd"),
+            (String::from("GC_Medal"), true)
+        );
+        assert_eq!(
+            MhnxEditor::table_language("GC_Medal_eng.gmd"),
+            (String::from("GC_Medal"), false)
+        );
+        assert_eq!(
+            MhnxEditor::table_language("activityData.atd"),
+            (String::from("activityData"), true)
+        );
+        // A folder with no table in it is None, not an empty list.
+        let empty = Scratch::new("nodatabase");
+        assert_eq!(MhnxEditor::database_dir(empty.path()), None);
+    }
+
+    /// The データベース tab lists every readable table of the dump on this
+    /// machine, and its filter reaches the rows inside a table.
+    #[test]
+    fn the_database_lists_the_tables_of_the_dump_on_this_machine() {
+        let table_dir = match std::env::var_os("MHNX_ROMFS_TABLE") {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from(r"C:\anyWorkspace\nx\mhxx\romfs\nativeNX\table"),
+        };
+        if !table_dir.is_dir() {
+            eprintln!("skipping: {} is not on this machine", table_dir.display());
+            return;
+        }
+        let dir = MhnxEditor::database_dir(&table_dir).expect("the table folder");
+        let load = MhnxEditor::read_database(&dir);
+        assert!(load.tables.len() >= 100, "{}", load.report);
+        // Ordered by file name, so the list cannot shuffle between reads.
+        let names: Vec<&str> = load.tables.iter().map(|t| t.file.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+
+        // No needle keeps every table; a needle only a row answers still finds
+        // the table that holds the row.
+        assert_eq!(
+            MhnxEditor::database_rows(&load.tables, "").len(),
+            load.tables.len()
+        );
+        let hits = MhnxEditor::database_rows(&load.tables, "調合書");
+        assert!(
+            hits.iter()
+                .any(|i| load.tables[*i].file == "itemData_jpn.gmd"),
+            "the item table was not found through its rows"
+        );
+        // The catalogue's own labels are searchable too.
+        let by_title = MhnxEditor::database_rows(&load.tables, "勲章");
+        assert!(by_title
+            .iter()
+            .any(|i| load.tables[*i].file == "GC_Medal_jpn.gmd"));
+        // A needle nothing answers is an empty list, not every table.
+        assert!(MhnxEditor::database_rows(&load.tables, "そんな名前はない").is_empty());
+        // The five tables the editor already reads are all in the list.
+        for name in [
+            "GC_Medal_jpn.gmd",
+            "GC_Title_1_jpn.gmd",
+            "GC_Title_2_jpn.gmd",
+            "activityData_jpn.gmd",
+            "activityData.atd",
+        ] {
+            assert!(
+                load.tables.iter().any(|t| t.file == name),
+                "{} is missing from the list",
+                name
+            );
+        }
+        println!("{}", load.report);
+    }
+
+    /// The データベース tab draws a frame empty, full and filtered: a duplicate
+    /// table id, or a row the column layout cannot fit, would panic here.
+    #[test]
+    fn the_database_tab_draws_a_frame() {
+        // Ctrl+F has to reach this tab's filter box like every other list.
+        let mut app = MhnxEditor {
+            tab: Tab::Database,
+            ..MhnxEditor::default()
+        };
+        assert!(app.tab_has_filter(), "Ctrl+F does not reach データベース");
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        // Nothing loaded: the tab is a heading, the path row and a hint. The tab
+        // must not need a save to be open.
+        assert!(app.save.is_none());
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_database(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the empty tab drew nothing");
+
+        // One table, read out of a folder of this test's own.
+        let dir = Scratch::new("drawdatabase");
+        let medal = synth_gmd("GC_Medal", &["award one", "award two", "d1", "d2"]);
+        std::fs::write(dir.path().join("GC_Medal_jpn.gmd"), medal).expect("a table");
+        app.romfs_path = dir.path().display().to_string();
+        app.load_database();
+        assert!(!app.db_tables.is_empty(), "{}", app.db_status);
+        assert_eq!(app.db_selected, Some(0));
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_database(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the table drew nothing");
+
+        // The filter reaches the rows: a word from the inside of the table keeps
+        // the table, and one from nowhere empties the list but still draws.
+        app.db_filter = String::from("award two");
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_database(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the filtered tab drew nothing");
+        assert_eq!(app.db_hits.as_ref().map(|(_, hits)| hits.len()), Some(1));
+        app.db_filter = String::from("そんな名前はない");
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_database(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the empty filter drew nothing");
+        assert_eq!(app.db_hits.as_ref().map(|(_, hits)| hits.len()), Some(0));
     }
 }
 
