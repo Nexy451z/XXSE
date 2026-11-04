@@ -1159,7 +1159,10 @@ fn cmd_charms(path: &str, slot: Option<usize>) -> Result<(), String> {
         let list = s.charms(i).ok_or("no such slot")?;
         println!("slot {}: {} charm(s) of {}", i + 1, list.len(), mhnx_core::charm::CHARM_COUNT);
         for c in &list {
-            println!("  #{:<5} {}", c.index, c.summary());
+            // The game's name of the kind, so the listing matches the box
+            // screen: 兵士の護石 … 龍の護石 … 天の護石.
+            let kind = s.charm_kind_name(i, c.index).unwrap_or("—");
+            println!("  #{:<5} {:<12} {}", c.index, kind, c.summary());
         }
     }
     Ok(())

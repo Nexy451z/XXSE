@@ -221,11 +221,18 @@ pub struct Line {
 }
 
 /// The charm currently being edited on the CharmEdit screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharmEdit {
     /// Charm slot index (0..1999).
     pub index: usize,
-    /// Talisman grade (rarity 97..100).
+    /// Talisman kind: the byte at +0x02, 1 兵士 … 10 天, with 7 龍.
+    ///
+    /// This is the row the console cycles; the grade below follows it, because
+    /// the game writes the rarity as part of the same pair (+0x12/+0x13 is the
+    /// charm item id 353..356). Cycling the rarity instead was what left 龍の
+    /// 護石 unreachable and renamed 天 to 英雄.
+    pub kind: u8,
+    /// Talisman grade (rarity 97..100), derived from [CharmEdit::kind].
     pub grade: crate::charm::TalismanGrade,
     /// Decoration slots.
     pub slots: u8,
@@ -239,6 +246,39 @@ pub struct CharmEdit {
     pub points2: i8,
     /// Which row the cursor is on.
     pub field: usize,
+}
+
+impl Default for CharmEdit {
+    fn default() -> Self {
+        CharmEdit {
+            index: 0,
+            kind: 10, // 天の護石, the grade the sample saves are full of
+            grade: crate::charm::TalismanGrade::Enduring,
+            slots: 0,
+            skill1: 0,
+            points1: 0,
+            skill2: 0,
+            points2: 0,
+            field: 0,
+        }
+    }
+}
+
+/// The next kind when the kind row is turned, skipping row 0 ("装備なし").
+fn step_kind(kind: u8, forward: bool) -> u8 {
+    let top = crate::charm::TALISMAN_KIND_COUNT;
+    let cur = if crate::charm::is_kind(kind) { kind } else { 10 };
+    if forward {
+        if cur >= top {
+            1
+        } else {
+            cur + 1
+        }
+    } else if cur <= 1 {
+        top
+    } else {
+        cur - 1
+    }
 }
 
 /// Rows on the equipment form when an existing record is edited.
@@ -3297,8 +3337,24 @@ impl Editor {
                     .and_then(crate::charm::rarity_of_record)
             })
             .unwrap_or_default();
+        // The kind is what names the talisman, so it is read from the record
+        // the form is seeded from rather than assumed: a 龍の護石 edited here
+        // must stay a 龍の護石, and a fresh one must not silently become 天.
+        let kind = self
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_box(self.slot))
+            .and_then(|b| {
+                let o = seed.index * crate::charm::CHARM_RECORD;
+                b.get(o..o + crate::charm::CHARM_RECORD)
+                    .and_then(crate::charm::kind_of_record)
+            })
+            .unwrap_or_else(|| {
+                crate::charm::canonical_kind(grade.rarity()).unwrap_or(10)
+            });
         self.charm_edit = Some(CharmEdit {
             index: seed.index,
+            kind,
             grade,
             slots: seed.slots,
             skill1: seed.skill1,
@@ -3371,14 +3427,16 @@ impl Editor {
                     // ranges, so moving it re-clamps both straight away
                     // instead of writing a record the game would refuse.
                     1 => {
-                        let all = crate::charm::TalismanGrade::ALL;
-                        let at = all.iter().position(|g| *g == e.grade).unwrap_or(3);
-                        let next = if d > 0 {
-                            (at + 1) % all.len()
-                        } else {
-                            (at + all.len() - 1) % all.len()
-                        };
-                        e.grade = all[next];
+                        // The kind, not the rarity: the ten rows of
+                        // amuletData_jpn.gmd are what the game names a talisman
+                        // by, and the rarity is written with the kind. 龍 (7)
+                        // is only reachable through this row.
+                        e.kind = step_kind(e.kind, d > 0);
+                        if let Some(g) = crate::charm::TalismanGrade::from_rarity(
+                            crate::charm::kind_rarity(e.kind).unwrap_or(0),
+                        ) {
+                            e.grade = g;
+                        }
                         e.slots = e.slots.min(e.grade.max_slots());
                         for (skill, pts, second) in [
                             (e.skill1, &mut e.points1, false),
@@ -3432,14 +3490,14 @@ impl Editor {
                     points2: e.points2,
                 };
                 self.push_undo("お守りの書き込み");
+                let kind_name = crate::charm::kind_name(e.kind).unwrap_or("?");
                 if let Some(s) = &mut self.save {
-                    if s.set_charm_with_grade(self.slot, &c, e.grade) {
+                    // The kind is written with the skills, and its rarity comes
+                    // along: the pair (+0x02, +0x12/+0x13) cannot disagree.
+                    if s.set_charm_with_kind(self.slot, &c, e.kind) {
                         self.dirty = true;
-                        self.message = format!(
-                            "お守り {} を書き込みました（{}）",
-                            e.index,
-                            e.grade.name()
-                        );
+                        self.message =
+                            format!("お守り {} を書き込みました（{}）", e.index, kind_name);
                     } else {
                         self.message = String::from(
                             "could not write here - the slot is a weapon or the box has no talisman to copy",
@@ -9521,9 +9579,17 @@ impl Editor {
                     start = list.len().saturating_sub(16);
                 }
                 for (i, c) in list.iter().enumerate().skip(start).take(16) {
+                    // The game's name of the kind comes first: it is the label
+                    // the box screen shows, and the one the report said was
+                    // missing.
+                    let kind = self
+                        .save
+                        .as_ref()
+                        .and_then(|s| s.charm_kind_name(self.slot, c.index))
+                        .unwrap_or("—");
                     push(
                         &mut out,
-                        format!("  #{:<5} {}", c.index, c.summary()),
+                        format!("  #{:<5} {:<12} {}", c.index, kind, c.summary()),
                         true,
                         i == self.cursor,
                     );
@@ -10339,8 +10405,13 @@ impl Editor {
                 let rows: [(alloc::string::String, alloc::string::String); 7] = [
                     (String::from("枠"), format!("{}", e.index)),
                     (
-                        String::from("レア度"),
-                        format!("{}（最大 S{}）", e.grade.name(), e.grade.max_slots()),
+                        String::from("種類"),
+                        format!(
+                            "{}（レア度 {} / 最大 S{}）",
+                            crate::charm::kind_name(e.kind).unwrap_or("?"),
+                            e.grade.rarity(),
+                            e.grade.max_slots()
+                        ),
                     ),
                     (String::from("装飾スロット"), format!("{}", e.slots)),
                     (
@@ -12017,7 +12088,7 @@ mod tests {
         ed.input(Key::A);
         assert_eq!(ed.undo_label(), Some("進行状況"), "{}", ed.message);
 
-        // 護石: the form writes through set_charm_with_grade.
+        // 護石: the form writes through set_charm_with_kind.
         ed.open_charms();
         ed.input(Key::L);
         ed.input(Key::A);

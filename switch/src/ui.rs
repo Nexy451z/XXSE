@@ -1253,11 +1253,18 @@ impl GuiState {
             },
             Screen::CharmEdit => match key {
                 Key::A => {
+                    // Rows are 0 index, 1 kind, 2 slots, 3 skill1, 4 points1,
+                    // 5 skill2, 6 points2. The picker belongs to the two skill
+                    // rows; it used to open on the slots row instead, so [A] on
+                    // 第1スキル wrote the charm and [A] on スロット数 did
+                    // nothing useful.
                     let field = ed.charm_edit.map(|c| c.field).unwrap_or(0);
-                    if field == 2 || field == 4 {
+                    if field == 3 || field == 5 {
                         ed.input(Key::Y); // Open Skill Picker
                     } else if field == 1 {
-                        ed.input(Key::Right); // Cycle slots 0..3
+                        ed.input(Key::Right); // Cycle the ten kinds (龍 included)
+                    } else if field == 2 {
+                        ed.input(Key::Right); // Cycle the slot count
                     } else {
                         ed.input(Key::A); // Apply charm to box
                     }
@@ -5108,9 +5115,16 @@ impl GuiState {
                 format!("{} {:+}", s1, chm.points1)
             };
             let slots_str = format!("S{}", chm.slots);
+            // The kind is what the game calls the talisman, so it opens the
+            // row: 「龍の護石 攻撃 +10」 reads like the box screen.
+            let kind = ed
+                .save
+                .as_ref()
+                .and_then(|s| s.charm_kind_name(ed.slot, chm.index))
+                .unwrap_or("—");
             rows.push((
                 i,
-                summary,
+                format!("{} {}", kind, summary),
                 format!("装備BOX枠 #{:04}", chm.index),
                 slots_str,
                 format!("#{:02}", i + 1),
@@ -5156,12 +5170,18 @@ impl GuiState {
             ),
             (
                 1,
-                String::from("レア度"),
-                // The ceiling lives in the meta column so the value column
-                // stays inside its 230px budget (the grade name alone already
-                // reads 古びた護石 R99).
-                format!("◀ ▶ で切替 / 最大 S{}", ce.grade.max_slots()),
-                String::from(ce.grade.name()),
+                String::from("種類"),
+                // The game's own name of the talisman is the value; the rarity
+                // and the slot ceiling live in the meta column because the
+                // value column has a 230px budget.
+                format!(
+                    "◀ ▶ で切替 / レア度 {} / 最大 S{}",
+                    ce.grade.rarity(),
+                    ce.grade.max_slots()
+                ),
+                alloc::string::String::from(
+                    mhnx_core::charm::kind_name(ce.kind).unwrap_or("?"),
+                ),
                 String::from("#02"),
             ),
             (

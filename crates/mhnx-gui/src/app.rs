@@ -861,6 +861,9 @@ pub struct MhnxEditor {
     pub scroll_to_item: Option<usize>,
     /// Grade a new talisman is created at, and the one the selector last hit.
     pub charm_new_grade: mhnx_core::charm::TalismanGrade,
+    /// Kind (the +0x02 byte) a new talisman is created as, and the one the
+    /// kind selector last hit. 1 兵士 … 10 天, 7 龍.
+    pub charm_new_kind: u8,
     /// Quest-equipment slot whose supply and ammo lists are on screen.
     pub qe_slot: Option<usize>,
     /// Supply or ammo entry the item picker is choosing for:
@@ -1175,6 +1178,7 @@ impl Default for MhnxEditor {
         charm_confirm: CharmConfirm::default(),
         scroll_to_item: None,
         charm_new_grade: mhnx_core::charm::TalismanGrade::Enduring,
+        charm_new_kind: 10, // 天の護石: the shape the sample saves are full of
         qe_slot: None,
         qe_pick: None,
         confirm: Confirm::default(),
@@ -11368,7 +11372,15 @@ impl MhnxEditor {
                                 if ui
                                     .selectable_label(
                                         self.charm_index == c.index,
-                                        format!("{:<6} {}", c.index, c.summary()),
+                                        // The game's name of the kind first:
+                                        // it is what the box screen shows.
+                                        format!(
+                                            "{:<6} {:<12} {}",
+                                            c.index,
+                                            mhnx_core::charm::kind_name_at(&charm_box, c.index)
+                                                .unwrap_or("—"),
+                                            c.summary()
+                                        ),
                                     )
                                     .clicked()
                                 {
@@ -11404,13 +11416,24 @@ impl MhnxEditor {
                 // bytes are not skills at all. The box is copied once per frame,
                 // so a grade click lands on the next frame's copy.
                 let rec_at = self.charm_index * mhnx_core::charm::CHARM_RECORD;
-                let cur_rec = charm_box.get(rec_at..rec_at + mhnx_core::charm::CHARM_RECORD);
-                let mut cur_grade = cur_rec.and_then(mhnx_core::charm::rarity_of_record);
+                // An owned copy: a kind switch re-reads the box a few lines
+                // below, and a slice into the old buffer would be invalidated
+                // by that assignment.
+                let cur_rec: Vec<u8> = charm_box
+                    .get(rec_at..rec_at + mhnx_core::charm::CHARM_RECORD)
+                    .map(|r| r.to_vec())
+                    .unwrap_or_default();
+                let cur_rec_ok = cur_rec.len() == mhnx_core::charm::CHARM_RECORD;
+                let is_blank = cur_rec_ok && mhnx_core::charm::is_empty_record(&cur_rec);
+                let is_talisman_here = cur_rec_ok && mhnx_core::charm::is_talisman(&cur_rec);
+                let mut cur_grade = if cur_rec_ok {
+                    mhnx_core::charm::rarity_of_record(&cur_rec)
+                } else {
+                    None
+                };
                 let bound = match cur_grade {
                     Some(g) => Some(g),
-                    None if cur_rec.map_or(false, mhnx_core::charm::is_empty_record) => {
-                        Some(self.charm_new_grade)
-                    }
+                    None if is_blank => Some(self.charm_new_grade),
                     None => None,
                 };
                 let max_slots = bound.map(|g| g.max_slots()).unwrap_or(3);
@@ -11475,59 +11498,85 @@ impl MhnxEditor {
                 // indexed by skill id - 1. Verified against all 650 talismans
                 // in the sample save.
                 if !charm_box.is_empty() {
-                    // The editor used to build every talisman from the most
-                    // common record in the box, which is always rarity 100, so
-                    // the lower grades could not be made at all. The grade is
-                    // now something you choose.
-                    let mut apply_grade: Option<mhnx_core::charm::TalismanGrade> = None;
+                    // The kind is the byte at +0x02, and it is what names the
+                    // talisman in game: the rows of amuletData_jpn.gmd, 1
+                    // 兵士 … 10 天, with 龍 at row 7. The rarity is not a
+                    // separate choice: the game writes it with the kind
+                    // (+0x12/+0x13 is the u16 charm item id 353..356), so a
+                    // selector that picked a rarity and guessed the kind
+                    // renamed 天の護石 to 英雄の護石 and could never reach
+                    // 龍の護石 at all.
+                    let cur_kind = if cur_rec_ok {
+                        mhnx_core::charm::kind_of_record(&cur_rec)
+                    } else {
+                        None
+                    };
+                    let mut apply_kind: Option<u8> = None;
                     ui.horizontal_wrapped(|ui| {
-                        ui.label("レア度");
-                        for g in mhnx_core::charm::TalismanGrade::ALL {
-                            let is_cur = cur_grade == Some(g);
+                        ui.label("種類");
+                        for (id, name) in mhnx_core::charm::TALISMAN_KINDS.iter().enumerate().skip(1) {
+                            let id = id as u8;
+                            let is_cur = cur_kind == Some(id);
+                            let grade = mhnx_core::charm::kind_rarity(id)
+                                .and_then(mhnx_core::charm::TalismanGrade::from_rarity);
                             let resp = ui
-                                .add(egui::Button::new(g.name()).selected(is_cur))
+                                .add(egui::Button::new(*name).selected(is_cur))
                                 .on_hover_text(format!(
-                                    "装飾スロットは最大 {} 個",
-                                    g.max_slots()
+                                    "レア度 {} / 装飾スロットは最大 {} 個",
+                                    mhnx_core::charm::kind_rarity(id).unwrap_or(0),
+                                    grade.map(|g| g.max_slots()).unwrap_or(0)
                                 ));
                             if resp.clicked() && !is_cur {
-                                apply_grade = Some(g);
+                                apply_kind = Some(id);
                             }
                         }
                     });
-                    if let Some(g) = apply_grade {
-                        self.push_undo(format!("お守り {} のレア度", self.charm_index));
+                    if let Some(kind) = apply_kind {
+                        let name = mhnx_core::charm::kind_name(kind).unwrap_or("?");
+                        // An existing talisman is retyped in place; an empty
+                        // slot has no record to retype, so the choice seeds the
+                        // next 「適用」/「新規作成」 instead.
+                        let mut written = false;
                         let mut ok = false;
+                        if is_talisman_here {
+                            self.push_undo(format!("お守り {} の種類", self.charm_index));
+                        }
                         if let Some(s) = &mut self.save {
-                            if let Some(b) = s.equipment_box_mut(self.slot) {
-                                ok = mhnx_core::charm::set_grade(b, self.charm_index, g);
-                                if ok {
-                                    mhnx_core::charm::clamp_points(b, self.charm_index, g);
-                                    mhnx_core::charm::clamp_slots(b, self.charm_index, g);
-                                }
+                            if is_talisman_here {
+                                ok = s.set_charm_kind(self.slot, self.charm_index, kind);
+                                written = ok;
+                            } else if is_blank {
+                                ok = true;
                             }
                         }
                         if ok {
-                            self.dirty = true;
-                            self.charm_new_grade = g;
-                            // The switch is already written, so the bounds and
-                            // the warning line below must describe the record as
-                            // it is now rather than as it was at frame start.
-                            cur_grade = Some(g);
-                            // Reflect what the clamps did to the record.
-                            self.charm_sync_from_record();
-                            charm_box = self
-                                .save
-                                .as_ref()
-                                .and_then(|s| s.equipment_box(self.slot))
-                                .map(|b| b.to_vec())
-                                .unwrap_or_default();
-                            self.message = format!(
-                                "レア度を {} に変更しました（許容範囲とスロットを調整）",
-                                g.name()
-                            );
+                            self.charm_new_kind = kind;
+                            if written {
+                                self.dirty = true;
+                                // The record now holds the kind and its rarity,
+                                // so the bounds and the warning line below have
+                                // to describe it as it is, not as it was when
+                                // the frame started.
+                                if let Some(g) = mhnx_core::charm::TalismanGrade::from_rarity(
+                                    mhnx_core::charm::kind_rarity(kind).unwrap_or(0),
+                                ) {
+                                    self.charm_new_grade = g;
+                                    cur_grade = Some(g);
+                                }
+                                self.charm_sync_from_record();
+                                charm_box = self
+                                    .save
+                                    .as_ref()
+                                    .and_then(|s| s.equipment_box(self.slot))
+                                    .map(|b| b.to_vec())
+                                    .unwrap_or_default();
+                                self.message = format!("種類を {} に変更しました", name);
+                            } else {
+                                self.message = format!("新しいお守りの種類を {} にしました", name);
+                            }
                         } else {
-                            self.message = format!("{} に変更できませんでした", g.name());
+                            self.message =
+                                format!("{} に変更できません（武器・防具の枠は保護されています）", name);
                         }
                     }
                     // Everything about this record the game would not have
@@ -11544,15 +11593,26 @@ impl MhnxEditor {
                     }
                     let ty = charm_box.get(rec_at + 2).copied().unwrap_or(0);
                     let rarity = mhnx_core::charm::rarity_of(ty);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "種別 0x{:02X} / レア度 {}",
-                            ty,
-                            rarity.map(|r| r.to_string()).unwrap_or_else(|| "-".into())
-                        ))
-                        .weak()
-                        .small(),
-                    );
+                    // The game's own name first: 「種類 龍の護石」 is the one
+                    // thing the box screen and the talisman agree on, and the
+                    // raw bytes follow it for anyone comparing with a hex dump.
+                    let kind_label = if cur_rec_ok {
+                        mhnx_core::charm::kind_name_of_record(&cur_rec).unwrap_or("—")
+                    } else {
+                        "—"
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(format!("種類 {}", kind_label)).strong());
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "（+0x02 = 0x{:02X} / レア度 {}）",
+                                ty,
+                                rarity.map(|r| r.to_string()).unwrap_or_else(|| "—".into())
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    });
                     for (label, sid, pts, second) in [
                         ("スキル1", self.charm_skill1, self.charm_points1, false),
                         ("スキル2", self.charm_skill2, self.charm_points2, true),
@@ -11605,21 +11665,37 @@ impl MhnxEditor {
                         // seeded from, and on an existing one it is applied with
                         // the five edited fields, so what is on screen is what
                         // lands in the box.
-                        let grade = cur_grade.unwrap_or(self.charm_new_grade);
+                        // A talisman is written as the kind it already is; an
+                        // empty slot as the kind the selector last chose. The
+                        // kind decides the rarity, so the two cannot disagree.
+                        let kind = if cur_rec_ok {
+                            mhnx_core::charm::kind_of_record(&cur_rec)
+                        } else {
+                            None
+                        }
+                        .unwrap_or(self.charm_new_kind);
                         self.push_undo(format!("お守り {} の更新", c.index));
                         let written = match &mut self.save {
-                            Some(s) => s.set_charm_with_grade(self.slot, &c, grade),
+                            Some(s) => s.set_charm_with_kind(self.slot, &c, kind),
                             None => false,
                         };
                         if written {
                             self.dirty = true;
-                            self.charm_new_grade = grade;
-                            // The call clamps the points to the grade, so read
-                            // the record back instead of still showing a value
-                            // it no longer holds.
+                            self.charm_new_kind = kind;
+                            if let Some(g) = mhnx_core::charm::TalismanGrade::from_rarity(
+                                mhnx_core::charm::kind_rarity(kind).unwrap_or(0),
+                            ) {
+                                self.charm_new_grade = g;
+                            }
+                            // The call clamps the points to the kind's rarity,
+                            // so read the record back instead of still showing
+                            // a value it no longer holds.
                             self.charm_sync_from_record();
-                            self.message =
-                                format!("お守り {} を更新しました（{}）", c.index, grade.name());
+                            self.message = format!(
+                                "お守り {} を更新しました（{}）",
+                                c.index,
+                                mhnx_core::charm::kind_name(kind).unwrap_or("?")
+                            );
                         } else {
                             self.message =
                                 String::from("書き込めません（武器・防具の枠は保護されています）");
@@ -11651,24 +11727,24 @@ impl MhnxEditor {
                             skill2: 0,
                             points2: 0,
                         };
-                        let grade = self.charm_new_grade;
+                        let kind = self.charm_new_kind;
+                        let kind_label = mhnx_core::charm::kind_name(kind).unwrap_or("?");
                         self.push_undo(format!("お守り {} の作成", self.charm_index));
                         if let Some(s) = &mut self.save {
-                            if s.set_charm_with_grade(self.slot, &new, grade) {
+                            if s.set_charm_with_kind(self.slot, &new, kind) {
                                 self.dirty = true;
                                 self.message = format!(
                                     "空き枠 {} に {} を作りました",
-                                    self.charm_index,
-                                    grade.name()
+                                    self.charm_index, kind_label
                                 );
                             } else {
-                                // set_charm_with_grade seeds a new record from
-                                // a real one of the requested grade, so this is
-                                // about the grade, not about the slot: the slot
-                                // just came back from first_free.
-                                self.message = format!(
-                                    "このレア度では作成できません（{} のレコードが装備ボックスにありません）",
-                                    grade.name()
+                                // set_charm_with_kind seeds a new record from a
+                                // real talisman (of the same kind when the box
+                                // holds one), so this is about the box having no
+                                // talisman to copy at all - the slot itself just
+                                // came back from first_free.
+                                self.message = String::from(
+                                    "作成できません（装備ボックスにコピー元のお守りがありません）",
                                 );
                             }
                         }
@@ -11677,7 +11753,7 @@ impl MhnxEditor {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(
-                        "装飾スロットは ● の数、ポイントは符号付きです。レア度を変えると、その範囲外のポイントとスロットは自動で調整されます。新規作成は最後に選んだレア度で作られます。",
+                        "装飾スロットは ● の数、ポイントは符号付きです。種類（兵士〜天・龍）を変えると、そのレア度の範囲外のポイントとスロットは自動で調整されます。新規作成は最後に選んだ種類で作られます。",
                     )
                     .weak()
                     .small(),
@@ -12183,10 +12259,21 @@ impl MhnxEditor {
                 skill2: self.charm_skill2,
                 points2: self.charm_points2,
             };
+            let kind = self
+                .save
+                .as_ref()
+                .and_then(|s| s.equipment_box(self.slot))
+                .and_then(|b| {
+                    let o = c.index * mhnx_core::charm::CHARM_RECORD;
+                    b.get(o..o + mhnx_core::charm::CHARM_RECORD)
+                        .and_then(mhnx_core::charm::kind_of_record)
+                })
+                .unwrap_or(self.charm_new_kind);
+            let kind_label = mhnx_core::charm::kind_name(kind).unwrap_or("?");
             if let Some(s) = &mut self.save {
-                if s.set_charm(self.slot, &c) {
+                if s.set_charm_with_kind(self.slot, &c, kind) {
                     self.dirty = true;
-                    self.message = format!("お守り {} を更新しました", c.index);
+                    self.message = format!("お守り {} を更新しました（{}）", c.index, kind_label);
                 } else {
                     self.message =
                         String::from("書き込めません（武器・防具の枠は保護されています）");

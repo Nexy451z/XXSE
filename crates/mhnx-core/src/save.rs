@@ -674,6 +674,36 @@ impl Save {
         c: &charm::Charm,
         grade: charm::TalismanGrade,
     ) -> bool {
+        // A grade is a rarity, and a rarity is two or three kinds. When the
+        // record already carries a kind of that rarity it keeps it; otherwise
+        // the group's top kind is used. Choosing the kind directly is
+        // set_charm_with_kind.
+        let keep = self
+            .equipment_box(slot)
+            .and_then(|b| {
+                let o = c.index.checked_mul(charm::CHARM_RECORD)?;
+                charm::kind_of_record(b.get(o..o + charm::CHARM_RECORD)?)
+            })
+            .filter(|k| charm::kind_rarity(*k) == Some(grade.rarity()));
+        let kind = keep.unwrap_or_else(|| grade.type_byte());
+        self.set_charm_with_kind(slot, c, kind)
+    }
+
+    /// Write a talisman of a chosen kind.
+    ///
+    /// `kind` is the byte at +0x02: 1 兵士 … 10 天, with 7 龍. The rarity that
+    /// belongs to the kind is written with it (+0x12/+0x13), because the game
+    /// writes the two as one pair. A new record is seeded from a talisman of
+    /// the same kind when the box holds one, otherwise from the most common
+    /// talisman with the pair written; that is the only way to create the
+    /// kinds the sample saves never hold.
+    ///
+    /// Returns false for a weapon or a piece of armour, and for a box with no
+    /// talisman in it at all (nothing to copy a shape from).
+    pub fn set_charm_with_kind(&mut self, slot: usize, c: &charm::Charm, kind: u8) -> bool {
+        if !charm::is_kind(kind) {
+            return false;
+        }
         let Some(b) = self.equipment_box(slot) else {
             return false;
         };
@@ -681,33 +711,90 @@ impl Save {
         if o + charm::CHARM_RECORD > b.len() {
             return false;
         }
+        let grade = charm::TalismanGrade::from_rarity(charm::kind_rarity(kind).unwrap_or(0));
         if charm::is_talisman(&b[o..o + charm::CHARM_RECORD]) {
             let Some(b) = self.equipment_box_mut(slot) else {
                 return false;
             };
-            let current = charm::rarity_of_record(&b[o..o + charm::CHARM_RECORD]);
             if !charm::update_charm(b, c) {
                 return false;
             }
-            // Only re-grade when the caller asked for a different one, and only
-            // then clamp: moving a talisman down a grade makes values illegal,
-            // but writing the skills someone typed must not silently rewrite
-            // them. The desktop build has always warned instead of clamping,
-            // and both builds behave the same way now.
-            if current != Some(grade) {
-                charm::set_grade(b, c.index, grade);
-                charm::clamp_points(b, c.index, grade);
-                charm::clamp_slots(b, c.index, grade);
+            // The pair is written even when the kind does not change: a record
+            // whose +0x13 is stale would name a charm item id that does not
+            // exist, and the game shows nothing for it.
+            charm::set_kind(b, c.index, kind);
+            if let Some(g) = grade {
+                charm::clamp_points(b, c.index, g);
+                charm::clamp_slots(b, c.index, g);
             }
             return true;
         }
-        let Some((template, _synth)) = charm::template_for_grade_or_pair(b, grade) else {
+        let Some((template, _synth)) = charm::template_for_kind_or_pair(b, kind) else {
             return false;
         };
         let Some(b) = self.equipment_box_mut(slot) else {
             return false;
         };
-        charm::create_charm(b, c.index, &template, c)
+        if !charm::create_charm_kind(b, c.index, &template, c, kind) {
+            return false;
+        }
+        if let Some(g) = grade {
+            charm::clamp_points(b, c.index, g);
+            charm::clamp_slots(b, c.index, g);
+        }
+        true
+    }
+
+    /// Change the kind of a talisman already in the box.
+    ///
+    /// The skills are left alone, so the caller should clamp afterwards with
+    /// [charm::clamp_points] and [charm::clamp_slots]; [set_charm_kind] does
+    /// both, which is what the UIs use.
+    pub fn set_charm_kind(&mut self, slot: usize, index: usize, kind: u8) -> bool {
+        if !charm::is_kind(kind) {
+            return false;
+        }
+        let Some(b) = self.equipment_box_mut(slot) else {
+            return false;
+        };
+        if !charm::set_kind(b, index, kind) {
+            return false;
+        }
+        if let Some(g) = charm::TalismanGrade::from_rarity(charm::kind_rarity(kind).unwrap_or(0)) {
+            charm::clamp_points(b, index, g);
+            charm::clamp_slots(b, index, g);
+        }
+        true
+    }
+
+    /// Change the grade (rarity) of a talisman, keeping its kind when the kind
+    /// already belongs to that rarity.
+    pub fn set_charm_grade(
+        &mut self,
+        slot: usize,
+        index: usize,
+        grade: charm::TalismanGrade,
+    ) -> bool {
+        let Some(b) = self.equipment_box_mut(slot) else {
+            return false;
+        };
+        if !charm::set_grade(b, index, grade) {
+            return false;
+        }
+        charm::clamp_points(b, index, grade);
+        charm::clamp_slots(b, index, grade);
+        true
+    }
+
+    /// The kind byte at +0x02 of the talisman at (slot, index).
+    pub fn charm_kind(&self, slot: usize, index: usize) -> Option<u8> {
+        charm::charm_kind(self, slot, index)
+    }
+
+    /// The game's name of the kind of the talisman at (slot, index).
+    pub fn charm_kind_name(&self, slot: usize, index: usize) -> Option<&'static str> {
+        let b = self.equipment_box(slot)?;
+        charm::kind_name_at(b, index)
     }
 
     /// Delete one talisman from the slot's equipment box.

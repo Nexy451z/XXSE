@@ -39,16 +39,27 @@
 //! linked pair, so merely opening and saving a save rewrote 70 talismans and
 //! turned rarity 99 records into rarity 100 ones.
 //!
-//! The pair is not arbitrary, though. +0x02 is the equipment id 1..10 and
-//! +0x12 is the talisman id 97..100, and TALISMAN_RARITY links them
-//! (1-2 -> 97, 3-4 -> 98, 5-7 -> 99, 8-10 -> 100). What is impossible is a
-//! record whose two bytes disagree. So a new talisman is built from a real
-//! record of the same grade when the box holds one, and otherwise from a real
-//! talisman with the pair set from that table - never a fixed pair regardless
-//! of grade, which is what broke the old version.
+//! The pair is not arbitrary, though. +0x02 is the talisman *kind* - the row of
+//! `amuletData_jpn.gmd`, 1 兵士 … 10 天 with 7 龍, see [TALISMAN_KINDS] - and
+//! +0x12/+0x13 is the u16 item id of the charm the talisman came from, 353..356
+//! (0x161..0x164): rarity 97..100 in the low byte and 1 in the high byte.
+//! TALISMAN_RARITY links the kind to that rarity (1-2 -> 97, 3-4 -> 98,
+//! 5-7 -> 99, 8-10 -> 100). What is impossible is a record whose two bytes
+//! disagree, so every writer here goes through [set_kind] and writes both.
 //!
-//! A brand new talisman therefore needs a template (see create_charm), and
-//! writing one over a weapon or a piece of armour is refused outright.
+//! Two earlier versions got this wrong and both showed up on hardware as "the
+//! talisman I made is not the one I asked for":
+//!
+//! * zeroing the record and writing a fixed 0x0A/100 pair turned every 99 into
+//!   a 天の護石 the moment the save was opened and written;
+//! * deriving the kind from the rarity table's first row wrote 0x08 (英雄の
+//!   護石) for rarity 100, so a "天の護石" on screen was an 英雄 in game, and no
+//!   other kind - 龍の護石 included - could be chosen at all.
+//!
+//! A new talisman is still copied from a real record when the box holds one of
+//! the same kind, so the shape the game wrote is preserved; only the pair is
+//! ever written on top, and only from the table above. Writing one over a
+//! weapon or a piece of armour is refused outright.
 
 use alloc::vec::Vec;
 
@@ -307,10 +318,37 @@ pub fn update_charm(box_bytes: &mut [u8], charm: &Charm) -> bool {
 /// enough to invent, so a template the game itself wrote is required rather
 /// than optional. Use template_from_box to get one.
 pub fn create_charm(box_bytes: &mut [u8], index: usize, template: &[u8], charm: &Charm) -> bool {
+    let kind = template
+        .get(0x02)
+        .copied()
+        .filter(|k| is_kind(*k))
+        .unwrap_or(0);
+    create_charm_kind(box_bytes, index, template, charm, kind)
+}
+
+/// Create a talisman of a chosen kind in a blank record.
+///
+/// Same as [create_charm], except that the kind byte at +0x02 and the rarity
+/// item id at +0x12 are written from [set_kind] instead of being inherited
+/// from the template. That is what makes a 龍の護石 possible at all: the sample
+/// save holds nothing but 天の護石 records, so an editor that only copies a
+/// template can never produce any other kind.
+///
+/// `kind` 0 means "keep whatever the template carries".
+pub fn create_charm_kind(
+    box_bytes: &mut [u8],
+    index: usize,
+    template: &[u8],
+    charm: &Charm,
+    kind: u8,
+) -> bool {
     if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
         return false;
     }
     if template.len() != CHARM_RECORD || !is_talisman(template) {
+        return false;
+    }
+    if kind != 0 && !is_kind(kind) {
         return false;
     }
     let o = index * CHARM_RECORD;
@@ -328,6 +366,11 @@ pub fn create_charm(box_bytes: &mut [u8], index: usize, template: &[u8], charm: 
     box_bytes[o + 0x0E] = charm.points1 as u8;
     box_bytes[o + 0x0F] = charm.points2 as u8;
     box_bytes[o + 0x10] = charm.slots;
+    if kind != 0 {
+        // The template's pair is replaced, not left in place: a 龍の護石 made
+        // from a 天の護石 template has to say 龍 in both linked bytes.
+        set_kind(box_bytes, index, kind);
+    }
     true
 }
 
@@ -385,6 +428,214 @@ pub fn template_from_box(box_bytes: &[u8]) -> Option<[u8; CHARM_RECORD]> {
     fallback
 }
 
+// ---------------------------------------------------------------------------
+// The eleven talisman kinds (the byte at +0x02)
+// ---------------------------------------------------------------------------
+
+/// The eleven rows of `amuletData_jpn.gmd`, in file order: the talisman kind
+/// the record carries at +0x02.
+///
+/// The table is not guesswork. `romfs/nativeNX/table/amuletData_jpn.gmd`
+/// (1448 bytes) holds eleven name strings and eleven descriptions, and its
+/// companion `amuletData.amlt` states the count as 11 (9-byte entries, ids
+/// 0..10). The names, read out of the file, are exactly these, in this order:
+///
+/// ```text
+/// 0 装備なし    1 兵士の護石   2 闘士の護石   3 騎士の護石
+/// 4 城塞の護石  5 女王の護石   6 王の護石     7 龍の護石
+/// 8 英雄の護石  9 伝説の護石  10 天の護石
+/// ```
+///
+/// Row 0 is "装備なし" (nothing), so a talisman record with 0x00 at +0x02 is
+/// not one the game wrote. The database tab lists the same eleven strings
+/// (database.rs, "護石名"), so the two must not drift.
+pub const TALISMAN_KINDS: [&str; 11] = [
+    "装備なし",
+    "兵士の護石",
+    "闘士の護石",
+    "騎士の護石",
+    "城塞の護石",
+    "女王の護石",
+    "王の護石",
+    "龍の護石",
+    "英雄の護石",
+    "伝説の護石",
+    "天の護石",
+];
+
+/// Rarity (97..100) of each kind, indexed by the byte at +0x02.
+///
+/// Same table as `gamedata::TALISMAN_RARITY`; kept here so the pairing works
+/// without the `gamedata` feature (the console build has it, a bare
+/// `cargo test -p mhnx-core` does not). Index 0 has no rarity: it is
+/// "装備なし".
+const KIND_RARITY: [u8; 11] = [0, 97, 97, 98, 98, 99, 99, 99, 100, 100, 100];
+
+/// How many kinds the game actually ships: 1..=10.
+pub const TALISMAN_KIND_COUNT: u8 = 10;
+
+/// Name of a kind byte, or None when it is not one of the eleven rows.
+pub fn kind_name(kind: u8) -> Option<&'static str> {
+    TALISMAN_KINDS.get(kind as usize).copied()
+}
+
+/// Is this byte one of the ten talisman kinds the game ships (1..=10)?
+///
+/// 0 is the "装備なし" row and is reported as not a kind: a record with it at
+/// +0x02 is not a record the game wrote.
+pub fn is_kind(kind: u8) -> bool {
+    kind >= 1 && kind <= TALISMAN_KIND_COUNT
+}
+
+/// Rarity (97..100) that belongs to a kind byte.
+pub fn kind_rarity(kind: u8) -> Option<u8> {
+    if !is_kind(kind) {
+        return None;
+    }
+    Some(KIND_RARITY[kind as usize])
+}
+
+/// The kind the game uses as the face of a rarity, when a caller asks for a
+/// grade instead of a kind.
+///
+/// The rarity groups hold two or three kinds each (97: 兵士/闘士, 98: 騎士/
+/// 城塞, 99: 女王/王/龍, 100: 英雄/伝説/天), and the game writes several of
+/// them. The one picked here is the highest kind of the group - 闘士 / 城塞 /
+/// 龍 / 天 - because a grade on its own cannot say which of the group the
+/// record is, and the pick has to be a record the game could have written.
+pub fn canonical_kind(rarity: u8) -> Option<u8> {
+    (1..=TALISMAN_KIND_COUNT)
+        .rev()
+        .find(|k| KIND_RARITY[*k as usize] == rarity)
+}
+
+/// The kind byte of a raw record, if the record is a talisman with a kind the
+/// game ships.
+pub fn kind_of_record(rec: &[u8]) -> Option<u8> {
+    if rec.len() < CHARM_RECORD || !is_talisman(rec) {
+        return None;
+    }
+    let kind = rec[0x02];
+    if is_kind(kind) {
+        Some(kind)
+    } else {
+        None
+    }
+}
+
+/// The game's name of the kind of the talisman at `index` of a box.
+pub fn kind_name_at(box_bytes: &[u8], index: usize) -> Option<&'static str> {
+    let o = index.checked_mul(CHARM_RECORD)?;
+    kind_name_of_record(box_bytes.get(o..o + CHARM_RECORD)?)
+}
+
+/// Every talisman of a box together with the game's name of its kind.
+///
+/// The list screens print the name in front of the skills, which is the one
+/// label the game's box screen and this editor now share.
+pub fn decode_box_named(box_bytes: &[u8]) -> Vec<(Charm, &'static str)> {
+    decode_box(box_bytes)
+        .into_iter()
+        .map(|c| {
+            let name = kind_name_at(box_bytes, c.index).unwrap_or("—");
+            (c, name)
+        })
+        .collect()
+}
+
+/// The game's name of a raw record's kind.
+///
+/// Every row of the table is named here, row 0 ("装備なし") included: two of
+/// the 650 talismans in the sample save carry 0x00 at +0x02 with a rarity of
+/// 99, which the table does not explain, and a screen that prints nothing for
+/// them would look broken. [kind_of_record] still answers None for them,
+/// because they are not a kind the game ships.
+pub fn kind_name_of_record(rec: &[u8]) -> Option<&'static str> {
+    if rec.len() < CHARM_RECORD || !is_talisman(rec) {
+        return None;
+    }
+    // Row 0 is "装備なし", exactly as the table says; a byte past the table
+    // has no name at all.
+    TALISMAN_KINDS.get(rec[0x02] as usize).copied()
+}
+
+/// Write the kind (and the rarity that belongs to it) into a talisman.
+///
+/// The two bytes are a linked pair: +0x02 is the kind and +0x12 is the u16
+/// item id of the charm the talisman came from, 353..356 (0x161..0x164), whose
+/// low byte is the rarity 97..100 and whose high byte is 1. Writing one
+/// without the other leaves a record the game never wrote - which is exactly
+/// what the old `set_grade` did when it copied the first table row of a
+/// rarity (0x08 for rarity 100, i.e. 英雄の護石) instead of the kind the user
+/// asked for (0x0A, 天の護石).
+pub fn set_kind(box_bytes: &mut [u8], index: usize, kind: u8) -> bool {
+    if index >= CHARM_COUNT || box_bytes.len() < CHARM_BOX_SIZE {
+        return false;
+    }
+    let Some(rarity) = kind_rarity(kind) else {
+        return false;
+    };
+    let o = index * CHARM_RECORD;
+    if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
+        return false;
+    }
+    box_bytes[o + 0x02] = kind;
+    box_bytes[o + 0x12] = rarity;
+    box_bytes[o + 0x13] = 1;
+    true
+}
+
+/// Kind of the talisman at (slot, index) of a save.
+pub fn charm_kind(save: &Save, slot: usize, index: usize) -> Option<u8> {
+    let box_bytes = save.equipment_box(slot)?;
+    let o = index.checked_mul(CHARM_RECORD)?;
+    kind_of_record(box_bytes.get(o..o + CHARM_RECORD)?)
+}
+
+/// A real record of the requested kind to copy, preferring a clean one.
+pub fn template_for_kind(box_bytes: &[u8], kind: u8) -> Option<[u8; CHARM_RECORD]> {
+    if box_bytes.len() < CHARM_BOX_SIZE || !is_kind(kind) {
+        return None;
+    }
+    let mut fallback: Option<[u8; CHARM_RECORD]> = None;
+    for i in 0..CHARM_COUNT {
+        let rec = &box_bytes[i * CHARM_RECORD..(i + 1) * CHARM_RECORD];
+        if !is_talisman(rec) || rec[0x02] != kind {
+            continue;
+        }
+        let mut out = [0u8; CHARM_RECORD];
+        out.copy_from_slice(rec);
+        if is_clean(rec) {
+            return Some(out);
+        }
+        if fallback.is_none() {
+            fallback = Some(out);
+        }
+    }
+    fallback
+}
+
+/// A template for a kind: a real record of that kind when the box holds one,
+/// otherwise a clean talisman with the kind's two paired bytes written.
+///
+/// The second value is true when the pair had to be written. That is allowed
+/// now that the pairing is known from the game's own table: the sample save
+/// only holds 天の護石 records (kind 10), and without writing the pair no
+/// other kind - 龍の護石 included - could be created at all.
+pub fn template_for_kind_or_pair(
+    box_bytes: &[u8],
+    kind: u8,
+) -> Option<([u8; CHARM_RECORD], bool)> {
+    if let Some(t) = template_for_kind(box_bytes, kind) {
+        return Some((t, false));
+    }
+    let rarity = kind_rarity(kind)?;
+    let mut t = template_from_box(box_bytes)?;
+    t[0x02] = kind;
+    t[0x12] = rarity;
+    t[0x13] = 1;
+    Some((t, true))
+}
 
 /// The four talisman grades the game ships.
 ///
@@ -460,22 +711,15 @@ impl TalismanGrade {
         }
     }
 
-    /// The first type byte the rarity table maps to this grade.
+    /// The kind this grade falls back to when the box holds no record of it.
     ///
-    /// Used only when the box has no real record of the grade to copy: the
-    /// pair still has to agree, and this is the pairing the table states.
-    #[cfg(feature = "gamedata")]
+    /// This used to be the *first* row of the rarity table for the grade, which
+    /// gave rarity 100 -> 0x08 (英雄の護石) and so renamed every talisman whose
+    /// rarity was switched to 天 to 英雄. The canonical kind is the highest of
+    /// the group instead: 闘士 (97), 城塞 (98), 龍 (99), 天 (100) - every one of
+    /// them a kind the game itself ships.
     pub fn type_byte(self) -> u8 {
-        crate::gamedata::TALISMAN_RARITY
-            .iter()
-            .position(|r| *r == self.rarity() as i32)
-            .unwrap_or(0) as u8
-    }
-
-    /// The first type byte the rarity table maps to this grade.
-    #[cfg(not(feature = "gamedata"))]
-    pub fn type_byte(self) -> u8 {
-        0
+        canonical_kind(self.rarity()).unwrap_or(0)
     }
 }
 
@@ -581,6 +825,9 @@ pub fn template_for_grade_or_pair(
     let mut t = template_from_box(box_bytes)?;
     t[0x02] = grade.type_byte();
     t[0x12] = grade.rarity();
+    // +0x13 is the high byte of the u16 charm item id at +0x12 (353..356);
+    // leaving a stale high byte would name an item that does not exist.
+    t[0x13] = 1;
     Some((t, true))
 }
 
@@ -781,11 +1028,19 @@ pub fn set_grade(box_bytes: &mut [u8], index: usize, grade: TalismanGrade) -> bo
     if !is_talisman(&box_bytes[o..o + CHARM_RECORD]) {
         return false;
     }
-    // Prefer the byte a real record of this grade uses; fall back to the
-    // table's first id for the grade, which the pairing still makes legal.
-    let type_byte = type_byte_for_grade(box_bytes, grade).unwrap_or_else(|| grade.type_byte());
+    // A kind that already belongs to the target rarity stays: switching a
+    // 龍の護石 to the "rarity 99" of its own group must not rename it to the
+    // 王の護石 that happens to sit earlier in the box. Only when the kind and
+    // the target disagree is another kind of the grade used - a real record's
+    // when the box holds one, the group's top kind otherwise.
+    let keep = kind_of_record(&box_bytes[o..o + CHARM_RECORD])
+        .filter(|k| KIND_RARITY[*k as usize] == grade.rarity());
+    let type_byte = keep
+        .or_else(|| type_byte_for_grade(box_bytes, grade))
+        .unwrap_or_else(|| grade.type_byte());
     box_bytes[o + 0x02] = type_byte;
     box_bytes[o + 0x12] = grade.rarity();
+    box_bytes[o + 0x13] = 1;
     true
 }
 
