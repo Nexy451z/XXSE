@@ -35,7 +35,7 @@ use mhnx_core::hbedit::{
     PalicoEquipRow, PalicoSkillRow, Screen, ARENA_COLUMNS, ARENA_PARTS, ARENA_ROWS, CHAR_FIELDS,
     CHARM_EDIT_ROWS, CONSOLE_SAVE, CSV_DIR, GUILD_TAB_ARENA, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT,
     ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE,
-    PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS,
+    PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_REQUESTS, SET_EDIT_ROWS,
     SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
@@ -288,11 +288,9 @@ pub enum UiAction {
     NewCharm,
     DeleteCharmConfirm,
     RosterMaxAll,
-    InstallOfficialDlc,
     InstallDlcCategory(u8),
     SetQuestTab(usize),
     ToggleBundledQuest(i32),
-    RemoveSaveQuest(i32),
     OpenBundledQuest(i32),
     OpenMibPicker(usize),
     MibPickerSelect(usize),
@@ -303,6 +301,14 @@ pub enum UiAction {
     InstallAllPalicoes,
     TogglePalicoLang,
     ExtractOfficialArcs,
+    /// Write the quest under the cursor of the save's quest list out to the
+    /// card. [-] on that screen is the two-press delete now, so the single
+    /// extract it used to be moved to a button of its own.
+    ExtractSelectedQuest,
+    /// Switch the hunt list between 記録ありのみ and every monster.
+    ToggleHuntShowAll,
+    /// Drop the equipment box's name filter and show every record again.
+    ClearEquipFilter,
     InstallArcRow(usize),
     // Built-in OSK
     OskTab(usize),
@@ -370,7 +376,6 @@ pub struct GuiState {
     pub osk: Option<OskState>,
     pub osk_result: Option<(usize, String)>,
     pub osk_cancelled: bool,
-    pub pending_delete: Option<i32>,
     pub sets_cursor: usize,
     pub sets_tab: usize,
     /// The snapshot a review is waiting on. Set by the [Y] press on the options
@@ -404,7 +409,6 @@ impl GuiState {
             osk: None,
             osk_result: None,
             osk_cancelled: false,
-            pending_delete: None,
             sets_cursor: 0,
             sets_tab: 0,
             pending_snapshot: None,
@@ -568,7 +572,6 @@ impl GuiState {
     }
 
     fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
-        self.pending_delete = None;
         self.close_set_form(ed);
         self.close_palico_panel(ed);
         // The item bulk menu is a mode of the item box. A section jump changes
@@ -781,7 +784,6 @@ impl GuiState {
     }
 
     pub fn select_sub_tab(&mut self, ed: &mut Editor, idx: usize) {
-        self.pending_delete = None;
         // The マイセット tab means the list, so a tab press also closes the
         // set editor; leaving the screen any other way does too.
         self.close_set_form(ed);
@@ -818,7 +820,7 @@ impl GuiState {
                     }
                 }
                 1 => {
-                    let sems = sem_entry_indices(ed);
+                    let sems = ed.sem_entry_indices();
                     if let Some(&pos) = sems.first() {
                         ed.gmd = None;
                         ed.entry = pos;
@@ -1437,8 +1439,18 @@ impl GuiState {
                         ed.toggle_bundled_quest(q.quest_id);
                     }
                 }
-                Key::A if ed.save_quests().is_empty() => {
-                    ed.install_official_dlc();
+                // [A] on an empty list used to install all 189 bundled
+                // official quests, with nothing on screen saying so. The state
+                // machine answers that press with a message now, and the bulk
+                // install has its own button in this screen's tool deck.
+                // [-] and [R] act on the save's own list. On the two bundle
+                // tabs the list on screen is not that list, so the press is
+                // refused with a message rather than deleting (or extracting) a
+                // quest the user is not looking at.
+                Key::Minus | Key::R if self.quest_tab > 0 => {
+                    ed.message = String::from(
+                        "この一覧では [-] / [R] は使いません（「セーブ内」タブで削除・展開、[A] で導入/解除）",
+                    );
                 }
                 Key::Y => {
                     ed.input(Key::Y); // Search filter
@@ -1855,24 +1867,21 @@ impl GuiState {
                     );
                 }
             }
-            UiAction::InstallOfficialDlc => ed.install_official_dlc(),
-            UiAction::InstallDlcCategory(cat) => match cat {
-                1 => ed.install_dlc_category(false, true, "没データ(34件)"),
-                _ => ed.install_dlc_category(true, false, "公式イベント(189件)"),
-            },
+            UiAction::InstallDlcCategory(cat) => {
+                // The label is what the message says afterwards, so it carries
+                // the count the bundle really has.
+                let (official_n, dead_n) = mhnx_core::dlc::bundled_quest_counts();
+                if cat == 1 {
+                    ed.install_dlc_category(false, true, &format!("没クエスト({}件)", dead_n));
+                } else {
+                    ed.install_dlc_category(true, false, &format!("公式イベント({}件)", official_n));
+                }
+            }
             UiAction::SetQuestTab(tab) => {
                 self.quest_tab = tab.min(2);
                 ed.screen = Screen::SaveQuests;
             }
             UiAction::ToggleBundledQuest(qid) => ed.toggle_bundled_quest(qid),
-            UiAction::RemoveSaveQuest(qid) => {
-                if self.pending_delete == Some(qid) {
-                    self.pending_delete = None;
-                    ed.remove_save_quest(qid);
-                } else {
-                    self.pending_delete = Some(qid);
-                }
-            }
             UiAction::OpenBundledQuest(qid) => ed.open_bundled_quest(qid),
             UiAction::OpenMibPicker(field_idx) => {
                 let _ = self.open_mib_picker(ed, field_idx);
@@ -1891,8 +1900,15 @@ impl GuiState {
             }
             UiAction::MibPickerScroll(delta) => self.scroll_mib_picker(delta),
             UiAction::MibPickerClose => self.mib_picker = None,
-            UiAction::MibPreset(preset) => apply_mib_preset(ed, preset),
-            UiAction::SemPreset(preset) => apply_sem_preset(ed, preset),
+            // Both presets rewrite every monster / spawn of the record at
+            // once, so they ask for a second press and say how many they would
+            // touch (hbedit::Editor::mib_preset_label / sem_preset_label).
+            UiAction::MibPreset(preset) => {
+                ed.mib_preset_press(preset);
+            }
+            UiAction::SemPreset(preset) => {
+                ed.sem_preset_press(preset);
+            }
             UiAction::InstallAllPalicoes => ed.install_all_dlc_palicoes(),
             UiAction::TogglePalicoLang => {
                 ed.palico_lang = 1 - ed.palico_lang;
@@ -1903,6 +1919,9 @@ impl GuiState {
                 };
             }
             UiAction::ExtractOfficialArcs => self.wants_extract_official_arcs = true,
+            UiAction::ExtractSelectedQuest => ed.request_extract_selected_quest(),
+            UiAction::ToggleHuntShowAll => ed.toggle_hunt_show_all(),
+            UiAction::ClearEquipFilter => ed.apply_equip_filter(String::new()),
             UiAction::InstallArcRow(idx) => {
                 ed.cursor = idx;
                 self.wants_install_arc_idx = Some(idx);
@@ -1994,26 +2013,6 @@ fn safe_flush_quest_entry(ed: &mut Editor) {
     }
 }
 
-fn sem_entry_indices(ed: &Editor) -> Vec<usize> {
-    let Some(arc) = &ed.arc else {
-        return Vec::new();
-    };
-    let mut active = Vec::new();
-    let mut dummy = Vec::new();
-    for (i, e) in arc.entries.iter().enumerate() {
-        if extension_for(e.type_hash) == Some("sem") && e.data.len() >= 0x20 {
-            let area = u32::from_le_bytes([e.data[0x0C], e.data[0x0D], e.data[0x0E], e.data[0x0F]]);
-            if e.name.contains("em000") && area == 0 {
-                dummy.push(i);
-            } else {
-                active.push(i);
-            }
-        }
-    }
-    active.extend(dummy);
-    active
-}
-
 fn adjust_mib_mob_sub(ed: &mut Editor, field_idx: usize, sub: usize, delta: i32) {
     let Some(f) = questfields::MIB_FIELDS.get(field_idx) else {
         return;
@@ -2091,7 +2090,7 @@ fn adjust_entry_view_row(ed: &mut Editor, row_idx: usize, delta: i32) {
         .and_then(|e| extension_for(e.type_hash));
     match ext {
         Some("sem") => {
-            let sems = sem_entry_indices(ed);
+            let sems = ed.sem_entry_indices();
             let sem_k = row_idx / 6;
             let field = row_idx % 6;
             let Some(&entry_idx) = sems.get(sem_k) else {
@@ -2180,61 +2179,6 @@ fn adjust_entry_view_row(ed: &mut Editor, row_idx: usize, delta: i32) {
             }
         }
         _ => {}
-    }
-}
-
-fn apply_sem_preset(ed: &mut Editor, preset: u8) {
-    let sems = sem_entry_indices(ed);
-    if sems.is_empty() {
-        return;
-    }
-    match preset {
-        0 => {
-            let first_idx = sems[0];
-            let Some(arc) = &mut ed.arc else { return };
-            let Some(src) = arc.entries.get(first_idx).map(|e| e.data.clone()) else {
-                return;
-            };
-            if src.len() < 0x20 {
-                return;
-            }
-            let mut count = 0usize;
-            for &idx in sems.iter().skip(1) {
-                if let Some(e) = arc.entries.get_mut(idx) {
-                    if !e.name.contains("em000") && e.data.len() >= 0x20 {
-                        e.data[0x0C..0x20].copy_from_slice(&src[0x0C..0x20]);
-                        count += 1;
-                    }
-                }
-            }
-            ed.dirty = true;
-            if count > 0 {
-                ed.message = format!("配置1のエリア・座標を他 {} 体の初期配置へコピーしました", count);
-            } else {
-                ed.message = String::from("コピー対象の2体目以降の初期配置がありません");
-            }
-        }
-        _ => {
-            let row_idx = ed.entry_row_cursor;
-            let sem_k = row_idx / 6;
-            let field = row_idx % 6;
-            let Some(&entry_idx) = sems.get(sem_k) else { return };
-            let Some(arc) = &mut ed.arc else { return };
-            let Some(e) = arc.entries.get_mut(entry_idx) else { return };
-            if e.data.len() < 0x20 {
-                return;
-            }
-            if (1..=4).contains(&field) {
-                let off = 0x10 + (field - 1) * 4;
-                e.data[off..off + 4].copy_from_slice(&0.0f32.to_le_bytes());
-                ed.dirty = true;
-                ed.message = format!("配置{} ({}) の選択座標を 0.0 にリセットしました", sem_k + 1, e.name);
-            } else {
-                e.data[0x10..0x20].fill(0);
-                ed.dirty = true;
-                ed.message = format!("配置{} ({}) の X/Y/Z/W をすべて 0.0 にリセットしました", sem_k + 1, e.name);
-            }
-        }
     }
 }
 
@@ -2420,7 +2364,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
                     Some("rem") | Some("sup") => {
                         ItemTable::parse(&e.data).map(|t| t.records.len()).unwrap_or(0)
                     }
-                    Some("sem") => sem_entry_indices(ed).len() * 6,
+                    Some("sem") => ed.sem_entry_indices().len() * 6,
                     Some("esl") => 1,
                     Some("qdp") => Qdp::parse(&e.data).map(|q| q.flags().len()).unwrap_or(0),
                     Some("qdl") | Some("qlv") => {
@@ -2726,7 +2670,9 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
                 .and_then(|e| extension_for(e.type_hash));
             if ext == Some("sem") {
                 ed.entry_row_cursor = idx;
-                apply_sem_preset(ed, 1);
+                // Through the same two-press path the button uses: a tap that
+                // arms the preset must not write on the first press either.
+                ed.sem_preset_press(1);
             } else {
                 let prev = ed.entry_row_cursor;
                 ed.entry_row_cursor = idx;
@@ -2755,50 +2701,6 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
     }
 }
 
-fn apply_mib_preset(ed: &mut Editor, preset: u8) {
-    let mib = &mut ed.mib_bytes;
-    if mib.len() < 0x180 {
-        return;
-    }
-    match preset {
-        0 => {
-            for f in questfields::MIB_FIELDS.iter() {
-                if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
-                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
-                    if mid != 0 {
-                        mib[f.offset + 5] = 1;
-                    }
-                }
-            }
-            ed.dirty = true;
-            ed.message = String::from("全モンスターの体力を最小(1)に設定しました");
-        }
-        1 => {
-            for f in questfields::MIB_FIELDS.iter() {
-                if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
-                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
-                    if mid != 0 {
-                        mib[f.offset + 9..f.offset + 11].copy_from_slice(&200u16.to_le_bytes());
-                    }
-                }
-            }
-            ed.dirty = true;
-            ed.message = String::from("全モンスターのサイズを 200% (最大金冠) に設定しました");
-        }
-        _ => {
-            for f in questfields::MIB_FIELDS.iter() {
-                if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
-                    let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
-                    if mid != 0 {
-                        mib[f.offset + 9..f.offset + 11].copy_from_slice(&50u16.to_le_bytes());
-                    }
-                }
-            }
-            ed.dirty = true;
-            ed.message = String::from("全モンスターのサイズを 50% (最小金冠) に設定しました");
-        }
-    }
-}
 
 /// The step table one screen really steps by, and the key that cycles it.
 ///
@@ -3143,21 +3045,39 @@ impl GuiState {
         self.add_hit(sx, 8, 44, 32, UiAction::CycleSection(true));
 
         // Right Status Area: Active Slot badge + [X] Save Pill
-        let slot_x = 964;
-        let slot_w = 144;
-        let slot_label = if let Some(save) = &ed.save {
-            let sname = save
-                .read_character(ed.slot)
-                .map(|ch| ch.name)
-                .unwrap_or_else(|| String::from("-"));
-            format!("Slot {}: {}", ed.slot + 1, sname)
-        } else {
-            String::from("未読込")
-        };
-        c.round_rect(slot_x, 8, slot_w, 32, t.corner_r, t.bg_panel);
-        c.round_rect_border(slot_x, 8, slot_w, 32, t.corner_r, 1, t.border_subtle);
-        btn_text(c, slot_x, 8, slot_w, 32, &slot_label, t.text_secondary, FontSize::Small);
-        self.add_hit(slot_x, 8, slot_w, 32, UiAction::SelectSlot((ed.slot + 1) % 3));
+        //
+        // Two lines, because one was never enough: "Slot 1: " and a name of up
+        // to ten full-width glyphs is 238px and the space between the section
+        // tabs and the save pill is 212, so the one-line badge cut every name
+        // to three glyphs and "..". The badge takes the whole gap and puts the
+        // slot number on its own line, which leaves the name its full 188px.
+        let slot_x = 900;
+        let slot_w = 208;
+        let slot_name = ed
+            .save
+            .as_ref()
+            .and_then(|save| save.read_character(ed.slot))
+            .map(|ch| ch.name)
+            .unwrap_or_else(|| String::from("未読込"));
+        c.round_rect(slot_x, 4, slot_w, 40, t.corner_r, t.bg_panel);
+        c.round_rect_border(slot_x, 4, slot_w, 40, t.corner_r, 1, t.border_subtle);
+        c.text_clipped(
+            slot_x + 10,
+            6,
+            slot_w - 20,
+            &format!("Slot {}", ed.slot + 1),
+            t.text_muted,
+            FontSize::Small,
+        );
+        c.text_clipped(
+            slot_x + 10,
+            22,
+            slot_w - 20,
+            &slot_name,
+            t.text_primary,
+            FontSize::Small,
+        );
+        self.add_hit(slot_x, 4, slot_w, 40, UiAction::SelectSlot((ed.slot + 1) % 3));
 
         // [X] Save Button
         let save_x = 1116;
@@ -3315,18 +3235,25 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "全28匹 一括導入", t.text_primary, FontSize::Small);
+                // The count is the list's own length (and the two language
+                // tables'), never a constant: it said 28 next to 60 rows.
+                let bulk = format!("全{}匹 一括導入", dlcats::all_ids().len());
+                btn_text(c, 1108, sy, 158, sh, &bulk, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::InstallAllPalicoes);
             }
             Screen::Mib => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "大型体力=1", t.accent_secondary, FontSize::Small);
+                // The two presets rewrite every monster of the quest, so the
+                // chip says how many and the press is the first of two.
+                let p0 = ed.mib_preset_label(0);
+                btn_text(c, 964, sy, 136, sh, &p0, t.accent_secondary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::MibPreset(0));
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "最大金冠 200%", t.text_primary, FontSize::Small);
+                let p1 = ed.mib_preset_label(1);
+                btn_text(c, 1108, sy, 158, sh, &p1, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::MibPreset(1));
             }
             // The arena view: the two keys a time that is not being stepped
@@ -3356,7 +3283,8 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "配置1座標コピー", t.text_primary, FontSize::Small);
+                let sem = ed.sem_preset_label(0);
+                btn_text(c, 1108, sy, 158, sh, &sem, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::SemPreset(0));
             }
             _ => {}
@@ -3368,117 +3296,12 @@ impl GuiState {
         c.rect(0, FOOTER_Y, 1280, FOOTER_H, t.bg_footer);
         c.hline(0, FOOTER_Y, 1280, t.border_subtle);
 
-        // Right: Concise, non-redundant key guide
-        // The talisman form's [A] is the row's own action, so its guide is a
-        // line the state machine builds (hbedit::CharmEdit::footer) instead of
-        // one of the fixed strings below.
-        let charm_hint = if ed.screen == Screen::CharmEdit {
-            ed.charm_edit.map(|c| c.footer())
-        } else {
-            None
-        };
-        let hint = match ed.screen {
-            Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
-            Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
-            Screen::Char => "[◀/▶] 増減  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
-            Screen::Items if ed.item_menu_open => {
-                "[▲/▼] 選択  [A] 実行（2回）  [-] 閉じる  [B] 戻る  [X] 保存"
-            }
-            Screen::Items => {
-                "[A] 変更  [-] 一括操作  [◀/▶] 個数  [Y] 刻み  [R] 数値入力  [X] 保存"
-            }
-            Screen::ItemPick if ed.item_pick_mode == 3 && ed.item_pick_stage == 1 => {
-                "[◀/▶] 個数  [▲/▼] ±10  [A] この個数を追加  [B] 選び直す"
-            }
-            Screen::ItemPick | Screen::SkillPick => "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る",
-            // One delete key on every screen: [-] twice. Creation moved to
-            // [＋], the key the equipment box already uses for "new record".
-            Screen::Charms => {
-                "[A] 編集  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存"
-            }
-            Screen::CharmEdit => charm_hint
-                .as_deref()
-                .unwrap_or("[A] 行ごとの操作  [▲/▼] 行  [◀/▶] 値  [X] 保存  [B] 戻る"),
-            Screen::Equip => {
-                "[A] 編集  [▲/▼] 行  [Y] 絞る  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
-            }
-            Screen::EquipEdit => {
-                "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品  [X] 保存  [B] 戻る"
-            }
-            Screen::JewelPick => {
-                "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [▲/▼] 行  [B] 戻る"
-            }
-            // The set editors are modes of the my-sets screen, so the chips
-            // change with them.
-            Screen::Sets if ed.set_edit.is_some() => {
-                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 外す（2回）  [Y] 警告  [X] 保存  [B] 一覧"
-            }
-            Screen::Sets if ed.item_set_edit.is_some() => {
-                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込（2回）  [-] ポーチへ（2回）  [B] 一覧"
-            }
-            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
-            // The CSV screen: A applies twice, Y writes, Minus reads the folder.
-            Screen::Csv if ed.csv_armed.is_some() => {
-                "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [-] 再読込"
-            }
-            Screen::Csv => {
-                "[A] 適用（2回）  [Y] 書き出し  [-] 再読込  [▲/▼] 行  [L/R] タブ"
-            }
-            // Y opens the same review dialog a save write uses and only the
-            // second [A] puts the snapshot back, so the chip says so.
-            Screen::Options => "[◀/▶] 値変更  [Y] スナップショットへ戻す(確認)  [X] 保存  [B] 戻る",
-            // The equipment panel is a mode of both palico screens: its chips
-            // replace theirs while it is open.
-            Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
-                "[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-] 解除（2回）  [B] 一覧  [X] 保存"
-            }
-            Screen::Roster if ed.palico_skill_open() => {
-                "[▲/▼] 枠  [◀/▶] 候補  [L/R] ±10  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
-            }
-            Screen::Roster => {
-                "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [+] スキル  [L/R] タブ  [X] 保存"
-            }
-            Screen::Palico => "[A] 導入/解除  [Y] 全導入  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
-            Screen::Hunts => {
-                "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [R] 数値入力  [L/R] サブタブ  [X] 保存"
-            }
-            // The three views of the progress screen, one line each: Y is the
-            // second bit on the quest view and the tab key on the other two.
-            Screen::Progress if ed.progress_view() == PROGRESS_QUESTS => {
-                "[A] クリア  [Y] 既読  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
-            }
-            Screen::Progress => {
-                "[A] ビット切替  [Y] タブ  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
-            }
-            Screen::SaveQuests => "[A] 編集/導入  [Y] 検索  [L/R] サブタブ  [X] 保存",
-            Screen::ArcEntries => "[A] 開く  [Y] 検査  [L/R] サブタブ  [X] 保存  [B] 戻る",
-            Screen::Mib => "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存",
-            Screen::Gmd => "[A] 文章編集  [L/R] サブタブ  [X] 保存  [B] 戻る",
-            Screen::EntryView => "[◀/▶] 座標・数値変更  [Y] 刻み  [L/R] サブタブ  [X] 保存  [B] 戻る",
-            // The guild card's two views: a short form and a grid, so the
-            // chips differ. Both fit the 1262px line at Small: the longest of
-            // them is about 574px, and the status message keeps its own room.
-            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA && ed.arena_edit => {
-                "[◀/▶] 分/秒/1-100  [▲/▼] 増減  [A] 終了  [Y] 直接入力  [X] 保存"
-            }
-            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => {
-                "[▲/▼] アリーナ  [◀/▶] 順位  [A] 編集  [Y] 直接入力  [X] 保存  [B] カードへ"
-            }
-            Screen::Guild => {
-                "[▼] 項目  [◀/▶] 増減  [R] 数値入力  [A] コメント  [-] 進行状況  [L/R] タブ  [X] 保存"
-            }
-            _ => "[A] 決定  [◀/▶] 調整  [L/R] サブタブ  [ZL/ZR] セクション  [X] 保存",
-        };
-        // [＋] quits on every screen where it is not a screen tool, and the
-        // footer says so: it was the one key that could throw the session away
-        // and the one key nothing named.
-        let plus_is_a_tool = matches!(ed.screen, Screen::Equip | Screen::Charms)
-            || (ed.screen == Screen::Roster && !ed.palico_skill_open());
-        let hint = if plus_is_a_tool {
-            hint.to_string()
-        } else {
-            format!("{}  [＋] 終了", hint)
-        };
+        // Right: the key guide, built by the state machine (hbedit::Editor::
+        // footer_hint). A key guide is a claim about what the keys do, so the
+        // one place that dispatches them is the one place that writes it; the
+        // review found three screens where the two had drifted apart, and the
+        // table that used to live here was a fourth.
+        let hint = ed.footer_hint();
         c.text_right(1262, FOOTER_Y + 9, &hint, t.text_secondary, FontSize::Small);
 
         // Left, top row: the whole-save undo. Both numbers the audit asked for
@@ -4074,6 +3897,9 @@ impl GuiState {
         c.hline(ix + 16, iy + 98, iw - 32, t.border_subtle);
 
         // Slot 4 (iy + 110, h = 48): Current Value Box
+        // It is a button too: the same row action the [A] button below runs,
+        // so a tap on the big number does what the row's own key does instead
+        // of nothing at all.
         let disp_val = if val.is_empty() { title.as_str() } else { val.as_str() };
         c.round_rect(ix + 20, iy + 110, iw - 40, 48, 6, t.bg_val_box);
         c.round_rect_border(ix + 20, iy + 110, iw - 40, 48, 6, 1, t.border_subtle);
@@ -4087,6 +3913,7 @@ impl GuiState {
             t.accent_primary,
             FontSize::Large,
         );
+        self.add_hit(ix + 20, iy + 110, iw - 40, 48, UiAction::ActivateRow(row_idx));
 
         // Slot 5 (iy + 168, h = 42): Primary [A] Button
         let btn_y = iy + 168;
@@ -4467,6 +4294,35 @@ impl GuiState {
                     "[＋] 新規装備を追加",
                     UiAction::Key(Key::Plus),
                 );
+                cur_y += 44;
+                // The filter is on the heading, and this is the way out of it
+                // for a finger: [X] used to be the clear key and [X] is save.
+                let filter_lbl = if ed.equip_filter.trim().is_empty() {
+                    "[Y] 絞り込み"
+                } else {
+                    "[Y] 絞り込みを変更 / 空で解除"
+                };
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    filter_lbl,
+                    UiAction::Key(Key::Y),
+                );
+                if !ed.equip_filter.trim().is_empty() {
+                    cur_y += 44;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "絞り込みを解除（全件）",
+                        UiAction::ClearEquipFilter,
+                    );
+                }
             }
             // The set editor is a mode of the my-sets screen; a touch press
             // goes through the same key path the pad uses, so a tap can never
@@ -4627,21 +4483,39 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "配信オトモ 全28匹を一括導入",
+                    &format!("配信オトモ 全{}匹を一括導入", dlcats::all_ids().len()),
                     UiAction::InstallAllPalicoes,
                 );
             }
             Screen::SaveQuests | Screen::ArcList => {
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
                 cur_y += 24;
+                // The counts come from the bundles themselves: the chips said
+                // 189 / 34 as literals, so a bundle that grew left the button
+                // lying.
+                let (official_n, dead_n) = mhnx_core::dlc::bundled_quest_counts();
+                let official = format!("公式イベント{}件 一括導入", official_n);
                 self.draw_tool_button(
                     c,
                     ix + 20,
                     cur_y,
                     full_w,
                     38,
-                    "公式イベント189件 一括導入",
-                    UiAction::InstallOfficialDlc,
+                    &official,
+                    UiAction::InstallDlcCategory(0),
+                );
+                cur_y += 44;
+                // The 没クエスト bundle had a tab and no bulk button at all:
+                // one row at a time was the only way in.
+                let dead = format!("没クエスト{}件 一括導入", dead_n);
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    &dead,
+                    UiAction::InstallDlcCategory(1),
                 );
                 cur_y += 44;
                 self.draw_tool_button(
@@ -4653,6 +4527,29 @@ impl GuiState {
                     "内蔵クエストをSDへ展開",
                     UiAction::ExtractOfficialArcs,
                 );
+                cur_y += 44;
+                if ed.screen == Screen::SaveQuests {
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "選択中のクエストをSDへ展開",
+                        UiAction::ExtractSelectedQuest,
+                    );
+                    cur_y += 44;
+                    // The pad's two-press delete, reachable by finger too.
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[-] 選択中のクエストを削除（2回）",
+                        UiAction::Key(Key::Minus),
+                    );
+                }
             }
             Screen::Mib => {
                 let is_mob = questfields::MIB_FIELDS
@@ -4711,10 +4608,15 @@ impl GuiState {
                     c.text_sized(ix + 20, cur_y, "一括操作・初期配置", t.text_muted, FontSize::Small);
                     cur_y += 24;
                 }
-                self.draw_tool_button(c, ix + 20, cur_y, half_w, 34, "大型体力=1", UiAction::MibPreset(0));
-                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 34, "最大金冠 200%", UiAction::MibPreset(1));
+                // Every chip names what it writes and how many monsters it
+                // would touch, and none of them runs on one press.
+                let p0 = ed.mib_preset_label(0);
+                let p1 = ed.mib_preset_label(1);
+                let p2 = ed.mib_preset_label(2);
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 34, &p0, UiAction::MibPreset(0));
+                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 34, &p1, UiAction::MibPreset(1));
                 cur_y += 38;
-                self.draw_tool_button(c, ix + 20, cur_y, half_w, 34, "最小金冠 50%", UiAction::MibPreset(2));
+                self.draw_tool_button(c, ix + 20, cur_y, half_w, 34, &p2, UiAction::MibPreset(2));
                 self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 34, "初期配置(.sem)", UiAction::SelectSubTab(1));
             }
             Screen::EntryView => {
@@ -4726,23 +4628,25 @@ impl GuiState {
                     .and_then(|a| a.entries.get(ed.entry))
                     .and_then(|e| extension_for(e.type_hash));
                 if ext == Some("sem") {
+                    let copy_lbl = ed.sem_preset_label(0);
                     self.draw_tool_button(
                         c,
                         ix + 20,
                         cur_y,
                         full_w,
                         36,
-                        "配置1のエリア・座標を他モンスターへコピー",
+                        &copy_lbl,
                         UiAction::SemPreset(0),
                     );
                     cur_y += 42;
+                    let reset_lbl = ed.sem_preset_label(1);
                     self.draw_tool_button(
                         c,
                         ix + 20,
                         cur_y,
                         full_w,
                         36,
-                        "選択中の座標を 0.0 にリセット",
+                        &reset_lbl,
                         UiAction::SemPreset(1),
                     );
                 } else {
@@ -4782,6 +4686,37 @@ impl GuiState {
                     38,
                     "次の表示 ▶",
                     UiAction::CycleSubTab(true),
+                );
+                cur_y += 44;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[X] 変更を保存",
+                    UiAction::QuickSave,
+                );
+            }
+            // The hunt list is a filter, so its deck gives the filter switch
+            // a touch target as well as the key. [-]/ ▲/▼ do not reach a
+            // finger.
+            Screen::Hunts => {
+                c.text_sized(ix + 20, cur_y, "表示切替", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                let lbl = if ed.hunt_show_all {
+                    "記録ありのみに戻す"
+                } else {
+                    "全モンスターを表示"
+                };
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    lbl,
+                    UiAction::ToggleHuntShowAll,
                 );
                 cur_y += 44;
                 self.draw_tool_button(
@@ -5481,10 +5416,13 @@ impl GuiState {
                 "[-] 2回で削除 / [＋] 新規追加 / [A] 編集・種別やIDを変えると差し替え",
             )],
         };
+        // The heading carries the filter: a filtered list that said nothing
+        // looked like a box that had lost rows, and the key that cleared it
+        // was [X], which is the save key everywhere.
         self.draw_adaptive_rows_warn(
             c,
             ed,
-            "装備BOX",
+            &ed.equip_filter_heading(),
             "",
             &rows,
             ed.equip_cursor.min(rows.len().saturating_sub(1)),
@@ -6109,35 +6047,32 @@ impl GuiState {
     fn draw_palico(&mut self, c: &mut Canvas, ed: &Editor) {
         let ids = dlcats::all_ids();
         let lang = if ed.palico_lang == 0 { Lang::Jp } else { Lang::En };
-        let installed_ids: Vec<u8> = ed
-            .save
-            .as_ref()
-            .map(|s| s.dlc_palicoes().iter().map(|cat| cat.id).collect())
-            .unwrap_or_default();
         let mut rows = Vec::with_capacity(ids.len());
         for (i, &id) in ids.iter().enumerate() {
             let name = dlcats::record(lang, id)
                 .map(dlcats::record_name)
                 .unwrap_or_else(|| format!("DLC #{}", id));
-            let installed = installed_ids.contains(&id);
-            let status = if installed { "導入済" } else { "未導入" };
+            // The install state is what [A] would do to this row, and the two
+            // words come from the state machine so the row, the chip and the
+            // key cannot disagree (hbedit::Editor::palico_row_value).
             rows.push((
                 i,
                 name,
                 format!("DLC ID: {}", id),
-                status.to_string(),
+                ed.palico_row_value(id).to_string(),
                 format!("#{:02}", i + 1),
             ));
         }
+        // The heading counts the list and the save: 一覧 / JP / EN / 導入済み.
         self.draw_adaptive_rows(
             c,
             ed,
-            "配信オトモ (全28匹)",
+            &ed.palico_bulk_label(),
             "",
             &rows,
             ed.palico_cursor.min(rows.len().saturating_sub(1)),
             false,
-            "導入/解除",
+            ed.palico_row_action(ids.get(ed.palico_cursor).copied().unwrap_or(0)),
         );
     }
 
@@ -6171,7 +6106,10 @@ impl GuiState {
                 format!("#{:03}", id + 1),
             ));
         }
-        let hdr = format!("狩猟記録 (編集列: {})", col_name);
+        // The heading says which list is on screen and the deck's [-] chip
+        // switches it: 記録ありのみ is the default, and without the other list a
+        // never-hunted monster could never be given a first record.
+        let hdr = format!("{} (編集列: {})", ed.hunt_heading(), col_name);
         let sub = format!(
             "討伐・捕獲の上限 {} / サイズ {}〜{}%",
             count_cap,
@@ -6245,7 +6183,9 @@ impl GuiState {
             &rows,
             ed.guild_field.min(2),
             true,
-            "編集",
+            // The row's own word: コメント is text ([A] opens the keyboard),
+            // HR and 時間 are numbers ([A] adds one step, like ▶).
+            ed.guild_a_label(),
             &warnings,
         );
     }
@@ -6666,7 +6606,7 @@ impl GuiState {
                 let total = mhnx_core::questprogress::BITS - 1;
                 rows.reserve(total);
                 for row in 0..total {
-                    let (is_cleared, is_seen, is_failed) = ed.progress_quest_state(row);
+                    let (is_cleared, is_seen, _) = ed.progress_quest_state(row);
                     let value = if is_cleared {
                         "クリア"
                     } else if is_seen {
@@ -6677,12 +6617,9 @@ impl GuiState {
                     rows.push((
                         row,
                         format!("クエスト {:04}", row + 1),
-                        format!(
-                            "クリア{} / 既読{} / 失敗{}",
-                            if is_cleared { "○" } else { "-" },
-                            if is_seen { "○" } else { "-" },
-                            if is_failed { "○" } else { "-" }
-                        ),
+                        // The failure bit is read-only, so its line says so
+                        // (hbedit::Editor::progress_quest_meta).
+                        ed.progress_quest_meta(row),
                         String::from(value),
                         format!("#{:04}", row + 1),
                     ));
@@ -7096,7 +7033,7 @@ impl GuiState {
                 }
             }
             "sem" => {
-                let sems = sem_entry_indices(ed);
+                let sems = ed.sem_entry_indices();
                 if let Some(arc) = &ed.arc {
                     for (k, &e_idx) in sems.iter().enumerate() {
                         let Some(se) = arc.entries.get(e_idx) else {

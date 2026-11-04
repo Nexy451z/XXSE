@@ -366,8 +366,8 @@ fn the_minus_key_and_the_back_button_belong_to_the_menu() {
     open(&mut ed, &copy);
     open_items(&mut ed);
 
-    // Minus is the menu's, so the console must not also use it to rescan.
-    assert!(ed.uses_minus(), "the item screen consumes Minus");
+    // Minus is the menu's, and the folder rescan never fires on this screen.
+    assert!(!ed.minus_rescans(), "the item screen must not rescan on Minus");
 
     open_menu(&mut ed);
     let cursor = ed.item_menu_cursor;

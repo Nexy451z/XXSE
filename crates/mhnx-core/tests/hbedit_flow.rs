@@ -515,9 +515,20 @@ fn palico_screen_installs_and_removes() {
         .count();
     ed.input(Key::A);
     assert!(ed.save.as_ref().unwrap().has_dlc_palico(0x66));
-    assert!(ed.message.contains("added"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("導入しました"),
+        "message was {}",
+        ed.message
+    );
 
-    // Pressing A again removes it.
+    // Releasing deletes the record, so it costs two presses: the first only
+    // names the palico, and the second one removes it.
+    ed.input(Key::A);
+    assert!(
+        ed.save.as_ref().unwrap().has_dlc_palico(0x66),
+        "one press must not delete a record"
+    );
+    assert!(ed.message.contains("もう一度"), "message was {}", ed.message);
     ed.input(Key::A);
     assert!(!ed.save.as_ref().unwrap().has_dlc_palico(0x66));
 
@@ -700,13 +711,14 @@ fn minus_is_only_swallowed_on_the_quest_entry_screen() {
     let mut ed = Editor::new();
     ed.set_arc_files(vec![real_arc().to_string_lossy().to_string()]);
     open_save(&mut ed);
-    // Elsewhere the Switch layer keeps Minus for its folder rescan.
-    assert!(!ed.uses_minus(), "slot screen must leave Minus to the rescan");
+    // One press, one thing: the folder rescan owns Minus on the save list and
+    // nowhere else, so no other screen can fire it alongside its own action.
+    assert!(!ed.minus_rescans(), "slot screen must not rescan on Minus");
     ed.input(Key::Y);
-    assert!(!ed.uses_minus(), "quest list must leave Minus to the rescan");
+    assert!(!ed.minus_rescans(), "quest list must not rescan on Minus");
     ed.input(Key::A);
     service(&mut ed);
-    assert!(ed.uses_minus(), "entry screen consumes Minus itself");
+    assert!(!ed.minus_rescans(), "entry screen must not rescan on Minus");
 }
 
 #[test]
@@ -865,7 +877,10 @@ fn minus_is_also_swallowed_on_the_save_quest_list() {
     ed.input(Key::Y);
     ed.input(Key::X);
     assert_eq!(ed.screen, Screen::SaveQuests);
-    assert!(ed.uses_minus(), "the save quest list uses Minus to extract");
+    assert!(
+        !ed.minus_rescans(),
+        "the save quest list owns Minus (the two-press delete)"
+    );
 }
 // ---------------------------------------------------------------------------
 // Item type change on the console side.
@@ -2352,8 +2367,18 @@ fn the_console_equipment_filter_narrows_and_clears() {
     assert!(filtered
         .iter()
         .all(|e| mhnx_core::equip::type_name(e.kind).contains("大剣")));
+    // [X] is the save key on every screen, so the clear is the empty answer
+    // from the filter box - and the heading says the filter is on.
     ed.input(Key::X);
-    assert_eq!(ed.equipment().len(), all, "X must clear the filter");
+    assert_eq!(ed.equipment().len(), filtered.len(), "[X] must not clear it");
+    assert!(
+        ed.equip_filter_heading().contains("大剣"),
+        "the heading must carry the filter: {}",
+        ed.equip_filter_heading()
+    );
+    ed.apply_equip_filter(String::new());
+    assert_eq!(ed.equipment().len(), all, "an empty filter clears it");
+    assert_eq!(ed.equip_filter_heading(), "装備BOX");
     // Nothing matching must not panic.
     ed.equip_filter = String::from("zzzz");
     assert!(ed.equipment().is_empty());
@@ -4416,7 +4441,7 @@ fn audit_the_my_sets_can_be_edited() {
     assert_eq!(ed.screen, Screen::Sets, "the editor is a mode, not a screen");
     assert!(ed.set_editor_open(), "A on the list must open the editor");
     assert!(
-        ed.uses_minus(),
+        !ed.minus_rescans(),
         "the editor owns Minus (the two-press part clear)"
     );
 

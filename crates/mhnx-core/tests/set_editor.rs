@@ -105,7 +105,7 @@ fn the_set_editor_walks_a_part_and_writes_it() {
     let set = open_editor(&mut ed);
 
     // The state machine keeps the minus button for the two-press clear.
-    assert!(ed.uses_minus(), "the console must not rescan on Minus here");
+    assert!(!ed.minus_rescans(), "the console must not rescan on Minus here");
     assert_eq!(ed.set_edit.map(|e| e.field), Some(0), "the form opens on the name");
 
     goto_part(&mut ed, 0);

@@ -840,6 +840,25 @@ pub fn install_dlc_quests_by_category(
     Ok((added, total_present))
 }
 
+/// How many quests each of the two bundles carries: (公式, 没).
+///
+/// Counted from the bundle, never written down twice: the console's tab labels,
+/// its bulk buttons and its messages all print these numbers, and the tabs said
+/// 189 / 34 as literals next to three different code paths.
+#[cfg(feature = "gamedata")]
+pub fn bundled_quest_counts() -> (usize, usize) {
+    use crate::dlc_bundle::DlcQuestCategory;
+    let mut official = 0usize;
+    let mut dead = 0usize;
+    for q in crate::dlc_bundle::OFFICIAL_QUESTS.iter() {
+        match q.category {
+            DlcQuestCategory::Official => official += 1,
+            DlcQuestCategory::Dead => dead += 1,
+        }
+    }
+    (official, dead)
+}
+
 /// Remove a quest from `save` by its `quest_id`, clearing both its slot and its
 /// catalogue bitmask bit (if present in `DLC_CATALOG`).
 #[cfg(feature = "gamedata")]

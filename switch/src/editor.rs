@@ -1265,8 +1265,8 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
     } else if idx == mhnx_core::hbedit::TEXT_SAVE_NAME {
         ed.apply_convert_name(s);
     } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
-        ed.equip_filter = s;
-        ed.equip_cursor = 0;
+        // Through the editor: an empty answer clears the filter and says so.
+        ed.apply_equip_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
         ed.apply_jewel_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_SET_NAME {
@@ -1712,9 +1712,13 @@ pub fn run() -> i32 {
                     need_draw = true;
                 }
 
-                // Minus means "extract this quest" on the quest-entry screen, so
-                // the global rescan only fires elsewhere.
-                if (down & BTN_MINUS != 0 && !ed.uses_minus()) || painter.gui.wants_rescan {
+                // One press, one thing. The global rescan fires only where the
+                // state machine says Minus has no other job (the save list);
+                // every other screen either owns the key or refreshes itself as
+                // part of its own action (the quest list's 展開 re-reads the
+                // quest folder). The old test was a negative list, so every
+                // Minus consumer added later fired both at once.
+                if (down & BTN_MINUS != 0 && ed.minus_rescans()) || painter.gui.wants_rescan {
                     painter.gui.wants_rescan = false;
                     ed.set_save_files(scan_saves());
                     ed.set_arc_files(scan_quests());

@@ -164,6 +164,28 @@ pub enum Key {
     Z,
 }
 
+/// The name of a key, for the lines that say a screen has no use for one.
+///
+/// A screen that answers nothing at all is the reviewer's "無反応" bug: every
+/// key has a name here so a message can say which one did nothing.
+pub fn key_name(k: Key) -> &'static str {
+    match k {
+        Key::Up => "[▲]",
+        Key::Down => "[▼]",
+        Key::Left => "[◀]",
+        Key::Right => "[▶]",
+        Key::A => "[A]",
+        Key::B => "[B]",
+        Key::X => "[X]",
+        Key::Y => "[Y]",
+        Key::L => "[L]",
+        Key::R => "[R]",
+        Key::Minus => "[-]",
+        Key::Plus => "[＋]",
+        Key::Z => "[ZR]",
+    }
+}
+
 /// Something the I/O layer has to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -2809,6 +2831,40 @@ pub struct Editor {
     /// console layer) so the pad, a touch button and the console model cannot
     /// disagree about how many presses a delete costs.
     pub charm_delete_armed: Option<usize>,
+    /// The download palico whose release is waiting for its second [A].
+    ///
+    /// Releasing a 配信オトモ deletes the record from the save, so it is one
+    /// of the two-press operations: the first [A] only says which palico would
+    /// go, and any other key drops the offer. Installed and not installed
+    /// therefore mean different things on the same key, and [Editor::palico_row_action]
+    /// is the one place that says which.
+    pub palico_delete_armed: Option<u8>,
+    /// The save quest whose [-] delete is waiting for its second press.
+    ///
+    /// The save's quest list had no delete at all: this is the one destructive
+    /// key on every screen, and it costs two presses here like it does on the
+    /// boxes. The id, not the row, so a cursor move cannot carry the offer to
+    /// another quest.
+    pub save_quest_armed: Option<i32>,
+    /// The .mib preset whose second press has not arrived yet.
+    ///
+    /// The three .mib presets rewrite every monster of the quest at once, so
+    /// they never run on the first press; [Editor::mib_preset_label] is what
+    /// the button and the message say, and it counts the monsters the preset
+    /// would touch.
+    pub mib_preset_armed: Option<u8>,
+    /// The .sem preset whose second press has not arrived yet.
+    ///
+    /// Same rule as the .mib presets: the area / coordinate copy writes every
+    /// spawn of the quest, so it asks twice and says how many it would move.
+    pub sem_preset_armed: Option<u8>,
+    /// Show every monster on the hunt screen, not only the ones with records.
+    ///
+    /// A filter, not a screen: the hunt tables carry a row per monster, and
+    /// "only the monsters with a record" made a never-hunted monster
+    /// unreachable (0 -> 1 was impossible). The default keeps the old list;
+    /// [-] switches, and the header names which list is on screen.
+    pub hunt_show_all: bool,
     /// The equipment set being edited, if the set editor is open.
     ///
     /// A mode of the my-sets screen, like `item_menu_open` is a mode of the
@@ -2995,6 +3051,11 @@ impl Editor {
             repeat_open: false,
             quit_armed: false,
             charm_delete_armed: None,
+            palico_delete_armed: None,
+            save_quest_armed: None,
+            mib_preset_armed: None,
+            sem_preset_armed: None,
+            hunt_show_all: false,
             set_edit: None,
             set_clear_armed: None,
             set_warnings: Vec::new(),
@@ -3357,32 +3418,617 @@ impl Editor {
         }
     }
 
-    /// Does the current screen consume the Minus button itself?
+    /// Does a Minus press on this screen refresh the card listing?
     ///
-    /// The Switch layer uses Minus to rescan folders everywhere else. The
-    /// equipment list uses it for the two-press delete and the item screen
-    /// uses it for the bulk operation menu, so the rescan must not fire there
-    /// (on the item screen it used to fire *and* undo, both at once).
-    pub fn uses_minus(&self) -> bool {
-        match self.screen {
-            Screen::ArcEntries | Screen::SaveQuests | Screen::Equip | Screen::Items => true,
-            // The equipment set editor uses Minus for the two-press part
-            // clear and the item set editor for the two-press pouch write. On
-            // the list above them Minus still means "rescan".
-            Screen::Sets => self.set_editor_open(),
-            // The CSV screen lists a folder, so Minus reads it again.
-            Screen::Csv => true,
-            // On the two palico screens Minus opens the equipment panel, so it
-            // cannot also rescan there: one press would do both at once.
-            Screen::Roster | Screen::Palico => true,
-            // Minus on the guild card opens the progress screen for the same
-            // reason: the rescan would fire on the same press.
-            Screen::Guild => true,
-            // The talisman list deletes on Minus (the one destructive key on
-            // every screen), so a rescan must not fire on the same press.
-            Screen::Charms => true,
-            _ => false,
+    /// One press does one thing. The rescan is what Minus means on the save
+    /// list and nowhere else; every other screen either gives Minus a job of
+    /// its own or has no use for the listing, and a screen that quietly did
+    /// both at once was the bug this replaced - the old answer was a *negative*
+    /// list ("everywhere except these"), so every Minus consumer added later
+    /// (the .arc list's 展開, the .mib monster rows, the CSV reload) fired the
+    /// rescan on the same press as its own action.
+    ///
+    /// The quest (.arc) list is the second card list, and it keeps its own
+    /// Minus: 展開 writes the bundled quests out and re-reads the quest folder
+    /// as part of that one action (see the Switch layer's
+    /// `wants_extract_official_arcs`), so the list is refreshed without the
+    /// global rescan stepping on it.
+    pub fn minus_rescans(&self) -> bool {
+        matches!(self.screen, Screen::SaveList)
+    }
+
+    /// May [＋] quit from this screen, or is it a tool here?
+    ///
+    /// Three screens spend [＋] on a tool of their own (both 新規 keys and the
+    /// roster's skill panel), so on those the way out is [B] and then [＋].
+    /// The footer says so: the key that ends the session must never be the one
+    /// nothing names.
+    pub fn plus_is_a_tool(&self) -> bool {
+        matches!(self.screen, Screen::Equip | Screen::Charms)
+            || (self.screen == Screen::Roster && !self.palico_skill_open())
+    }
+
+    /// The key guide on the footer, for the screen that is showing.
+    ///
+    /// It lives here rather than in the console layer because a key guide is a
+    /// claim about what the state machine does, and the state machine is the
+    /// only thing that can answer it. The console draws this string verbatim
+    /// (see the Switch layer's `draw_footer`), so the chips and the dispatch
+    /// cannot disagree - the review found three screens where they did.
+    pub fn footer_hint(&self) -> String {
+        // The talisman form's [A] is the row's own action, so its line comes
+        // from the form (CharmEdit::footer) rather than from the table.
+        let base: String = match self.screen {
+            // The form's [A] is the row's own action, so the form writes the
+            // line (CharmEdit::footer).
+            Screen::CharmEdit => self.charm_edit.map(|c| c.footer()).unwrap_or_else(|| {
+                String::from("[A] 行ごとの操作  [▲/▼] 行  [◀/▶] 値  [X] 保存  [B] 戻る")
+            }),
+            // [A] installs on a row that is not in the save and releases on one
+            // that is: the same key, two words, and the footer says which one
+            // is waiting under the cursor (Editor::palico_row_action).
+            Screen::Palico => {
+                let id = dlcats::all_ids().get(self.palico_cursor).copied().unwrap_or(0);
+                format!(
+                    "[A] {}  [Y] 全導入  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
+                    self.palico_row_action(id)
+                )
+            }
+            // The card's [A] is the row's own action too: the comment opens the
+            // keyboard and the two numbers take a step.
+            Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => format!(
+                "[▼] 項目  [◀/▶] 増減  [R] 数値入力  [A] {}  [-] 進行状況  [L/R] タブ  [X] 保存",
+                self.guild_a_label()
+            ),
+            _ => String::from(self.static_footer()),
+        };
+        if self.plus_is_a_tool() {
+            format!("{}（[＋] 終了は [B] で戻ってから）", base)
+        } else {
+            format!("{}  [＋] 終了", base)
         }
+    }
+
+    /// The fixed key guide for every screen but the talisman form.
+    fn static_footer(&self) -> &'static str {
+        let base = match self.screen {
+            Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
+            Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
+            Screen::Char => "[◀/▶] 増減  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
+            Screen::Items if self.item_menu_open => {
+                "[▲/▼] 選択  [A] 実行（2回）  [-] 閉じる  [B] 戻る  [X] 保存"
+            }
+            // L / R walk the BOX pages of the item box rather than a page of
+            // rows: the chip used to say ページ, which reads like a scroll and
+            // is not what the key does.
+            Screen::Items => {
+                "[A] 変更  [-] 一括操作  [◀/▶] 個数  [L/R] BOX切替  [Y] 刻み  [R] 数値入力  [X] 保存"
+            }
+            Screen::ItemPick if self.item_pick_mode == 3 && self.item_pick_stage == 1 => {
+                "[◀/▶] 個数  [▲/▼] ±10  [A] この個数を追加  [B] 選び直す"
+            }
+            Screen::ItemPick | Screen::SkillPick => {
+                "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る"
+            }
+            // One delete key on every screen: [-] twice.
+            Screen::Charms => "[A] 編集  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存",
+            // Built by the form, not here: see footer_hint.
+            Screen::CharmEdit => "",
+            Screen::Equip => {
+                "[A] 編集  [▲/▼] 行  [Y] 絞る/解除  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
+            }
+            Screen::EquipEdit => {
+                "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品  [X] 保存  [B] 戻る"
+            }
+            Screen::JewelPick => {
+                "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [▲/▼] 行  [B] 戻る"
+            }
+            Screen::Sets if self.set_edit.is_some() => {
+                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 外す（2回）  [Y] 警告  [X] 保存  [B] 一覧"
+            }
+            Screen::Sets if self.item_set_edit.is_some() => {
+                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込（2回）  [-] ポーチへ（2回）  [B] 一覧"
+            }
+            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
+            Screen::Csv if self.csv_armed.is_some() => {
+                "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [-] 再読込"
+            }
+            Screen::Csv => "[A] 適用（2回）  [Y] 書き出し  [-] 再読込  [▲/▼] 行  [L/R] タブ",
+            Screen::Options => {
+                "[◀/▶] 値変更  [Y] スナップショットへ戻す(確認)  [X] 保存  [B] 戻る"
+            }
+            Screen::Roster | Screen::Palico if self.palico_equip_open() => {
+                "[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-] 解除（2回）  [B] 一覧  [X] 保存"
+            }
+            Screen::Roster if self.palico_skill_open() => {
+                "[▲/▼] 枠  [◀/▶] 候補  [L/R] ±10  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
+            }
+            Screen::Roster => {
+                "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [+] スキル  [L/R] タブ  [X] 保存"
+            }
+            // Built in footer_hint: the word after [A] follows the row.
+            Screen::Palico => "",
+            Screen::Hunts => {
+                "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [-] 表示切替  [R] 数値入力  [L/R] サブタブ  [X] 保存"
+            }
+            Screen::Progress if self.progress_view() == PROGRESS_QUESTS => {
+                "[A] クリア  [Y] 既読  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
+            }
+            Screen::Progress => {
+                "[A] ビット切替  [Y] タブ  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
+            }
+            Screen::SaveQuests => {
+                "[A] 編集/導入  [Y] 検索  [-] 削除（2回）  [R] SDへ全展開  [L/R] サブタブ  [X] 保存"
+            }
+            // Screen-specific because every key here does something the other
+            // screens do not have: Y installs the file into the open save and
+            // Minus writes the bundled quests out.
+            Screen::ArcList => "[A] 開く  [Y] セーブへ導入  [-] SDへ展開  [B] 戻る",
+            Screen::ArcEntries => "[A] 開く  [Y] 検査  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            Screen::Mib => {
+                "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存"
+            }
+            Screen::Gmd => "[A] 文章編集  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            Screen::EntryView => {
+                "[◀/▶] 座標・数値変更  [Y] 刻み  [L/R] サブタブ  [X] 保存  [B] 戻る"
+            }
+            // The arena editor's four directions mean one thing each: ◀/▶ walk
+            // the parts of the time and ▲/▼ step the part under the cursor.
+            Screen::Guild if self.guild_view() == GUILD_TAB_ARENA && self.arena_edit => {
+                "[◀/▶] 項目  [▲/▼] 増減  [A] 終了  [Y] 直接入力  [X] 保存"
+            }
+            Screen::Guild if self.guild_view() == GUILD_TAB_ARENA => {
+                "[▲/▼] アリーナ  [◀/▶] 順位  [A] 編集  [Y] 直接入力  [X] 保存  [B] カードへ"
+            }
+            // Built in footer_hint: the word after [A] follows the row.
+            Screen::Guild => "",
+            // The checker's [A] is the automatic fix, and it is the only thing
+            // the key does: the old catch-all said "決定" with "◀/▶ 調整"
+            // beside it, neither of which this screen has.
+            Screen::Check => "[A] 自動修正  [▲/▼] 指摘  [X] .arc 保存  [B] 戻る",
+            Screen::QuestEquip => {
+                "[A] 開く  [◀/▶] 個数  [▲/▼] 行  [L/R] サブタブ  [X] 保存  [B] 戻る"
+            }
+            // Convert and the remaining leaf screens have no tools of their own.
+            Screen::Convert => "[◀/▶] 値変更  [X] 保存  [B] 戻る",
+        };
+        base
+    }
+
+    // -------------------------------------------------------------------
+    // Labels and the two-press operations behind them
+    // -------------------------------------------------------------------
+
+    /// Is this download palico already in the save?
+    pub fn is_dlc_palico_installed(&self, id: u8) -> bool {
+        self.save
+            .as_ref()
+            .map(|s| s.has_dlc_palico(id))
+            .unwrap_or(false)
+    }
+
+    /// How many download palicoes the save holds right now.
+    pub fn installed_dlc_palico_count(&self) -> usize {
+        self.save
+            .as_ref()
+            .map(|s| s.dlc_palicoes().len())
+            .unwrap_or(0)
+    }
+
+    /// The bulk line above the download palico list.
+    ///
+    /// Both counts come from the tables and from the save: the screen said
+    /// 「全28匹」 next to a list of 60 rows and a bulk install of 57 (JP) / 27
+    /// (EN), which is three different numbers for one thing.
+    pub fn palico_bulk_label(&self) -> String {
+        format!(
+            "配信オトモ 一覧 {} 匹（JP {} / EN {}）・導入済み {}",
+            dlcats::all_ids().len(),
+            dlcats::JP_IDS.len(),
+            dlcats::EN_IDS.len(),
+            self.installed_dlc_palico_count()
+        )
+    }
+
+    /// What [A] does on one download palico: the row's own word.
+    ///
+    /// Installing adds a record, releasing deletes one; the delete costs a
+    /// second press, so the two states cannot print the same chip.
+    pub fn palico_row_action(&self, id: u8) -> &'static str {
+        if self.is_dlc_palico_installed(id) {
+            "解除（2回）"
+        } else {
+            "導入"
+        }
+    }
+
+    /// What the download palico screen prints for one row's value column.
+    pub fn palico_row_value(&self, id: u8) -> &'static str {
+        if self.is_dlc_palico_installed(id) {
+            "導入済"
+        } else {
+            "未導入"
+        }
+    }
+
+    /// One [A] on the download palico screen.
+    ///
+    /// Installing is one press (it adds a record and the whole-save undo takes
+    /// it back). Releasing deletes the record, so it is two: the first press
+    /// names the palico, any other key drops the offer, and the id is what is
+    /// armed so moving the cursor cannot carry the offer to another row.
+    pub fn palico_a_press(&mut self) {
+        let ids = dlcats::all_ids();
+        let Some(id) = ids.get(self.palico_cursor).copied() else {
+            self.message = String::from("配信オトモの一覧がありません");
+            return;
+        };
+        let lang = if self.palico_lang == 0 {
+            Lang::Jp
+        } else {
+            Lang::En
+        };
+        let installed = self.is_dlc_palico_installed(id);
+        if !installed {
+            self.palico_delete_armed = None;
+            self.push_undo("配信オトモ");
+            let Some(s) = &mut self.save else {
+                self.message = String::from("先にセーブを開いてください");
+                return;
+            };
+            match s.install_dlc_palico(lang, id) {
+                Ok(slot) => {
+                    let name = s
+                        .dlc_palicoes()
+                        .get(slot)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    self.dirty = true;
+                    self.message = format!(
+                        "{} を導入しました（枠 {}）— もう一度 [X] で保存",
+                        name,
+                        slot + 1
+                    );
+                }
+                Err(e) => self.message = format!("{}", e),
+            }
+            return;
+        }
+        // Installed: this screen's delete, and it asks twice.
+        if self.palico_delete_armed != Some(id) {
+            self.palico_delete_armed = Some(id);
+            let name = self
+                .save
+                .as_ref()
+                .and_then(|s| s.dlc_palicoes().into_iter().find(|c| c.id == id).map(|c| c.name))
+                .unwrap_or_default();
+            self.message = format!(
+                "{} を解除しますか？ もう一度 [A] で解除（2回・記録が消えます）",
+                name
+            );
+            return;
+        }
+        self.palico_delete_armed = None;
+        self.push_undo("配信オトモ解除");
+        let Some(s) = &mut self.save else {
+            return;
+        };
+        if let Some(sl) = s.dlc_palicoes().iter().find(|c| c.id == id).map(|c| c.index) {
+            let name = s
+                .dlc_palicoes()
+                .get(sl)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
+            s.remove_dlc_palico(sl);
+            self.dirty = true;
+            self.message = format!("{} を解除しました（[L長押し] で元に戻せます）", name);
+        }
+    }
+
+    /// Every .sem entry the open .arc carries, in spawn order.
+    ///
+    /// Moved here from the console layer so the .sem presets (and their
+    /// counts) can be tested without a Switch.
+    pub fn sem_entry_indices(&self) -> Vec<usize> {
+        let Some(arc) = &self.arc else {
+            return Vec::new();
+        };
+        let mut active = Vec::new();
+        let mut dummy = Vec::new();
+        for (i, e) in arc.entries.iter().enumerate() {
+            if extension_for(e.type_hash) == Some("sem") && e.data.len() >= 0x20 {
+                let area =
+                    u32::from_le_bytes([e.data[0x0C], e.data[0x0D], e.data[0x0E], e.data[0x0F]]);
+                if e.name.contains("em000") && area == 0 {
+                    dummy.push(i);
+                } else {
+                    active.push(i);
+                }
+            }
+        }
+        active.extend(dummy);
+        active
+    }
+
+    /// How many monster slots the open .mib really has (id != 0).
+    pub fn mib_mob_count(&self) -> usize {
+        let mib = &self.mib_bytes;
+        questfields::MIB_FIELDS
+            .iter()
+            .filter(|f| f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len())
+            .filter(|f| u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]) != 0)
+            .count()
+    }
+
+    /// The .mib preset button: what it would write, and to how many monsters.
+    ///
+    /// The count is the whole point: 「最大金冠 200%」 alone does not say that
+    /// one press rewrites every monster of the quest.
+    pub fn mib_preset_label(&self, preset: u8) -> String {
+        let n = self.mib_mob_count();
+        // The count is in the label and the action covers every monster with
+        // an id, so the two cannot disagree about "all".
+        let what = match preset {
+            0 => "全モンスターの体力=1",
+            1 => "全モンスターのサイズ=200%",
+            _ => "全モンスターのサイズ=50%",
+        };
+        format!("{}（全{}体）", what, n)
+    }
+
+    /// One press of a .mib preset. True means it ran, false means it only asked.
+    pub fn mib_preset_press(&mut self, preset: u8) -> bool {
+        let preset = preset.min(2);
+        if self.mib_preset_armed != Some(preset) {
+            self.mib_preset_armed = Some(preset);
+            self.message = format!(
+                "{} を実行しますか？ もう一度押すと実行（2回）",
+                self.mib_preset_label(preset)
+            );
+            return false;
+        }
+        self.mib_preset_armed = None;
+        self.apply_mib_preset(preset);
+        true
+    }
+
+    fn apply_mib_preset(&mut self, preset: u8) {
+        let mib = &mut self.mib_bytes;
+        if mib.len() < 0x180 {
+            self.message = String::from("この .mib は小さすぎてプリセットを書けません");
+            return;
+        }
+        let mut touched = 0usize;
+        for f in questfields::MIB_FIELDS.iter() {
+            if f.key.starts_with("mob_slot[") && f.offset + 13 <= mib.len() {
+                let mid = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
+                if mid != 0 {
+                    match preset {
+                        0 => mib[f.offset + 5] = 1,
+                        1 => mib[f.offset + 9..f.offset + 11]
+                            .copy_from_slice(&200u16.to_le_bytes()),
+                        _ => mib[f.offset + 9..f.offset + 11]
+                            .copy_from_slice(&50u16.to_le_bytes()),
+                    }
+                    touched += 1;
+                }
+            }
+        }
+        self.dirty = true;
+        self.message = format!("{} を書きました（全{}体・[X] で保存）", {
+            match preset {
+                0 => "体力=1",
+                1 => "サイズ 200%",
+                _ => "サイズ 50%",
+            }
+        }, touched);
+    }
+
+    /// The .sem preset button, with the number of spawns it would move.
+    pub fn sem_preset_label(&self, preset: u8) -> String {
+        let n = self.sem_entry_indices().len();
+        match preset {
+            0 => format!("配置1のエリア・座標を他の全{}体へコピー", n.saturating_sub(1)),
+            _ => format!("選択中の座標を 0.0 にリセット（全{}体の初期配置）", n),
+        }
+    }
+
+    /// One press of a .sem preset. True means it ran.
+    pub fn sem_preset_press(&mut self, preset: u8) -> bool {
+        let preset = u8::from(preset != 0);
+        if self.sem_preset_armed != Some(preset) {
+            self.sem_preset_armed = Some(preset);
+            self.message = format!(
+                "{} を実行しますか？ もう一度押すと実行（2回）",
+                self.sem_preset_label(preset)
+            );
+            return false;
+        }
+        self.sem_preset_armed = None;
+        self.apply_sem_preset(preset);
+        true
+    }
+
+    fn apply_sem_preset(&mut self, preset: u8) {
+        let sems = self.sem_entry_indices();
+        if sems.is_empty() {
+            self.message = String::from("この .arc に .sem (初期配置) がありません");
+            return;
+        }
+        if preset == 0 {
+            let first_idx = sems[0];
+            let Some(arc) = &mut self.arc else { return };
+            let Some(src) = arc.entries.get(first_idx).map(|e| e.data.clone()) else {
+                return;
+            };
+            if src.len() < 0x20 {
+                return;
+            }
+            let mut count = 0usize;
+            for &idx in sems.iter().skip(1) {
+                if let Some(e) = arc.entries.get_mut(idx) {
+                    if !e.name.contains("em000") && e.data.len() >= 0x20 {
+                        e.data[0x0C..0x20].copy_from_slice(&src[0x0C..0x20]);
+                        count += 1;
+                    }
+                }
+            }
+            self.dirty = true;
+            self.message = if count > 0 {
+                format!("配置1のエリア・座標を他 {} 体の初期配置へコピーしました", count)
+            } else {
+                String::from("コピー対象の2体目以降の初期配置がありません")
+            };
+            return;
+        }
+        let row_idx = self.entry_row_cursor;
+        let sem_k = row_idx / 6;
+        let field = row_idx % 6;
+        let Some(&entry_idx) = sems.get(sem_k) else {
+            self.message = String::from("リセットする初期配置を選んでください");
+            return;
+        };
+        let Some(arc) = &mut self.arc else { return };
+        let Some(e) = arc.entries.get_mut(entry_idx) else {
+            return;
+        };
+        if e.data.len() < 0x20 {
+            return;
+        }
+        if (1..=4).contains(&field) {
+            let off = 0x10 + (field - 1) * 4;
+            e.data[off..off + 4].copy_from_slice(&0.0f32.to_le_bytes());
+            self.dirty = true;
+            self.message = format!(
+                "配置{} ({}) の選択座標を 0.0 にリセットしました",
+                sem_k + 1,
+                e.name
+            );
+        } else {
+            e.data[0x10..0x20].fill(0);
+            self.dirty = true;
+            self.message = format!(
+                "配置{} ({}) の X/Y/Z/W をすべて 0.0 にリセットしました",
+                sem_k + 1,
+                e.name
+            );
+        }
+    }
+
+    /// The equipment list's header, with the filter state on it.
+    ///
+    /// The filter was applied but never shown: a list that had silently
+    /// dropped rows looked like a box that had lost them.
+    pub fn equip_filter_heading(&self) -> String {
+        let needle = self.equip_filter.trim();
+        if needle.is_empty() {
+            String::from("装備BOX")
+        } else {
+            format!("装備BOX（絞り込み: {}）[Y] で変更・空で解除", needle)
+        }
+    }
+
+    /// The hunt list's header: which rows the list is showing.
+    pub fn hunt_heading(&self) -> String {
+        let rows = self.hunt_rows().len();
+        if self.hunt_show_all {
+            format!("狩猟記録（全モンスター {} 体）", rows)
+        } else {
+            format!("狩猟記録（記録ありのみ {} 体・[-] で全表示）", rows)
+        }
+    }
+
+    /// The inspector's meta line for one row of the quest-progress view.
+    ///
+    /// The failure bit is read-only - the game does not keep a failure that a
+    /// write can reproduce - so the line says so instead of leaving the user
+    /// pressing [A] on it.
+    pub fn progress_quest_meta(&self, row: usize) -> String {
+        let (cleared, seen, failed) = self.progress_quest_state(row);
+        format!(
+            "クリア{} / 既読{} / 失敗{}（参照のみ）",
+            if cleared { "○" } else { "-" },
+            if seen { "○" } else { "-" },
+            if failed { "○" } else { "-" }
+        )
+    }
+
+    /// What [A] does on one row of the guild card.
+    ///
+    /// The comment is text and needs the keyboard; the rank and the clock are
+    /// numbers, and [A] there adds one step to the value - the same step
+    /// [◀/▶] take. It used to print 編集 on every row and do nothing on two of
+    /// them.
+    pub fn guild_a_label(&self) -> &'static str {
+        if self.guild_field == 2 {
+            "編集"
+        } else {
+            "+刻み"
+        }
+    }
+
+    /// Add one step to the guild card row under the cursor.
+    ///
+    /// Shared by [A] and ▶ so the two cannot drift apart. The comment row has
+    /// no number to step and answers false.
+    pub fn guild_step_row(&mut self) -> bool {
+        if self.guild_field == 2 {
+            return false;
+        }
+        let slot = self.slot;
+        let step = STEPS[self.step].max(1) as u32;
+        self.push_undo("ギルドカード");
+        let Some(save) = &mut self.save else {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        };
+        let ok = match self.guild_field {
+            0 => {
+                let cur = crate::guildcard::hunter_rank(save, slot).unwrap_or(0);
+                crate::guildcard::set_hunter_rank(save, slot, (cur + 1).min(999))
+            }
+            _ => {
+                let cur = crate::guildcard::play_time(save, slot).unwrap_or(0);
+                crate::guildcard::set_play_time(save, slot, cur.saturating_add(step))
+            }
+        };
+        if ok {
+            self.dirty = true;
+        }
+        ok
+    }
+
+    /// Ask the I/O layer to write the highlighted save quest out as a file.
+    pub fn request_extract_selected_quest(&mut self) {
+        let list = self.filtered_quests();
+        match list.get(self.save_quest_cursor) {
+            Some(q) => {
+                let qid = q.quest_id;
+                self.pending_request = Some(Request::ExtractQuests { ids: alloc::vec![qid] });
+            }
+            None => self.message = String::from("書き出すクエストがありません"),
+        }
+    }
+
+    /// One press of [-] on the save's quest list: the two-press delete.
+    pub fn save_quest_delete_press(&mut self) {
+        let list = self.filtered_quests();
+        let Some(q) = list.get(self.save_quest_cursor) else {
+            self.save_quest_armed = None;
+            self.message = String::from("削除するクエストを選んでください");
+            return;
+        };
+        let qid = q.quest_id;
+        if self.save_quest_armed != Some(qid) {
+            self.save_quest_armed = Some(qid);
+            self.message = format!(
+                "クエスト {} を削除しますか？ もう一度 [-] で削除（2回）",
+                qid
+            );
+            return;
+        }
+        self.save_quest_armed = None;
+        self.remove_save_quest(qid);
     }
 
     /// The I/O layer answers an ExtractQuests request with this.
@@ -4506,6 +5152,11 @@ impl Editor {
         }
         let ids = dlcats::all_ids();
         let n = ids.len();
+        // Any other key takes the release offer back: the second [A] must be
+        // the next thing the user does, on the row they are looking at.
+        if key != Key::A {
+            self.palico_delete_armed = None;
+        }
         match key {
             // palico_cursor is the highlighted row.
             Key::Up => {
@@ -4524,38 +5175,12 @@ impl Editor {
                     String::from("オトモ名（英語）")
                 };
             }
-            Key::A => {
-                let id = match ids.get(self.palico_cursor) {
-                    Some(v) => *v,
-                    None => return,
-                };
-                let lang = if self.palico_lang == 0 { Lang::Jp } else { Lang::En };
-                let installed = self
-                    .save
-                    .as_ref()
-                    .map(|s| s.has_dlc_palico(id))
-                    .unwrap_or(false);
-                self.push_undo("配信オトモ");
-                if let Some(s) = &mut self.save {
-                    if installed {
-                        if let Some(sl) = s.dlc_palicoes().iter().find(|c| c.id == id).map(|c| c.index) {
-                            let name = s.dlc_palicoes().get(sl).map(|c| c.name.clone()).unwrap_or_default();
-                            s.remove_dlc_palico(sl);
-                            self.dirty = true;
-                            self.message = format!("removed {}", name);
-                        }
-                    } else {
-                        match s.install_dlc_palico(lang, id) {
-                            Ok(slot) => {
-                                let name = s.dlc_palicoes().get(slot).map(|c| c.name.clone()).unwrap_or_default();
-                                self.dirty = true;
-                                self.message = format!("added {} to slot {}", name, slot + 1);
-                            }
-                            Err(e) => self.message = format!("{}", e),
-                        }
-                    }
-                }
-            }
+            // [A] is the row's own action: 導入 on a palico that is not in
+            // the save, and 解除 on one that is. A release deletes the record,
+            // so it costs two presses (Editor::palico_a_press); the chip the
+            // row prints comes from Editor::palico_row_action, so the key and
+            // the label are the same answer.
+            Key::A => self.palico_a_press(),
             // Minus opens the equipment panel for the palico the highlighted
             // download entry became in the roster. Y already means "install
             // all", L / R mean "language", A installs or removes and X saves,
@@ -6097,7 +6722,13 @@ impl Editor {
         }
     }
 
-    /// The hunt tables as a flat list of monsters that have records.
+    /// The hunt tables as a flat list, one row per monster.
+    ///
+    /// Two lists, one table: "記録ありのみ" is the default because a save
+    /// carries a row for every monster and 100+ empty rows is noise, and
+    /// [Editor::hunt_show_all] is the other one. The filter only ever ran one
+    /// way, so a monster with no record could never be given one (0 -> 1 was
+    /// unreachable), which is what the `-` key now fixes.
     pub fn hunt_rows(&self) -> Vec<(usize, u16, u16, u16, u16)> {
         let Some(save) = &self.save else {
             return Vec::new();
@@ -6110,8 +6741,26 @@ impl Editor {
                 let (a, b) = size.get(i).copied().unwrap_or((0, 0));
                 (i, slay[i], cap.get(i).copied().unwrap_or(0), a, b)
             })
-            .filter(|(_, s, c, _, _)| *s > 0 || *c > 0)
+            .filter(|(_, s, c, _, _)| self.hunt_show_all || *s > 0 || *c > 0)
             .collect()
+    }
+
+    /// Switch the hunt list between 記録ありのみ and every monster.
+    ///
+    /// The cursor is clamped to the new list so it cannot point past its end.
+    pub fn toggle_hunt_show_all(&mut self) {
+        self.hunt_show_all = !self.hunt_show_all;
+        let n = self.hunt_rows().len();
+        if n == 0 {
+            self.hunt_cursor = 0;
+        } else if self.hunt_cursor >= n {
+            self.hunt_cursor = n - 1;
+        }
+        self.message = if self.hunt_show_all {
+            format!("全モンスター表示（{} 体）— 記録の無いモンスターも 0→1 にできます", n)
+        } else {
+            format!("記録ありのみ表示（{} 体）— [-] で全モンスター", n)
+        };
     }
 
     fn input_hunts(&mut self, key: Key) {
@@ -6176,6 +6825,10 @@ impl Editor {
                     self.message = String::from("先にセーブを開いてください");
                 }
             }
+            // [-] switches the list. Nothing else on this screen wants the
+            // key (the delete rule does not apply: a hunt record has no
+            // delete), and a display toggle is exactly a one-press thing.
+            Key::Minus => self.toggle_hunt_show_all(),
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
@@ -6183,7 +6836,14 @@ impl Editor {
             Key::Plus => {
                 self.press_quit();
             }
-            _ => {}
+            // No key on this screen is silent: an arrow on a row with nothing
+            // to step says so instead of doing nothing.
+            other => {
+                self.message = format!(
+                    "この画面では {} は使いません（[◀/▶] 増減 / [Y] 列 / [-] 表示切替）",
+                    key_name(other)
+                );
+            }
         }
     }
 
@@ -6237,13 +6897,20 @@ impl Editor {
             Key::R => {
                 self.request_guild_text();
             }
-            // The comment is text, so it needs the keyboard.
+            // [A] is the row's own action (Editor::guild_a_label): the comment
+            // needs the keyboard, and the rank / clock take one step more,
+            // exactly what [▶] would add. It used to print 編集 on every row
+            // and do nothing on two of them.
             Key::A => {
                 if self.guild_field == 2 {
                     if let Some(save) = &self.save {
                         let cur = crate::guildcard::comment(save, self.slot).unwrap_or_default();
                         self.pending_text = Some((TEXT_GUILD_COMMENT, cur));
+                    } else {
+                        self.message = String::from("先にセーブを開いてください");
                     }
+                } else if !self.guild_step_row() {
+                    self.message = String::from("先にセーブを開いてください");
                 }
             }
             // The card is the last record of this kind and the progress screen
@@ -8659,15 +9326,15 @@ impl Editor {
                     self.equip_cursor = (self.equip_cursor + 1).min(n - 1);
                 }
             }
+            // [Y] opens the filter box with the current filter in it, so
+            // emptying it clears the filter: the clear used to be on [X], and
+            // [X] is the save key on every screen, so a filtered list could not
+            // be unfiltered at all.
             Key::Y => {
                 self.pending_text = Some((TEXT_EQUIP_FILTER, self.equip_filter.clone()));
             }
             // A opens the form for the highlighted record.
             Key::A => self.open_equip_editor(),
-            Key::X => {
-                self.equip_filter.clear();
-                self.equip_cursor = 0;
-            }
             // Two presses: the first only names what would go, the second one
             // clears the record. The reference check is the same one
             // equipops::clear runs, asked first so the first press cannot
@@ -9542,6 +10209,29 @@ impl Editor {
         self.save_quest_cursor = 0;
     }
 
+    /// The io layer answers an equipment filter request with this.
+    ///
+    /// An empty answer clears the filter: the box used to hide rows behind a
+    /// filter that nothing on screen admitted to, and the key that cleared it
+    /// was [X], which is the save key everywhere and never reached the state
+    /// machine. The heading prints the filter (Editor::equip_filter_heading)
+    /// and emptying the box is the way out.
+    pub fn apply_equip_filter(&mut self, text: String) {
+        let cleared = text.trim().is_empty();
+        self.equip_filter = text;
+        self.equip_cursor = 0;
+        self.equip_delete_armed = None;
+        self.message = if cleared {
+            String::from("絞り込みを解除しました（全件表示）")
+        } else {
+            format!(
+                "絞り込み「{}」— {} 件。[Y] で変更、空にすると解除",
+                self.equip_filter.trim(),
+                self.equipment().len()
+            )
+        };
+    }
+
     /// Cached title for a quest id.
     pub fn quest_title(&self, id: i32) -> &str {
         if let Some((_, t)) = self
@@ -9735,6 +10425,11 @@ impl Editor {
     fn input_save_quests(&mut self, key: Key) {
         let list = self.filtered_quests();
         let n = list.len();
+        // One delete key, two presses, and the offer belongs to the row it was
+        // made on: anything but the confirmation drops it first.
+        if key != Key::Minus {
+            self.save_quest_armed = None;
+        }
         match key {
             Key::Up => {
                 self.save_quest_cursor = (self.save_quest_cursor + n.saturating_sub(1)) % n.max(1);
@@ -9744,18 +10439,31 @@ impl Editor {
                 self.save_quest_cursor = (self.save_quest_cursor + 1) % n.max(1);
                 self.cursor = self.save_quest_cursor;
             }
-            Key::A => {
-                if let Some(q) = list.get(self.save_quest_cursor) {
+            // A opens the highlighted quest. It used to install all 189
+            // bundled official quests when the list happened to be empty: a
+            // press that wrote 189 records with nothing on screen to say so.
+            // The bulk install lives on its own button now, and an empty list
+            // says where that button is.
+            Key::A => match list.get(self.save_quest_cursor) {
+                Some(q) => {
                     let id = q.quest_id;
                     self.open_quest_from_save(id);
                 }
-            }
-            Key::Minus => {
-                if let Some(q) = list.get(self.save_quest_cursor) {
-                    self.pending_request = Some(Request::ExtractQuests { ids: alloc::vec![q.quest_id] });
+                None => {
+                    self.save_quest_armed = None;
+                    self.message = String::from(
+                        "セーブ内にクエストがありません（公式・没クエストは右の一括ボタンから導入します）",
+                    );
                 }
-            }
+            },
+            // [-] is this screen's delete, twice, like every other list: the
+            // save had no way to take a quest out of it at all, and the single
+            // extract that used to sit here moved to its own button
+            // (Editor::request_extract_selected_quest).
+            Key::Minus => self.save_quest_delete_press(),
+            // [R] writes every quest of the save out to the card.
             Key::R => {
+                self.save_quest_armed = None;
                 self.pending_request = Some(Request::ExtractQuests { ids: Vec::new() });
             }
             // 175 quests at 16 rows a page needs a filter.
