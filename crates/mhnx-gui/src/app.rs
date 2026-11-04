@@ -11767,6 +11767,9 @@ impl MhnxEditor {
     /// the heading says so, and the rows are the core crate's own table
     /// ([mhnx_core::savemap::fields]), so the list cannot name bytes the other
     /// tabs do not edit.
+    ///
+    /// An MHGU save is refused ([MhnxEditor::save_map_refusal]) for the same
+    /// reason 進行状況 / DLC / 変更一覧 refuse it: every row is an MHXX offset.
     fn tab_save_map(&mut self, ui: &mut egui::Ui) {
         ui.heading("セーブマップ");
         ui.label(
@@ -11782,6 +11785,19 @@ impl MhnxEditor {
                 "セーブを開くと、セーブの全フィールドを 名前・オフセット・長さ・現在値 で一覧します",
             );
             return;
+        }
+        // Every row in the map was measured on MHXX saves, and an MHGU slot is
+        // 0x1104 bytes longer, so the same relative offset names a different
+        // place in that file. Listing the rows anyway would show a wrong offset
+        // and a wrong value with nothing to say they are wrong. The other tabs
+        // (進行状況, ダウンロードクエスト, 変更一覧) refuse the same save; this one
+        // has to as well, with the same reason.
+        if let Some(save) = self.save.as_ref() {
+            if let Some(reason) = Self::save_map_refusal(save) {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new(reason).color(warning_color()));
+                return;
+            }
         }
         // The filter box first: it mutates editor state, and the rows below
         // need the save borrowed for their values.
@@ -11859,10 +11875,10 @@ impl MhnxEditor {
                         });
                         row.col(|ui| {
                             ui.add(
-                                egui::Label::new(egui::RichText::new(&r.field.name).small())
+                                egui::Label::new(egui::RichText::new(r.field.name).small())
                                     .truncate(),
                             )
-                            .on_hover_text(&r.field.name);
+                            .on_hover_text(r.field.name);
                         });
                         row.col(|ui| {
                             ui.add(
@@ -11896,7 +11912,7 @@ impl MhnxEditor {
         };
         let offset = mhnx_core::savemap::offset_in(save, index).unwrap_or(field.offset);
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new(&field.name).strong());
+            ui.label(egui::RichText::new(field.name).strong());
             ui.label(
                 egui::RichText::new(format!(
                     "{} · 0x{:06X} · {} バイト · {}",
@@ -11932,6 +11948,23 @@ impl MhnxEditor {
             None => {
                 ui.label(egui::RichText::new("このセーブにはこの範囲がありません").weak());
             }
+        }
+    }
+
+    /// Why the セーブマップ tab refuses this save, or `None` when the map applies.
+    ///
+    /// MHGU's slots are 0x1104 bytes longer than MHXX's and every row of the map
+    /// was measured on MHXX saves, so the same relative offset names a different
+    /// place in an MHGU file. The tab is read-only either way, but a list of
+    /// rows resolved through the wrong layout looks right and is wrong, which is
+    /// the one failure this tool refuses to ship. The wording is the one the
+    /// 進行状況 tab uses: the rows were confirmed on MHXX saves.
+    fn save_map_refusal(save: &Save) -> Option<&'static str> {
+        match save.kind() {
+            SaveKind::Mhgu => Some(
+                "このセーブは MHGU です。セーブマップの位置は MHXX のセーブで確認したものなので、このタブでは表示もしません。",
+            ),
+            _ => None,
         }
     }
 
@@ -13621,6 +13654,20 @@ mod tests {
         let save = mhnx_core::save::empty_switch_save();
         let path = dir.join(name);
         std::fs::write(&path, save.to_bytes()).expect("write the fixture");
+        path
+    }
+
+    /// A well formed MHGU Switch save: the 36 byte container header plus a
+    /// zeroed body carrying the marker the parser checks. Nothing in it is
+    /// valid MHXX data, which is exactly the point: the tabs have to refuse it
+    /// before they read a byte.
+    fn write_an_mhgu_save(dir: &std::path::Path, name: &str) -> PathBuf {
+        let body = mhnx_core::MHGU_SIZE - mhnx_core::SWITCH_HEADER_SIZE;
+        let mut data = mhnx_core::save::switch_header(name, body).to_vec();
+        data.resize(mhnx_core::MHGU_SIZE, 0);
+        data[mhnx_core::SWITCH_HEADER_SIZE] = 0xC6;
+        let path = dir.join(name);
+        std::fs::write(&path, &data).expect("write the MHGU fixture");
         path
     }
 
@@ -17862,6 +17909,128 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
         });
         assert!(!output.shapes.is_empty(), "the empty filter drew nothing");
+    }
+
+    /// The セーブマップ tab refuses an MHGU save the way 進行状況, DLC and 変更一覧
+    /// do. Every row is an MHXX offset; an MHGU slot is 0x1104 bytes longer, so
+    /// the same relative offset names other bytes there and the tab would show a
+    /// wrong row with nothing to say it is wrong.
+    #[test]
+    fn the_save_map_tab_refuses_an_mhgu_save() {
+        let dir = Scratch::new("mhgumap");
+        let path = write_an_mhgu_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        assert_eq!(
+            app.save.as_ref().expect("a save").kind(),
+            SaveKind::Mhgu,
+            "{}",
+            app.message
+        );
+        // The reason is the one the other tabs give, and it says which table the
+        // offsets were measured on.
+        let reason = MhnxEditor::save_map_refusal(app.save.as_ref().expect("a save"))
+            .expect("the map refuses an MHGU save");
+        assert!(reason.contains("MHGU"), "{}", reason);
+        assert!(
+            reason.contains("MHXX のセーブで確認したもの"),
+            "{}",
+            reason
+        );
+        // An MHXX save is not refused: the guard is about the layout, not about
+        // saves the tab cannot read for another reason.
+        assert_eq!(
+            MhnxEditor::save_map_refusal(&mhnx_core::save::empty_switch_save()),
+            None
+        );
+
+        // The tab draws the refusal and lands on no row. Without the guard it
+        // would have set savemap_selected to the first MHXX row and dumped the
+        // bytes of a row that does not exist in this file.
+        assert!(app.savemap_selected.is_none());
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the refusal drew nothing");
+        assert!(
+            app.savemap_selected.is_none(),
+            "the tab landed on row {:?} of an MHGU save",
+            app.savemap_selected
+        );
+    }
+
+    /// The same name on all three screens that show a difference, for a talisman
+    /// edit: 変更一覧's 領域 column, the pre-save review and the snapshot
+    /// comparison. The 護石 tab writes the same 36 byte record as the equipment
+    /// box, so this is the case where the two rows of the save map overlap and
+    /// the value has to decide which name is printed.
+    #[test]
+    fn a_talismans_edit_is_named_a_talisman_on_every_screen() {
+        let dir = Scratch::new("charmname");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // Record #1 of slot 1's equipment box becomes a talisman: type 6 at
+        // +0x00, skill 1 at +0x0C and its points at +0x0E. The sample-free
+        // fixture means this runs on every machine.
+        let box_at = {
+            let save = app.save.as_mut().expect("a save");
+            let base = save.slot_base(0).expect("slot 1 has a base") as usize;
+            let at = base + mhnx_core::save::OFF_EQUIPMENT_BOX;
+            let record = &mut save.body_mut()[at..at + mhnx_core::save::EQUIPMENT_RECORD];
+            record[0] = mhnx_core::charm::CHARM_TYPE;
+            record[0x0C] = 1;
+            record[0x0E] = 2;
+            at
+        };
+        // Settle the file on disk to what the editor holds, so the only
+        // difference the screens find is the edit below.
+        let before = planned_bytes(&app);
+        std::fs::write(&path, &before).expect("settle the fixture");
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = String::from("system-20261104-012812.sav");
+        std::fs::write(snaps.join(&name), &before).expect("snapshot");
+        app.refresh_snapshots();
+
+        // One skill point up, written exactly where the 護石 tab writes it.
+        app.save.as_mut().expect("a save").body_mut()[box_at + 0x0E] = 3;
+        app.dirty = true;
+        let planned = planned_bytes(&app);
+
+        // 1. 保存前レビュー: the body the dialog draws.
+        let diff = mhnx_core::hbedit::diff_save(&before, &planned);
+        let head = diff.ranges.first().expect("a range").head();
+        assert_eq!(head, "スロット1 護石 #1");
+        let review = diff.window_lines(12).join("\n");
+        assert!(review.contains(&head), "{}", review);
+        assert!(review.contains("護石 #1 スキル1"), "{}", review);
+
+        // 2. 変更一覧: the 領域 column comes from the same walk.
+        app.build_review_list();
+        let list = app.review_list.as_ref().expect("a list");
+        let areas: Vec<String> = list.rows.iter().map(|row| row.area.clone()).collect();
+        assert!(areas.iter().any(|area| area.contains(&head)), "{:?}", areas);
+        // The noun of the range and of the value line now agree.
+        assert!(
+            !areas.iter().any(|area| area.contains("装備ボックス #1")),
+            "{:?}",
+            areas
+        );
+
+        // 3. スナップショット比較: the same wording, read-only.
+        app.compare_snapshot(name, None);
+        let text = app.compare.as_ref().expect("a comparison").text();
+        assert!(text.contains(&head), "{}", text);
     }
 
     /// A minimal well formed .gmd, built here so the データベース tab can be fed

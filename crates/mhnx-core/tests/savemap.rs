@@ -83,13 +83,13 @@ fn the_map_covers_every_region_of_the_save() {
         match field.kind {
             FieldKind::U16 => assert_eq!(field.len, 2, "{}", field.name),
             FieldKind::U32 => assert_eq!(field.len, 4, "{}", field.name),
-            FieldKind::Record { size, count } => {
+            FieldKind::Record { size, count, .. } => {
                 assert_eq!(size * count, field.len, "{}", field.name);
             }
             FieldKind::Byte | FieldKind::BitMap | FieldKind::Text => {}
         }
         assert!(
-            seen.insert((field.slot, field.name.clone())),
+            seen.insert((field.slot, field.name)),
             "{} is listed twice for slot {:?}",
             field.name,
             field.slot

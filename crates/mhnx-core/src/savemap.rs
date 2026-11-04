@@ -25,18 +25,18 @@
 //! still read at the right place. [dump] works on raw body bytes and therefore
 //! has to assume the MHXX layout.
 //!
-//! ## Why the `std` feature
+//! ## Both builds
 //!
-//! [fields] hands out `&'static [Field]` and a [Field] carries an owned name, so
-//! the table has to be built once behind a `Sync` once-cell. `core` + `alloc`
-//! has no such cell and this crate forbids `unsafe`, so the module is compiled
-//! with the `std` feature, exactly like [crate::safety]. The console build has
-//! no save map screen, so nothing is lost there.
+//! The table is plain data laid out at compile time, not a once-cell: every
+//! row's name is a `&'static str` and nothing is allocated or initialised when
+//! it is first read. That is what lets the console build - which has no `std`
+//! at all - hand out the same rows as the PC one. The review on hardware
+//! therefore names records the same way ("装備ボックス #24"), instead of
+//! falling back to "装備ボックス +0x33C".
 
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::sync::OnceLock;
 
 use crate::save::{self, Save};
 use crate::{
@@ -53,6 +53,21 @@ pub const DUMP_COLUMNS: usize = 16;
 /// for finding your place in a record, not for reading a box out of a window,
 /// so it stops at the same 512 bytes the reference page uses.
 pub const DUMP_BYTES: usize = 512;
+
+/// Which records of an array belong to a row.
+///
+/// Two rows can cover the same bytes. 装備ボックス is 2,000 records of 36 bytes
+/// holding weapons, armour and talismans side by side, and 護石 is the very
+/// same 2,000 records read for the talismans among them. Which row a change
+/// belongs to is a question about the value, not about the table order: the
+/// record's type byte ([crate::charm::record_type]) is what says talisman.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Claim {
+    /// Every record the row covers belongs to it.
+    Any,
+    /// Only the records [crate::charm::is_talisman] accepts belong to it.
+    Talisman,
+}
 
 /// What a stretch of bytes holds, as far as this crate can decode it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +86,8 @@ pub enum FieldKind {
         size: usize,
         /// Records the stretch holds.
         count: usize,
+        /// Which of those records the row names.
+        claim: Claim,
     },
     /// UTF-8 text, NUL padded.
     Text,
@@ -91,7 +108,11 @@ impl FieldKind {
 }
 
 /// One named stretch of the save.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Plain data the compiler can lay out ahead of time: the name is a
+/// `&'static str`, so a row holds no allocation and the whole table is built
+/// by a `const fn`. That is what the console build (no `std`) reads too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Field {
     /// Character slot the row lives in, `None` for the body-wide parts.
     pub slot: Option<usize>,
@@ -101,7 +122,7 @@ pub struct Field {
     /// How many bytes the row covers.
     pub len: usize,
     /// What the row is called, in the language of the interface.
-    pub name: String,
+    pub name: &'static str,
     /// What the bytes hold.
     pub kind: FieldKind,
 }
@@ -119,7 +140,7 @@ enum Origin {
 
 impl Origin {
     /// The base the canonical MHXX layout uses for this origin.
-    fn canonical(self) -> usize {
+    const fn canonical(self) -> usize {
         match self {
             Origin::Body => 0,
             Origin::Slot(n) => save::FIRST_SLOT_BASE as usize + n * save::SLOT_STRIDE,
@@ -128,7 +149,7 @@ impl Origin {
     }
 
     /// The slot index a [Field] reports for this origin.
-    fn slot(self) -> Option<usize> {
+    const fn slot(self) -> Option<usize> {
         match self {
             Origin::Slot(n) => Some(n),
             _ => None,
@@ -159,8 +180,7 @@ const DLC_BASE: usize = save::FIRST_SLOT_BASE as usize
 
 /// One row of the table, before it is turned into a [Field].
 ///
-/// The name is a `&'static str` here because this is a `static`: [fields] is
-/// what turns them into owned names, once.
+/// Everything here is plain data, because the whole table is a `const`.
 struct Spec {
     /// Offset from the row's origin.
     offset: usize,
@@ -182,7 +202,28 @@ const fn record(size: usize, count: usize, len: usize) -> FieldKind {
         size * count == len,
         "a record row's size x count must equal its length"
     );
-    FieldKind::Record { size, count }
+    FieldKind::Record {
+        size,
+        count,
+        claim: Claim::Any,
+    }
+}
+
+/// The same, for a row that names only the talisman records of an array.
+///
+/// 護石 is the one row built this way: it covers the equipment box's bytes, but
+/// a weapon or a piece of armour in them is not a talisman, so the row must not
+/// claim it. [row_at] uses this to settle the tie between the two rows.
+const fn talisman_records(size: usize, count: usize, len: usize) -> FieldKind {
+    assert!(
+        size * count == len,
+        "a record row's size x count must equal its length"
+    );
+    FieldKind::Record {
+        size,
+        count,
+        claim: Claim::Talisman,
+    }
 }
 
 /// The rows that sit in the body itself.
@@ -282,12 +323,15 @@ static SLOT_SPECS: &[Spec] = &[
     },
     // The talismans are the records of the equipment box whose type byte says
     // so; the row is here because the charm module is where that is decoded,
-    // and it is the same bytes as 装備ボックス above (the name says so).
+    // and it is the same bytes as 装備ボックス above. The claim is what keeps
+    // the two rows from fighting over a change: a talisman record is named by
+    // this row, a weapon or a piece of armour by the box's, whichever the table
+    // lists first.
     Spec {
         offset: save::OFF_EQUIPMENT_BOX,
         len: charm::CHARM_BOX_SIZE,
-        name: "護石（装備ボックスと同範囲）",
-        kind: record(charm::CHARM_RECORD, charm::CHARM_COUNT, charm::CHARM_BOX_SIZE),
+        name: "護石",
+        kind: talisman_records(charm::CHARM_RECORD, charm::CHARM_COUNT, charm::CHARM_BOX_SIZE),
     },
     Spec {
         offset: palicogear::PALICO_EQUIP_OFFSET,
@@ -467,54 +511,146 @@ static SLOT_SPECS: &[Spec] = &[
 ];
 
 /// How many rows the map has.
-fn total() -> usize {
-    BODY_SPECS.len() + DLC_SPECS.len() + SLOT_SPECS.len() * save::MAX_SLOTS
-}
+pub const ROWS: usize = BODY_SPECS.len() + DLC_SPECS.len() + SLOT_SPECS.len() * save::MAX_SLOTS;
+
+/// A row with nothing in it, used only to size [TABLE].
+const EMPTY_ROW: Field = Field {
+    slot: None,
+    offset: 0,
+    len: 0,
+    name: "",
+    kind: FieldKind::Byte,
+};
 
 /// The row behind an index, with the origin its offset counts from.
-fn spec(index: usize) -> Option<(Origin, &'static Spec)> {
+const fn spec_at(index: usize) -> (Origin, &'static Spec) {
     let body = BODY_SPECS.len();
     if index < body {
-        return Some((Origin::Body, &BODY_SPECS[index]));
+        return (Origin::Body, &BODY_SPECS[index]);
     }
-    let i = index - body;
-    if i < DLC_SPECS.len() {
-        return Some((Origin::Dlc, &DLC_SPECS[i]));
+    let index = index - body;
+    if index < DLC_SPECS.len() {
+        return (Origin::Dlc, &DLC_SPECS[index]);
     }
-    let i = i - DLC_SPECS.len();
-    let slot = i / SLOT_SPECS.len();
-    if slot >= save::MAX_SLOTS {
-        return None;
-    }
-    Some((Origin::Slot(slot), &SLOT_SPECS[i % SLOT_SPECS.len()]))
+    let index = index - DLC_SPECS.len();
+    (
+        Origin::Slot(index / SLOT_SPECS.len()),
+        &SLOT_SPECS[index % SLOT_SPECS.len()],
+    )
 }
 
 /// Build one [Field] from a row.
-fn field_at(index: usize) -> Option<Field> {
-    let (origin, spec) = spec(index)?;
-    Some(Field {
+const fn field_at(index: usize) -> Field {
+    let (origin, spec) = spec_at(index);
+    Field {
         slot: origin.slot(),
         offset: origin.canonical() + spec.offset,
         len: spec.len,
-        name: String::from(spec.name),
+        name: spec.name,
         kind: spec.kind,
-    })
+    }
+}
+
+/// The table, laid out by the compiler: no allocation, no once-cell.
+const fn build_table() -> [Field; ROWS] {
+    let mut out = [EMPTY_ROW; ROWS];
+    let mut index = 0;
+    while index < ROWS {
+        out[index] = field_at(index);
+        index += 1;
+    }
+    out
+}
+
+/// Every row of the map, built ahead of time.
+static TABLE: [Field; ROWS] = build_table();
+
+/// The row behind an index, when the index is in the table.
+fn spec(index: usize) -> Option<(Origin, &'static Spec)> {
+    if index >= ROWS {
+        return None;
+    }
+    Some(spec_at(index))
 }
 
 /// Every named stretch of a save, in the order the tab lists them.
 ///
-/// The table is built once and handed out by reference: the GUI asks for it
-/// every frame and the rows never change.
+/// The table is a `static` built at compile time and handed out by reference:
+/// the GUI asks for it every frame, the rows never change, and the console
+/// build reads the very same ones.
 ///
 /// The rows are grouped the way the tabs are (character, boxes, records, guild
 /// card, progress, shoutouts) rather than sorted by offset, because a reader
 /// looks for "the equipment box" before "whatever lives at 0x62EE". Within a
 /// group the order follows the offsets.
 pub fn fields() -> &'static [Field] {
-    static TABLE: OnceLock<Vec<Field>> = OnceLock::new();
-    TABLE
-        .get_or_init(|| (0..total()).filter_map(field_at).collect())
-        .as_slice()
+    &TABLE
+}
+
+/// How strongly the row at `index` claims the byte at `body_off`.
+///
+/// A row that names any record it covers claims weakly (0); one that names
+/// only records of one kind claims strongly (1) when the value is that kind
+/// and not at all (-1) when it is not. 護石 is the only row of the second sort:
+/// the box holds weapons, armour and talismans side by side, so whether a
+/// change is a talisman's is a question about the record's type byte
+/// ([crate::charm::is_talisman]), not about which row the table lists first.
+fn claim_rank(save: &Save, index: usize, start: usize, body_off: usize) -> i8 {
+    match TABLE[index].kind {
+        FieldKind::Record {
+            claim: Claim::Any, ..
+        } => 0,
+        FieldKind::Record {
+            size,
+            claim: Claim::Talisman,
+            ..
+        } => {
+            let at = start + ((body_off - start) / size) * size;
+            match save.body().get(at..at + size) {
+                Some(record) if charm::is_talisman(record) => 1,
+                _ => -1,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// The row that names the byte at `body_off`, or `None` when no row covers it.
+///
+/// The narrowest row wins. Two rows of the same width are settled by how
+/// strongly they claim the byte: 装備ボックス and 護石 cover the same 72,000
+/// bytes, so the record's type byte decides, and a talisman's skill point is
+/// named `護石 #225` rather than `装備ボックス #225`. A row whose records are
+/// not the kind it names takes no part at all.
+///
+/// Every build reads this: the table carries `&'static str` names, so the
+/// console one has it too and its review names records the same way as the PC
+/// one.
+pub fn row_at(save: &Save, body_off: usize) -> Option<usize> {
+    let mut best: Option<(usize, i8)> = None;
+    for index in 0..ROWS {
+        let Some(start) = offset_in(save, index) else {
+            continue;
+        };
+        if body_off < start || body_off >= start + TABLE[index].len {
+            continue;
+        }
+        let rank = claim_rank(save, index, start, body_off);
+        if rank < 0 {
+            continue;
+        }
+        let keep = match best {
+            Some((kept, kept_rank)) => {
+                TABLE[kept].len < TABLE[index].len
+                    || (TABLE[kept].len == TABLE[index].len && kept_rank >= rank)
+            }
+            None => false,
+        };
+        if !keep {
+            best = Some((index, rank));
+        }
+    }
+    best.map(|(index, _)| index)
 }
 
 /// What the row at `field_index` belongs to: 本体, DLC セクション, or スロットN.
@@ -646,7 +782,7 @@ fn describe(bytes: &[u8], kind: FieldKind) -> String {
                 ones
             )
         }
-        FieldKind::Record { size, count } => format!("{} バイト × {} 件", size, count),
+        FieldKind::Record { size, count, .. } => format!("{} バイト × {} 件", size, count),
     }
 }
 
@@ -713,15 +849,51 @@ mod tests {
             match field.kind {
                 FieldKind::U16 => assert_eq!(field.len, 2, "{}", field.name),
                 FieldKind::U32 => assert_eq!(field.len, 4, "{}", field.name),
-                FieldKind::Record { size, count } => {
+                FieldKind::Record { size, count, .. } => {
                     assert!(size > 0 && count > 0, "{}", field.name);
                     assert_eq!(size * count, field.len, "{}", field.name);
                 }
                 _ => {}
             }
         }
-        // The table is built once and handed out by reference.
+        // The table is one `static`: the same rows every time, built by the
+        // compiler rather than by a once-cell the console build does not have.
         assert!(core::ptr::eq(fields().as_ptr(), fields().as_ptr()));
+        assert_eq!(fields().len(), ROWS);
+    }
+
+    /// The names are `&'static str` and the table is a `const`, which is what
+    /// lets the review name records on the console build too. A `String` here
+    /// would put a once-cell (and `std`) back into the module.
+    #[test]
+    fn the_rows_need_no_cell_and_no_allocation() {
+        let name: &'static str = fields()[0].name;
+        assert_eq!(name, "画面の明るさ");
+        // Rows can be held in a const: nothing in Field is an allocation.
+        const FIRST: Field = TABLE[0];
+        assert_eq!(FIRST.name, "画面の明るさ");
+        // The one proviso: the charm row names only talisman records.
+        let charm_row = fields()
+            .iter()
+            .position(|f| f.name == "護石")
+            .expect("the talisman row");
+        assert!(matches!(
+            fields()[charm_row].kind,
+            FieldKind::Record {
+                claim: Claim::Talisman,
+                ..
+            }
+        ));
+        assert!(fields()
+            .iter()
+            .filter(|f| f.name != "護石")
+            .all(|f| !matches!(
+                f.kind,
+                FieldKind::Record {
+                    claim: Claim::Talisman,
+                    ..
+                }
+            )));
     }
 
     /// The rows have to be the constants' own numbers: a row that recomputed

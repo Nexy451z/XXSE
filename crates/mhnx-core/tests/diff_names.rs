@@ -325,3 +325,97 @@ fn edit_guild_card(save: &mut Save) {
         "the guild card writes"
     );
 }
+
+// ------------------------------------------------------------- the talisman
+
+/// A talisman and a piece of equipment are the same 36 byte record at the same
+/// offset: 72,000 bytes hold all 2,000 of them, weapons and armour and
+/// talismans side by side. The review used to name both with whichever row the
+/// table lists first (装備ボックス) while the value line under it said
+/// 「護石 #225 スキル1」. The record's type byte decides now.
+#[test]
+fn a_talisman_is_named_by_the_talisman_row() {
+    let box_at = equipment_box_byte();
+    // Record #1 of slot 1 as a talisman: type 6 at +0x00, skill 1 at +0x0C and
+    // its points at +0x0E - the two bytes the 護石 tab writes.
+    let mut base = save::empty_switch_save();
+    {
+        let record = &mut base.body_mut()[box_at..box_at + save::EQUIPMENT_RECORD];
+        record[0] = mhnx_core::charm::CHARM_TYPE;
+        record[0x0C] = 1;
+        record[0x0E] = 2;
+    }
+    let old = base.to_bytes();
+    let mut new_save = base.clone();
+    new_save.body_mut()[box_at + 0x0E] = 3;
+
+    let diff = hbedit::diff_save(&old, &new_save.to_bytes());
+    assert_eq!(diff.ranges.len(), 1, "{:?}", diff.ranges);
+    let range = &diff.ranges[0];
+    // The gate is still the layout's part: the value walk runs the same
+    // getters, only the printed name changes.
+    assert_eq!(range.part, "装備ボックス");
+    assert_eq!(range.name, "護石 #1");
+    assert_eq!(range.head(), "スロット1 護石 #1");
+    assert_eq!(
+        range.line(),
+        "スロット1 護石 #1 1 バイト（1 枠）"
+    );
+    assert_eq!(
+        range.window_line(),
+        "スロット1 護石 #1 +0xE 付近 1 バイト（1 枠）"
+    );
+    // The value line says the same noun as the range line, which is the whole
+    // point: before this the two disagreed on screen.
+    let text = bodies(&diff);
+    assert!(text.contains("護石 #1 スキル1"), "{}", text);
+    assert!(!text.contains("装備ボックス #1"), "{}", text);
+
+    // The very same bytes with an armour piece in the record: the type byte is
+    // what moved the name to 護石 above, so this one has to stay 装備ボックス.
+    let mut armour = save::empty_switch_save();
+    {
+        let record = &mut armour.body_mut()[box_at..box_at + save::EQUIPMENT_RECORD];
+        record[0] = 2; // armour (types 1..5), not the talisman's 6
+        record[0x0C] = 1;
+        record[0x0E] = 2;
+    }
+    let old = armour.to_bytes();
+    let mut new_save = armour.clone();
+    new_save.body_mut()[box_at + 0x0E] = 3;
+    let diff = hbedit::diff_save(&old, &new_save.to_bytes());
+    assert_eq!(diff.ranges.len(), 1, "{:?}", diff.ranges);
+    assert_eq!(diff.ranges[0].part, "装備ボックス");
+    assert_eq!(diff.ranges[0].name, "装備ボックス #1");
+    assert_eq!(diff.ranges[0].head(), "スロット1 装備ボックス #1");
+}
+
+// ---------------------------------------------------- both builds, one name
+
+/// The review's names are table data on both builds now (no `std` gate, no
+/// `OnceLock`), so the console reads the same records the PC does. This pins
+/// the two things that used to differ: `map_row_at` returned `None` without
+/// `std`, and the map was left out of that build altogether.
+#[test]
+fn the_naming_path_is_not_gated_on_std() {
+    let hbedit = include_str!("../src/hbedit.rs");
+    let start = hbedit.find("fn map_row_at").expect("fn map_row_at");
+    let tail = &hbedit[start..];
+    let end = tail.find("\n}\n").expect("the end of map_row_at");
+    let body = &tail[..end];
+    assert!(
+        !body.contains("feature = \"std\""),
+        "map_row_at is gated on std again: the console review would name offsets where the PC names records:\n{}",
+        body
+    );
+    // The map itself holds in a build without std: plain data, no once-cell.
+    let savemap = include_str!("../src/savemap.rs");
+    assert!(
+        !savemap.contains("feature = \"std\""),
+        "the save map is behind the std feature again"
+    );
+    assert!(
+        !savemap.contains("OnceLock"),
+        "the save map went back to a once-cell, which the console build has no way to build"
+    );
+}

@@ -1145,9 +1145,9 @@ pub struct SaveUndo {
 // is narrower, so a change the table cannot name is printed with the map's own
 // row instead of "その他". A row neither table covers is still "その他".
 //
-// The save map is built behind a `OnceLock`, so it is only compiled with the
-// `std` feature; the console build falls back to this table alone ([map_row_at]
-// is the one place that differs).
+// The save map is plain table data (`&'static str` names, no once-cell), so it
+// is compiled into both builds and the console names records exactly like the
+// PC one. This table stays as the fallback for bytes the map does not cover.
 // ---------------------------------------------------------------------------
 
 /// One named part of the save.
@@ -1607,52 +1607,29 @@ impl MapRow {
 
 /// The save map row that covers `body_off`, narrowest first.
 ///
-/// Rows of equal length are taken in table order, which is what keeps
-/// 装備ボックス the name of an equipment edit: 護石 covers the same 72,000
-/// bytes (the same records, whichever way the box is read), and calling an
-/// armour level a talisman would be worse than the offset it replaced.
+/// Which row that is when two of them cover the same bytes is decided by the
+/// value, in [crate::savemap::row_at]: 装備ボックス and 護石 both span the
+/// equipment box's 72,000 bytes, and the record's type byte (`charm`) says
+/// which one a change belongs to. Everything here reads the row it hands back.
 ///
-/// The save map is built once behind a `OnceLock` and therefore only compiled
-/// with the `std` feature. The console build has no rows, so this is where the
-/// one difference between the two builds lives: everything below falls back to
-/// the layout, exactly the way it did before the map existed.
+/// The map is plain data on both builds (its names are `&'static str`), so the
+/// console review names records the same way the PC one does. There is no
+/// `std` gate left in this path: an offset-only fallback on hardware was the
+/// one place the two reviews disagreed.
 fn map_row_at(save: &Save, body_off: usize) -> Option<MapRow> {
-    #[cfg(not(feature = "std"))]
-    {
-        let _ = (save, body_off);
-        None
-    }
-    #[cfg(feature = "std")]
-    {
-        use crate::savemap::{self, FieldKind};
-        let mut best: Option<MapRow> = None;
-        for (index, field) in savemap::fields().iter().enumerate() {
-            let Some(start) = savemap::offset_in(save, index) else {
-                continue;
-            };
-            if body_off < start || body_off >= start + field.len {
-                continue;
-            }
-            // Strictly narrower: an equal span is the row seen first, which is
-            // the order the tab lists them in.
-            if let Some(row) = &best {
-                if field.len >= row.len {
-                    continue;
-                }
-            }
-            best = Some(MapRow {
-                slot: field.slot,
-                start,
-                len: field.len,
-                name: field.name.as_str(),
-                record: match field.kind {
-                    FieldKind::Record { size, .. } => size,
-                    _ => 0,
-                },
-            });
-        }
-        best
-    }
+    use crate::savemap::{self, FieldKind};
+    let index = savemap::row_at(save, body_off)?;
+    let field = savemap::fields().get(index)?;
+    Some(MapRow {
+        slot: field.slot,
+        start: savemap::offset_in(save, index)?,
+        len: field.len,
+        name: field.name,
+        record: match field.kind {
+            FieldKind::Record { size, .. } => size,
+            _ => 0,
+        },
+    })
 }
 
 /// Where a body offset sits, as the review names it.
@@ -1742,12 +1719,9 @@ fn region_starts(save: &Save) -> Vec<usize> {
     }
     // The map's rows start named stretches too: a gap between two parts ends at
     // whichever table names the byte that follows it.
-    #[cfg(feature = "std")]
-    {
-        for index in 0..crate::savemap::fields().len() {
-            if let Some(start) = crate::savemap::offset_in(save, index) {
-                starts.push(start);
-            }
+    for index in 0..crate::savemap::fields().len() {
+        if let Some(start) = crate::savemap::offset_in(save, index) {
+            starts.push(start);
         }
     }
     starts
