@@ -9,11 +9,12 @@ use mhnx_core::arc::{extension_for, Arc};
 use mhnx_core::awards;
 use mhnx_core::check::{self, Finding, Severity};
 use mhnx_core::csvout::{self, ApplyReport, EquipmentRow};
+use mhnx_core::diffvalues::ValueChange;
 use mhnx_core::dlc;
 use mhnx_core::equipops::{self, EquipError};
 use mhnx_core::equiprefs::EquipRef;
 use mhnx_core::gamedata::LAST_ITEM_ID;
-use mhnx_core::hbedit::SaveDiff;
+use mhnx_core::hbedit::{DiffRange, SaveDiff};
 use mhnx_core::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT};
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::questfields::FieldKind;
@@ -125,6 +126,9 @@ pub enum Tab {
     Palico,
     Sets,
     Extras,
+    /// The 変更一覧: every value that differs from the file on disk, one line
+    /// each, with the one-item undo the audit found missing.
+    Review,
     About,
 }
 
@@ -216,6 +220,16 @@ pub enum Confirm {
     /// what it changes. The difference waits in [MhnxEditor::review];
     /// 「保存する」 runs that very write, 「やめる」 drops it.
     ReviewWrite,
+    /// One line of the 変更一覧 put back to the saved value. It changes the
+    /// save the editor holds (not the file), so it asks first like any other
+    /// edit that writes bytes; see [MhnxEditor::restore_review_row].
+    ReviewRestore {
+        /// Which line of [MhnxEditor::review_list] the answer runs.
+        row: usize,
+        /// The line as it was shown, so the dialog says what it is about
+        /// without depending on the list still holding that index.
+        line: String,
+    },
 }
 
 /// Two-step confirmation for the destructive charm delete.
@@ -422,6 +436,82 @@ pub struct WriteReview {
     pub new_len: usize,
     /// The difference between the two.
     pub diff: SaveDiff,
+}
+
+/// One line of the 変更一覧: a value that differs from the file on disk, and
+/// the bytes that have to go back for that one line to disappear.
+///
+/// The bytes are not guessed from the name of the line. They are worked out
+/// when the list is built, by putting one stretch of the saved file at a time
+/// back into the planned save and running the same value walk the review runs
+/// (see [MhnxEditor::plan_review_rows]). A line whose value stops differing is
+/// made of that stretch, and a line that shares a stretch with another line is
+/// refused rather than allowed to take the other one with it.
+pub struct ReviewRow {
+    /// The value itself, worded the way the review words it.
+    pub change: ValueChange,
+    /// Absolute offsets in the file, with the length to copy from the saved
+    /// bytes. None when the line cannot be put back on its own.
+    pub atoms: Option<Vec<(usize, usize)>>,
+    /// Where the bytes live, as the core layout names that part, for the 領域
+    /// column. Empty when the bytes are not known.
+    pub area: String,
+    /// Why the line cannot be put back on its own; empty when it can.
+    pub blocked: String,
+}
+
+impl ReviewRow {
+    /// "領域 / 項目: 旧 → 新", the line the tests print and the reason lines
+    /// are built from.
+    pub fn line(&self) -> String {
+        if self.area.is_empty() {
+            self.change.line()
+        } else {
+            format!("{} / {}", self.area, self.change.line())
+        }
+    }
+
+    /// Can this line be put back without touching another one?
+    pub fn can_restore(&self) -> bool {
+        self.atoms.is_some()
+    }
+}
+
+/// The 変更一覧 tab's list: what the open save differs from the file on disk
+/// in, one line per value, each restorable on its own.
+///
+/// The reference is the file on disk - the contents the editor opened, or the
+/// contents it last saved - which is the same reference the pre-save review
+/// compares against. The two screens therefore cannot disagree about what has
+/// changed. The saved bytes are kept so a line can be put back without reading
+/// the file again.
+pub struct ReviewList {
+    /// The file the comparison starts from.
+    pub path: PathBuf,
+    /// Its bytes, kept so a line's 旧 side can be copied back.
+    pub old: Vec<u8>,
+    /// Length of what the editor would write now.
+    pub new_len: usize,
+    /// How many bytes differ from the file on disk.
+    pub changed: usize,
+    /// Feature level lines, e.g. "スロット1: 名前、装備ボックス 1 枠".
+    pub summary: Vec<String>,
+    /// One line per readable value, in file order.
+    pub rows: Vec<ReviewRow>,
+    /// How many named stretches the byte walk found. Not every stretch gets a
+    /// value line - a byte nobody can decode keeps its range and no line - so
+    /// this is the count the header prints beside the lines.
+    pub ranges: usize,
+    /// A cheap fingerprint of the planned bytes, so a line cannot be applied to
+    /// a save the list was not built from.
+    pub stamp: u64,
+}
+
+impl ReviewList {
+    /// How many lines can be put back on their own.
+    pub fn restorable(&self) -> usize {
+        self.rows.iter().filter(|row| row.can_restore()).count()
+    }
 }
 
 // The review body itself is built by mhnx_core
@@ -727,6 +817,13 @@ pub struct MhnxEditor {
     pub write_reviewed: bool,
     /// The write that passed the safety check and is waiting for its review.
     pub review: Option<WriteReview>,
+    /// The 変更一覧 tab's list. Built when the tab is opened rather than every
+    /// frame: building it reads and parses a 4.7 MB file and runs the byte wide
+    /// diff, which is not something to do sixty times a second.
+    pub review_list: Option<ReviewList>,
+    /// The tab drawn last frame, so opening 変更一覧 knows it was opened and
+    /// rebuilds the list the other tabs have invalidated.
+    pub shown_tab: Option<Tab>,
 
     // ---- undo: the whole save, shared by every tab ----
     /// Steps of the all-tab undo, newest last. Each one is a whole parsed save
@@ -907,6 +1004,8 @@ impl Default for MhnxEditor {
             write_force: false,
             write_reviewed: false,
             review: None,
+            review_list: None,
+            shown_tab: None,
             undo: Vec::new(),
             redo: Vec::new(),
             undo_steps: Self::DEFAULT_UNDO_STEPS,
@@ -1019,6 +1118,9 @@ impl MhnxEditor {
         // A received card belongs to the slot that received it; the same index
         // in another slot is a different hunter's card.
         self.card_selected = None;
+        // The 変更一覧 was built against the save that is being replaced here,
+        // so its rows and their byte plans no longer mean anything.
+        self.review_list = None;
         let Some(s) = &self.save else { return };
         if let Some(c) = s.read_character(self.slot) {
             self.edit = c;
@@ -1840,6 +1942,381 @@ impl MhnxEditor {
         lines.join("\n")
     }
 
+    // --------------------------------------------- the 変更一覧 (per line)
+
+    /// Rebuild [MhnxEditor::review_list] from the file on disk and the save as
+    /// the next write would land it.
+    ///
+    /// The file is read again instead of keeping what it looked like at open
+    /// time: the reference is "last saved", which is what the disk holds, and
+    /// after a save that is no longer the contents the editor opened.
+    pub fn build_review_list(&mut self) {
+        self.review_list = None;
+        let Some(path) = self.save_path.clone() else {
+            return;
+        };
+        let Some(planned) = self.planned_save() else {
+            return;
+        };
+        // MHGU is a different layout: naming values with MHXX offsets would
+        // point at the wrong bytes, and the write is refused anyway. No list.
+        if planned.kind() == SaveKind::Mhgu {
+            return;
+        }
+        let Ok(old) = std::fs::read(&path) else {
+            return;
+        };
+        self.review_list = Some(Self::review_list_of(&path, old, &planned, &self.title_table));
+    }
+
+    /// The list for one pair of byte slices.
+    ///
+    /// Both sides are parsed when they parse so the ranges can be named; a file
+    /// that changed kind (a 3DS body under a Switch save) still gets its byte
+    /// count, with every line refused because nothing can say which bytes
+    /// belong to which value.
+    fn review_list_of(
+        path: &std::path::Path,
+        old: Vec<u8>,
+        planned: &Save,
+        titles: &mhnx_core::guildcard::TitleTable,
+    ) -> ReviewList {
+        let new = planned.to_bytes();
+        let header = if planned.kind().has_header() {
+            mhnx_core::save::SWITCH_HEADER_SIZE
+        } else {
+            0
+        };
+        let (changed, ranges) = mhnx_core::hbedit::diff_ranges(&old, &new, header, planned);
+        let previous = Save::from_bytes(&old).ok();
+        let comparable =
+            matches!(&previous, Some(previous) if previous.kind() == planned.kind());
+        let (summary, values) = match &previous {
+            Some(previous) if comparable && changed > 0 => (
+                mhnx_core::hbedit::diff_summary(&ranges, previous, planned),
+                mhnx_core::diffvalues::diff_values(&ranges, previous, planned, Some(titles)),
+            ),
+            _ => (Vec::new(), Vec::new()),
+        };
+        let rows = match &previous {
+            Some(previous) if comparable && changed > 0 => {
+                Self::plan_review_rows(&old, &new, &ranges, previous, planned, &values, titles)
+            }
+            _ => values
+                .iter()
+                .map(|value| ReviewRow {
+                    change: value.clone(),
+                    atoms: None,
+                    area: String::new(),
+                    blocked: String::from(
+                        "ディスク上のファイルがセーブとして読めない（または形式が違う）ため、戻す範囲を特定できません",
+                    ),
+                })
+                .collect(),
+        };
+        ReviewList {
+            path: path.to_path_buf(),
+            old,
+            new_len: new.len(),
+            changed,
+            summary,
+            rows,
+            ranges: ranges.len(),
+            stamp: Self::bytes_stamp(&new),
+        }
+    }
+
+    /// Work out which bytes belong to which line.
+    ///
+    /// Every contiguous stretch of changed bytes is put back into the planned
+    /// save on its own and the value walk runs again: the lines that stop
+    /// differing are the ones that stretch belongs to. A line made of several
+    /// stretches is put back all at once and checked the same way against the
+    /// whole list, so a plan is only accepted when the result is exactly "the
+    /// list minus this line". A line that shares a stretch with another line is
+    /// refused, because putting it back would take the other one with it.
+    fn plan_review_rows(
+        old: &[u8],
+        new: &[u8],
+        ranges: &[DiffRange],
+        old_save: &Save,
+        new_save: &Save,
+        values: &[ValueChange],
+        titles: &mhnx_core::guildcard::TitleTable,
+    ) -> Vec<ReviewRow> {
+        // Beyond this the list is refused: the probe parses a save and walks
+        // the values once per stretch, and a save wide edit would turn opening
+        // the tab into a minute of work. Refusing is the safe side.
+        const MAX_STRETCHES: usize = 64;
+        let mut rows: Vec<ReviewRow> = values
+            .iter()
+            .map(|value| ReviewRow {
+                change: value.clone(),
+                atoms: None,
+                area: String::new(),
+                blocked: String::new(),
+            })
+            .collect();
+        if rows.is_empty() {
+            return rows;
+        }
+        let refuse_all = |rows: &mut Vec<ReviewRow>, why: &str| {
+            for row in rows.iter_mut() {
+                row.blocked = why.to_owned();
+            }
+        };
+        if old.len() != new.len() {
+            refuse_all(
+                &mut rows,
+                "ファイルのサイズが変わるため、項目ごとのバイト範囲を特定できません",
+            );
+            return rows;
+        }
+        let header = if new_save.kind().has_header() {
+            mhnx_core::save::SWITCH_HEADER_SIZE
+        } else {
+            0
+        };
+        let atoms = Self::changed_atoms(old, new);
+        if atoms.len() > MAX_STRETCHES {
+            refuse_all(
+                &mut rows,
+                &format!(
+                    "変更が {} か所に分かれているため、項目ごとのバイト範囲を特定できません（一度に扱えるのは {} か所まで）",
+                    atoms.len(),
+                    MAX_STRETCHES
+                ),
+            );
+            return rows;
+        }
+        // Which lines each stretch moves, and what the layout calls it.
+        let mut moved: Vec<Vec<usize>> = Vec::with_capacity(atoms.len());
+        let mut areas: Vec<String> = Vec::with_capacity(atoms.len());
+        for atom in &atoms {
+            let probe = Self::put_back(old, new, std::slice::from_ref(atom))
+                .and_then(|bytes| Save::from_bytes(&bytes).ok().map(|save| (bytes, save)));
+            let Some((bytes, save)) = probe else {
+                moved.push(Vec::new());
+                areas.push(String::new());
+                continue;
+            };
+            areas.push(Self::range_heads(&bytes, new, header, new_save).join("、"));
+            let after = mhnx_core::diffvalues::diff_values(ranges, old_save, &save, Some(titles));
+            moved.push(
+                values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| {
+                        match after.iter().find(|other| Self::same_field(other, value)) {
+                            Some(after) => after != *value,
+                            None => true,
+                        }
+                    })
+                    .map(|(index, _)| index)
+                    .collect(),
+            );
+        }
+        for (index, row) in rows.iter_mut().enumerate() {
+            let mine: Vec<usize> = (0..atoms.len())
+                .filter(|atom| moved[*atom].contains(&index))
+                .collect();
+            if mine.is_empty() {
+                row.blocked = String::from(
+                    "この項目のバイト列を特定できませんでした（値が複数の場所から読まれているか、ほかの変更と同じ場所にあります）",
+                );
+                continue;
+            }
+            let mut others: Vec<String> = Vec::new();
+            for atom in &mine {
+                for other in &moved[*atom] {
+                    if *other != index && !others.contains(&values[*other].field) {
+                        others.push(values[*other].field.clone());
+                    }
+                }
+            }
+            if !others.is_empty() {
+                let shown: Vec<String> = others.iter().take(3).cloned().collect();
+                row.blocked = format!(
+                    "同じバイト列に他の変更（{}）があるため、この項目だけは戻せません",
+                    shown.join("、")
+                );
+                continue;
+            }
+            let set: Vec<(usize, usize)> = mine.iter().map(|atom| atoms[*atom]).collect();
+            let Some(bytes) = Self::put_back(old, new, &set) else {
+                row.blocked = String::from("戻すバイト列を作れませんでした");
+                continue;
+            };
+            let Ok(save) = Save::from_bytes(&bytes) else {
+                row.blocked =
+                    String::from("戻した内容がセーブとして読めないため、この項目は戻せません");
+                continue;
+            };
+            let after = mhnx_core::diffvalues::diff_values(ranges, old_save, &save, Some(titles));
+            let mut expected = values.to_vec();
+            expected.remove(index);
+            if after != expected {
+                row.blocked =
+                    String::from("戻すとほかの値も一緒に変わるため、この項目だけは戻せません");
+                continue;
+            }
+            let mut heads: Vec<String> = Vec::new();
+            for atom in &mine {
+                if !areas[*atom].is_empty() && !heads.contains(&areas[*atom]) {
+                    heads.push(areas[*atom].clone());
+                }
+            }
+            row.area = heads.join("、");
+            row.atoms = Some(set);
+        }
+        rows
+    }
+
+    /// Every contiguous stretch of bytes the planned save changes, in file
+    /// order.
+    ///
+    /// Not the same as [mhnx_core::hbedit::diff_ranges]: that groups stretches
+    /// closer than 32 bytes so the review gets one line per record. A line can
+    /// only be put back from bytes that really belong to it, so these are the
+    /// raw runs of differing bytes, with nothing merged across a gap.
+    fn changed_atoms(old: &[u8], new: &[u8]) -> Vec<(usize, usize)> {
+        let common = old.len().min(new.len());
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut at = 0;
+        while at < common {
+            if old[at] == new[at] {
+                at += 1;
+                continue;
+            }
+            let start = at;
+            while at < common && old[at] != new[at] {
+                at += 1;
+            }
+            out.push((start, at - start));
+        }
+        out
+    }
+
+    /// A copy of `new` with the saved bytes of these stretches put back.
+    fn put_back(old: &[u8], new: &[u8], atoms: &[(usize, usize)]) -> Option<Vec<u8>> {
+        if old.len() != new.len() {
+            return None;
+        }
+        let mut bytes = new.to_vec();
+        for (start, len) in atoms {
+            let end = start.checked_add(*len)?;
+            if end > bytes.len() {
+                return None;
+            }
+            bytes[*start..end].copy_from_slice(&old[*start..end]);
+        }
+        Some(bytes)
+    }
+
+    /// What the layout calls the stretches `probe` differs from `new` in.
+    ///
+    /// The same walk the review uses, over a pair whose only difference is one
+    /// line's bytes, so the names come from the core layout instead of a table
+    /// of this window's own.
+    fn range_heads(probe: &[u8], new: &[u8], header: usize, save: &Save) -> Vec<String> {
+        let mut heads: Vec<String> = Vec::new();
+        for range in mhnx_core::hbedit::diff_ranges(probe, new, header, save).1 {
+            let head = range.head();
+            if !heads.contains(&head) {
+                heads.push(head);
+            }
+        }
+        heads
+    }
+
+    /// Do two lines describe the same field?
+    ///
+    /// A line's identity is its slot and its field: putting bytes back only
+    /// changes the 新 side, never the 旧 one, so a line that is still there is
+    /// the same line.
+    fn same_field(a: &ValueChange, b: &ValueChange) -> bool {
+        a.slot == b.slot && a.field == b.field
+    }
+
+    /// A cheap fingerprint of the planned bytes (FNV-1a, 64 bit).
+    ///
+    /// The list is built once and used later, and the save can be edited from
+    /// the keyboard while it is on screen. A row is only applied when this
+    /// still matches, so a plan can never land on bytes it was not built from.
+    fn bytes_stamp(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Put one line of the 変更一覧 back to the value the saved file holds.
+    ///
+    /// Only the bytes the list decided belong to that line are copied, and only
+    /// after the plan was checked against the whole value walk (see
+    /// [MhnxEditor::plan_review_rows]). Nothing is written to disk: the save
+    /// the editor holds changes, the next 保存 puts it out, and the step goes
+    /// onto the same LIFO history as every other edit, so 元に戻す can take it
+    /// back. The list is rebuilt, so the line that was restored is gone from it.
+    pub fn restore_review_row(&mut self, index: usize) -> bool {
+        let Some(list) = self.review_list.as_ref() else {
+            self.message = String::from("変更一覧がありません（タブを開き直してください）");
+            return false;
+        };
+        let Some(row) = list.rows.get(index) else {
+            self.message = String::from("その行は一覧にありません（一覧を作り直してください）");
+            return false;
+        };
+        let Some(atoms) = row.atoms.clone() else {
+            self.message = format!("この項目は戻せません: {}", row.blocked);
+            return false;
+        };
+        let line = row.line();
+        let field = row.change.field.clone();
+        let old = list.old.clone();
+        let stamp = list.stamp;
+        let Some(planned) = self.planned_save() else {
+            self.message = String::from("戻す元のセーブがありません");
+            return false;
+        };
+        let mut bytes = planned.to_bytes();
+        if bytes.len() != old.len() || Self::bytes_stamp(&bytes) != stamp {
+            self.review_list = None;
+            self.message =
+                String::from("一覧が古くなっていたので作り直しました。もう一度その行を選んでください");
+            return false;
+        }
+        for (start, len) in &atoms {
+            let end = start.saturating_add(*len);
+            if end > bytes.len() {
+                self.message =
+                    String::from("戻す範囲がファイルの外を指しているので、この項目は戻しません");
+                return false;
+            }
+            bytes[*start..end].copy_from_slice(&old[*start..end]);
+        }
+        let Ok(restored) = Save::from_bytes(&bytes) else {
+            self.message =
+                String::from("戻した内容がセーブとして読めないので、この項目は戻しません");
+            return false;
+        };
+        // The step keeps the state that was on screen, edits that had not been
+        // folded into the save included, so 元に戻す returns to exactly that.
+        self.save = Some(planned);
+        self.push_undo(format!("{} を戻す", field));
+        self.save = Some(restored);
+        self.dirty = true;
+        self.reload_from_save();
+        self.build_review_list();
+        self.message = format!(
+            "「{}」だけを戻しました（まだファイルには書いていません）",
+            line
+        );
+        true
+    }
+
     // -------------------------------------------------- undo, shared by tabs
 
     /// The history depth a fresh editor starts with.
@@ -2042,6 +2519,9 @@ impl MhnxEditor {
                 }
                 m += &Self::snapshot_note(stamped);
                 self.message = m;
+                // The file now holds what the editor holds: the list would be
+                // empty, and was built against the previous state.
+                self.review_list = None;
             }
             Err(e) => {
                 // Nothing landed, so the edits are still only in memory.
@@ -2109,6 +2589,10 @@ impl MhnxEditor {
                 let note = stamped.map(|s| format!("{}/snapshots/{}", dir.display(), s));
                 m += &Self::snapshot_note(note);
                 self.message = m;
+                // Same as the single file: what the list compared against just
+                // changed. (The pair may be another folder; rebuilding is
+                // cheap and never wrong.)
+                self.review_list = None;
             }
             (e1, e2) => {
                 // At least one of the two did not land; say which and why.
@@ -2146,6 +2630,7 @@ impl MhnxEditor {
                 self.remember_file(&path);
                 let mut m = format!("3DS 形式で書き出しました: {}", path.display());
                 m += &format!("（{}）", check);
+                self.review_list = None;
                 if let Some(b) = backup {
                     m += &format!("（元のファイルは {} に退避）", b.display());
                 }
@@ -2601,6 +3086,15 @@ impl eframe::App for MhnxEditor {
         // The hooks main.rs does not know about are resolved here; see
         // apply_launch_env.
         self.apply_launch_env();
+        // Opening 変更一覧 rebuilds its list: it names what the other tabs
+        // changed, and rebuilding it every frame would read, parse and diff a
+        // 4.7 MB file sixty times a second.
+        if self.shown_tab != Some(self.tab) {
+            if self.tab == Tab::Review {
+                self.review_list = None;
+            }
+            self.shown_tab = Some(self.tab);
+        }
         // The keyboard shortcuts, in one place: Ctrl+S / Ctrl+O / Ctrl+Z /
         // Ctrl+Shift+Z and Ctrl+Y / Ctrl+F. A text field keeps its own keys
         // while it has focus, and a dialog is answering a question the
@@ -2671,6 +3165,7 @@ impl MhnxEditor {
             Tab::Palico => self.tab_palico_detail(ui),
             Tab::Sets => self.tab_sets(ui),
             Tab::Extras => self.tab_extras(ui),
+            Tab::Review => self.tab_review(ui),
             Tab::About => self.tab_about(ui),
         }
     }
@@ -3021,6 +3516,7 @@ impl MhnxEditor {
                     (Tab::Palico, "オトモ"),
                     (Tab::Sets, "マイセット"),
                     (Tab::Extras, "設定/オトモ"),
+                    (Tab::Review, "変更一覧"),
                     (Tab::About, "情報"),
                 ] {
                     // A save has to be open before a tab can be anything but a
@@ -3975,6 +4471,21 @@ impl MhnxEditor {
                     ("保存前の確認", self.review_text(), "保存する")
                 }
             }
+            // One line of the 変更一覧 changes the save, so it asks first. The
+            // bytes were decided when the list was built; the answer runs that
+            // very row again rather than trusting the index alone
+            // (restore_review_row re-checks the list is still current).
+            Confirm::ReviewRestore { line, .. } => (
+                "この項目だけ元に戻します",
+                format!(
+                    "「{}」を、保存されている値に戻します。\n\
+                     一覧のほかの行には触れません。\n\
+                     ファイルには書き込まず、アプリの中のセーブだけを変えます\n\
+                     （次の保存でディスクに反映されます。元に戻すで取り消せます）。",
+                    line
+                ),
+                "戻す",
+            ),
             Confirm::SetClear(n) => {
                 // The name is read now, so the dialog says which set it means
                 // rather than only a number.
@@ -4141,6 +4652,24 @@ impl MhnxEditor {
                             self.write_reviewed = false;
                         }
                     }
+                    // The row's bytes are copied from the saved file into the
+                    // save the editor holds; nothing is written to disk. The
+                    // list may have been rebuilt while the dialog was open, so
+                    // the line is found again by its text rather than trusted
+                    // by index (the index is the fallback; the stale-bytes
+                    // check inside the restore then refuses it).
+                    Confirm::ReviewRestore { row, line } => {
+                        let index = self
+                            .review_list
+                            .as_ref()
+                            .and_then(|list| {
+                                list.rows
+                                    .iter()
+                                    .position(|candidate| candidate.line() == line)
+                            })
+                            .unwrap_or(row);
+                        self.restore_review_row(index);
+                    }
                     Confirm::None => {}
                 }
             }
@@ -4155,6 +4684,11 @@ impl MhnxEditor {
                 if matches!(self.confirm, Confirm::UnsafeWrite) {
                     self.write_stopped = None;
                     self.message = String::from("書き込みをやめました");
+                }
+                // やめる on a row restore leaves the save as it was; the line
+                // stays in the list for another try.
+                if matches!(self.confirm, Confirm::ReviewRestore { .. }) {
+                    self.message = String::from("この項目を戻すのをやめました");
                 }
                 // やめる on a reviewed write drops it: the file is not touched,
                 // and the edits stay in the editor for another try.
@@ -10881,6 +11415,210 @@ impl MhnxEditor {
         }
     }
 
+    /// One side of a line, with the empty string spelled out the way the line
+    /// spells it.
+    fn review_cell(value: &str) -> String {
+        if value.is_empty() {
+            String::from("（空）")
+        } else {
+            value.to_owned()
+        }
+    }
+
+    /// 変更一覧: what the open save differs from the file on disk in, one line
+    /// per value, each line restorable on its own.
+    ///
+    /// The reference is the file on disk - the contents the editor opened, or
+    /// the contents it last saved - which is the same reference the pre-save
+    /// review compares against, so the two screens cannot disagree. The LIFO
+    /// 元に戻す is a separate history and still works beside this: a line that
+    /// is put back is one step on it.
+    fn tab_review(&mut self, ui: &mut egui::Ui) {
+        if self.save.is_none() {
+            ui.centered_and_justified(|ui| {
+                ui.label("セーブを開くと、保存した内容との違いを一覧します")
+            });
+            return;
+        }
+        if matches!(&self.save, Some(save) if save.kind() == SaveKind::Mhgu) {
+            ui.add_space(8.0);
+            ui.label(
+                "MHGU のセーブは保存できないため、変更一覧は作りません（このツールのオフセットは MHXX 用です）",
+            );
+            return;
+        }
+        if self.review_list.is_none() {
+            self.build_review_list();
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(self.save_path.is_some(), egui::Button::new("一覧を更新"))
+                .on_hover_text("いまの状態でもう一度作り直します（編集は他のタブで行ってから）")
+                .clicked()
+            {
+                self.build_review_list();
+            }
+        });
+        let Some(list) = self.review_list.as_ref() else {
+            ui.add_space(8.0);
+            ui.label("一覧を作れませんでした（比べられるファイルがあるか確認してください）");
+            return;
+        };
+        if list.changed == 0 {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("変更はありません").strong());
+            ui.label(
+                egui::RichText::new("ディスク上の内容と、いまのセーブは同じです")
+                    .weak()
+                    .small(),
+            );
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("比較元").strong());
+            ui.label(list.path.display().to_string()).on_hover_text(
+                "ディスク上の内容と比べます。まだ保存していない編集は「新」側に出ます",
+            );
+            ui.label(
+                egui::RichText::new("（最後に保存した内容。保存前は開いた時点の内容）")
+                    .weak()
+                    .small(),
+            );
+        });
+        let restorable = list.restorable();
+        let blocked = list.rows.len() - restorable;
+        ui.label(
+            egui::RichText::new(format!(
+                "{} バイトの違い（{} バイト → {} バイト）/ バイトの範囲 {} か所 / 値として読める変更 {} 件 / 戻せる行 {} 件{}",
+                list.changed,
+                list.old.len(),
+                list.new_len,
+                list.ranges,
+                list.rows.len(),
+                restorable,
+                if blocked > 0 {
+                    format!("（戻せない行 {} 件）", blocked)
+                } else {
+                    String::new()
+                }
+            ))
+            .strong(),
+        );
+        for line in list.summary.iter() {
+            ui.label(egui::RichText::new(format!("・{}", line)).weak().small());
+        }
+        if list.rows.is_empty() {
+            ui.add_space(6.0);
+            ui.label(
+                "値として読める変更はありません（バイトの範囲だけが動いています。保存前の確認には範囲が出ます）",
+            );
+        }
+        // The reasons come before the table and are grouped: a save wide edit
+        // blocks every line with the same sentence, and printing it a hundred
+        // times would push the table off the window.
+        let mut reasons: Vec<(String, usize, String)> = Vec::new();
+        for row in list.rows.iter().filter(|row| !row.can_restore()) {
+            match reasons.iter_mut().find(|(why, _, _)| *why == row.blocked) {
+                Some(entry) => entry.1 += 1,
+                None => reasons.push((row.blocked.clone(), 1, row.line())),
+            }
+        }
+        if !reasons.is_empty() {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("■ 戻せない行").strong());
+            for (why, count, first) in reasons {
+                let head = if count == 1 {
+                    first
+                } else {
+                    format!("{} 件（例: {}）", count, first)
+                };
+                ui.label(egui::RichText::new(format!("・{}: {}", head, why)).weak().small());
+            }
+        }
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new(
+                "行を押すと、その項目だけを保存されている値に戻します（確認あり）。ファイルには書き込まず、次の保存で反映されます。元に戻す（Ctrl+Z）でも取り消せます。値として読めないバイト（保存画面だけが使う写しなど）はそのまま残るので、上のバイト数とは一致しません。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.add_space(4.0);
+        let mut restore: Option<(usize, String)> = None;
+        // Wrapped: a value can be a whole name or a comment, and the table
+        // would otherwise stretch the window.
+        TableBuilder::new(ui)
+            .id_salt("review_table")
+            .striped(true)
+            // The whole row is the way to put a line back, not only a small
+            // button at the end of it.
+            .sense(egui::Sense::click())
+            .column(Column::initial(190.0).at_least(120.0))
+            .column(Column::initial(230.0).at_least(150.0))
+            .column(Column::initial(150.0).at_least(80.0))
+            .column(Column::remainder().at_least(80.0))
+            .column(Column::exact(100.0))
+            .header(22.0, |mut header| {
+                for name in ["領域", "項目", "旧", "新", "戻す"] {
+                    header.col(|ui| {
+                        ui.strong(name);
+                    });
+                }
+            })
+            .body(|body| {
+                body.rows(22.0, list.rows.len(), |mut row| {
+                    let index = row.index();
+                    let item = &list.rows[index];
+                    let can = item.can_restore();
+                    let mut pressed = false;
+                    row.col(|ui| {
+                        let area = if item.area.is_empty() {
+                            String::from("—")
+                        } else {
+                            item.area.clone()
+                        };
+                        ui.label(area)
+                            .on_hover_text("変更されているバイトの場所（core のレイアウト名）");
+                    });
+                    row.col(|ui| {
+                        ui.label(item.change.field.clone())
+                            .on_hover_text(item.change.line());
+                    });
+                    row.col(|ui| {
+                        ui.label(Self::review_cell(&item.change.old));
+                    });
+                    row.col(|ui| {
+                        ui.label(Self::review_cell(&item.change.new));
+                    });
+                    row.col(|ui| {
+                        if can {
+                            if ui
+                                .small_button("戻す")
+                                .on_hover_text(
+                                    "この項目だけ、保存されている値に戻します（確認あり）",
+                                )
+                                .clicked()
+                            {
+                                pressed = true;
+                            }
+                        } else {
+                            ui.add_enabled(false, egui::Button::new("戻せない").small())
+                                .on_hover_text(item.blocked.as_str());
+                        }
+                    });
+                    let row_clicked = can && row.response().clicked();
+                    if can && (pressed || row_clicked) {
+                        restore = Some((index, item.line()));
+                    }
+                });
+            });
+        if let Some((row, line)) = restore {
+            // The bytes change, so the same question the other edits ask:
+            // say what, and wait for the answer.
+            self.confirm = Confirm::ReviewRestore { row, line };
+        }
+    }
+
     fn tab_about(&mut self, ui: &mut egui::Ui) {
         ui.heading("XXSE");
         ui.label("Monster Hunter XX / MHGU のセーブとクエストを編集するツールです。");
@@ -15773,6 +16511,353 @@ mod tests {
         assert_eq!(std::fs::read(&sample).expect("the sample"), original);
     }
 
+    /// A blank Switch save whose first slot is marked used, so a test's own
+    /// edits are the only thing the 変更一覧 lists (the fixture would otherwise
+    /// also show the スロット使用フラグ being set when the first edit folds).
+    fn write_a_used_save(dir: &std::path::Path, name: &str) -> PathBuf {
+        let mut save = mhnx_core::save::empty_switch_save();
+        save.set_slot_used(0, true);
+        let path = dir.join(name);
+        std::fs::write(&path, save.to_bytes()).expect("write the fixture");
+        path
+    }
+
+    /// The fields the list holds, in list order, for the assertions and for the
+    /// printed evidence.
+    fn review_fields(app: &MhnxEditor) -> Vec<String> {
+        app.review_list
+            .as_ref()
+            .map(|list| list.rows.iter().map(|row| row.line()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The first residual the fifth audit named: a screen that lists the
+    /// changes one value at a time, and a way to put one of them back without
+    /// touching the others. Three edits, three lines, one line restored, two
+    /// left.
+    #[test]
+    fn the_review_list_names_three_changes_and_restores_one() {
+        let dir = Scratch::new("reviewline");
+        let path = write_a_used_save(dir.path(), "system");
+        let on_disk = std::fs::read(&path).expect("read the fixture");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        app.edit.funds = 12_345;
+        app.apply_to_save();
+        app.items[0] = ItemSlot { id: 7, count: 3 };
+        app.apply_to_save();
+        assert!(app.set_arena_time(0, 0, 1_234), "{}", app.message);
+
+        app.build_review_list();
+        let fields = review_fields(&app);
+        println!("一覧:\n{}", fields.join("\n"));
+        assert_eq!(fields.len(), 3, "{}", fields.join("\n"));
+        assert!(fields.iter().any(|f| f.contains("所持金")), "{:?}", fields);
+        assert!(
+            fields.iter().any(|f| f.contains("アイテムボックス #1")),
+            "{:?}",
+            fields
+        );
+        assert!(
+            fields.iter().any(|f| f.contains("闘技大会 1 の 1 位")),
+            "{:?}",
+            fields
+        );
+        assert!(
+            app.review_list.as_ref().expect("a list").restorable() == 3,
+            "all three lines can be put back: {:?}",
+            fields
+        );
+        // The 領域 column names the core layout, not a table of this window's.
+        assert!(
+            fields.iter().any(|f| f.starts_with("スロット1 闘技大会の記録 / ")),
+            "{:?}",
+            fields
+        );
+
+        // One line only: the arena time.
+        let row = app
+            .review_list
+            .as_ref()
+            .expect("a list")
+            .rows
+            .iter()
+            .position(|row| row.change.field.contains("闘技大会"))
+            .expect("the arena line");
+        assert!(app.restore_review_row(row), "{}", app.message);
+        assert!(app.dirty, "a restore has to be written by the next save");
+        assert!(app.message.contains("だけを戻しました"), "{}", app.message);
+        assert!(
+            app.undo_label().map(|label| label.contains("戻す")) == Some(true),
+            "the LIFO history keeps the step: {:?}",
+            app.undo_label()
+        );
+
+        let left = review_fields(&app);
+        println!("戻したあと:\n{}", left.join("\n"));
+        assert_eq!(left.len(), 2, "{}", left.join("\n"));
+        assert!(!left.iter().any(|f| f.contains("闘技大会")), "{:?}", left);
+        // The two that were left are still the new values, and the one that was
+        // put back is the value on disk.
+        let back = app.planned_save().expect("a save");
+        assert_eq!(
+            back.read_character(0).map(|c| c.funds),
+            Some(12_345),
+            "the money is untouched"
+        );
+        assert_eq!(
+            back.read_item_box(0).map(|box_| (box_[0].id, box_[0].count)),
+            Some((7, 3)),
+            "the item is untouched"
+        );
+        let file = Save::from_bytes(&on_disk).expect("the fixture parses");
+        assert_eq!(
+            mhnx_core::guildcard::arena(&back, 0).into_iter().next().map(|e| e.centis),
+            mhnx_core::guildcard::arena(&file, 0).into_iter().next().map(|e| e.centis),
+            "the arena time is the saved one again"
+        );
+        // Nothing was written: the restore only changes what the editor holds.
+        assert_eq!(std::fs::read(&path).expect("read"), on_disk);
+    }
+
+    /// Two lines read out of one stretch of bytes cannot be separated. The
+    /// first two weapon counts of a venue are two adjacent 2 byte entries, so
+    /// setting both makes them one run of changed bytes: each line says why it
+    /// cannot be put back instead of taking the other one with it.
+    #[test]
+    fn a_line_that_shares_bytes_with_another_says_so() {
+        let dir = Scratch::new("reviewshare");
+        let path = write_a_used_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        // The weapon grid only opens the value walk when the arena log moved
+        // (both are read behind the same gate), so one arena time comes along.
+        assert!(app.set_arena_time(0, 0, 1_234), "{}", app.message);
+        let venue = mhnx_core::guildcard::Venue::ALL[0];
+        assert!(app.set_weapon_count(venue, 0, 0x0102), "{}", app.message);
+        assert!(app.set_weapon_count(venue, 1, 0x0304), "{}", app.message);
+        app.build_review_list();
+        let lines = review_fields(&app);
+        println!("{}", lines.join("\n"));
+        let list = app.review_list.as_ref().expect("a list");
+        let shared: Vec<&ReviewRow> = list
+            .rows
+            .iter()
+            .filter(|row| row.change.field.contains("武器使用数"))
+            .collect();
+        assert_eq!(shared.len(), 2, "{}", lines.join("\n"));
+        for row in shared {
+            assert!(!row.can_restore(), "{}", row.line());
+            assert!(
+                row.blocked.contains("同じバイト列に他の変更"),
+                "{}: {}",
+                row.line(),
+                row.blocked
+            );
+        }
+        // The arena line does not share those bytes, so it can still be put
+        // back: refusing one line must not refuse the list.
+        assert!(
+            list.rows
+                .iter()
+                .any(|row| row.change.field.contains("闘技大会") && row.can_restore()),
+            "{}",
+            lines.join("\n")
+        );
+        let index = list
+            .rows
+            .iter()
+            .position(|row| row.change.field.contains("武器使用数"))
+            .expect("a weapon line");
+        assert!(!app.restore_review_row(index), "a refused line stays refused");
+        assert!(app.message.contains("戻せません"), "{}", app.message);
+    }
+
+    /// A save wide edit is hundreds of separate stretches: probing each one
+    /// would make opening the tab slow, so the whole list says why it cannot
+    /// separate the lines instead of guessing.
+    #[test]
+    fn a_save_wide_edit_refuses_to_separate_the_lines() {
+        let dir = Scratch::new("reviewwide");
+        let path = write_a_used_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        for index in (0..200).step_by(2) {
+            app.items[index] = ItemSlot { id: 1, count: 5 };
+        }
+        app.apply_to_save();
+        app.build_review_list();
+        let list = app.review_list.as_ref().expect("a list");
+        assert!(list.changed > 0, "the edits differ from the file");
+        assert!(list.rows.len() >= 100, "{} lines", list.rows.len());
+        assert_eq!(list.restorable(), 0, "nothing can be separated here");
+        assert!(
+            list.rows[0].blocked.contains("一度に扱えるのは 64 か所まで"),
+            "{}",
+            list.rows[0].blocked
+        );
+        assert!(!app.restore_review_row(0), "a refused line is not applied");
+        assert!(app.message.starts_with("この項目は戻せません"), "{}", app.message);
+    }
+
+    /// A save that differs in nothing has no list to show: the tab says so
+    /// rather than drawing an empty table.
+    #[test]
+    fn an_unchanged_save_says_there_is_nothing_to_restore() {
+        let dir = Scratch::new("reviewnone");
+        let path = write_a_used_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.build_review_list();
+        let list = app.review_list.as_ref().expect("a list");
+        assert_eq!(list.changed, 0);
+        assert!(list.rows.is_empty());
+        assert_eq!(list.restorable(), 0);
+        assert!(!app.restore_review_row(0), "there is no row to restore");
+        assert!(app.message.contains("一覧にありません"), "{}", app.message);
+    }
+    /// The same list on the real save: a money edit, an arena time and one
+    /// talisman point, then one of the three put back. Skipped when the sample
+    /// is not on the machine, the way the other sample tests are.
+    #[test]
+    fn the_review_list_of_the_sample_save_restores_one_line() {
+        let Some(sample) = sample_save() else {
+            return;
+        };
+        let dir = Scratch::new("reviewlistreal");
+        let original = std::fs::read(&sample).expect("read the sample");
+        let copy = dir.path().join("system");
+        std::fs::write(&copy, &original).expect("copy");
+        let mut app = MhnxEditor::default();
+        app.open_save(copy.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        let old = Save::from_bytes(&original).expect("the sample parses");
+        let old_funds = old.read_character(0).map(|c| c.funds).unwrap_or(0);
+        let old_arena = mhnx_core::guildcard::arena(&old, 0)
+            .into_iter()
+            .next()
+            .map(|entry| entry.centis)
+            .unwrap_or(0);
+        // Three changes, in three places that do not share bytes.
+        app.edit.funds = old_funds + 12_345;
+        app.apply_to_save();
+        assert!(
+            app.set_arena_time(0, 0, old_arena.wrapping_add(777)),
+            "{}",
+            app.message
+        );
+        let talisman = app
+            .save
+            .as_ref()
+            .and_then(|save| save.charms(0))
+            .and_then(|charms| charms.into_iter().find(|charm| charm.points1 < 127))
+            .expect("the sample save has a talisman with room to grow");
+        let mut changed = talisman;
+        changed.points1 += 1;
+        assert!(
+            app.save.as_mut().expect("save").set_charm(0, &changed),
+            "the talisman is writable"
+        );
+        app.build_review_list();
+        let lines = review_fields(&app);
+        println!("実セーブの変更一覧:\n{}", lines.join("\n"));
+        assert_eq!(lines.len(), 3, "{}", lines.join("\n"));
+        assert!(
+            lines.iter().any(|line| line.contains("所持金:")),
+            "{:?}",
+            lines
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("闘技大会 1 の 1 位:")),
+            "{:?}",
+            lines
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("護石 #{} スキル1:", talisman.index + 1))),
+            "{:?}",
+            lines
+        );
+        let row = app
+            .review_list
+            .as_ref()
+            .expect("a list")
+            .rows
+            .iter()
+            .position(|row| row.change.field.contains("闘技大会"))
+            .expect("the arena line");
+        assert!(app.restore_review_row(row), "{}", app.message);
+        let left = review_fields(&app);
+        println!("1 行だけ戻したあと:\n{}", left.join("\n"));
+        assert_eq!(left.len(), 2, "{}", left.join("\n"));
+        assert!(!left.iter().any(|line| line.contains("闘技大会")), "{:?}", left);
+        let back = app.planned_save().expect("a save");
+        assert_eq!(
+            mhnx_core::guildcard::arena(&back, 0)
+                .into_iter()
+                .next()
+                .map(|entry| entry.centis),
+            Some(old_arena),
+            "the arena time is the saved one again"
+        );
+        assert_eq!(
+            back.read_character(0).map(|c| c.funds),
+            Some(old_funds + 12_345),
+            "the money is untouched"
+        );
+        assert_eq!(
+            back.charms(0)
+                .and_then(|charms| charms.into_iter().find(|charm| charm.index == talisman.index))
+                .map(|charm| charm.points1),
+            Some(talisman.points1 + 1),
+            "the talisman is untouched"
+        );
+        assert!(app.dirty);
+        assert_eq!(std::fs::read(&copy).expect("read"), original);
+        assert_eq!(std::fs::read(&sample).expect("the sample"), original);
+    }
+
+    /// The tab draws a frame with a list and with nothing to list: a duplicate
+    /// table id, or a row the layout cannot fit, would panic here.
+    #[test]
+    fn the_review_tab_draws_a_frame() {
+        let dir = Scratch::new("drawreviewtab");
+        let path = write_a_used_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_review(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the empty list drew nothing");
+        app.edit.funds = 999;
+        app.apply_to_save();
+        assert!(app.set_arena_time(0, 0, 1_234));
+        app.review_list = None;
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_review(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the table drew nothing");
+        assert_eq!(app.review_list.as_ref().expect("a list").rows.len(), 2);
+        // The question a row asks draws too: the dialog names the very line.
+        app.confirm = Confirm::ReviewRestore {
+            row: 0,
+            line: String::from("スロット1 / 所持金: 0 z → 999 z"),
+        };
+        let output = ctx.run(input, |ctx| app.confirm_dialog(ctx));
+        assert!(!output.shapes.is_empty(), "the confirm drew nothing");
+    }
     /// The new pieces draw a frame: the 元に戻す button in the top bar and the
     /// review dialog with its summary. A duplicate egui id or a window the
     /// layout cannot fit would panic here.
