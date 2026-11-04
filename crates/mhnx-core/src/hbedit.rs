@@ -1139,8 +1139,15 @@ pub struct SaveUndo {
 // The save layout, for naming what a write changes
 //
 // Every boundary below is an existing constant from mhnx-core, so the names
-// cannot drift away from the offsets the writers use. Ranges nothing in this
-// crate writes are left out; a change there is reported as "その他".
+// cannot drift away from the offsets the writers use. This table names the
+// parts a writer knows (the box, the record, the card); the 183 rows of
+// [crate::savemap] name the bytes inside them, and the review prefers whichever
+// is narrower, so a change the table cannot name is printed with the map's own
+// row instead of "その他". A row neither table covers is still "その他".
+//
+// The save map is built behind a `OnceLock`, so it is only compiled with the
+// `std` feature; the console build falls back to this table alone ([map_row_at]
+// is the one place that differs).
 // ---------------------------------------------------------------------------
 
 /// One named part of the save.
@@ -1336,13 +1343,23 @@ const DLC_SECTION: Layout = Layout {
 };
 
 /// One stretch of bytes a write changes, named by what lives there.
+///
+/// Two names travel with a stretch. [DiffRange::part] is the layout part, and
+/// it is what [crate::diffvalues] gates its getters on, so a finer name cannot
+/// change which values the review walks. [DiffRange::name] is what the screens
+/// print, and it comes from the save map when the map has a row for these bytes:
+/// "装備ボックス #24" instead of "装備ボックス +0x33C".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffRange {
     /// Character slot this belongs to, None for the body-wide parts.
     pub slot: Option<usize>,
-    /// What the layout calls this place, e.g. "装備ボックス".
-    pub name: &'static str,
-    /// Distance from the start of the named part.
+    /// The layout part these bytes belong to, e.g. "装備ボックス"; "その他"
+    /// when the layout has no entry for them.
+    pub part: &'static str,
+    /// What the screens print, e.g. "装備ボックス #24": the save map's name for
+    /// the bytes, with the record the change starts at.
+    pub name: String,
+    /// Distance from the start of the stretch [DiffRange::name] names.
     pub rel: usize,
     /// How many bytes differ inside the stretch.
     pub len: usize,
@@ -1351,11 +1368,11 @@ pub struct DiffRange {
 }
 
 impl DiffRange {
-    /// "スロット1 装備ボックス" - the place, without the size.
+    /// "スロット1 装備ボックス #24" - the place, without the size.
     pub fn head(&self) -> String {
         match self.slot {
             Some(i) => format!("スロット{} {}", i + 1, self.name),
-            None => String::from(self.name),
+            None => self.name.clone(),
         }
     }
 
@@ -1512,9 +1529,9 @@ impl SaveDiff {
 /// Overlapping entries are resolved by span: the arena log and the award map
 /// both sit inside the guild card block, and naming a change after the
 /// narrowest piece is what tells the user which one moved.
-fn region_at(save: &Save, body_off: usize) -> Option<(Option<usize>, &'static Layout)> {
+fn layout_at(save: &Save, body_off: usize) -> Option<(Option<usize>, &'static Layout, usize)> {
     fn consider(
-        best: &mut Option<(usize, Option<usize>, &'static Layout)>,
+        best: &mut Option<(usize, Option<usize>, &'static Layout, usize)>,
         body_off: usize,
         slot: Option<usize>,
         layout: &'static Layout,
@@ -1523,12 +1540,12 @@ fn region_at(save: &Save, body_off: usize) -> Option<(Option<usize>, &'static La
         let end = start + (layout.end - layout.start);
         if body_off >= start && body_off < end {
             let span = end - start;
-            if best.map(|(s, _, _)| span < s).unwrap_or(true) {
-                *best = Some((span, slot, layout));
+            if best.map(|(s, _, _, _)| span < s).unwrap_or(true) {
+                *best = Some((span, slot, layout, start));
             }
         }
     }
-    let mut best: Option<(usize, Option<usize>, &'static Layout)> = None;
+    let mut best: Option<(usize, Option<usize>, &'static Layout, usize)> = None;
     for layout in BODY_LAYOUT {
         consider(&mut best, body_off, None, layout, layout.start);
     }
@@ -1545,7 +1562,170 @@ fn region_at(save: &Save, body_off: usize) -> Option<(Option<usize>, &'static La
     if dlc > 0 && dlc_end <= save.body().len() {
         consider(&mut best, body_off, None, &DLC_SECTION, dlc);
     }
-    best.map(|(_, slot, layout)| (slot, layout))
+    best.map(|(_, slot, layout, start)| (slot, layout, start))
+}
+
+/// One row of [crate::savemap], resolved against a particular save.
+///
+/// The map's rows hold the canonical MHXX offset; this is the offset the file
+/// in hand actually has, read the same way [crate::savemap::offset_in] reads it
+/// (so an imported character or a save with a moved download section is named
+/// where its own pointers say).
+struct MapRow {
+    /// Character slot the row lives in, None for the body-wide rows.
+    slot: Option<usize>,
+    /// Body offset the row starts at in this save.
+    start: usize,
+    /// How many bytes it covers.
+    len: usize,
+    /// What the map calls it, e.g. "装備ボックス".
+    name: &'static str,
+    /// Bytes per record when the row is an array, 0 when it is not.
+    record: usize,
+}
+
+impl MapRow {
+    /// The row for these bytes, with #N when the row is an array.
+    ///
+    /// "#24" is the record the change starts in, counted from one the way the
+    /// value lines count ("装備ボックス #24 レベル"): a reader looks the same
+    /// number up in the box, so the two screens have to agree on it.
+    fn name(&self, rel: usize, len: usize) -> String {
+        let mut out = String::from(self.name);
+        if self.record > 0 && len > 0 {
+            let first = rel / self.record + 1;
+            let last = (rel + len - 1) / self.record + 1;
+            if first == last {
+                out.push_str(&format!(" #{}", first));
+            } else {
+                out.push_str(&format!(" #{}〜#{}", first, last));
+            }
+        }
+        out
+    }
+}
+
+/// The save map row that covers `body_off`, narrowest first.
+///
+/// Rows of equal length are taken in table order, which is what keeps
+/// 装備ボックス the name of an equipment edit: 護石 covers the same 72,000
+/// bytes (the same records, whichever way the box is read), and calling an
+/// armour level a talisman would be worse than the offset it replaced.
+///
+/// The save map is built once behind a `OnceLock` and therefore only compiled
+/// with the `std` feature. The console build has no rows, so this is where the
+/// one difference between the two builds lives: everything below falls back to
+/// the layout, exactly the way it did before the map existed.
+fn map_row_at(save: &Save, body_off: usize) -> Option<MapRow> {
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (save, body_off);
+        None
+    }
+    #[cfg(feature = "std")]
+    {
+        use crate::savemap::{self, FieldKind};
+        let mut best: Option<MapRow> = None;
+        for (index, field) in savemap::fields().iter().enumerate() {
+            let Some(start) = savemap::offset_in(save, index) else {
+                continue;
+            };
+            if body_off < start || body_off >= start + field.len {
+                continue;
+            }
+            // Strictly narrower: an equal span is the row seen first, which is
+            // the order the tab lists them in.
+            if let Some(row) = &best {
+                if field.len >= row.len {
+                    continue;
+                }
+            }
+            best = Some(MapRow {
+                slot: field.slot,
+                start,
+                len: field.len,
+                name: field.name.as_str(),
+                record: match field.kind {
+                    FieldKind::Record { size, .. } => size,
+                    _ => 0,
+                },
+            });
+        }
+        best
+    }
+}
+
+/// Where a body offset sits, as the review names it.
+struct Region {
+    /// Character slot the bytes belong to.
+    slot: Option<usize>,
+    /// The layout part, for the value walk's gates; "その他" when the layout
+    /// has no entry for these bytes.
+    part: &'static str,
+    /// The save map row that names them, when the map has one.
+    row: Option<MapRow>,
+    /// The layout entry that covers them, when the layout has one.
+    layout: Option<&'static Layout>,
+    /// Body offset the printed name starts at.
+    start: usize,
+    /// Body offset it ends at.
+    end: usize,
+}
+
+/// What names the bytes at `body_off`.
+///
+/// The save map is preferred: it is the table with 183 rows against this
+/// module's 23, so it is the one that can say "装備ボックス #24" (and the one
+/// that names the bytes between the layout's parts at all). The layout entry is
+/// still fetched, because its name is the key the value walk gates on and the
+/// fallback name when the map has no row.
+///
+/// The narrowest wins; on an equal span the map wins, because its rows are the
+/// finer grain. `None` means neither table covers the byte, and the review
+/// reports it as "その他".
+fn region_at(save: &Save, body_off: usize) -> Option<Region> {
+    let layout = layout_at(save, body_off);
+    let part = layout.map(|(_, layout, _)| layout.name).unwrap_or("その他");
+    let row = match (map_row_at(save, body_off), layout) {
+        (Some(row), Some((_, layout, _))) => {
+            // An equal span is a row that names the same bytes as the layout
+            // entry: the map's row is the one that knows the record size.
+            if row.len <= layout.end - layout.start {
+                Some(row)
+            } else {
+                None
+            }
+        }
+        (row, None) => row,
+        (None, Some(_)) => None,
+    };
+    let (slot, start, end) = match (&row, layout) {
+        (Some(row), _) => (row.slot, row.start, row.start + row.len),
+        (None, Some((slot, layout, start))) => (slot, start, start + (layout.end - layout.start)),
+        (None, None) => return None,
+    };
+    Some(Region {
+        slot,
+        part,
+        row,
+        layout: layout.map(|(_, layout, _)| layout),
+        start,
+        end,
+    })
+}
+
+impl Region {
+    /// What the screens call this stretch: the map's row and record when there
+    /// is one, the layout's part otherwise.
+    fn name(&self, rel: usize, len: usize) -> String {
+        match &self.row {
+            Some(row) => row.name(rel, len),
+            None => String::from(match self.layout {
+                Some(layout) => layout.name,
+                None => self.part,
+            }),
+        }
+    }
 }
 
 /// Where the named parts start, so an unnamed gap ends where the next begins.
@@ -1559,6 +1739,16 @@ fn region_starts(save: &Save) -> Vec<usize> {
     let dlc = save.dlc_section_offset() as usize;
     if dlc > 0 {
         starts.push(dlc);
+    }
+    // The map's rows start named stretches too: a gap between two parts ends at
+    // whichever table names the byte that follows it.
+    #[cfg(feature = "std")]
+    {
+        for index in 0..crate::savemap::fields().len() {
+            if let Some(start) = crate::savemap::offset_in(save, index) {
+                starts.push(start);
+            }
+        }
     }
     starts
 }
@@ -1613,7 +1803,8 @@ pub fn diff_ranges(
                 let end = run_end.min(header_len);
                 out.push(DiffRange {
                     slot: None,
-                    name: "ファイルヘッダ",
+                    part: "ファイルヘッダ",
+                    name: String::from("ファイルヘッダ"),
                     rel: at,
                     len: end - at,
                     records: None,
@@ -1623,24 +1814,22 @@ pub fn diff_ranges(
             }
             let body = at - header_len;
             match region_at(save, body) {
-                Some((slot, layout)) => {
-                    let start = match slot {
-                        Some(i) => save.slot_base(i).map(|b| b as usize).unwrap_or(0) + layout.start,
-                        None => layout.start,
-                    };
-                    let region_end = start + (layout.end - layout.start);
-                    let end = region_end.min(body + (run_end - at));
+                Some(region) => {
+                    let end = region.end.min(body + (run_end - at));
                     let stop = (header_len + end).min(run_end);
                     let len = stop - at;
-                    let records = if layout.unit > 0 {
-                        Some(((len + layout.unit - 1) / layout.unit, layout.unit_name))
-                    } else {
-                        None
+                    let rel = body.saturating_sub(region.start);
+                    let records = match region.layout {
+                        Some(layout) if layout.unit > 0 => {
+                            Some(((len + layout.unit - 1) / layout.unit, layout.unit_name))
+                        }
+                        _ => None,
                     };
                     out.push(DiffRange {
-                        slot,
-                        name: layout.name,
-                        rel: body.saturating_sub(start),
+                        slot: region.slot,
+                        part: region.part,
+                        name: region.name(rel, len),
+                        rel,
                         len,
                         records,
                     });
@@ -1655,7 +1844,8 @@ pub fn diff_ranges(
                     let stop = (header_len + next).min(run_end);
                     out.push(DiffRange {
                         slot: None,
-                        name: "その他",
+                        part: "その他",
+                        name: String::from("その他"),
                         rel: body,
                         len: stop - at,
                         records: None,
@@ -1739,7 +1929,11 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
     let mut body: Vec<String> = Vec::new();
     let mut dlc: Vec<String> = Vec::new();
     for range in ranges {
-        let part = match (range.slot, range.name) {
+        // The summary stays at the layout's grain ("装備ボックス 1 枠"): it is
+        // the feature level line, and which record it was is what the range
+        // section underneath already says. Bytes the layout cannot name keep
+        // the save map's name, because that is the whole point of reading it.
+        let part = match (range.slot, range.part) {
             (Some(slot), "キャラクター情報") => {
                 let fields = character_fields_changed(old, new, slot);
                 if fields.is_empty() {
@@ -1748,9 +1942,10 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
                     fields.join("、")
                 }
             }
-            (Some(_), name) => match range.records {
-                Some((n, what)) => format!("{} {} {}", name, n, what),
-                None => String::from(name),
+            (Some(_), "その他") => range.name.clone(),
+            (Some(_), part) => match range.records {
+                Some((n, what)) => format!("{} {} {}", part, n, what),
+                None => String::from(part),
             },
             (None, "DLC セクション") => {
                 let n = quests_changed(old, new);
@@ -1761,7 +1956,8 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
                 }
             }
             (None, "ファイルヘッダ") => String::from("ファイルヘッダ（名前のハッシュなど）"),
-            (None, name) => String::from(name),
+            (None, "その他") => range.name.clone(),
+            (None, part) => String::from(part),
         };
         match range.slot {
             Some(slot) => match per_slot.iter_mut().find(|(s, _)| *s == slot) {
@@ -1773,7 +1969,7 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
                 None => per_slot.push((slot, alloc::vec![part])),
             },
             None => {
-                let list = if range.name == "DLC セクション" {
+                let list = if range.part == "DLC セクション" {
                     &mut dlc
                 } else {
                     &mut body
@@ -1826,7 +2022,8 @@ pub fn diff_save(old: &[u8], new: &[u8]) -> SaveDiff {
             diff.summary = alloc::vec![format!("セーブ全体: {} バイト", changed)];
             diff.ranges = alloc::vec![DiffRange {
                 slot: None,
-                name: "セーブファイル",
+                part: "セーブファイル",
+                name: String::from("セーブファイル"),
                 rel: 0,
                 len: changed,
                 records: None,
@@ -11111,8 +11308,17 @@ mod tests {
         let diff = diff_save(&old.to_bytes(), &new.to_bytes());
         let summary = diff.summary.join(" / ");
         assert!(summary.contains("DLC: クエスト 2 件"), "{}", summary);
+        // The part is the section, so the value walk still finds the quests;
+        // the printed name is the save map's row - the quest slot itself.
         assert!(
-            diff.ranges.iter().any(|r| r.name == "DLC セクション"),
+            diff.ranges.iter().all(|r| r.part == "DLC セクション"),
+            "{:?}",
+            diff.ranges
+        );
+        assert!(
+            diff.ranges
+                .iter()
+                .any(|r| r.name.starts_with("DLC クエスト（205 枠） #")),
             "{:?}",
             diff.ranges
         );
@@ -11276,7 +11482,8 @@ mod tests {
             values: Vec::new(),
             ranges: alloc::vec![DiffRange {
                 slot: None,
-                name: "セーブファイル",
+                part: "セーブファイル",
+                name: String::from("セーブファイル"),
                 rel: 0,
                 len: 3,
                 records: None,

@@ -15646,7 +15646,10 @@ mod tests {
         assert_eq!(changed, mhnx_core::save::EQUIPMENT_RECORD);
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].slot, Some(0), "the first slot owns +0x62EE");
-        assert_eq!(ranges[0].name, "装備ボックス");
+        assert_eq!(ranges[0].part, "装備ボックス");
+        // The name comes from the save map, which knows the box is 2,000
+        // records of 36 bytes: "+0xB4" became "#6", the record itself.
+        assert_eq!(ranges[0].name, "装備ボックス #6");
         assert_eq!(ranges[0].rel, 5 * mhnx_core::save::EQUIPMENT_RECORD);
         assert_eq!(ranges[0].records, Some((1, "枠")));
         // Both wordings come from the library now: range.line() for the
@@ -15655,7 +15658,7 @@ mod tests {
         assert_eq!(
             ranges[0].window_line(),
             format!(
-                "スロット1 装備ボックス +0x{:X} 付近 {} バイト（1 枠）",
+                "スロット1 装備ボックス #6 +0x{:X} 付近 {} バイト（1 枠）",
                 5 * mhnx_core::save::EQUIPMENT_RECORD,
                 mhnx_core::save::EQUIPMENT_RECORD
             )
@@ -15680,11 +15683,12 @@ mod tests {
         assert_eq!(changed, 8);
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].slot, None);
-        // The library names the whole region, not only the quests in it: the
-        // section also carries the download palicoes and the 45 loadouts, and
-        // a palico or equipment edit is not a quest change. The window prints
-        // the same name (it used to translate 「DLC クエスト」 into its own).
-        assert_eq!(ranges[0].name, "DLC セクション");
+        // The part is the whole section, not only the quests in it: it also
+        // carries the download palicoes and the 45 loadouts, and a palico or
+        // equipment edit is not a quest change. The printed name is the save
+        // map's row for the quest slot that moved.
+        assert_eq!(ranges[0].part, "DLC セクション");
+        assert_eq!(ranges[0].name, "DLC クエスト（205 枠） #1");
         let summary = mhnx_core::hbedit::diff_summary(&ranges, &save, &save);
         assert!(
             summary.iter().any(|line| line == "DLC: クエスト"),
@@ -15698,17 +15702,68 @@ mod tests {
             ranges,
         };
         let lines = diff.window_lines(12);
-        // The offset is the body one: the download section's own start is
-        // carried by the save, and the walk has always reported from the body.
+        // The offset is now the one inside the named row: the quest slot that
+        // moved, counted from its own start (the change is at the slot's first
+        // byte, so it is zero). The body offset the walk used to print is no
+        // longer needed to say where the bytes are.
         assert!(
             lines.iter().any(|line| line
-                == &format!(
-                    "・DLC セクション +0x{:X} 付近 8 バイト",
-                    dlc + mhnx_core::dlc::QUEST_ARRAY_OFFSET
-                )),
+                == "・DLC クエスト（205 枠） #1 +0x0 付近 8 バイト"),
             "{:?}",
             lines
         );
+    }
+
+    /// The same name on all three screens that show a difference: the 変更一覧
+    /// tab's 領域 column, the pre-save review, and the snapshot comparison.
+    /// All three read the core's `DiffRange`, and this is what keeps them from
+    /// drifting back into a table of their own.
+    #[test]
+    fn the_change_list_the_review_and_the_comparison_print_one_name() {
+        let dir = Scratch::new("one-name");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        // The file on disk is put back the way the editor holds it (opening
+        // flags the slot as used), so the only difference the snapshot and the
+        // 変更一覧 find is the edit below.
+        let before = planned_bytes(&app);
+        std::fs::write(&path, &before).expect("settle the fixture");
+        let snaps = MhnxEditor::snapshot_dir(&path);
+        std::fs::create_dir_all(&snaps).expect("folder");
+        let name = String::from("system-20261104-012812.sav");
+        std::fs::write(snaps.join(&name), &before).expect("snapshot");
+        app.refresh_snapshots();
+
+        // The guild card's rank: the layout stops at ギルドカード, the save map
+        // names the two bytes inside it that the value line reads.
+        assert!(mhnx_core::guildcard::set_hunter_rank(
+            app.save.as_mut().expect("a save"),
+            0,
+            777
+        ));
+        app.dirty = true;
+        let planned = planned_bytes(&app);
+
+        // 1. 保存前レビュー: the body the dialog draws.
+        let diff = mhnx_core::hbedit::diff_save(&before, &planned);
+        let head = diff.ranges.first().expect("a range").head();
+        assert_eq!(head, "スロット1 ギルドカード（HR）");
+        let review = diff.window_lines(12).join("\n");
+        assert!(review.contains(&head), "{}", review);
+
+        // 2. 変更一覧: the 領域 column comes from the same walk, over the same
+        // plan.
+        app.build_review_list();
+        let list = app.review_list.as_ref().expect("a list");
+        let areas: Vec<String> = list.rows.iter().map(|row| row.area.clone()).collect();
+        assert!(areas.iter().any(|area| area.contains(&head)), "{:?}", areas);
+
+        // 3. スナップショット比較: the same wording, read-only.
+        app.compare_snapshot(name, None);
+        let text = app.compare.as_ref().expect("a comparison").text();
+        assert!(text.contains(&head), "{}", text);
     }
 
     /// The bytes the editor would write right now, without writing them.
@@ -16107,7 +16162,7 @@ mod tests {
         assert!(text.contains("■ 変更される内容"), "{}", text);
         assert!(text.contains("闘技大会の記録"), "{}", text);
         assert!(text.contains("■ 変更される範囲"), "{}", text);
-        assert!(text.contains("闘技大会の記録 +0x"), "{}", text);
+        assert!(text.contains("闘技大会の記録 #1 +0x"), "{}", text);
         assert!(text.contains("この内容で保存しますか？"), "{}", text);
 
         // 「保存する」 is the one-shot grant its own dialog sets.
@@ -16845,9 +16900,12 @@ mod tests {
             "all three lines can be put back: {:?}",
             fields
         );
-        // The 領域 column names the core layout, not a table of this window's.
+        // The 領域 column names the core layout (and the save map's record
+        // number inside it), not a table of this window's.
         assert!(
-            fields.iter().any(|f| f.starts_with("スロット1 闘技大会の記録 / ")),
+            fields
+                .iter()
+                .any(|f| f.starts_with("スロット1 闘技大会の記録 #1 / ")),
             "{:?}",
             fields
         );

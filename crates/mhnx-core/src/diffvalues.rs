@@ -131,10 +131,11 @@ pub fn diff_values(
         slot_values(ranges, old, new, slot, titles, &mut out);
     }
     // The request flags are the one slot value with no layout entry of their
-    // own: they sit between the named parts and are reported as その他, a range
-    // that does not name the slot it came from. So when such a range moved,
-    // every slot is asked, and the getters decide which one really changed.
-    if touched(ranges, None, &["その他"]) {
+    // own: they sit between the named parts. The review prints them with the
+    // save map's row (依頼フラグ) and the row does say which slot they belong to,
+    // but the part is still その他 - that is the key this walk gates on - so
+    // every slot is asked and the getters decide which one really changed.
+    if ranges.iter().any(|range| range.part == "その他") {
         for slot in 0..MAX_SLOTS {
             request_values(old, new, slot, &mut out);
         }
@@ -143,10 +144,14 @@ pub fn diff_values(
 }
 
 /// Does a range name this part of this slot?
+///
+/// The gate is on [DiffRange::part], never on the printed name: the save map
+/// can name the same bytes more finely ("装備ボックス #24"), and a getter must
+/// run for every range of its part whatever the row is called.
 fn touched(ranges: &[DiffRange], slot: Option<usize>, names: &[&str]) -> bool {
     ranges
         .iter()
-        .any(|range| range.slot == slot && names.contains(&range.name))
+        .any(|range| range.slot == slot && names.contains(&range.part))
 }
 
 /// The body wide values: options, slot flags, download palicoes, download
@@ -1292,7 +1297,7 @@ mod tests {
         );
         // The gate opened on the ポーチ range and nothing else moved.
         assert!(
-            diff.ranges.iter().all(|range| range.name == "ポーチ"),
+            diff.ranges.iter().all(|range| range.part == "ポーチ"),
             "{:?}",
             diff.ranges
         );
