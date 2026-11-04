@@ -1322,11 +1322,15 @@ const BODY_LAYOUT: &[Layout] = &[
     },
 ];
 
-/// The download-quest section, whose offset the save itself carries.
+/// The download section, whose offset the save itself carries.
+///
+/// It holds the download palicoes, the quest payloads and the 45 quest-equipment
+/// loadouts, so it is named for the section rather than for the quests alone:
+/// a write that only touches a loadout is not a quest change.
 const DLC_SECTION: Layout = Layout {
     start: 0,
     end: crate::dlc::EQUIP_ARRAY_OFFSET + crate::dlc::EQUIP_SLOTS * crate::dlc::EQUIP_SLOT_SIZE,
-    name: "DLC クエスト",
+    name: "DLC セクション",
     unit: 0,
     unit_name: "",
 };
@@ -1357,8 +1361,21 @@ impl DiffRange {
 
     /// The line the review prints for this stretch, e.g.
     /// "スロット1 装備ボックス 3 バイト（1 枠）".
+    ///
+    /// The console wording: its review has no room for "+0x… 付近", so the
+    /// offset stays out. The window wording is [`DiffRange::window_line`].
     pub fn line(&self) -> String {
         let mut out = format!("{} {} バイト", self.head(), self.len);
+        if let Some((n, what)) = self.records {
+            out.push_str(&format!("（{} {}）", n, what));
+        }
+        out
+    }
+
+    /// The same line as the desktop dialog prints it, with where inside the
+    /// part the change starts: "スロット1 装備ボックス +0x3C 付近 3 バイト（1 枠）".
+    pub fn window_line(&self) -> String {
+        let mut out = format!("{} +0x{:X} 付近 {} バイト", self.head(), self.rel, self.len);
         if let Some((n, what)) = self.records {
             out.push_str(&format!("（{} {}）", n, what));
         }
@@ -1386,24 +1403,74 @@ pub struct SaveDiff {
 /// How many ranges the review names before it says "ほか N 件".
 pub const REVIEW_RANGES: usize = 8;
 
+/// Which wording a review body is written in.
+///
+/// The console review and the desktop dialog print the same three sections;
+/// what differs is the range line ("+0x… 付近" only fits the window) and what
+/// an empty summary does. Keeping both in [`SaveDiff::review_lines`] is what
+/// stops the two screens from drifting apart again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewWording {
+    /// The console's two-press review.
+    Console,
+    /// The desktop review dialog and the snapshot comparison.
+    Window,
+}
+
 impl SaveDiff {
     /// Is there anything to review at all?
     pub fn is_empty(&self) -> bool {
         self.changed == 0
     }
 
+    /// The review body the console draws: [`SaveDiff::review_lines`] in
+    /// [`ReviewWording::Console`].
+    pub fn lines(&self, shown: usize) -> Vec<String> {
+        self.review_lines(shown, ReviewWording::Console)
+    }
+
+    /// The review body the desktop review dialog and the snapshot comparison
+    /// draw: the same assembly, in [`ReviewWording::Window`].
+    ///
+    /// Both windows call this instead of building the sections themselves, so
+    /// the order (内容 → 値 → 範囲), the caps and the "ほか N 件" wording exist
+    /// once. Only the range line and the empty-summary case differ, and the
+    /// wording enum says how.
+    pub fn window_lines(&self, shown: usize) -> Vec<String> {
+        self.review_lines(shown, ReviewWording::Window)
+    }
+
     /// The review body: what changes, then what values, then where. shown caps
     /// the ranges and [crate::diffvalues::VALUE_SHOWN] the values, so a
     /// difference in hundreds of places cannot push the buttons off screen;
     /// what is left over is counted rather than dropped silently.
-    pub fn lines(&self, shown: usize) -> Vec<String> {
+    ///
+    /// This is the one place the three sections are assembled. The console
+    /// ([SaveDiff::lines]) and the desktop windows ([SaveDiff::window_lines])
+    /// both come through here, which is what keeps the two reviews from saying
+    /// the same thing in two slightly different ways.
+    pub fn review_lines(&self, shown: usize, wording: ReviewWording) -> Vec<String> {
+        let window = wording == ReviewWording::Window;
         let mut out: Vec<String> = Vec::new();
-        out.push(String::from("■ 変更される内容"));
-        if self.summary.is_empty() {
-            out.push(format!("・変更 {} バイト", self.changed));
-        }
-        for line in &self.summary {
-            out.push(format!("・{}", line));
+        // A window over a file that did not parse has no summary line at all,
+        // and leaves the section out; the console keeps the heading and puts
+        // the byte count under it.
+        if window {
+            if !self.summary.is_empty() {
+                out.push(String::new());
+                out.push(String::from("■ 変更される内容"));
+                for line in &self.summary {
+                    out.push(format!("・{}", line));
+                }
+            }
+        } else {
+            out.push(String::from("■ 変更される内容"));
+            if self.summary.is_empty() {
+                out.push(format!("・変更 {} バイト", self.changed));
+            }
+            for line in &self.summary {
+                out.push(format!("・{}", line));
+            }
         }
         if !self.values.is_empty() {
             out.push(String::new());
@@ -1425,7 +1492,13 @@ impl SaveDiff {
             out.push(String::from("・特定できる違いはありません"));
         }
         for range in self.ranges.iter().take(shown) {
-            out.push(format!("・{}", range.line()));
+            out.push(format!(
+                "・{}",
+                match wording {
+                    ReviewWording::Console => range.line(),
+                    ReviewWording::Window => range.window_line(),
+                }
+            ));
         }
         if self.ranges.len() > shown {
             out.push(format!("・ほか {} 件", self.ranges.len() - shown));
@@ -1679,7 +1752,7 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
                 Some((n, what)) => format!("{} {} {}", name, n, what),
                 None => String::from(name),
             },
-            (None, "DLC クエスト") => {
+            (None, "DLC セクション") => {
                 let n = quests_changed(old, new);
                 if n > 0 {
                     format!("クエスト {} 件", n)
@@ -1700,7 +1773,7 @@ pub fn diff_summary(ranges: &[DiffRange], old: &Save, new: &Save) -> Vec<String>
                 None => per_slot.push((slot, alloc::vec![part])),
             },
             None => {
-                let list = if range.name == "DLC クエスト" {
+                let list = if range.name == "DLC セクション" {
                     &mut dlc
                 } else {
                     &mut body
@@ -11039,7 +11112,7 @@ mod tests {
         let summary = diff.summary.join(" / ");
         assert!(summary.contains("DLC: クエスト 2 件"), "{}", summary);
         assert!(
-            diff.ranges.iter().any(|r| r.name == "DLC クエスト"),
+            diff.ranges.iter().any(|r| r.name == "DLC セクション"),
             "{:?}",
             diff.ranges
         );
@@ -11127,5 +11200,100 @@ mod tests {
             Write::File { bytes, .. } => assert_eq!(bytes, new),
         }
         assert!(!ed.review_open());
+    }
+
+    /// The review body is assembled once: the console (`lines`) and the
+    /// desktop dialog (`window_lines`) come through the same function and
+    /// differ only where a screen really needs it - the range offset, and
+    /// what an empty summary does.
+    #[test]
+    fn the_window_and_the_console_read_the_same_review_body() {
+        let old = crate::save::empty_switch_save();
+        let mut new = old.clone();
+        let mut character = new.read_character(0).expect("a character record");
+        character.name = String::from("差分テスト");
+        character.funds = 123_456;
+        new.write_character(&character).expect("the character writes");
+
+        let diff = diff_save(&old.to_bytes(), &new.to_bytes());
+        assert!(!diff.is_empty());
+        let console = diff.lines(REVIEW_RANGES);
+        let window = diff.window_lines(REVIEW_RANGES);
+        let heads = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|line| line.starts_with('■'))
+                .cloned()
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(heads(&console), heads(&window), "{:?}\n{:?}", console, window);
+        // The console starts on the heading; the window leaves a blank line
+        // above it, because the dialog already printed its own header there.
+        assert_eq!(console.first().map(String::as_str), Some("■ 変更される内容"));
+        assert_eq!(window.first().map(String::as_str), Some(""));
+        // Every value line is the same word for word.
+        let values = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|line| line.contains(" → "))
+                .cloned()
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(values(&console), values(&window));
+        assert!(
+            values(&console)
+                .iter()
+                .any(|line| line.contains("所持金: 0 z → 123456 z")),
+            "{:?}",
+            values(&console)
+        );
+        // The range line is the one wording difference. Take the offset out
+        // of the window line and it is the console line exactly.
+        let range = |lines: &[String]| {
+            lines
+                .iter()
+                .find(|line| line.contains("名前") && line.contains("バイト"))
+                .cloned()
+                .expect("a 名前 range line")
+        };
+        let console_range = range(&console);
+        let window_range = range(&window);
+        assert!(!console_range.contains("+0x"), "{}", console_range);
+        let at = window_range.find(" +0x").expect("the window names the offset");
+        let end = at + window_range[at..].find(" 付近 ").expect("付近") + " 付近 ".len();
+        assert_eq!(
+            format!("{} {}", &window_range[..at], &window_range[end..]),
+            console_range,
+            "the same range in two wordings"
+        );
+
+        // A file that did not parse has no summary. The console keeps the
+        // heading and puts the byte count under it; the window leaves the
+        // section out, the way its dialogs always have.
+        let bare = SaveDiff {
+            changed: 3,
+            summary: Vec::new(),
+            values: Vec::new(),
+            ranges: alloc::vec![DiffRange {
+                slot: None,
+                name: "セーブファイル",
+                rel: 0,
+                len: 3,
+                records: None,
+            }],
+        };
+        let console = bare.lines(REVIEW_RANGES);
+        assert_eq!(console[0], "■ 変更される内容");
+        assert_eq!(console[1], "・変更 3 バイト");
+        let window = bare.window_lines(REVIEW_RANGES);
+        assert!(
+            !window.iter().any(|line| line == "■ 変更される内容"),
+            "{:?}",
+            window
+        );
+        assert_eq!(window[0], "");
+        assert!(window
+            .iter()
+            .any(|line| line.contains("セーブファイル") && line.contains("3 バイト")));
     }
 }

@@ -20,12 +20,13 @@
 //!
 //! The body wide parts (options, slot flags, download palicoes, download
 //! quests), every character slot (character sheet, guild card, arena log,
-//! equipment box, item box, item and equipment sets, palico roster, hunt
-//! records, palico equipment box, quest progress, awards) and the 45
-//! quest-equipment loadouts the DLC section carries. The last three were the
-//! areas an audit named as "editable, but the review only shows bytes": their
-//! getters ([crate::hunts], [crate::palicogear], [crate::dlc]) were already
-//! there, so they are read the same way as everything else.
+//! equipment box, item box, the pouch, item and equipment sets, palico roster,
+//! hunt records, palico equipment box, quest progress, awards) and the 45
+//! quest-equipment loadouts the DLC section carries. The pouch was the last
+//! area an audit found "editable, but the review only shows bytes"; its getter
+//! ([`myset::pouch`]) was already there, so it is read the same way as
+//! everything else. 狩猟記録, オトモ装備ボックス and クエスト装備 had the same
+//! fault and got their walks the same way.
 
 use alloc::borrow::ToOwned;
 use alloc::format;
@@ -185,7 +186,7 @@ fn body_values(ranges: &[DiffRange], old: &Save, new: &Save, out: &mut Vec<Value
     // read when a range says the section really moved: the quest payloads are
     // compared byte for byte (a quest that changed at the same size is still a
     // change) and the 45 quest-equipment loadouts are read entry by entry.
-    if !touched(ranges, None, &["DLC クエスト"]) {
+    if !touched(ranges, None, &["DLC セクション"]) {
         return;
     }
     dlc_quest_values(old, new, out);
@@ -320,13 +321,20 @@ fn slot_values(
     if moved(&["アイテムボックス"]) {
         item_values(old, new, slot, out);
     }
+    // The pouch sits between the item sets and the money. It is written from
+    // two screens (the item box editor and ポーチへ適用 in the set editor), and
+    // before this gate it had a byte range and no value at all.
+    if moved(&["ポーチ"]) {
+        pouch_values(old, new, slot, out);
+    }
     if moved(&["アイテムマイセット", "装備マイセット"]) {
         set_values(old, new, slot, out);
     }
     if moved(&["オトモ"]) {
         palico_values(old, new, slot, out);
     }
-    // The three areas that used to keep their byte range and nothing else.
+    // The areas that used to keep their byte range and nothing else. The
+    // pouch above is the newest of them.
     if moved(&["狩猟記録"]) {
         hunt_values(old, new, slot, out);
     }
@@ -664,10 +672,43 @@ fn item_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) 
 
 /// One item box record as the item box screen words it.
 fn item_line(slot: &ItemSlot) -> String {
-    if slot.id == 0 {
+    item_count_line(slot.id, slot.count as u16)
+}
+
+/// One (id, count) pair as the item box, the sets and the pouch word it.
+fn item_count_line(id: u16, count: u16) -> String {
+    if id == 0 {
         String::from("なし")
     } else {
-        format!("{} ×{}", crate::hbedit::item_name_of(slot.id), slot.count)
+        format!("{} ×{}", crate::hbedit::item_name_of(id), count)
+    }
+}
+
+/// The pouch: the thirty-two entries the hunter carries into a quest.
+///
+/// Two screens write it - the item box editor's ポーチ column and ポーチへ適用
+/// in the set editor - and until this walk existed a change there showed its
+/// byte range and no value. [myset::pouch] is the getter the set screen already
+/// reads, so both sides are read through it and nothing is decoded twice.
+fn pouch_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>) {
+    let (a, b) = (myset::pouch(old, slot), myset::pouch(new, slot));
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        if x == y {
+            continue;
+        }
+        differing(
+            out,
+            Some(slot),
+            format!("ポーチ #{}", i + 1),
+            item_count_line(x.id, x.count),
+            // The name again only when the item itself changed: a count
+            // edit reads as "回復薬 ×10 → ×3", not the name twice.
+            if x.id == y.id && y.id != 0 {
+                format!("×{}", y.count)
+            } else {
+                item_count_line(y.id, y.count)
+            },
+        );
     }
 }
 
@@ -1221,5 +1262,39 @@ mod tests {
         for line in section.iter().filter(|l| !l.is_empty()) {
             assert!(line.starts_with('・'), "{}", line);
         }
+    }
+
+    /// The pouch is editable from two screens, and until this walk existed a
+    /// change there showed the byte range and no value: the audit found it as
+    /// the last hole of that kind. A count edit names the item once and the
+    /// count twice; clearing says なし.
+    #[test]
+    fn the_pouch_reports_the_item_and_the_count() {
+        let mut old = crate::save::empty_switch_save();
+        // 9 is 回復薬 in the item table.
+        assert!(myset::set_pouch_item(&mut old, 0, 0, 9, 10));
+        assert!(myset::set_pouch_item(&mut old, 0, 3, 9, 2));
+        let mut new = old.clone();
+        assert!(myset::set_pouch_item(&mut new, 0, 0, 9, 3));
+        assert!(myset::set_pouch_item(&mut new, 0, 3, 0, 0));
+
+        let diff = diff_save(&old.to_bytes(), &new.to_bytes());
+        let text = joined(&diff);
+        assert!(
+            text.contains("スロット1 ポーチ #1: 回復薬 ×10 → ×3"),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains("スロット1 ポーチ #4: 回復薬 ×2 → なし"),
+            "{}",
+            text
+        );
+        // The gate opened on the ポーチ range and nothing else moved.
+        assert!(
+            diff.ranges.iter().all(|range| range.name == "ポーチ"),
+            "{:?}",
+            diff.ranges
+        );
     }
 }

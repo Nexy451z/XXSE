@@ -9,7 +9,6 @@ use mhnx_core::arc::{extension_for, Arc};
 use mhnx_core::awards;
 use mhnx_core::check::{self, Finding, Severity};
 use mhnx_core::csvout::{self, ApplyReport, EquipmentRow};
-use mhnx_core::diffvalues::VALUE_SHOWN;
 use mhnx_core::dlc;
 use mhnx_core::equipops::{self, EquipError};
 use mhnx_core::equiprefs::EquipRef;
@@ -303,7 +302,7 @@ impl SnapshotCompare {
         };
         lines.push(format!("{} バイトが違います{}。", self.diff.changed, size));
         lines.push(String::from("+0x… はその機能の先頭からの位置です。"));
-        lines.extend(diff_sections(&self.diff, SHOWN));
+        lines.extend(self.diff.window_lines(SHOWN));
         lines.push(String::new());
         lines.push(String::from(
             "この比較は読み取り専用です（どちらのファイルも書き換えません）。",
@@ -386,8 +385,9 @@ pub struct StoppedWrite {
 /// bytes their own tab owns, so every new tab needed its own undo and the other
 /// nine tabs had none. A step here is the whole parsed save instead, which
 /// every tab shares. A step is 4,726,188 bytes (the 4,726,152 byte body plus
-/// the 36 byte Switch header), so the 16 step cap is 75,619,008 bytes, about
-/// 72 MiB of RAM; see [MhnxEditor::UNDO_STEPS].
+/// the 36 byte Switch header). The number of steps is a setting, eight by
+/// default: 8 undo + 8 redo steps are 75,619,008 bytes, about 72 MiB; see
+/// [MhnxEditor::undo_steps] and [MhnxEditor::set_undo_steps].
 pub struct SaveUndo {
     /// What the edit was called, for the status line and the tooltip.
     pub label: String,
@@ -405,8 +405,10 @@ pub struct SaveUndo {
 // window's review, once there for the console's - and the two spellings of the
 // download section disagreed (「DLC セクション」 here, 「DLC クエスト」 there),
 // so this file translated the names on the way into the value walk. One copy
-// means one spelling: the window now prints what the library names. Only the
-// wording stays here, because the console has no room for "+0x… 付近".
+// means one spelling: the window now prints what the library names. The
+// wording difference that is real - the window can afford "+0x… 付近", the
+// console cannot - is passed to the library as a wording choice instead of
+// being a second copy of the body.
 
 /// A write that is waiting for the user to agree to what it changes.
 pub struct WriteReview {
@@ -422,69 +424,16 @@ pub struct WriteReview {
     pub diff: SaveDiff,
 }
 
-/// The three sections a difference is printed as.
-///
-/// Shared by the pre-save review and the snapshot comparison so the two read
-/// the same: the feature level summary, the values that changed, then the
-/// named byte ranges. `shown` caps the ranges and [VALUE_SHOWN] the values, so
-/// a difference in hundreds of places cannot push the rest of a dialog out of
-/// the window; what is left over is counted rather than dropped silently.
-pub fn diff_sections(diff: &SaveDiff, shown: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    if !diff.summary.is_empty() {
-        lines.push(String::new());
-        lines.push(String::from("■ 変更される内容"));
-        for line in &diff.summary {
-            lines.push(format!("・{}", line));
-        }
-    }
-    if !diff.values.is_empty() {
-        lines.push(String::new());
-        lines.push(String::from("■ 変更される値（旧 → 新）"));
-        for value in diff.values.iter().take(VALUE_SHOWN) {
-            lines.push(format!("・{}", value.line()));
-        }
-        if diff.values.len() > VALUE_SHOWN {
-            lines.push(format!(
-                "・ほか {} 件（値は先頭 {} 件まで。残りは下の範囲に残ります）",
-                diff.values.len() - VALUE_SHOWN,
-                VALUE_SHOWN
-            ));
-        }
-    }
-    lines.push(String::new());
-    lines.push(String::from("■ 変更される範囲"));
-    if diff.ranges.is_empty() {
-        lines.push(String::from("・特定できる違いはありません"));
-    }
-    for range in diff.ranges.iter().take(shown) {
-        lines.push(format!("・{}", range_line(range)));
-    }
-    if diff.ranges.len() > shown {
-        lines.push(format!("・ほか {} 件", diff.ranges.len() - shown));
-    }
-    lines
-}
-
-/// One range as the review prints it: the place, how far into it the change
-/// starts, how many bytes moved, and the records those bytes cover.
-///
-/// The "+0x…" is the window's half of the wording: the console review has no
-/// room for it, so [mhnx_core::hbedit::DiffRange::line] leaves it out, and the
-/// sentence that explains it ("+0x… はその機能の先頭からの位置です。") is drawn
-/// by [MhnxEditor::review_text] and [SnapshotCompare::text].
-fn range_line(range: &mhnx_core::hbedit::DiffRange) -> String {
-    let mut out = format!(
-        "{} +0x{:X} 付近 {} バイト",
-        range.head(),
-        range.rel,
-        range.len
-    );
-    if let Some((n, what)) = range.records {
-        out += &format!("（{} {}）", n, what);
-    }
-    out
-}
+// The review body itself is built by mhnx_core
+//
+// [mhnx_core::hbedit::SaveDiff::window_lines] assembles the three sections -
+// 内容 → 値 → 範囲 - and the caps and "ほか N 件" wording that go with them.
+// Building them here as well is what the last audit found: the same document
+// written twice, free to drift. The window only says how its ranges are
+// spelled ("+0x… 付近", which the console has no room for); the core function
+// takes that wording and nothing else. The sentence that explains the offset
+// ("+0x… はその機能の先頭からの位置です。") stays with the two dialogs that
+// draw it, above and below the shared body.
 
 /// One received guild card, as the ギルド tab lists it.
 ///
@@ -781,17 +730,27 @@ pub struct MhnxEditor {
 
     // ---- undo: the whole save, shared by every tab ----
     /// Steps of the all-tab undo, newest last. Each one is a whole parsed save
-    /// (`save::BODY_SIZE` plus the Switch header, 4,726,188 bytes), so 16 of
-    /// them are about 75 MB; see [MhnxEditor::push_undo].
+    /// (`save::BODY_SIZE` plus the Switch header, 4,726,188 bytes), so the
+    /// stack costs [MhnxEditor::undo_steps] times 4.7 MB; see
+    /// [MhnxEditor::push_undo].
     pub undo: Vec<SaveUndo>,
     /// Steps 元に戻す took back, newest last, so やり直す can put them back.
     ///
     /// A step is the save as it was when the undo was pressed, kept under the
-    /// name of the edit it takes back. The same [MhnxEditor::UNDO_STEPS] cap
-    /// and the same 4.7 MB per step, so both stacks full is about 144 MiB. A
-    /// new edit drops the stack: a redo that no longer follows the history
-    /// would put back bytes that were never removed.
+    /// name of the edit it takes back. Both stacks share
+    /// [MhnxEditor::undo_steps], so the default of eight costs about 72 MiB for
+    /// the pair. A new edit drops the stack: a redo that no longer follows the
+    /// history would put back bytes that were never removed.
     pub redo: Vec<SaveUndo>,
+    /// How many steps each of the two history stacks keeps.
+    ///
+    /// A setting rather than a constant: one step is the whole save, so the
+    /// cost is linear and belongs to the user. The 設定 window offers
+    /// [MhnxEditor::UNDO_STEP_CHOICES] and prints the memory beside each, and
+    /// the default is [MhnxEditor::DEFAULT_UNDO_STEPS].
+    pub undo_steps: usize,
+    /// Is the 設定 window open?
+    pub show_settings: bool,
 
     // ---- guild card: the cards received from other hunters ----
     /// Which of the two lists (kept cards / courier inbox) is on screen.
@@ -950,6 +909,8 @@ impl Default for MhnxEditor {
             review: None,
             undo: Vec::new(),
             redo: Vec::new(),
+            undo_steps: Self::DEFAULT_UNDO_STEPS,
+            show_settings: false,
             card_list: mhnx_core::guildcard::CardList::Stored,
             card_selected: None,
             scroll_to_cards: 0,
@@ -1864,7 +1825,7 @@ impl MhnxEditor {
             review.diff.changed, size
         ));
         lines.push(String::from("+0x… はその機能の先頭からの位置です。"));
-        lines.extend(diff_sections(&review.diff, SHOWN));
+        lines.extend(review.diff.window_lines(SHOWN));
         lines.push(String::new());
         lines.push(String::from(if restore {
             "この内容で戻しますか？"
@@ -1881,15 +1842,61 @@ impl MhnxEditor {
 
     // -------------------------------------------------- undo, shared by tabs
 
-    /// How many steps the all-tab undo keeps.
+    /// The history depth a fresh editor starts with.
     ///
-    /// Memory: a step is one whole save, `save::BODY_SIZE` = 4,726,152 bytes
-    /// plus the 36 byte Switch header, so the stack tops out at 75,619,008
-    /// bytes (about 72 MiB; one step prints as "4.51 MB"). The steps are
-    /// dropped oldest first, the same way the item and progress stacks work; a
-    /// new file or a slot switch clears them all, because a step names the slot
-    /// it belonged to.
-    const UNDO_STEPS: usize = 16;
+    /// A step is one whole save, `save::BODY_SIZE` = 4,726,152 bytes plus
+    /// the 36 byte Switch header, and undo and redo each keep this many steps:
+    /// eight is 75,619,008 bytes for the pair, about 72 MiB. It used to be
+    /// sixteen in each stack, 144 MiB, for users who never asked for it; eight
+    /// halves that and is still more than the four the console keeps. The steps
+    /// are dropped oldest first, the same way the item and progress stacks work;
+    /// a new file or a slot switch clears them all, because a step names the
+    /// slot it belonged to.
+    pub const DEFAULT_UNDO_STEPS: usize = 8;
+
+    /// The depths the 設定 window offers, in order.
+    pub const UNDO_STEP_CHOICES: [usize; 3] = [4, 8, 16];
+
+    /// The most either stack may keep, and the cap on the setting.
+    pub const MAX_UNDO_STEPS: usize = 16;
+
+    /// Bytes both history stacks can hold at this depth.
+    ///
+    /// One stack is the save size times the steps; undo and redo both exist,
+    /// so the pair is twice that. Printed as MiB (1024 based) because that is
+    /// the number a task manager shows.
+    pub fn undo_memory_bytes(steps: usize) -> u64 {
+        (mhnx_core::save::SWITCH_SIZE * steps * 2) as u64
+    }
+
+    /// The same as "72.1 MiB", for the 設定 window and the tooltips.
+    pub fn undo_memory_text(steps: usize) -> String {
+        format!(
+            "{:.1} MiB",
+            Self::undo_memory_bytes(steps) as f64 / (1024.0 * 1024.0)
+        )
+    }
+
+    /// Change how many steps each history stack keeps.
+    ///
+    /// Lowering it drops the oldest steps at once, so the memory is given back
+    /// when the setting says so instead of at some later edit. Zero is refused:
+    /// a history that keeps nothing is not a setting, it is a bug.
+    pub fn set_undo_steps(&mut self, steps: usize) {
+        let steps = steps.clamp(1, Self::MAX_UNDO_STEPS);
+        self.undo_steps = steps;
+        while self.undo.len() > steps {
+            self.undo.remove(0);
+        }
+        while self.redo.len() > steps {
+            self.redo.remove(0);
+        }
+        self.message = format!(
+            "元に戻せる回数を {} 段にしました（元に戻す + やり直すで最大 {}）",
+            steps,
+            Self::undo_memory_text(steps)
+        );
+    }
 
     /// Keep the save as it is now, before an edit changes it.
     ///
@@ -1903,7 +1910,7 @@ impl MhnxEditor {
             slot: self.slot,
             save,
         });
-        while self.undo.len() > Self::UNDO_STEPS {
+        while self.undo.len() > self.undo_steps {
             self.undo.remove(0);
         }
         // A new edit is a new branch: what やり直す would have put back does
@@ -1937,7 +1944,7 @@ impl MhnxEditor {
                 slot: self.slot,
                 save,
             });
-            while self.redo.len() > Self::UNDO_STEPS {
+            while self.redo.len() > self.undo_steps {
                 self.redo.remove(0);
             }
         }
@@ -1964,7 +1971,7 @@ impl MhnxEditor {
                 slot: self.slot,
                 save,
             });
-            while self.undo.len() > Self::UNDO_STEPS {
+            while self.undo.len() > self.undo_steps {
                 self.undo.remove(0);
             }
         }
@@ -2615,6 +2622,7 @@ impl eframe::App for MhnxEditor {
         // A window rather than a dialog: it stays open while the editor behind
         // it is looked at, and the side panel can switch what it compares.
         self.compare_window(ctx);
+        self.settings_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // These tabs stack several sections and could grow past the
@@ -2880,11 +2888,12 @@ impl MhnxEditor {
                 let last = self.undo_label().map(|s| s.to_owned());
                 let hover = match &last {
                     Some(label) => format!(
-                        "{} を取り消します（Ctrl+Z）\n保持している段数: {} / {}（1 段 = {}）",
+                        "{} を取り消します（Ctrl+Z）\n保持している段数: {} / {}（1 段 = {}、2 つの履歴で最大 {}）",
                         label,
                         depth,
-                        Self::UNDO_STEPS,
-                        Self::human_size(mhnx_core::save::SWITCH_SIZE as u64)
+                        self.undo_steps,
+                        Self::human_size(mhnx_core::save::SWITCH_SIZE as u64),
+                        Self::undo_memory_text(self.undo_steps)
                     ),
                     None => String::from("戻せる操作がありません（Ctrl+Z）"),
                 };
@@ -2902,11 +2911,12 @@ impl MhnxEditor {
                 let redo_last = self.redo_label().map(|s| s.to_owned());
                 let redo_hover = match &redo_last {
                     Some(label) => format!(
-                        "{} をやり直します（Ctrl+Shift+Z / Ctrl+Y）\n保持している段数: {} / {}（1 段 = {}）",
+                        "{} をやり直します（Ctrl+Shift+Z / Ctrl+Y）\n保持している段数: {} / {}（1 段 = {}、2 つの履歴で最大 {}）",
                         label,
                         redo_depth,
-                        Self::UNDO_STEPS,
-                        Self::human_size(mhnx_core::save::SWITCH_SIZE as u64)
+                        self.undo_steps,
+                        Self::human_size(mhnx_core::save::SWITCH_SIZE as u64),
+                        Self::undo_memory_text(self.undo_steps)
                     ),
                     None => String::from("やり直せる操作がありません（Ctrl+Shift+Z / Ctrl+Y）"),
                 };
@@ -2916,6 +2926,21 @@ impl MhnxEditor {
                     .clicked()
                 {
                     self.redo_last();
+                }
+                ui.separator();
+                // The history depth and its memory cost live in one small
+                // window rather than in the bar: the bar is full, and the
+                // number is a preference, not an action.
+                let memory = Self::undo_memory_text(self.undo_steps);
+                if ui
+                    .button("設定")
+                    .on_hover_text(format!(
+                        "元に戻せる回数（いま {} 段・2 つの履歴で最大 {}）",
+                        self.undo_steps, memory
+                    ))
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
                 }
                 ui.separator();
                 if ui.button(".arc を開く").clicked() {
@@ -3284,6 +3309,67 @@ impl MhnxEditor {
             self.compare_snapshot(left, right);
         } else if close {
             self.compare = None;
+        }
+    }
+
+    /// The 設定 window: the history depth, with what each choice costs.
+    ///
+    /// Every option prints the memory the two stacks would take at that depth,
+    /// so the choice is made with the number in view rather than after the
+    /// fact. The setting lives in this run; nothing is written to disk.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = self.show_settings;
+        let mut pick: Option<usize> = None;
+        egui::Window::new("設定")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("履歴とメモリ").strong());
+                ui.label("元に戻せる回数");
+                ui.horizontal_wrapped(|ui| {
+                    for steps in Self::UNDO_STEP_CHOICES {
+                        let label = format!("{} 段（{}）", steps, Self::undo_memory_text(steps));
+                        if ui
+                            .selectable_label(self.undo_steps == steps, label)
+                            .on_hover_text(format!(
+                                "元に戻す {} 段 + やり直す {} 段。1 段はセーブ全体（{}）です",
+                                steps,
+                                steps,
+                                Self::human_size(mhnx_core::save::SWITCH_SIZE as u64)
+                            ))
+                            .clicked()
+                        {
+                            pick = Some(steps);
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "いま: 元に戻す {} 段 + やり直す {} 段 = 最大 {}（1 段 = {}）",
+                        self.undo_steps,
+                        self.undo_steps,
+                        Self::undo_memory_text(self.undo_steps),
+                        Self::human_size(mhnx_core::save::SWITCH_SIZE as u64)
+                    ))
+                    .weak()
+                    .small(),
+                );
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "1 段はセーブ全体（4,726,188 バイト）です。回数を増やすほどメモリを使います。\n\
+                         段を減らすと、いちばん古い段から捨てます。",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+        self.show_settings = open;
+        if let Some(steps) = pick {
+            self.set_undo_steps(steps);
         }
     }
 
@@ -11950,8 +12036,9 @@ mod tests {
     //! filesystem helpers and the editor state, never at egui.
 
     use super::*;
-    // Only the save-size constants are used here, so they are imported here
-    // rather than in the module above, where nothing reads them.
+    // Only the save sizes and the value cap are used here, so they are
+    // imported here rather than in the module above, where nothing reads them.
+    use mhnx_core::diffvalues::VALUE_SHOWN;
     use mhnx_core::save::{BODY_SIZE, SWITCH_SIZE};
 
     /// A scratch folder that removes itself.
@@ -14548,10 +14635,11 @@ mod tests {
         assert_eq!(ranges[0].name, "装備ボックス");
         assert_eq!(ranges[0].rel, 5 * mhnx_core::save::EQUIPMENT_RECORD);
         assert_eq!(ranges[0].records, Some((1, "枠")));
-        // The line is the window's: the library names the place, and the
-        // "+0x… 付近" half (which the console has no room for) is added here.
+        // Both wordings come from the library now: range.line() for the
+        // console, range.window_line() for the +0x… 付近 half the window has
+        // room for. This file keeps no copy of either.
         assert_eq!(
-            range_line(&ranges[0]),
+            ranges[0].window_line(),
             format!(
                 "スロット1 装備ボックス +0x{:X} 付近 {} バイト（1 枠）",
                 5 * mhnx_core::save::EQUIPMENT_RECORD,
@@ -14578,10 +14666,11 @@ mod tests {
         assert_eq!(changed, 8);
         assert_eq!(ranges.len(), 1);
         assert_eq!(ranges[0].slot, None);
-        // The library's spelling, which the review now prints too (this file
-        // used to say 「DLC セクション」 and translate on the way into the value
-        // walk).
-        assert_eq!(ranges[0].name, "DLC クエスト");
+        // The library names the whole region, not only the quests in it: the
+        // section also carries the download palicoes and the 45 loadouts, and
+        // a palico or equipment edit is not a quest change. The window prints
+        // the same name (it used to translate 「DLC クエスト」 into its own).
+        assert_eq!(ranges[0].name, "DLC セクション");
         let summary = mhnx_core::hbedit::diff_summary(&ranges, &save, &save);
         assert!(
             summary.iter().any(|line| line == "DLC: クエスト"),
@@ -14594,13 +14683,13 @@ mod tests {
             values: Vec::new(),
             ranges,
         };
-        let lines = diff_sections(&diff, 12);
+        let lines = diff.window_lines(12);
         // The offset is the body one: the download section's own start is
         // carried by the save, and the walk has always reported from the body.
         assert!(
             lines.iter().any(|line| line
                 == &format!(
-                    "・DLC クエスト +0x{:X} 付近 8 バイト",
+                    "・DLC セクション +0x{:X} 付近 8 バイト",
                     dlc + mhnx_core::dlc::QUEST_ARRAY_OFFSET
                 )),
             "{:?}",
@@ -15019,6 +15108,66 @@ mod tests {
         assert_eq!(written.len(), SWITCH_SIZE);
     }
 
+    /// The dialog body is not built here any more: it is
+    /// `SaveDiff::window_lines` from the library, printed as it comes. What
+    /// the window adds is its own header above and its question below.
+    #[test]
+    fn the_review_body_is_the_library_window_body() {
+        let dir = Scratch::new("reviewbody");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(app.set_arena_time(0, 0, 1234));
+        app.write_force = true;
+        app.write_current(path);
+        assert!(matches!(app.confirm, Confirm::ReviewWrite), "{}", app.message);
+        let body = app
+            .review
+            .as_ref()
+            .expect("the review waits")
+            .diff
+            .window_lines(12)
+            .join("\n");
+        let text = app.review_text();
+        assert!(
+            text.contains(&body),
+            "the dialog prints the library body as it comes\n{}\n---\n{}",
+            body,
+            text
+        );
+        // The one thing the wrapper adds around the body.
+        assert!(
+            !body.contains("+0x… はその機能の先頭からの位置です。"),
+            "the note belongs to the dialog: {}",
+            body
+        );
+        assert!(text.contains("+0x… はその機能の先頭からの位置です。"));
+    }
+
+    /// The last value hole the audit named: the pouch was writable from two
+    /// screens and the review only showed its byte range. It is named now.
+    #[test]
+    fn the_review_names_a_pouch_change() {
+        let dir = Scratch::new("reviewpouch");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        assert!(app.save.is_some(), "{}", app.message);
+        // 9 is 回復薬; the pouch column of the item box writes it.
+        assert!(app.pouch_entry_write(0, 9, 3), "{}", app.message);
+        app.write_force = true;
+        app.write_current(path);
+        assert!(matches!(app.confirm, Confirm::ReviewWrite), "{}", app.message);
+        let text = app.review_text();
+        assert!(
+            text.contains("スロット1 ポーチ #1: なし → 回復薬 ×3"),
+            "{}",
+            text
+        );
+        assert!(text.contains("■ 変更される範囲"), "{}", text);
+    }
+
     /// 元に戻す covers the tabs that never had one: 装備 and ギルド here, one
     /// press per edit, newest first.
     #[test]
@@ -15070,9 +15219,10 @@ mod tests {
         assert!(app.message.contains("戻せる操作がありません"), "{}", app.message);
     }
 
-    /// The cap, and the memory it stands for: 16 whole saves.
+    /// The default cap, and the memory it stands for: 8 whole saves in each
+    /// stack, 72 MiB for the pair.
     #[test]
-    fn the_undo_stack_keeps_sixteen_steps_and_drops_the_oldest() {
+    fn the_undo_stack_keeps_eight_steps_by_default_and_drops_the_oldest() {
         let dir = Scratch::new("undocap");
         let path = write_a_save_with_slots(dir.path(), "system");
         let mut app = MhnxEditor::default();
@@ -15080,20 +15230,74 @@ mod tests {
         for i in 0..20 {
             app.push_undo(format!("手順 {}", i));
         }
-        assert_eq!(app.undo.len(), MhnxEditor::UNDO_STEPS);
+        assert_eq!(app.undo.len(), MhnxEditor::DEFAULT_UNDO_STEPS);
         assert_eq!(app.undo_label(), Some("手順 19"));
         assert_eq!(
             app.undo.first().map(|step| step.label.as_str()),
-            Some("手順 4"),
+            Some("手順 12"),
             "the oldest steps go first"
         );
-        let bytes = (mhnx_core::save::SWITCH_SIZE * MhnxEditor::UNDO_STEPS) as u64;
-        assert_eq!(bytes, 75_619_008, "16 × 4,726,188 bytes");
+        let bytes = MhnxEditor::undo_memory_bytes(MhnxEditor::DEFAULT_UNDO_STEPS);
+        assert_eq!(bytes, 75_619_008, "8 × 2 × 4,726,188 bytes");
+        assert_eq!(MhnxEditor::undo_memory_text(8), "72.1 MiB");
         assert!(
             MhnxEditor::human_size(bytes).ends_with("MB"),
             "{}",
             MhnxEditor::human_size(bytes)
         );
+    }
+
+    /// The history depth is a setting with the memory printed beside it:
+    /// 4 / 8 / 16 steps, eight by default, and lowering it gives the memory
+    /// back at once instead of at the next edit.
+    #[test]
+    fn the_undo_depth_is_a_setting_with_its_memory_beside_it() {
+        let dir = Scratch::new("undosetting");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path.clone());
+        let save = app.save.clone().expect("save");
+        assert_eq!(app.undo_steps, MhnxEditor::DEFAULT_UNDO_STEPS);
+        assert_eq!(MhnxEditor::DEFAULT_UNDO_STEPS, 8);
+        assert_eq!(MhnxEditor::UNDO_STEP_CHOICES, [4, 8, 16]);
+        // Both stacks count: undo 8 + redo 8 whole saves is 72.1 MiB.
+        assert_eq!(MhnxEditor::undo_memory_bytes(8), 75_619_008);
+        assert_eq!(MhnxEditor::undo_memory_text(4), "36.1 MiB");
+        assert_eq!(MhnxEditor::undo_memory_text(8), "72.1 MiB");
+        assert_eq!(MhnxEditor::undo_memory_text(16), "144.2 MiB");
+
+        // Six steps in each stack, then the setting drops the oldest of both.
+        for i in 0..6 {
+            app.undo.push(SaveUndo {
+                label: format!("手順 {}", i),
+                slot: 0,
+                save: save.clone(),
+            });
+            app.redo.push(SaveUndo {
+                label: format!("戻し {}", i),
+                slot: 0,
+                save: save.clone(),
+            });
+        }
+        app.set_undo_steps(4);
+        assert_eq!(app.undo.len(), 4);
+        assert_eq!(app.undo.first().map(|s| s.label.as_str()), Some("手順 2"));
+        assert_eq!(app.undo_label(), Some("手順 5"));
+        assert_eq!(app.redo.len(), 4);
+        assert_eq!(app.redo.first().map(|s| s.label.as_str()), Some("戻し 2"));
+        assert!(app.message.contains("4 段"), "{}", app.message);
+        assert!(app.message.contains("36.1 MiB"), "{}", app.message);
+
+        // The other end, and the guards: more than the maximum clamps down,
+        // zero clamps up, and the stacks follow whichever the setting is.
+        app.set_undo_steps(16);
+        assert_eq!(app.undo_steps, 16);
+        app.set_undo_steps(64);
+        assert_eq!(app.undo_steps, MhnxEditor::MAX_UNDO_STEPS);
+        app.set_undo_steps(0);
+        assert_eq!(app.undo_steps, 1);
+        assert_eq!(app.undo.len(), 1, "the stack follows the setting down");
+        assert_eq!(app.redo.len(), 1);
     }
 
     /// やり直す is the other direction of the same stack: it puts back exactly
@@ -15151,14 +15355,14 @@ mod tests {
     /// The redo stack is capped the same way the undo one is, and drops the
     /// oldest step first.
     #[test]
-    fn the_redo_stack_keeps_sixteen_steps_and_drops_the_oldest() {
+    fn the_redo_stack_keeps_the_configured_steps_and_drops_the_oldest() {
         let dir = Scratch::new("redocap");
         let path = write_a_save_with_slots(dir.path(), "system");
         let mut app = MhnxEditor::default();
         app.open_save(path.clone());
         let save = app.save.clone().expect("save");
-        // Filled past the cap on purpose: push_undo would keep only 16, and
-        // this test is about what undo_last does with them.
+        // Filled past the cap on purpose: push_undo would keep only the
+        // default eight, and this test is about what undo_last does with them.
         for i in 0..20 {
             app.undo.push(SaveUndo {
                 label: format!("手順 {}", i),
@@ -15169,11 +15373,11 @@ mod tests {
         for _ in 0..20 {
             app.undo_last();
         }
-        assert_eq!(app.redo.len(), MhnxEditor::UNDO_STEPS);
+        assert_eq!(app.redo.len(), MhnxEditor::DEFAULT_UNDO_STEPS);
         assert_eq!(app.redo_label(), Some("手順 0"));
         assert_eq!(
             app.redo.first().map(|step| step.label.as_str()),
-            Some("手順 15"),
+            Some("手順 7"),
             "the oldest steps go first"
         );
     }
@@ -15632,6 +15836,25 @@ mod tests {
             !output.shapes.is_empty(),
             "the snapshot list and the comparison window drew nothing"
         );
+    }
+
+    /// The 設定 window draws a frame with the three depths: a duplicate egui
+    /// id, or a window the layout cannot fit, would panic here. This is the
+    /// only place the depth setting is rendered.
+    #[test]
+    fn the_settings_window_draws_a_frame() {
+        let mut app = MhnxEditor::default();
+        app.show_settings = true;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        let output = ctx.run(input, |ctx| {
+            app.settings_window(ctx);
+        });
+        assert!(!output.shapes.is_empty(), "the 設定 window drew nothing");
     }
 }
 
