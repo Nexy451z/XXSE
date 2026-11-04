@@ -264,6 +264,245 @@ impl Default for CharmEdit {
     }
 }
 
+/// Rows on the talisman form.
+///
+/// Seven, and the state machine (Up / Down wrap with 7), the console's list
+/// geometry and the host tests all read this number, so the highlight and the
+/// row the form edits cannot drift apart.
+pub const CHARM_EDIT_ROWS: usize = 7;
+
+/// What `[A]` does on one row of the talisman form.
+///
+/// The console's `[A]` used to be one thing on every row - write the form into
+/// the box - while the pad dispatch already did something else on the kind, the
+/// slot and the two skill rows. The footer and the inspector button therefore
+/// said `[A] BOXへ反映` next to a key that opened the skill list. The row's
+/// meaning lives here now, and the label, the footer line and the key the
+/// console hands to the state machine are all read from this value, so the
+/// three cannot disagree again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharmAction {
+    /// 装備BOX枠: write the form into the box slot it names.
+    WriteToBox,
+    /// 種類: cycle the kind, and the rarity that is stored with it.
+    CycleKind,
+    /// スロット数: cycle the slot count inside the kind's ceiling.
+    CycleSlots,
+    /// 第1スキル / 第2スキル: open the skill name picker.
+    PickSkill,
+    /// 第1スキル値 / 第2スキル値: raise the value by one step.
+    RaisePoints,
+}
+
+impl CharmAction {
+    /// The action `[A]` takes on a row, by row number.
+    ///
+    /// Row 0 is the one row that still writes: it names the box slot the form
+    /// would go into, so `[A]` there is the copy itself. The other rows edit
+    /// one field each, the way the arrow keys do.
+    pub fn of_row(row: usize) -> Self {
+        match row {
+            1 => CharmAction::CycleKind,
+            2 => CharmAction::CycleSlots,
+            3 | 5 => CharmAction::PickSkill,
+            4 | 6 => CharmAction::RaisePoints,
+            _ => CharmAction::WriteToBox,
+        }
+    }
+
+    /// The word the footer and the inspector `[A]` button print.
+    pub fn label(self) -> &'static str {
+        match self {
+            CharmAction::WriteToBox => "BOXへ反映",
+            CharmAction::CycleKind => "種類を切替",
+            CharmAction::CycleSlots => "スロットを切替",
+            CharmAction::PickSkill => "スキルを選ぶ",
+            CharmAction::RaisePoints => "数値を増やす",
+        }
+    }
+
+    /// The key the console sends to the state machine for this action.
+    pub fn key(self) -> Key {
+        match self {
+            CharmAction::WriteToBox => Key::A,
+            CharmAction::PickSkill => Key::Y,
+            // The three that step a field use the arrow key the footer names,
+            // so `[A]` and `[◀/▶]` cannot drift apart either.
+            CharmAction::CycleKind | CharmAction::CycleSlots | CharmAction::RaisePoints => Key::Right,
+        }
+    }
+
+}
+
+impl CharmEdit {
+    /// The row the cursor is on, clamped to the rows the form has.
+    pub fn row(&self) -> usize {
+        self.field.min(CHARM_EDIT_ROWS - 1)
+    }
+
+    /// What `[A]` does on the row the cursor is on.
+    pub fn a_action(&self) -> CharmAction {
+        CharmAction::of_row(self.row())
+    }
+
+    /// The label the footer and the inspector `[A]` button print.
+    pub fn a_label(&self) -> &'static str {
+        self.a_action().label()
+    }
+
+    /// The key the console sends when `[A]` is pressed on this row.
+    pub fn a_key(&self) -> Key {
+        self.a_action().key()
+    }
+
+    /// The footer line for this row: the `[A]` chip is the row's own word, the
+    /// rest are the keys the form always has.
+    pub fn footer(&self) -> String {
+        // [X] is the save key on every non-picker screen (the console's global
+        // X -> QuickSave), which on this form writes the record into the box and
+        // then saves the file. It used to be advertised as 刻み here, which the
+        // pad never sent the state machine.
+        format!(
+            "[A] {}  [▲/▼] 行  [◀/▶] 値  [Y] スキル行で選択  [X] 保存  [B] 戻る",
+            self.a_label()
+        )
+    }
+
+    /// The line the form prints beside its header: the measured ceiling of the
+    /// kind on the form, 「R100 / スキル1+10 / スキル2+13 / S3」.
+    ///
+    /// It is drawn there rather than in a list column because the list draws
+    /// only the title and the value of a row - the meta column is the
+    /// inspector's, shown for the selected row alone.
+    pub fn header_note(&self) -> String {
+        match charm::kind_limits(self.kind) {
+            Some(l) => format!("R{} / {}", l.rarity, l.compact()),
+            None => format!(
+                "レア度 {} / 最大 S{}",
+                self.grade.rarity(),
+                self.grade.max_slots()
+            ),
+        }
+    }
+}
+
+/// One row of the drawn talisman form.
+///
+/// The console's list draws `title` on the left and `value` on the right and
+/// never draws `meta`: that is the inspector's second line, and the inspector
+/// only shows the row the cursor is on. The measured ceiling used to live in
+/// the 種類 row's meta alone, which is why it was missing from the row itself;
+/// the form prints it beside its header as well ([CharmEdit::header_note]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharmFormRow {
+    /// The row number Up / Down counts.
+    pub field: usize,
+    /// Left column: the field's name.
+    pub title: String,
+    /// The inspector's second line (the list never draws this).
+    pub meta: String,
+    /// Right column: the value the row holds.
+    pub value: String,
+    /// The row badge ("#04").
+    pub badge: String,
+}
+
+/// The seven rows of the drawn talisman form, in row order.
+///
+/// The console builds its list from this instead of assembling the strings
+/// itself, so what the host tests read is what the screen draws.
+pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
+    let s1 = crate::skills::skill_name(e.skill1).unwrap_or("なし");
+    let s2 = crate::skills::skill_name(e.skill2).unwrap_or("なし");
+    // The kind on the form carries the measured ceiling of its row of
+    // charm::KIND_LIMITS. It is the tighter of the two answers, so the range
+    // column reports it: 女王 / 王 / 龍 stop at +8 on the first skill even
+    // though the rarity-99 table reaches +13 on the second.
+    let limits = charm::kind_limits(e.kind);
+    let range_of = |skill: u8, second: bool| -> String {
+        if skill == 0 {
+            return String::from("なし");
+        }
+        let cap = limits.and_then(|l| l.max_points(second));
+        match charm::allowed_points_rarity(e.grade.rarity(), skill, second) {
+            Some(r) if r.min == 0 && r.max == 0 => String::from("このレア度では不可"),
+            Some(r) => match cap {
+                Some(c) => format!("{} 〜 {}", r.min, r.max.min(c)),
+                None => String::from("この種類は第2スキル不可"),
+            },
+            None => match cap {
+                Some(c) => format!("上限 {}", c),
+                None => String::from("—"),
+            },
+        }
+    };
+    [
+        CharmFormRow {
+            field: 0,
+            title: String::from("装備BOX枠"),
+            meta: String::from("対象スロット"),
+            value: format!("#{:04}", e.index),
+            badge: String::from("#01"),
+        },
+        CharmFormRow {
+            field: 1,
+            title: String::from("種類"),
+            // The game's own name of the talisman is the value; the rarity and
+            // the measured ceiling of this kind are the inspector's line.
+            meta: match limits {
+                Some(l) => format!("R{} / {}", l.rarity, l.compact()),
+                None => format!(
+                    "◀ ▶ で切替 / レア度 {} / 最大 S{}",
+                    e.grade.rarity(),
+                    e.grade.max_slots()
+                ),
+            },
+            value: String::from(charm::kind_name(e.kind).unwrap_or("?")),
+            badge: String::from("#02"),
+        },
+        CharmFormRow {
+            field: 2,
+            title: String::from("スロット数"),
+            meta: format!(
+                "0 〜 {}",
+                limits
+                    .map(|l| l.max_slots.min(e.grade.max_slots()))
+                    .unwrap_or_else(|| e.grade.max_slots())
+            ),
+            value: format!("S{} ({})", e.slots, "◯".repeat(e.slots.min(3) as usize)),
+            badge: String::from("#03"),
+        },
+        CharmFormRow {
+            field: 3,
+            title: String::from("第1スキル"),
+            meta: format!("Skill ID: {}", e.skill1),
+            value: s1.to_string(),
+            badge: String::from("#04"),
+        },
+        CharmFormRow {
+            field: 4,
+            title: String::from("第1スキル値"),
+            meta: range_of(e.skill1, false),
+            value: format!("{:+}", e.points1),
+            badge: String::from("#05"),
+        },
+        CharmFormRow {
+            field: 5,
+            title: String::from("第2スキル"),
+            meta: format!("Skill ID: {}", e.skill2),
+            value: s2.to_string(),
+            badge: String::from("#06"),
+        },
+        CharmFormRow {
+            field: 6,
+            title: String::from("第2スキル値"),
+            meta: range_of(e.skill2, true),
+            value: format!("{:+}", e.points2),
+            badge: String::from("#07"),
+        },
+    ]
+}
+
 /// The next kind when the kind row is turned, skipping row 0 ("装備なし").
 fn step_kind(kind: u8, forward: bool) -> u8 {
     let top = crate::charm::TALISMAN_KIND_COUNT;

@@ -6,7 +6,10 @@
 //!   - `A`: Always Open / Edit / Choose from list (unified across every screen, never deletes!).
 //!   - `◀ / ▶`: Always adjust numeric values (`±step`).
 //!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `お守り反映`).
-//!   - `Y`: Secondary tool action (`刻み幅切替` / `検索` / `合法MAX` / `2段階確認削除`).
+//!   - `Y`: Secondary tool action (`刻み幅切替` / `検索` / `スキル選択` / `2段階確認削除`).
+//!   - 護石の `[A]` は行ごとの操作（種類/スロット/スキル選択/数値/BOXへ反映）で、
+//!     フッターと `[A]` ボタンの文言はその行の動作と同じ値から作られる
+//!     （`mhnx_core::hbedit::CharmAction`）。
 //!   - `B`: Back / Cancel.
 //!
 //! Two Distinct Visual Architectures (controlled by `XXSE_UI_VARIANT`):
@@ -27,12 +30,13 @@ use mhnx_core::check::Severity;
 use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
-    arena_clock, arena_name, arena_part_name, arena_rank_name, decoration_name_of, item_name_of,
-    monster_name, palico_part_name, palico_skill_tab_name, Editor, ItemSetOp, Key, PalicoEquipRow,
-    PalicoSkillRow, Screen, ARENA_COLUMNS, ARENA_PARTS, ARENA_ROWS, CHAR_FIELDS, CONSOLE_SAVE,
-    CSV_DIR, GUILD_TAB_ARENA, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT, ITEM_OP_DEDUPE,
-    ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS,
-    PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
+    arena_clock, arena_name, arena_part_name, arena_rank_name, charm_form_rows, decoration_name_of,
+    item_name_of, monster_name, palico_part_name, palico_skill_tab_name, Editor, ItemSetOp, Key,
+    PalicoEquipRow, PalicoSkillRow, Screen, ARENA_COLUMNS, ARENA_PARTS, ARENA_ROWS, CHAR_FIELDS,
+    CHARM_EDIT_ROWS, CONSOLE_SAVE, CSV_DIR, GUILD_TAB_ARENA, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT,
+    ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE,
+    PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS,
+    SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -274,8 +278,8 @@ pub enum UiAction {
     ItemOp(usize),
     // One-tap Bulk Cheats & Presets
     CharMaxAll,
-    CharmLegalMax,
-    CharmPreset(u8),
+    // The talisman screen has no bulk action and no preset: its rows are
+    // edited one field at a time, with [A] acting on the selected row.
     NewCharm,
     DeleteCharmConfirm,
     RosterMaxAll,
@@ -1252,25 +1256,18 @@ impl GuiState {
                 other => ed.input(other),
             },
             Screen::CharmEdit => match key {
+                // [A] is the row's own action: 種類 and スロット数 cycle, the
+                // two skill rows open the name picker, the two point rows step
+                // the value, and the box-slot row writes the form into the box.
+                // Which one it is comes from hbedit::CharmAction - the same
+                // value the footer line and the inspector's [A] button print -
+                // so the hint and the key can no longer disagree. [Y] is left
+                // to the state machine: on a skill row it opens the picker too,
+                // on any other row it says which row to move to. It used to be
+                // the 合法最大値 preset key, which read nothing like the footer.
                 Key::A => {
-                    // Rows are 0 index, 1 kind, 2 slots, 3 skill1, 4 points1,
-                    // 5 skill2, 6 points2. The picker belongs to the two skill
-                    // rows; it used to open on the slots row instead, so [A] on
-                    // 第1スキル wrote the charm and [A] on スロット数 did
-                    // nothing useful.
-                    let field = ed.charm_edit.map(|c| c.field).unwrap_or(0);
-                    if field == 3 || field == 5 {
-                        ed.input(Key::Y); // Open Skill Picker
-                    } else if field == 1 {
-                        ed.input(Key::Right); // Cycle the ten kinds (龍 included)
-                    } else if field == 2 {
-                        ed.input(Key::Right); // Cycle the slot count
-                    } else {
-                        ed.input(Key::A); // Apply charm to box
-                    }
-                }
-                Key::Y => {
-                    self.apply_action(ed, UiAction::CharmLegalMax);
+                    let a = ed.charm_edit.map(|c| c.a_key()).unwrap_or(Key::A);
+                    ed.input(a);
                 }
                 other => ed.input(other),
             },
@@ -1752,99 +1749,11 @@ impl GuiState {
                 ed.item_dedupe_armed = false;
                 ed.run_item_op(ed.item_menu_cursor);
             }
-            UiAction::CharmLegalMax => {
-                if let Some(mut ce) = ed.charm_edit {
-                    // The ceiling now comes from the kind the form shows, not
-                    // from the type byte still stored in the box: those two
-                    // disagree the moment the kind row is moved. charm::KIND_LIMITS
-                    // is the measured one (兵士 stops at one slot and no second
-                    // skill; 女王/王/龍 stop at +8 on the first skill).
-                    let grade = ce.grade;
-                    let limits = charm::kind_limits(ce.kind);
-                    ce.slots = limits
-                        .map(|l| l.max_slots.min(grade.max_slots()))
-                        .unwrap_or_else(|| grade.max_slots());
-                    for (skill, pts, second) in [
-                        (ce.skill1, &mut ce.points1, false),
-                        (ce.skill2, &mut ce.points2, true),
-                    ] {
-                        if skill == 0 {
-                            continue;
-                        }
-                        let cap = limits.and_then(|l| l.max_points(second));
-                        if let Some(r) = charm::allowed_points_rarity(grade.rarity(), skill, second)
-                        {
-                            if r.max > 0 {
-                                *pts = match cap {
-                                    Some(c) => r.max.min(c),
-                                    None => r.max,
-                                };
-                            }
-                        } else if let Some(c) = cap {
-                            // No table for the grade, but the kind still has a
-                            // ceiling, so the button can still answer.
-                            *pts = c;
-                        }
-                    }
-                    ed.charm_edit = Some(ce);
-                    ed.message = format!(
-                        "護石を合法最大値・スロ{}に設定しました（{}）",
-                        ce.slots,
-                        limits
-                            .map(|l| l.name())
-                            .unwrap_or_else(|| grade.name())
-                    );
-                }
-            }
-            UiAction::CharmPreset(preset_id) => {
-                if let Some(mut ce) = ed.charm_edit {
-                    let find_skill = |target: &str| -> u8 {
-                        mhnx_core::skills::SKILL_NAMES
-                            .iter()
-                            .position(|&n| n == target)
-                            .map(|i| (i + 1) as u8)
-                            .unwrap_or(0)
-                    };
-                    let (s1_name, p1, s2_name, p2) = match preset_id {
-                        0 => ("痛撃", 6i8, "達人", 10i8),
-                        1 => ("斬れ味", 6, "達人", 10),
-                        2 => ("溜め短縮", 6, "達人", 10),
-                        3 => ("通常弾強化", 6, "達人", 10),
-                        _ => ("貫通弾強化", 6, "達人", 10),
-                    };
-                    let grade = ce.grade;
-                    ce.skill1 = find_skill(s1_name);
-                    ce.skill2 = find_skill(s2_name);
-                    // A preset asks for the strongest version of a build; the
-                    // kind still decides how many slots it may carry and how
-                    // high each of its two skills may go, so a 兵士 preset
-                    // lands on S1 and no second skill at all.
-                    let limits = charm::kind_limits(ce.kind);
-                    ce.slots = limits
-                        .map(|l| l.max_slots.min(grade.max_slots()))
-                        .unwrap_or_else(|| grade.max_slots());
-                    ce.points1 = preset_points(grade, ce.kind, ce.skill1, p1, false);
-                    ce.points2 = preset_points(grade, ce.kind, ce.skill2, p2, true);
-                    // A kind with no slot-2 table (兵士 / 闘士) cannot hold the
-                    // second skill at all, so the preset drops it instead of
-                    // leaving a skill with zero points behind - a shape the
-                    // game never writes.
-                    if limits.map(|l| !l.has_second_skill()).unwrap_or(false) {
-                        ce.skill2 = 0;
-                        ce.points2 = 0;
-                    }
-                    ed.charm_edit = Some(ce);
-                    ed.message = format!(
-                        "プリセット ({} {:+} / {} {:+} / S{}) を適用しました（{}）",
-                        s1_name,
-                        ce.points1,
-                        s2_name,
-                        ce.points2,
-                        ce.slots,
-                        grade.name()
-                    );
-                }
-            }
+            // The talisman screen has no bulk action and no preset. The
+            // 合法最大値 button and the four 痛撃/斬れ味/溜め短縮/通常 presets
+            // wrote a whole record in one press, which is exactly the shape the
+            // per-kind ceiling exists to prevent; the form edits one field at a
+            // time and [A] acts on the row the cursor is on instead.
             UiAction::NewCharm => {
                 ed.open_charms();
                 ed.input(Key::L);
@@ -2389,7 +2298,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         }
         Screen::ItemPick => ed.item_pick_matches().len(),
         Screen::Charms => ed.charms().len(),
-        Screen::CharmEdit => 7,
+        Screen::CharmEdit => CHARM_EDIT_ROWS,
         Screen::SkillPick => ed.skill_pick_matches().len(),
         Screen::Equip => ed.equipment().len(),
         // The form has two shapes: 9 rows for an existing record and 3 for a
@@ -3006,40 +2915,6 @@ fn charm_warnings(
     out
 }
 
-/// A preset's requested points, clamped to what the grade actually allows.
-///
-/// The four presets used to force `slots = 3` and their nominal `+6/+10`
-/// whatever the grade was, which is exactly the record the game would reject.
-fn preset_points(
-    grade: charm::TalismanGrade,
-    kind: u8,
-    skill: u8,
-    want: i8,
-    second: bool,
-) -> i8 {
-    if skill == 0 {
-        return 0;
-    }
-    // The preset is an explicit request, so it is clamped to both ceilings:
-    // the per-skill table of the grade and the measured one of the kind.
-    let cap = charm::kind_limits(kind).and_then(|l| l.max_points(second));
-    match charm::allowed_points_rarity(grade.rarity(), skill, second) {
-        Some(r) if r.max > 0 => {
-            let high = match cap {
-                Some(c) => r.max.min(c),
-                None => r.max,
-            };
-            want.clamp(r.min, high)
-        }
-        // "0~0": the grade cannot carry this skill, so do not write points for it.
-        Some(_) => 0,
-        None => match cap {
-            Some(c) => want.clamp(-128, c),
-            None => want,
-        },
-    }
-}
-
 impl GuiState {
     pub fn draw(&mut self, c: &mut Canvas, ed: &Editor) {
         self.hits.clear();
@@ -3229,30 +3104,11 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, "新規護石作成", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::NewCharm);
             }
-            Screen::CharmEdit => {
-                // Slot ceiling follows the grade on screen, never a fixed S3.
-                // The ceiling of the kind on the form, not of the grade: the
-                // two agree, but charm::KIND_LIMITS is the measured one, so a
-                // 兵士 preset button says S1 rather than promising an S3.
-                let max_s = ed
-                    .charm_edit
-                    .map(|c| {
-                        charm::kind_limits(c.kind)
-                            .map(|l| l.max_slots.min(c.grade.max_slots()))
-                            .unwrap_or_else(|| c.grade.max_slots())
-                    })
-                    .unwrap_or(3);
-                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
-                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[Y] 合法最大値", t.accent_secondary, FontSize::Small);
-                self.add_hit(964, sy, 136, sh, UiAction::CharmLegalMax);
-
-                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
-                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                let preset_lbl = format!("痛撃6 達人10 S{}", max_s);
-                btn_text(c, 1108, sy, 158, sh, &preset_lbl, t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::CharmPreset(0));
-            }
+            // The talisman form has no bulk chip and no preset chip any more:
+            // its [A] is the row's own action, which the inspector button and
+            // the footer name for the selected row, and the ceiling of the kind
+            // is printed beside the header (hbedit::CharmEdit::header_note)
+            // instead of behind a 合法最大値 button.
             // The skill panel is the other mode of the roster screen, so its
             // two keys are the chips while it is open.
             Screen::Roster if ed.palico_skill_open() => {
@@ -3352,6 +3208,14 @@ impl GuiState {
         c.hline(0, FOOTER_Y, 1280, t.border_subtle);
 
         // Right: Concise, non-redundant key guide
+        // The talisman form's [A] is the row's own action, so its guide is a
+        // line the state machine builds (hbedit::CharmEdit::footer) instead of
+        // one of the fixed strings below.
+        let charm_hint = if ed.screen == Screen::CharmEdit {
+            ed.charm_edit.map(|c| c.footer())
+        } else {
+            None
+        };
         let hint = match ed.screen {
             Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
             Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
@@ -3365,9 +3229,9 @@ impl GuiState {
             }
             Screen::ItemPick | Screen::SkillPick => "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る",
             Screen::Charms => "[A] 編集  [Y×2] 削除  [-] 新規  [L/R] サブタブ  [X] 保存",
-            Screen::CharmEdit => {
-                "[A] BOXへ反映  [▲/▼] 行  [◀/▶] 値  [Y] スキル選択  [X] 刻み  [B] 戻る"
-            }
+            Screen::CharmEdit => charm_hint
+                .as_deref()
+                .unwrap_or("[A] 行ごとの操作  [▲/▼] 行  [◀/▶] 値  [X] 保存  [B] 戻る"),
             Screen::Equip => {
                 "[A] 編集  [▲/▼] 行  [Y] 絞る  [-] 削除×2  [＋] 新規  [X] 保存  [B] 戻る"
             }
@@ -3644,7 +3508,7 @@ impl GuiState {
         c: &mut Canvas,
         ed: &Editor,
         header_title: &str,
-        _unused_sub: &str,
+        sub: &str,
         rows: &[(usize, String, String, String, String)],
         active_row_idx: usize,
         has_stepper: bool,
@@ -3654,6 +3518,7 @@ impl GuiState {
             c,
             ed,
             header_title,
+            sub,
             rows,
             active_row_idx,
             has_stepper,
@@ -3669,6 +3534,7 @@ impl GuiState {
         c: &mut Canvas,
         ed: &Editor,
         header_title: &str,
+        sub: &str,
         rows: &[(usize, String, String, String, String)],
         active_row_idx: usize,
         has_stepper: bool,
@@ -3679,6 +3545,7 @@ impl GuiState {
         let total = rows.len();
 
         // Compact Section Title Line (y = 100..130) — No redundant explanation string!
+        let title_w = c.text_width_sized(header_title, FontSize::Medium);
         c.text_clipped(
             MAIN_X + 4,
             CONTENT_Y,
@@ -3687,6 +3554,26 @@ impl GuiState {
             t.text_primary,
             FontSize::Medium,
         );
+
+        // The subtitle sits on the same line, right of the title. Screens that
+        // have a second fact worth saying at all times (the talisman form's
+        // measured ceiling) put it here: the list itself only draws a row's
+        // title and value, so a fact put in a row's meta column would only be
+        // visible in the inspector of the selected row. The budget stops short
+        // of the "n / m" counter on the right, which is why the two can never
+        // collide however long the text is.
+        if !sub.is_empty() {
+            let note_x = MAIN_X + 4 + title_w + 18;
+            let note_right = MAIN_X + V1_LIST_W - 96;
+            c.text_clipped(
+                note_x,
+                CONTENT_Y + 4,
+                (note_right - note_x).max(80),
+                sub,
+                t.text_secondary,
+                FontSize::Small,
+            );
+        }
 
         let cur_pos = rows
             .iter()
@@ -4298,36 +4185,11 @@ impl GuiState {
                     );
                 }
             }
-            Screen::Charms | Screen::CharmEdit => {
-                // The slot count on these labels is whatever the current grade
-                // allows, so a preset can no longer promise an S3 the game
-                // refuses at rarity 97/98.
-                // The ceiling of the kind on the form, not of the grade: the
-                // two agree, but charm::KIND_LIMITS is the measured one, so a
-                // 兵士 preset button says S1 rather than promising an S3.
-                let max_s = ed
-                    .charm_edit
-                    .map(|c| {
-                        charm::kind_limits(c.kind)
-                            .map(|l| l.max_slots.min(c.grade.max_slots()))
-                            .unwrap_or_else(|| c.grade.max_slots())
-                    })
-                    .unwrap_or(3);
-                c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
-                cur_y += 24;
-                let legal_lbl = format!("合法最大値 + スロ{}をセット", max_s);
-                self.draw_tool_button(c, ix + 20, cur_y, full_w, 36, &legal_lbl, UiAction::CharmLegalMax);
-                cur_y += 42;
-                let p0 = format!("痛撃6 達人10 S{}", max_s);
-                let p1 = format!("斬れ味6 達人10 S{}", max_s);
-                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, &p0, UiAction::CharmPreset(0));
-                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, &p1, UiAction::CharmPreset(1));
-                cur_y += 42;
-                let p2 = format!("溜め6 達人10 S{}", max_s);
-                let p3 = format!("通常6 達人10 S{}", max_s);
-                self.draw_tool_button(c, ix + 20, cur_y, half_w, 36, &p2, UiAction::CharmPreset(2));
-                self.draw_tool_button(c, ix + 28 + half_w, cur_y, half_w, 36, &p3, UiAction::CharmPreset(3));
-            }
+            // The talisman screens have no tool deck: no bulk action and no
+            // preset writes a whole record from here any more. Every field is
+            // edited one row at a time, and [A] on the selected row is the
+            // action the inspector button and the footer name.
+            Screen::Charms | Screen::CharmEdit => {}
             Screen::Equip => {
                 // Both buttons go through the same key path the pad uses, so
                 // the touch build cannot delete anything the pad would refuse.
@@ -5261,100 +5123,17 @@ impl GuiState {
         let Some(ce) = ed.charm_edit else {
             return;
         };
-        let s1 = mhnx_core::skills::skill_name(ce.skill1).unwrap_or("なし");
-        let s2 = mhnx_core::skills::skill_name(ce.skill2).unwrap_or("なし");
-        // The kind on the form carries the measured ceiling of its row of
-        // charm::KIND_LIMITS. It is the tighter of the two answers, so the
-        // range column reports it: 女王 / 王 / 龍 stop at +8 on the first
-        // skill even though the rarity-99 table reaches +13 on the second.
-        let limits = mhnx_core::charm::kind_limits(ce.kind);
-        let range_of = |skill: u8, second: bool| -> alloc::string::String {
-            if skill == 0 {
-                return String::from("なし");
-            }
-            let cap = limits.and_then(|l| l.max_points(second));
-            match mhnx_core::charm::allowed_points_rarity(ce.grade.rarity(), skill, second) {
-                Some(r) if r.min == 0 && r.max == 0 => String::from("このレア度では不可"),
-                Some(r) => match cap {
-                    Some(c) => format!("{} 〜 {}", r.min, r.max.min(c)),
-                    None => String::from("この種類は第2スキル不可"),
-                },
-                None => match cap {
-                    Some(c) => format!("上限 {}", c),
-                    None => String::from("—"),
-                },
-            }
-        };
-        let rows = alloc::vec![
-            (
-                0,
-                String::from("装備BOX枠"),
-                String::from("対象スロット"),
-                format!("#{:04}", ce.index),
-                String::from("#01"),
-            ),
-            (
-                1,
-                String::from("種類"),
-                // The game's own name of the talisman is the value; the rarity
-                // and the measured ceiling of this kind live in the meta
-                // column because the value column has a 230px budget.
-                match limits {
-                    // The full measured ceiling of this kind, on the row that
-                    // names it: 「R100 / スキル1+10 / スキル2+13 / S3」.
-                    Some(l) => format!("R{} / {}", l.rarity, l.compact()),
-                    None => format!(
-                        "◀ ▶ で切替 / レア度 {} / 最大 S{}",
-                        ce.grade.rarity(),
-                        ce.grade.max_slots()
-                    ),
-                },
-                alloc::string::String::from(
-                    mhnx_core::charm::kind_name(ce.kind).unwrap_or("?"),
-                ),
-                String::from("#02"),
-            ),
-            (
-                2,
-                String::from("スロット数"),
-                format!(
-                    "0 〜 {}",
-                    limits
-                        .map(|l| l.max_slots.min(ce.grade.max_slots()))
-                        .unwrap_or_else(|| ce.grade.max_slots())
-                ),
-                format!("S{} ({})", ce.slots, "◯".repeat(ce.slots.min(3) as usize)),
-                String::from("#03"),
-            ),
-            (
-                3,
-                String::from("第1スキル"),
-                format!("Skill ID: {}", ce.skill1),
-                s1.to_string(),
-                String::from("#04"),
-            ),
-            (
-                4,
-                String::from("第1スキル値"),
-                range_of(ce.skill1, false),
-                format!("{:+}", ce.points1),
-                String::from("#05"),
-            ),
-            (
-                5,
-                String::from("第2スキル"),
-                format!("Skill ID: {}", ce.skill2),
-                s2.to_string(),
-                String::from("#06"),
-            ),
-            (
-                6,
-                String::from("第2スキル値"),
-                range_of(ce.skill2, true),
-                format!("{:+}", ce.points2),
-                String::from("#07"),
-            ),
-        ];
+        // The seven rows and the strings they carry live in the state machine
+        // (hbedit::charm_form_rows), so the host tests read exactly what this
+        // list draws. The measured ceiling of the kind is NOT one of the row
+        // strings the list draws: this list draws a row's title and value only,
+        // and a row's meta is the inspector's line for the selected row. It is
+        // passed below as the header note instead, where it is always on
+        // screen.
+        let rows: alloc::vec::Vec<(usize, String, String, String, String)> = charm_form_rows(&ce)
+            .into_iter()
+            .map(|r| (r.field, r.title, r.meta, r.value, r.badge))
+            .collect();
 
         // Warnings for the record in the box and for what the form would write.
         let box_bytes = ed.save.as_ref().and_then(|s| s.equipment_box(ed.slot));
@@ -5370,20 +5149,20 @@ impl GuiState {
             ce.points2,
         );
 
-        // [A] always writes the form into the box (core: Key::A on any row),
-        // so every row carries the same label; [Y] is the skill picker.
-        let a_lbl = "BOXへ反映";
-
+        // [A] means one thing per row, and the label, the footer and the key
+        // all come from the same value (hbedit::CharmAction), so the button can
+        // no longer promise 反映 while the key opens the skill list.
         self.draw_adaptive_rows_warn(
             c,
             ed,
             "護石編集",
+            &ce.header_note(),
             &rows,
             // The form has seven rows (0..=6); clamping to 5 left the last row
             // unhighlighted whenever the second skill's value was being edited.
-            ce.field.min(6),
+            ce.field.min(CHARM_EDIT_ROWS - 1),
             true,
-            a_lbl,
+            ce.a_label(),
             &warnings,
         );
     }
@@ -5426,6 +5205,7 @@ impl GuiState {
             c,
             ed,
             "装備BOX",
+            "",
             &rows,
             ed.equip_cursor.min(rows.len().saturating_sub(1)),
             false,
@@ -5495,6 +5275,7 @@ impl GuiState {
                 c,
                 ed,
                 "装備を新規作成",
+                "",
                 &rows,
                 ee.field.min(rows.len().saturating_sub(1)),
                 true,
@@ -5599,6 +5380,7 @@ impl GuiState {
             c,
             ed,
             "装備編集",
+            "",
             &rows,
             ee.field.min(rows.len().saturating_sub(1)),
             true,
@@ -5763,6 +5545,7 @@ impl GuiState {
             c,
             ed,
             &hdr,
+            "",
             &rows,
             e.field.min(rows.len().saturating_sub(1)),
             e.field != SET_ROW_NAME,
@@ -5842,6 +5625,7 @@ impl GuiState {
             c,
             ed,
             &hdr,
+            "",
             &rows,
             e.field,
             false,
@@ -5879,6 +5663,7 @@ impl GuiState {
             c,
             ed,
             &hdr,
+            "",
             &rows,
             ed.csv_cursor.min(rows.len().saturating_sub(1)),
             false,
@@ -5926,6 +5711,7 @@ impl GuiState {
             c,
             ed,
             &hdr,
+            "",
             &rows,
             field.min(PALICO_EQUIP_ROWS.saturating_sub(1)),
             false,
@@ -5988,7 +5774,7 @@ impl GuiState {
             rows_total
         );
         let warnings = ed.palico_skill_warnings();
-        self.draw_adaptive_rows_warn(c, ed, &hdr, &rows, field, false, "差し替え", &warnings);
+        self.draw_adaptive_rows_warn(c, ed, &hdr, "", &rows, field, false, "差し替え", &warnings);
     }
 
     fn draw_roster(&mut self, c: &mut Canvas, ed: &Editor) {
@@ -6138,6 +5924,7 @@ impl GuiState {
             c,
             ed,
             "ギルドカード",
+            "",
             &rows,
             ed.guild_field.min(2),
             true,
@@ -6612,6 +6399,7 @@ impl GuiState {
             c,
             ed,
             &header,
+            "",
             &rows,
             ed.progress_cursor(),
             false,

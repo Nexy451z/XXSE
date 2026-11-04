@@ -4608,10 +4608,18 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     let arms = switch_hint_arms();
 
     // Every chip must name a key the screen actually handles, and the charm
-    // screen has to advertise the L that creates a talisman.
+    // screen has to advertise the key that creates a talisman. That is [-] on
+    // the console: switch/src/ui.rs sends it to the state machine's L, because
+    // a plain L is the sub-tab key on every screen. The table describes the
+    // console's dispatch (the drawn footer in switch/src/ui.rs prints the same
+    // [-]), so it is the console's key that has to be here.
     assert!(
-        hint_keys(&arms, "Charms").iter().any(|k| k == "L"),
-        "the charm screen creates with L, so it must say so"
+        hint_keys(&arms, "Charms").iter().any(|k| k == "-"),
+        "the charm screen creates with [-], so it must say so"
+    );
+    assert!(
+        !hint_keys(&arms, "Charms").iter().any(|k| k == "L"),
+        "L is the sub-tab key on the console, not a talisman"
     );
     // ArcEntries: - and R write quests out.
     let arc = hint_keys(&arms, "ArcEntries");

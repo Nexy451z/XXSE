@@ -991,8 +991,25 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("X", "クリア"),
             ("B", "戻る"),
         ],
-        Charms => &[("Y", "新規/編集"), ("L", "新規"), ("A", "削除"), ("X", "保存"), ("B", "戻る")],
-        CharmEdit => &[("Y", "スキル選択"), ("</>", "値"), ("A", "保存"), ("B", "戻る")],
+        // The console's pad dispatch, not the bare state machine: [A] on the
+        // charm list opens the form and [Y] is the two-press delete there.
+        Charms => &[
+            ("A", "編集"),
+            ("Y", "削除(2回)"),
+            ("-", "新規"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
+        // The form's [A] is the selected row's own action (hbedit::CharmAction),
+        // so this line cannot name a single one; the drawn build prints the
+        // row's own word in its footer and on its [A] button.
+        CharmEdit => &[
+            ("A", "選択中の行の操作"),
+            ("</>", "値"),
+            ("Y", "スキル選択"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
         SkillPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
         Equip => &[
             ("A", "編集"),
