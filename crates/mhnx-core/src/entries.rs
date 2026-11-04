@@ -7,10 +7,13 @@
 //! - .rem (184 B) reward table
 //!   - +0x00 f32  weight, always 1.0
 //!   - +0x04 u32  1
-//!   - +0x08 u16  slot count for the first group
-//!   - +0x0A u16  slot count for the second group
-//!   - +0x18      records of 4 bytes: { u16 item id, u8 count, u8 slot }
-//!                terminated by 00 00 00 FF, zero padded
+//!   - +0x08      8 x (u8 category flag, u8 row count), unused pairs zero;
+//!                one pair per roll group (513 of the 563 shipped tables use
+//!                one group, the rest up to eight)
+//!   - +0x18      records of 4 bytes: { u16 item id, u8 count, u8 chance % }
+//!                each group's records end with 00 00 00 FF; zero padded.
+//!                The chances of one group add up to 100 (one official table
+//!                is 104), and every chance is 1..=100.
 //! - .sup (168 B) supply box
 //!   - +0x00 f32  weight, always 1.0
 //!   - +0x04 u32  1
@@ -33,6 +36,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::quest::{clamp_probability, RewardGroup, REWARD_PROB_TOTAL};
 use crate::Error;
 
 /// One reward or supply record.
@@ -42,7 +46,12 @@ pub struct ItemRecord {
     pub item: u16,
     /// Stack count.
     pub count: u8,
-    /// Slot index the game shows it in.
+    /// The fourth byte: chance in percent for a reward row, display slot for
+    /// a supply.
+    ///
+    /// Measured on the 141 shipped quests: every reward row stores 1..=100
+    /// here and the rows of one roll group add up to 100, while a supply row
+    /// stores 0..=4 and no chance at all.
     pub slot: u8,
 }
 
@@ -87,6 +96,15 @@ pub struct ItemTable {
     /// empty). Writing a terminator into a .sup changed bytes that were
     /// already correct.
     pub terminated: bool,
+    /// Where each roll group of a .rem starts, with the category byte from
+    /// the header pair at QUEST_GROUP_TABLE_OFFSET + 2 * group.
+    ///
+    /// A .rem is a list of groups, each closed by a 00 00 00 FF terminator
+    /// (50 of the 563 shipped tables have two or more). Storing where they
+    /// start keeps every group editable and keeps `to_bytes` from writing a
+    /// terminator over the first row of the next one. A .sup has no groups:
+    /// its records are a fixed array, not a roll table.
+    pub group_starts: Vec<(usize, u8)>,
 }
 
 impl ItemTable {
@@ -103,23 +121,37 @@ impl ItemTable {
         let capacity = (raw.len() - first) / 4;
         let mut records = Vec::new();
         let mut positions = Vec::new();
+        let mut group_starts: Vec<(usize, u8)> = Vec::new();
+        let mut open_group = false;
         let mut terminated = false;
-        // .rem is a list that ends; .sup is a fixed array, so an empty record
-        // is just a free slot and the scan continues past it.
+        // .rem is a list of roll groups that each end with a terminator; .sup
+        // is a fixed array, so an empty record is just a free slot and the
+        // scan continues past it.
         let fixed = raw.len() != 184;
         for i in 0..capacity {
             let o = first + i * 4;
             let r = ItemRecord::read(&raw[o..o + 4]);
-            // 00 00 00 FF ends the list; anything after it is padding.
-            if r.item == 0 && r.count == 0 && r.slot == 0xFF {
+            // 00 00 00 FF closes a group. It is not the end of the file: a
+            // second group follows (50 of the 563 shipped tables have more
+            // than one), so stopping here hid those rows from every editor.
+            if !fixed && r.item == 0 && r.count == 0 && r.slot == 0xFF {
                 terminated = true;
-                break;
+                open_group = false;
+                continue;
             }
             if r.item == 0 && r.count == 0 && r.slot == 0 {
                 if fixed {
                     continue;
                 }
                 break;
+            }
+            if !open_group {
+                // +0x08 holds one (u8 flag, u8 rows) pair per group; a group
+                // past the eighth pair has no category byte to read.
+                let g = group_starts.len();
+                let flag = if g < 8 { raw[0x08 + g * 2] } else { 0 };
+                group_starts.push((records.len(), flag));
+                open_group = true;
             }
             records.push(r);
             positions.push(i);
@@ -131,6 +163,7 @@ impl ItemTable {
             records,
             positions,
             terminated,
+            group_starts,
         })
     }
 
@@ -148,14 +181,68 @@ impl ItemTable {
             }
             r.write(&mut out[o..o + 4]);
         }
-        // Only re-terminate a list that was terminated to begin with.
-        if self.terminated {
-            let t = self.first + self.records.len() * 4;
-            if t + 4 <= out.len() {
-                out[t..t + 4].copy_from_slice(&[0, 0, 0, 0xFF]);
+        // The group terminators are left exactly where the file put them.
+        // Re-writing one after the last record (as this used to) landed on
+        // the first row of the next group in a multi-group table, so editing
+        // one row silently wiped another.
+        out
+    }
+
+    /// Is this a reward table (.rem) rather than a supply box (.sup)?
+    pub fn is_reward_table(&self) -> bool {
+        self.first == 0x18
+    }
+
+    /// The roll groups of a .rem, in file order (empty for a .sup).
+    ///
+    /// Each group's rows are the records up to its terminator, and the group's
+    /// chance total is summed from the records as they are now, so an edit to
+    /// one row is reflected without a re-parse.
+    pub fn groups(&self) -> Vec<RewardGroup> {
+        let mut out = Vec::new();
+        if !self.is_reward_table() {
+            return out;
+        }
+        for (g, &(start, flag)) in self.group_starts.iter().enumerate() {
+            let end = self
+                .group_starts
+                .get(g + 1)
+                .map(|p| p.0)
+                .unwrap_or(self.records.len());
+            if end <= start || start >= self.records.len() {
+                continue;
             }
+            let end = end.min(self.records.len());
+            let total = self.records[start..end].iter().map(|r| r.slot as u16).sum();
+            out.push(RewardGroup {
+                start,
+                len: end - start,
+                flag,
+                total,
+            });
         }
         out
+    }
+
+    /// Write a chance into one reward record; clamped, nothing else touched.
+    ///
+    /// Returns the value written, or None for a supply box (which has no
+    /// chance) and for an index past the records.
+    pub fn set_probability(&mut self, index: usize, value: u8) -> Option<u8> {
+        if !self.is_reward_table() {
+            return None;
+        }
+        let r = self.records.get_mut(index)?;
+        r.slot = clamp_probability(value);
+        Some(r.slot)
+    }
+
+    /// Groups whose chance column adds up to more than 100.
+    pub fn groups_over_total(&self) -> Vec<RewardGroup> {
+        self.groups()
+            .into_iter()
+            .filter(|g| g.total > REWARD_PROB_TOTAL)
+            .collect()
     }
 }
 
@@ -337,6 +424,79 @@ mod tests {
         let mut expect = raw.clone();
         expect[24..28].copy_from_slice(&[42, 0, 9, 5]);
         assert_eq!(out, expect);
+    }
+
+    fn two_group_rem() -> Vec<u8> {
+        // Two roll groups (3 rows then 2 rows), the shape 50 of the 563
+        // shipped tables have.
+        let mut v = alloc::vec![0u8; 184];
+        v[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        v[4..8].copy_from_slice(&1u32.to_le_bytes());
+        v[0x08] = 1;
+        v[0x09] = 3;
+        v[0x0A] = 3;
+        v[0x0B] = 2;
+        let rows: [[u8; 4]; 6] = [
+            [100, 0, 1, 50],
+            [101, 0, 2, 30],
+            [102, 0, 1, 20],
+            [0, 0, 0, 0xFF],
+            [200, 0, 1, 60],
+            [201, 0, 1, 40],
+        ];
+        for (i, r) in rows.iter().enumerate() {
+            v[0x18 + i * 4..0x18 + i * 4 + 4].copy_from_slice(r);
+        }
+        v
+    }
+
+    #[test]
+    fn a_multi_group_rem_reads_every_group() {
+        let raw = two_group_rem();
+        let t = ItemTable::parse(&raw).unwrap();
+        assert_eq!(t.records.len(), 5, "both groups, not just the first");
+        assert!(t.terminated, "the first group is closed by a terminator");
+        let g = t.groups();
+        assert_eq!(g.len(), 2);
+        assert_eq!((g[0].start, g[0].len, g[0].flag, g[0].total), (0, 3, 1, 100));
+        // Records are the used rows only, so the second group starts at 3.
+        assert_eq!((g[1].start, g[1].len, g[1].flag, g[1].total), (3, 2, 3, 100));
+        assert_eq!(t.to_bytes(), raw, "an untouched table must not move");
+    }
+
+    #[test]
+    fn changing_a_chance_keeps_the_other_group_intact() {
+        let raw = two_group_rem();
+        let mut t = ItemTable::parse(&raw).unwrap();
+        // Row 0 of group 1 goes to 60: group 1 is now at 110%.
+        assert_eq!(t.set_probability(0, 60), Some(60));
+        assert_eq!(t.records[0].slot, 60);
+        assert_eq!(t.records[0].item, 100, "the item must not move");
+        assert_eq!(t.groups()[0].total, 110);
+        assert_eq!(t.groups()[1].total, 100, "group 2 is untouched");
+        assert_eq!(t.groups_over_total().len(), 1);
+        let out = t.to_bytes();
+        // Exactly one byte moved, and it is the chance byte of row 0.
+        let moved: alloc::vec::Vec<usize> = (0..raw.len()).filter(|i| raw[*i] != out[*i]).collect();
+        assert_eq!(moved, alloc::vec![0x18 + 3]);
+        // Re-reading finds the same groups and the same rows.
+        let back = ItemTable::parse(&out).unwrap();
+        assert_eq!(back.records.len(), 5);
+        assert_eq!(back.records[3].item, 200);
+        assert_eq!(back.groups()[0].total, 110);
+    }
+
+    #[test]
+    fn a_supply_box_has_no_chance_to_write() {
+        let mut raw = alloc::vec![0u8; 168];
+        raw[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        raw[4..8].copy_from_slice(&1u32.to_le_bytes());
+        raw[8..12].copy_from_slice(&[0xB4, 0x06, 0x03, 0x00]);
+        let mut t = ItemTable::parse(&raw).unwrap();
+        assert!(!t.is_reward_table());
+        assert!(t.groups().is_empty());
+        assert_eq!(t.set_probability(0, 50), None, "supplies carry no chance");
+        assert_eq!(t.records[0].slot, 0, "the byte must not change");
     }
 
     #[test]

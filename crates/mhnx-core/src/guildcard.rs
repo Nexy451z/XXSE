@@ -48,7 +48,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::romfstables::gmd_strings;
-use crate::save::Save;
+use crate::save::{check_name, NameError, NameFit, NameUnit, Save};
 
 /// Offset of the guild card, relative to the slot base.
 pub const OFF_GUILD_CARD: usize = 0xC71BD;
@@ -96,6 +96,10 @@ pub const GC_ID: usize = 0x8B0;
 pub const GC_COMMENT: usize = 0x878;
 /// Characters in the comment.
 pub const GC_COMMENT_CHARS: usize = 28;
+/// Bytes the card name field can hold: eleven UTF-16 units.
+pub const NAME_CAPACITY: usize = GC_NAME_UNITS * 2;
+/// Bytes the comment field can hold: twenty-eight UTF-16 units.
+pub const COMMENT_CAPACITY: usize = GC_COMMENT_CHARS * 2;
 
 /// Offset of the arena log, relative to the slot base.
 pub const OFF_ARENA: usize = 0xC83E1;
@@ -583,6 +587,40 @@ pub fn card_name(save: &Save, slot: usize) -> Option<String> {
     Some(name_in(full_card(save, slot)?))
 }
 
+/// Check a card name against the eleven unit field, without writing.
+///
+/// A line break is allowed - the game draws it as a second line and the field
+/// stores it as the unit 0x000A. Any other control character is refused with
+/// [`NameError::Control`]; a name longer than eleven units is passed but
+/// flagged with [`crate::save::NameWarning::TooLong`].
+pub fn name_check(text: &str) -> Result<NameFit, NameError> {
+    check_name(text, NAME_CAPACITY, NameUnit::Utf16)
+}
+
+/// The lines of a card block's name, as the screen draws them.
+///
+/// The card stores the name as UTF-16, so this decodes first and then splits;
+/// every line is owned because the decode allocates.
+pub fn name_lines_in(card: &[u8]) -> Vec<String> {
+    let name = name_in(card);
+    name.split('\n').map(String::from).collect()
+}
+
+/// How many lines a card block's name takes on screen.
+pub fn name_line_count_in(card: &[u8]) -> usize {
+    crate::save::name_line_count(&name_in(card))
+}
+
+/// The card name of one character, split into the lines the screen draws.
+pub fn card_name_lines(save: &Save, slot: usize) -> Option<Vec<String>> {
+    Some(name_lines_in(full_card(save, slot)?))
+}
+
+/// How many lines the card name of one character takes on screen.
+pub fn card_name_line_count(save: &Save, slot: usize) -> Option<usize> {
+    Some(name_line_count_in(full_card(save, slot)?))
+}
+
 /// The hunter rank stored on the card.
 pub fn hunter_rank(save: &Save, slot: usize) -> Option<u16> {
     let base = save.slot_base(slot)? as usize;
@@ -619,6 +657,36 @@ pub fn comment_in(card: &[u8]) -> String {
 /// The profile comment, decoded from UTF-16.
 pub fn comment(save: &Save, slot: usize) -> Option<String> {
     Some(comment_in(full_card(save, slot)?))
+}
+
+/// Check a comment against the twenty-eight unit field, without writing.
+///
+/// Same rule as [`name_check`]: a line break goes in, every other control
+/// character is refused, and a comment that does not fit is flagged rather than
+/// silently dropped.
+pub fn comment_check(text: &str) -> Result<NameFit, NameError> {
+    check_name(text, COMMENT_CAPACITY, NameUnit::Utf16)
+}
+
+/// The lines of a card block's comment, as the screen draws them.
+pub fn comment_lines_in(card: &[u8]) -> Vec<String> {
+    let text = comment_in(card);
+    text.split('\n').map(String::from).collect()
+}
+
+/// How many lines a card block's comment takes on screen.
+pub fn comment_line_count_in(card: &[u8]) -> usize {
+    crate::save::name_line_count(&comment_in(card))
+}
+
+/// The comment of one character, split into the lines the screen draws.
+pub fn comment_lines(save: &Save, slot: usize) -> Option<Vec<String>> {
+    Some(comment_lines_in(full_card(save, slot)?))
+}
+
+/// How many lines the comment of one character takes on screen.
+pub fn comment_line_count(save: &Save, slot: usize) -> Option<usize> {
+    Some(comment_line_count_in(full_card(save, slot)?))
 }
 
 // ---- weapon usage ----------------------------------------------------------
@@ -1116,7 +1184,14 @@ pub fn set_play_time(save: &mut Save, slot: usize, seconds: u32) -> bool {
 }
 
 /// Rewrite the profile comment. Longer text is truncated to the field.
+///
+/// The field is UTF-16, so a line break is stored as the unit 0x000A and the
+/// game draws it as a second line. Any other control character is refused, so
+/// false means the card is untouched.
 pub fn set_comment(save: &mut Save, slot: usize, text: &str) -> bool {
+    if comment_check(text).is_err() {
+        return false;
+    }
     let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
         return false;
     };
@@ -1134,6 +1209,21 @@ pub fn set_comment(save: &mut Save, slot: usize, text: &str) -> bool {
     true
 }
 
+/// Rewrite the profile comment, refusing control characters.
+///
+/// The checked form of [`set_comment`]. Both fields are UTF-16, so a line
+/// break is stored as the unit 0x000A and the decoder hands it back as '\n';
+/// every other control character makes the call fail without touching the
+/// card. A comment that does not fit comes back flagged, cut to twenty-eight
+/// units on a character boundary.
+pub fn set_comment_checked(save: &mut Save, slot: usize, text: &str) -> Result<NameFit, NameError> {
+    let fit = comment_check(text)?;
+    if !set_comment(save, slot, text) {
+        return Err(NameError::NoField);
+    }
+    Ok(fit)
+}
+
 /// Rewrite the hunter name on the card.
 ///
 /// Only the characters and the terminator are written. The field is eleven
@@ -1141,7 +1231,15 @@ pub fn set_comment(save: &mut Save, slot: usize, text: &str) -> bool {
 /// terminator (GC_NAME lists them), so zeroing the rest would rewrite bytes
 /// nobody asked to change. Text shorter than eleven units gets a NUL behind it;
 /// text that fills the field gets none, and longer text is truncated.
+///
+/// A line break is written as the unit 0x000A, which is the second line the
+/// game draws. Any other control character is refused, so false means the card
+/// is untouched; [`set_card_name_checked`] reports the same write with the
+/// warnings a caller may want to show.
 pub fn set_card_name(save: &mut Save, slot: usize, text: &str) -> bool {
+    if name_check(text).is_err() {
+        return false;
+    }
     let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
         return false;
     };
@@ -1166,6 +1264,20 @@ pub fn set_card_name(save: &mut Save, slot: usize, text: &str) -> bool {
         dst[written * 2..written * 2 + 2].copy_from_slice(&0u16.to_le_bytes());
     }
     true
+}
+
+/// Rewrite the hunter name on the card, refusing control characters.
+///
+/// The checked form of [`set_card_name`]. A line break is stored as the unit
+/// 0x000A and survives the UTF-16 decode as '\n', which is the second line the
+/// game draws; any other control character fails the call and leaves the card
+/// alone.
+pub fn set_card_name_checked(save: &mut Save, slot: usize, text: &str) -> Result<NameFit, NameError> {
+    let fit = name_check(text)?;
+    if !set_card_name(save, slot, text) {
+        return Err(NameError::NoField);
+    }
+    Ok(fit)
 }
 
 /// Rewrite one arena entry's time, in hundredths of a second.

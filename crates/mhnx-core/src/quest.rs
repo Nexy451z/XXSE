@@ -253,6 +253,51 @@ pub const REWARD_SLOTS: usize = 40;
 pub const REWARD_DATA_OFFSET: usize = 24;
 /// Offset of the first supply record.
 pub const SUP_DATA_OFFSET: usize = 8;
+/// Offset of the per-group table at the top of a .rem.
+///
+/// Eight pairs of u8 flag and u8 rows, unused pairs zero. Measured on the 141
+/// shipped quests: 513 of the 563 reward tables use one pair, the rest up to
+/// eight (one table really does use all eight).
+pub const REM_GROUP_TABLE_OFFSET: usize = 0x08;
+/// How many groups the header of a .rem can describe.
+pub const REM_MAX_GROUPS: usize = 8;
+/// Highest chance one reward row can carry, in percent.
+///
+/// Measured over the shipped quests (664 .rem files: 563 reward tables and 101
+/// all-zero rem_000000 dummies): every chance byte is 1..=100. No row that
+/// holds an item stores 0, and nothing goes above 100, so a typed value is
+/// clamped to this range rather than wrapped.
+pub const REWARD_PROB_MAX: u8 = 100;
+/// What the chance column of one reward group adds up to.
+///
+/// All 636 groups of the shipped tables sum to exactly 100. The game rolls
+/// each row on its own percentage, so a table that misses 100 still loads:
+/// one official table outside this dump (rem_230073) really does sum to 104,
+/// which is why a total over 100 is reported and never silently corrected.
+pub const REWARD_PROB_TOTAL: u16 = 100;
+
+/// Clamp a typed chance to the range the shipped tables use.
+pub fn clamp_probability(value: u8) -> u8 {
+    value.min(REWARD_PROB_MAX)
+}
+
+/// One roll group inside a .rem.
+///
+/// The records of a group are the rows up to a 00 00 00 FF terminator, and the
+/// header pair at REM_GROUP_TABLE_OFFSET + 2 * index names the group's category
+/// byte and how many rows it holds. A table with more than one group rolls each
+/// group separately, so each one's chances add up to 100 on their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RewardGroup {
+    /// First row, as an index into the forty records.
+    pub start: usize,
+    /// Number of rows in the group.
+    pub len: usize,
+    /// Category byte from the header (1, 2 and 3 cover most shipped tables).
+    pub flag: u8,
+    /// Sum of the chance column.
+    pub total: u16,
+}
 
 /// One reward or supply entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -261,7 +306,12 @@ pub struct RewardSlot {
     pub id: u16,
     /// Stack count.
     pub count: u8,
-    /// Probability (rewards) or unknown (supplies).
+    /// Chance in percent for a reward row; a display slot for a supply.
+    ///
+    /// Measured on the shipped quests: a reward row stores 1..=100 and the
+    /// rows of one group add up to 100. A supply row instead stores 0..=4
+    /// here and never a chance, which is why the supply table has no
+    /// probability to edit.
     pub probability: u8,
 }
 
@@ -332,6 +382,108 @@ macro_rules! table_impl {
 
 table_impl!(Rem, REM_SIZE, REWARD_DATA_OFFSET);
 table_impl!(Sup, SUP_SIZE, SUP_DATA_OFFSET);
+
+impl Rem {
+    /// The roll groups of this table, in file order.
+    ///
+    /// A group ends at a 00 00 00 FF terminator (and the last one may end at
+    /// the zero padding instead). Reading only the first group hid every row
+    /// after the first terminator: 50 of the 563 shipped tables have more than
+    /// one group, and those rows were not editable anywhere.
+    pub fn groups(&self) -> Vec<RewardGroup> {
+        let slots = self.slots();
+        let mut out: Vec<RewardGroup> = Vec::new();
+        let mut start = 0usize;
+        let mut open = false;
+        let mut end = 0usize;
+        for (i, s) in slots.iter().enumerate() {
+            if s.id == 0 && s.count == 0 && s.probability == 0xFF {
+                if open {
+                    out.push(self.make_group(&slots, start, i, out.len()));
+                    open = false;
+                }
+                continue;
+            }
+            if s.id == 0 && s.count == 0 && s.probability == 0 {
+                break;
+            }
+            if !open {
+                start = i;
+                open = true;
+            }
+            end = i + 1;
+        }
+        // A last group that no terminator closes still ends at its last row.
+        if open {
+            out.push(self.make_group(&slots, start, end, out.len()));
+        }
+        out
+    }
+
+    fn make_group(
+        &self,
+        slots: &[RewardSlot; REWARD_SLOTS],
+        start: usize,
+        end: usize,
+        index: usize,
+    ) -> RewardGroup {
+        let end = end.min(REWARD_SLOTS);
+        let len = end.saturating_sub(start);
+        let total = slots[start..end].iter().map(|s| s.probability as u16).sum();
+        let o = REM_GROUP_TABLE_OFFSET + index * 2;
+        let flag = if index < REM_MAX_GROUPS && o < REWARD_DATA_OFFSET {
+            self.raw[o]
+        } else {
+            0
+        };
+        RewardGroup {
+            start,
+            len,
+            flag,
+            total,
+        }
+    }
+
+    /// The chance stored on one row, or None past the forty records.
+    pub fn probability(&self, index: usize) -> Option<u8> {
+        if index >= REWARD_SLOTS {
+            return None;
+        }
+        Some(self.raw[REWARD_DATA_OFFSET + index * 4 + 3])
+    }
+
+    /// Write a chance into one row and leave every other byte alone.
+    ///
+    /// The value is clamped to REWARD_PROB_MAX; the row's item, count and the
+    /// other rows are untouched. Nothing is normalised: a group whose chances
+    /// add up past 100 is reported by Rem::groups_over_total, not silently
+    /// rescaled, because one official table really is 104%.
+    ///
+    /// Returns the value that was written, or None past the forty records.
+    pub fn set_probability(&mut self, index: usize, value: u8) -> Option<u8> {
+        if index >= REWARD_SLOTS {
+            return None;
+        }
+        let o = REWARD_DATA_OFFSET + index * 4;
+        // Only a row that already holds an item can take a chance: writing
+        // into a terminator would split the table, and writing into the zero
+        // padding would create the dummy row the checker refuses.
+        if self.raw[o] == 0 && self.raw[o + 1] == 0 {
+            return None;
+        }
+        let v = clamp_probability(value);
+        self.raw[o + 3] = v;
+        Some(v)
+    }
+
+    /// Groups whose chance column adds up to more than 100.
+    pub fn groups_over_total(&self) -> Vec<RewardGroup> {
+        self.groups()
+            .into_iter()
+            .filter(|g| g.total > REWARD_PROB_TOTAL)
+            .collect()
+    }
+}
 
 /// A fixed or variable length payload we do not fully model yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -428,6 +580,70 @@ mod tests {
         assert_eq!(back.client(), Some("Guildmaster"));
         assert_eq!(back.main_monster(), Some("Great Maccao x2"));
         assert_eq!(back.success(), Some("Hunt 2 Great Maccao"));
+    }
+
+    /// A 184 byte reward table: two groups (3 rows and 2 rows), useful for
+    /// the chance and group tests.
+    fn two_group_rem() -> Rem {
+        let mut v = alloc::vec![0u8; REM_SIZE];
+        v[0..4].copy_from_slice(&1.0f32.to_le_bytes());
+        v[4..8].copy_from_slice(&1u32.to_le_bytes());
+        // +0x08: (flag 1, 3 rows), (flag 3, 2 rows).
+        v[REM_GROUP_TABLE_OFFSET] = 1;
+        v[REM_GROUP_TABLE_OFFSET + 1] = 3;
+        v[REM_GROUP_TABLE_OFFSET + 2] = 3;
+        v[REM_GROUP_TABLE_OFFSET + 3] = 2;
+        let rows: [[u8; 4]; 6] = [
+            [100, 0, 1, 50],
+            [101, 0, 2, 30],
+            [102, 0, 1, 20],
+            [0, 0, 0, 0xFF],
+            [200, 0, 1, 60],
+            [201, 0, 1, 40],
+        ];
+        for (i, r) in rows.iter().enumerate() {
+            v[REWARD_DATA_OFFSET + i * 4..REWARD_DATA_OFFSET + i * 4 + 4]
+                .copy_from_slice(r);
+        }
+        Rem::from_bytes(&v).expect("a 184 byte .rem")
+    }
+
+    #[test]
+    fn reward_groups_are_split_at_the_terminator() {
+        let r = two_group_rem();
+        let g = r.groups();
+        assert_eq!(g.len(), 2, "two groups: {:?}", g);
+        assert_eq!((g[0].start, g[0].len, g[0].flag, g[0].total), (0, 3, 1, 100));
+        assert_eq!((g[1].start, g[1].len, g[1].flag, g[1].total), (4, 2, 3, 100));
+        assert!(r.groups_over_total().is_empty());
+    }
+
+    #[test]
+    fn a_chance_is_written_clamped_and_only_that_byte_moves() {
+        let mut r = two_group_rem();
+        let before = r.raw.clone();
+        assert_eq!(r.set_probability(0, 250), Some(REWARD_PROB_MAX));
+        assert_eq!(r.probability(0), Some(REWARD_PROB_MAX));
+        let moved: alloc::vec::Vec<usize> = (0..before.len()).filter(|i| before[*i] != r.raw[*i]).collect();
+        assert_eq!(moved, alloc::vec![REWARD_DATA_OFFSET + 3], "one byte, the chance");
+        // The terminator row is not a row that can take a chance: writing
+        // there would split the table.
+        assert_eq!(r.set_probability(3, 10), None);
+        assert_eq!(r.probability(REWARD_SLOTS), None);
+    }
+
+    #[test]
+    fn a_total_over_100_is_reported_and_not_rescaled() {
+        let mut r = two_group_rem();
+        assert_eq!(r.set_probability(0, 60), Some(60));
+        assert_eq!(r.set_probability(1, 40), Some(40));
+        let over = r.groups_over_total();
+        assert_eq!(over.len(), 1, "the first group is at 120: {:?}", over);
+        assert_eq!(over[0].total, 120);
+        // Nothing was normalised: the three chances are still what was typed.
+        assert_eq!(r.probability(0), Some(60));
+        assert_eq!(r.probability(1), Some(40));
+        assert_eq!(r.probability(2), Some(20));
     }
 
     #[test]

@@ -36,7 +36,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::save::Save;
+use crate::save::{check_name, NameError, NameFit, NameUnit, Save};
 
 /// Offset of the item set array, relative to the slot base.
 pub const OFF_ITEM_SETS: usize = 0x17CF;
@@ -48,6 +48,14 @@ pub const ITEM_SET_SIZE: usize = 170;
 pub const ITEM_SET_ITEMS: usize = 32;
 /// Offset of the item pairs.
 pub const ITEM_SET_BODY: usize = 0x2A;
+/// Bytes the name field of a my-set record occupies.
+///
+/// Both arrays use the same 32 byte UTF-8 field in front of the ten reserved
+/// bytes at +0x20, so a name may hold a line break the game draws on a second
+/// line and fills at most [@@NAME_CAPACITY@@] of them.
+pub const NAME_LEN: usize = 32;
+/// Bytes of a my-set name the field can hold: one short, for the NUL.
+pub const NAME_CAPACITY: usize = NAME_LEN - 1;
 
 /// Offset of the equipment set array.
 pub const OFF_EQUIP_SETS: usize = 0x208CE;
@@ -121,6 +129,21 @@ impl ItemSet {
     pub fn used_items(&self) -> Vec<SetItem> {
         self.items.iter().copied().filter(|i| i.id != 0).collect()
     }
+
+    /// The set name split into the lines the screen draws.
+    pub fn name_lines(&self) -> Vec<&str> {
+        name_lines(&self.name)
+    }
+
+    /// How many lines the set name takes on screen.
+    pub fn name_line_count(&self) -> usize {
+        name_line_count(&self.name)
+    }
+
+    /// What writing this name would do to the record's field.
+    pub fn name_fit(&self) -> Result<NameFit, NameError> {
+        name_check(&self.name)
+    }
 }
 
 /// An equipment set.
@@ -154,6 +177,21 @@ impl EquipSet {
     /// Is this slot unused?
     pub fn is_empty(&self) -> bool {
         self.name == EMPTY_NAME || self.parts.iter().all(|p| *p == NONE)
+    }
+
+    /// The set name split into the lines the screen draws.
+    pub fn name_lines(&self) -> Vec<&str> {
+        name_lines(&self.name)
+    }
+
+    /// How many lines the set name takes on screen.
+    pub fn name_line_count(&self) -> usize {
+        name_line_count(&self.name)
+    }
+
+    /// What writing this name would do to the record's field.
+    pub fn name_fit(&self) -> Result<NameFit, NameError> {
+        name_check(&self.name)
     }
 
     /// A slice of the tail, copied out.
@@ -212,7 +250,7 @@ impl EquipSet {
 }
 
 fn read_name(b: &[u8]) -> String {
-    let raw = &b[..32.min(b.len())];
+    let raw = &b[..NAME_LEN.min(b.len())];
     let end = raw.iter().position(|x| *x == 0).unwrap_or(raw.len());
     String::from_utf8_lossy(&raw[..end]).into_owned()
 }
@@ -299,16 +337,57 @@ pub fn equip_sets(save: &Save, slot: usize) -> Vec<EquipSet> {
     out
 }
 
+/// Check a my-set name against a record's field, without writing.
+///
+/// Item sets and equipment sets share the 32 byte name field, so both go
+/// through this. A line break is allowed; any other control character is
+/// refused with [`NameError::Control`].
+pub fn name_check(name: &str) -> Result<NameFit, NameError> {
+    check_name(name, NAME_CAPACITY, NameUnit::Bytes)
+}
+
+/// The lines a my-set name holds, as the screen draws them.
+pub fn name_lines(name: &str) -> Vec<&str> {
+    crate::save::name_lines(name)
+}
+
+/// How many lines a my-set name holds.
+pub fn name_line_count(name: &str) -> usize {
+    crate::save::name_line_count(name)
+}
+
+/// Rename an item set, refusing control characters.
+///
+/// The checked form of [`set_item_set_name`]: nothing is written when the name
+/// does not pass [`name_check`]. Line breaks are kept as they are and their
+/// warnings (leading, trailing, doubled) come back with the fit.
+pub fn set_item_set_name_checked(
+    save: &mut Save,
+    slot: usize,
+    index: usize,
+    name: &str,
+) -> Result<NameFit, NameError> {
+    let fit = name_check(name)?;
+    if !set_item_set_name(save, slot, index, name) {
+        return Err(NameError::NoField);
+    }
+    Ok(fit)
+}
+
 /// Rename an item set.
+///
+/// A line break is written as it stands; any other control character is
+/// refused, so false means the record is untouched. [`set_item_set_name_checked`]
+/// reports the same write with the warnings a caller may want to show.
 pub fn set_item_set_name(save: &mut Save, slot: usize, index: usize, name: &str) -> bool {
-    if index >= ITEM_SETS {
+    if index >= ITEM_SETS || name_check(name).is_err() {
         return false;
     }
     let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
         return false;
     };
     let at = base + OFF_ITEM_SETS + index * ITEM_SET_SIZE;
-    let Some(dst) = save.body_mut().get_mut(at..at + 32) else {
+    let Some(dst) = save.body_mut().get_mut(at..at + NAME_LEN) else {
         return false;
     };
     write_name(dst, name);
@@ -716,16 +795,36 @@ pub fn item_set_warnings(save: &Save, slot: usize, set: usize) -> Vec<String> {
     out
 }
 
+/// Rename an equipment set, refusing control characters.
+///
+/// The checked form of [`set_equip_set_name`], with the same warnings as the
+/// item set writer.
+pub fn set_equip_set_name_checked(
+    save: &mut Save,
+    slot: usize,
+    index: usize,
+    name: &str,
+) -> Result<NameFit, NameError> {
+    let fit = name_check(name)?;
+    if !set_equip_set_name(save, slot, index, name) {
+        return Err(NameError::NoField);
+    }
+    Ok(fit)
+}
+
 /// Rename an equipment set.
+///
+/// Same rule as [`set_item_set_name`]: a line break goes in, every other
+/// control character is refused, and false means nothing was written.
 pub fn set_equip_set_name(save: &mut Save, slot: usize, index: usize, name: &str) -> bool {
-    if index >= EQUIP_SETS {
+    if index >= EQUIP_SETS || name_check(name).is_err() {
         return false;
     }
     let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
         return false;
     };
     let at = base + OFF_EQUIP_SETS + index * EQUIP_SET_SIZE;
-    let Some(dst) = save.body_mut().get_mut(at..at + 32) else {
+    let Some(dst) = save.body_mut().get_mut(at..at + NAME_LEN) else {
         return false;
     };
     write_name(dst, name);
@@ -740,6 +839,16 @@ pub fn set_equip_set_name(save: &mut Save, slot: usize, index: usize, name: &str
 /// a name a user typed never ends up split in half.
 pub fn set_name(save: &mut Save, slot: usize, set: usize, name: &str) -> bool {
     set_equip_set_name(save, slot, set, name)
+}
+
+/// The checked form of [`set_name`].
+pub fn set_name_checked(
+    save: &mut Save,
+    slot: usize,
+    set: usize,
+    name: &str,
+) -> Result<NameFit, NameError> {
+    set_equip_set_name_checked(save, slot, set, name)
 }
 
 // ---------------------------------------------------------------------------

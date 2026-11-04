@@ -1293,6 +1293,12 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.apply_guild_time_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
         ed.apply_hunt_count_text(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB
+        || idx == mhnx_core::hbedit::TEXT_REWARD_COUNT
+    {
+        // The row's own field says which number is written; the sentinel only
+        // says that a reward row asked for one.
+        ed.apply_reward_text(&s);
     } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME {
         let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
         let clipped: String = s.chars().take(20).collect();
@@ -1508,6 +1514,10 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("プレイ時間 (H:MM または秒)", 12)
         } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
             ("狩猟数 (0〜9999) / サイズ % (0〜300)", 6)
+        } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB {
+            ("報酬の確率 % (0〜100)", 4)
+        } else if idx == mhnx_core::hbedit::TEXT_REWARD_COUNT {
+            ("報酬の個数 (0〜99)", 4)
         } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME
             && idx < mhnx_core::hbedit::TEXT_GUILD_COMMENT
         {

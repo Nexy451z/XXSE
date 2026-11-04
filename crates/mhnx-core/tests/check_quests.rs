@@ -108,6 +108,45 @@ fn checker_reports_the_real_save_as_clean() {
     assert!(f.iter().all(|x| x.severity != Severity::Error));
 }
 
+/// A reward group whose chances do not add up to 100 is a warning, never a
+/// silent correction: the game rolls each row on its own chance, so the
+/// numbers the user typed have to survive a check.
+#[test]
+fn checker_flags_a_reward_group_that_is_not_100_percent() {
+    let p = PathBuf::from(r"C:\anyWorkspace\nx\mhxx\mhnxeditor\dist\quests_all\q1010165.arc");
+    if !p.exists() {
+        return;
+    }
+    let mut a = Arc::parse(&std::fs::read(&p).unwrap()).unwrap();
+    let raised = {
+        let e = a
+            .entries
+            .iter_mut()
+            .find(|e| e.name.contains("\\rem\\") && !e.name.ends_with("rem_000000"))
+            .expect("a real reward table");
+        let t = mhnx_core::entries::ItemTable::parse(&e.data).unwrap();
+        assert!(!t.records.is_empty());
+        assert_eq!(t.groups()[0].total, 100, "the shipped table is at 100");
+        // The chance byte of record 0 is the fourth byte from 0x18.
+        let before = e.data[0x18 + 3];
+        e.data[0x18 + 3] = before + 1;
+        before + 1
+    };
+    let f = check_quest(&a);
+    let hit = f
+        .iter()
+        .find(|x| x.code == "reward-probability-sum")
+        .unwrap_or_else(|| {
+            panic!(
+                "no reward-probability-sum, got {:?}",
+                f.iter().map(|x| x.code).collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(hit.severity, Severity::Warn);
+    assert!(hit.message.contains("101"), "{} {}%", hit.message, raised);
+    assert!(!hit.fixable, "a total is reported, never rescaled");
+}
+
 #[test]
 fn checker_detects_a_dummy_only_reward_set() {
     // Build a synthetic archive whose only .rem is the dummy.

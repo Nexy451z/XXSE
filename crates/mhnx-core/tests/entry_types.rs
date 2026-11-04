@@ -144,6 +144,68 @@ fn editing_a_reward_record_changes_only_that_record() {
     assert_eq!(diff[0], t.first + 2, "the count byte of record 0");
 }
 
+/// The chance column of every shipped reward table, measured in one place.
+///
+/// A .rem is a list of roll groups. Each group's chances are percentages that
+/// the game rolls against, so a row is 1..=100 and one group adds up to 100.
+/// Every group is read here (a table can hold up to eight), which is what the
+/// editor needs before it can show or change a row's chance.
+#[test]
+fn every_shipped_reward_table_holds_chances_in_the_measured_range() {
+    let files = arcs();
+    let (mut tables, mut groups, mut multi) = (0usize, 0usize, 0usize);
+    let mut rows = 0usize;
+    let mut outside = Vec::new();
+    let mut bad_total = Vec::new();
+    for f in &files {
+        let bytes = std::fs::read(f).unwrap();
+        let arc = Arc::parse(&bytes).unwrap();
+        for e in &arc.entries {
+            if extension_for(e.type_hash) != Some("rem") {
+                continue;
+            }
+            let t = ItemTable::parse(&e.data).unwrap();
+            if t.records.is_empty() {
+                // The all-zero rem_000000 dummy.
+                continue;
+            }
+            tables += 1;
+            let g = t.groups();
+            groups += g.len();
+            if g.len() > 1 {
+                multi += 1;
+            }
+            for r in &t.records {
+                rows += 1;
+                if r.slot == 0 || r.slot > 100 {
+                    outside.push(format!("{}:{} -> {}%", f.display(), r.item, r.slot));
+                }
+            }
+            for (gi, grp) in g.iter().enumerate() {
+                // Every group of this dump adds up to exactly 100. (One
+                // official table outside it, rem_230073, is 104%, which is
+                // why the editor only warns about a bad total and never
+                // rescales one.)
+                if grp.total != 100 {
+                    bad_total.push(format!("{} group {} = {}%", f.display(), gi + 1, grp.total));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "measured: {} tables, {} groups ({} multi-group), {} rows",
+        tables, groups, multi, rows
+    );
+    assert!(tables > 100, "reward tables: {}", tables);
+    assert!(multi > 0, "the set must exercise multi-group tables");
+    assert!(outside.is_empty(), "chances outside 1..=100: {:?}", &outside[..outside.len().min(5)]);
+    assert!(
+        bad_total.is_empty(),
+        "every group should add up to 100%: {:?}",
+        &bad_total[..bad_total.len().min(5)]
+    );
+}
+
 #[test]
 fn a_truncated_container_is_rejected_not_panicked() {
     for len in [0usize, 1, 4, 7] {

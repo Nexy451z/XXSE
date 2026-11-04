@@ -31,7 +31,7 @@ use crate::equipops::{self, EquipError};
 use crate::equiprefs;
 use crate::save::Options;
 use crate::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT, TOTAL_ITEM_SLOTS};
-use crate::quest::{Gmd, Mib};
+use crate::quest::{Gmd, Mib, REWARD_PROB_MAX, REWARD_PROB_TOTAL};
 use crate::questfields::{self, FieldKind};
 use crate::questprogress::{self, Progress};
 use crate::requests;
@@ -1114,6 +1114,14 @@ pub const TEXT_GUILD_HR: usize = usize::MAX - 1_004;
 pub const TEXT_GUILD_TIME: usize = usize::MAX - 1_005;
 /// Sentinel id for "ask for the hunt count of the selected monster".
 pub const TEXT_HUNT_COUNT: usize = usize::MAX - 1_006;
+/// Sentinel id for "ask for the chance of the selected reward row".
+///
+/// Below TEXT_PALICO_NAME for the reason TEXT_SET_NAME is: the console layer
+/// reads one contiguous range as palico names, so a sentinel above it would be
+/// answered as a palico that does not exist.
+pub const TEXT_REWARD_PROB: usize = usize::MAX - 1_007;
+/// Sentinel id for "ask for the count of the selected reward row".
+pub const TEXT_REWARD_COUNT: usize = usize::MAX - 1_008;
 
 // ---------------------------------------------------------------------------
 // 闘技大会 (the arena log): the guild screen's second view
@@ -2726,6 +2734,12 @@ pub struct Editor {
     pub entry_item_row: usize,
     /// Cursor over the records of the open reward table.
     pub entry_row_cursor: usize,
+    /// Which number [◀/▶] changes on a reward row: 0 = 個数, 1 = 確率.
+    ///
+    /// A reward row holds two editable numbers and the list shows both, so
+    /// [-] switches which one the key is on. Supplies have no chance, so the
+    /// field stays 0 there and [-] says why.
+    pub entry_field: u8,
     /// File name chosen for the converted save, without path or extension.
     pub convert_name: String,
     /// Hunt record cursor and the working copies.
@@ -3060,6 +3074,7 @@ impl Editor {
             item_pick_mode: 0,
             entry_item_row: 0,
             entry_row_cursor: 0,
+            entry_field: 0,
             quest_filter: String::new(),
             skill_pick_filter: String::new(),
             skill_pick_cursor: 0,
@@ -3593,6 +3608,11 @@ impl Editor {
                 "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存"
             }
             Screen::Gmd => "[A] 文章編集  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            // A reward / supply row carries its numbers, so the guide names the
+            // key that picks which one and the key that types it.
+            Screen::EntryView if self.entry_has_numbers() => {
+                "[◀/▶] 増減  [-] 個数/確率  [A] アイテム  [R] 数値入力  [Y] 刻み  [X] 保存"
+            }
             Screen::EntryView => {
                 "[◀/▶] 座標・数値変更  [Y] 刻み  [L/R] サブタブ  [X] 保存  [B] 戻る"
             }
@@ -4818,15 +4838,34 @@ impl Editor {
                     self.cursor = self.entry;
                 }
                 Key::Up => {
-                    self.entry_row_cursor = self.entry_row_cursor.saturating_sub(1);
+                    let n = self.entry_record_count();
+                    self.entry_row_cursor = if n == 0 {
+                        0
+                    } else {
+                        self.entry_row_cursor.min(n - 1).saturating_sub(1)
+                    };
                 }
                 Key::Down => {
-                    self.entry_row_cursor += 1;
+                    let n = self.entry_record_count();
+                    self.entry_row_cursor = if n == 0 {
+                        0
+                    } else {
+                        (self.entry_row_cursor + 1).min(n - 1)
+                    };
                 }
-                // The console could swap the item but not say how many of it
-                // the quest hands out; the count was printed and fixed.
-                Key::Left => self.adjust_entry_count(-1),
-                Key::Right => self.adjust_entry_count(1),
+                // The row carries two numbers on a reward table (個数 and 確率)
+                // and one on a supply box (個数). [-] picks which one, so the
+                // same key pair changes whichever the screen is showing.
+                Key::Left => {
+                    let d = STEPS[self.step].min(10).max(1);
+                    self.adjust_entry_field(-d);
+                }
+                Key::Right => {
+                    let d = STEPS[self.step].min(10).max(1);
+                    self.adjust_entry_field(d);
+                }
+                Key::Minus => self.toggle_entry_field(),
+                Key::R => self.request_entry_number_text(),
                 // Only the reward and supply tables hold editable records.
                 Key::A => {
                     let ext = self
@@ -6530,52 +6569,269 @@ impl Editor {
         self.item_pick_cursor = 0;
     }
 
-    /// Change how many of the item one reward record holds.
-    ///
-    /// The desktop build has had a drag value here for a while; this is the
-    /// same edit for the console, where only the item was swappable.
-    fn adjust_entry_count(&mut self, delta: i64) {
-        let row = self.entry_row_cursor;
-        let idx = self.entry;
-        let ext = self
-            .arc
+    /// The extension of the open .arc entry, if one is open.
+    fn entry_ext(&self) -> Option<&'static str> {
+        self.arc
             .as_ref()
-            .and_then(|a| a.entries.get(idx))
-            .and_then(|e| extension_for(e.type_hash));
-        if !matches!(ext, Some("rem") | Some("sup")) {
+            .and_then(|a| a.entries.get(self.entry))
+            .and_then(|e| extension_for(e.type_hash))
+    }
+
+    /// The open entry parsed as a reward / supply table.
+    fn entry_table(&self) -> Option<crate::entries::ItemTable> {
+        if !self.entry_has_numbers() {
+            return None;
+        }
+        let e = self.arc.as_ref()?.entries.get(self.entry)?;
+        crate::entries::ItemTable::parse(&e.data).ok()
+    }
+
+    /// How many records the open reward / supply table holds.
+    pub fn entry_record_count(&self) -> usize {
+        self.entry_table().map(|t| t.records.len()).unwrap_or(0)
+    }
+
+    /// Does the open entry hold rows with numbers [◀/▶] can change?
+    pub fn entry_has_numbers(&self) -> bool {
+        matches!(self.entry_ext(), Some("rem") | Some("sup"))
+    }
+
+    /// Does the open entry hold a chance column (.rem does, .sup does not)?
+    pub fn entry_has_chance(&self) -> bool {
+        self.entry_ext() == Some("rem")
+    }
+
+    /// Which number the row cursor is on, as the label the screen prints.
+    pub fn entry_field_label(&self) -> &'static str {
+        if self.entry_has_chance() && self.entry_field == 1 {
+            "確率%"
+        } else {
+            "個数"
+        }
+    }
+
+    /// The line the reward screen prints beside its title.
+    ///
+    /// One group reads 「合計 100% / 6枠」; a multi-group table names each one,
+    /// because each group is rolled on its own and each adds up to 100.
+    pub fn entry_reward_sub(&self) -> alloc::string::String {
+        if !self.entry_has_chance() {
+            return String::from("支給品: 確率は使いません");
+        }
+        let Some(t) = self.entry_table() else {
+            return String::new();
+        };
+        let groups = t.groups();
+        let field = self.entry_field_label();
+        if groups.len() <= 1 {
+            let (total, len) = groups
+                .first()
+                .map(|g| (g.total, g.len))
+                .unwrap_or((0, 0));
+            return alloc::format!("合計 {}% / {}枠  編集中: {}", total, len, field);
+        }
+        let mut out = String::new();
+        for (i, g) in groups.iter().enumerate() {
+            if i > 0 {
+                out.push_str(" / ");
+            }
+            out.push_str(&alloc::format!("G{} {}%", i + 1, g.total));
+        }
+        out.push_str(&alloc::format!("  編集中: {}", field));
+        out
+    }
+
+    /// Groups whose chance column is not 100, as one line each.
+    ///
+    /// Reported, never corrected: the game rolls each row on its own chance
+    /// and one official table really does add up to 104%.
+    pub fn entry_reward_warnings(&self) -> Vec<alloc::string::String> {
+        if !self.entry_has_chance() {
+            return Vec::new();
+        }
+        let Some(t) = self.entry_table() else {
+            return Vec::new();
+        };
+        t.groups()
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g.total != REWARD_PROB_TOTAL)
+            .map(|(i, g)| {
+                if g.total > REWARD_PROB_TOTAL {
+                    alloc::format!(
+                        "グループ{} の合計が {}% です（{}枠）— 100% を超えています",
+                        i + 1,
+                        g.total,
+                        g.len
+                    )
+                } else {
+                    alloc::format!(
+                        "グループ{} の合計が {}% です（{}枠）— 100% に届いていません",
+                        i + 1,
+                        g.total,
+                        g.len
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// Change the number [◀/▶] is on: the count, or the chance on a reward row.
+    fn adjust_entry_field(&mut self, delta: i64) {
+        if !self.entry_has_numbers() {
             self.message = String::from("このエントリに編集できる項目はありません");
             return;
         }
-        let Some(a) = &mut self.arc else {
+        if self.entry_has_chance() && self.entry_field == 1 {
+            let row = self.entry_row_cursor;
+            let cur = self
+                .entry_table()
+                .and_then(|t| t.records.get(row).map(|r| r.slot as i64))
+                .unwrap_or(0);
+            self.store_entry_number(cur + delta, true);
+        } else {
+            let row = self.entry_row_cursor;
+            let cur = self
+                .entry_table()
+                .and_then(|t| t.records.get(row).map(|r| r.count as i64))
+                .unwrap_or(0);
+            self.store_entry_number(cur + delta, false);
+        }
+    }
+
+    /// Switch [-] between 個数 and 確率 on a reward row.
+    fn toggle_entry_field(&mut self) {
+        if !self.entry_has_numbers() {
+            self.message = String::from("このエントリに編集できる項目はありません");
             return;
-        };
-        let Some(e) = a.entries.get_mut(idx) else {
+        }
+        if !self.entry_has_chance() {
+            self.entry_field = 0;
+            self.message = String::from("支給品 (.sup) は確率を使いません（個数のみ編集できます）");
             return;
-        };
+        }
+        self.entry_field = (self.entry_field + 1) % 2;
+        self.message = alloc::format!(
+            "編集中の項目を {} に切り替えました（[◀/▶] で増減）",
+            self.entry_field_label()
+        );
+    }
+
+    /// Write one number into the row under the cursor.
+    ///
+    /// `chance` picks the fourth byte of a .rem record (its chance) instead of
+    /// the count byte. The value is clamped to the measured range, nothing
+    /// else in the table moves, and the message says when the group's total is
+    /// no longer 100.
+    fn store_entry_number(&mut self, value: i64, chance: bool) -> Option<u8> {
+        let row = self.entry_row_cursor;
+        let idx = self.entry;
+        let a = self.arc.as_mut()?;
+        let e = a.entries.get_mut(idx)?;
         let Ok(mut t) = crate::entries::ItemTable::parse(&e.data) else {
             self.message = String::from("この表を読み取れません");
-            return;
+            return None;
         };
         if row >= t.records.len() {
             self.message = String::from("その記録はありません");
-            return;
+            return None;
         }
         if t.records[row].item == 0 {
             self.message = String::from("空の行です。先に A でアイテムを選んでください");
-            return;
+            return None;
         }
-        let next = (t.records[row].count as i64 + delta).clamp(0, 99) as u8;
-        if next == t.records[row].count {
-            return;
-        }
-        t.records[row].count = next;
+        let written = if chance {
+            if !t.is_reward_table() {
+                self.message = String::from("支給品 (.sup) は確率を使いません");
+                return None;
+            }
+            let next = value.clamp(0, REWARD_PROB_MAX as i64) as u8;
+            t.set_probability(row, next)?
+        } else {
+            let next = value.clamp(0, 99) as u8;
+            t.records[row].count = next;
+            next
+        };
+        let groups = t.groups();
+        let gi = if chance {
+            groups
+                .iter()
+                .position(|g| row >= g.start && row < g.start + g.len)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let (total, len) = groups
+            .get(gi)
+            .map(|g| (g.total, g.len))
+            .unwrap_or((0, 0));
         e.data = t.to_bytes();
         self.dirty = true;
-        self.message = alloc::format!(
-            "{} 行目の個数を {} にしました（X で .arc に書き込み）",
-            row,
-            next
-        );
+        self.message = if !chance {
+            alloc::format!(
+                "{} 行目の個数を {} にしました（X で .arc に書き込み）",
+                row,
+                written
+            )
+        } else if total > REWARD_PROB_TOTAL {
+            alloc::format!(
+                "{} 枠目の確率を {}% にしました（グループ{}の合計 {}% / {}枠 — 100% を超えています。自動補正はしません）",
+                row + 1,
+                written,
+                gi + 1,
+                total,
+                len
+            )
+        } else {
+            alloc::format!(
+                "{} 枠目の確率を {}% にしました（グループ{}の合計 {}% / {}枠）",
+                row + 1,
+                written,
+                gi + 1,
+                total,
+                len
+            )
+        };
+        Some(written)
+    }
+
+    /// [R] on a reward row: type the number instead of stepping it.
+    fn request_entry_number_text(&mut self) {
+        if !self.entry_has_numbers() {
+            self.message = String::from("この画面のこの行は直接入力できません");
+            return;
+        }
+        let Some(t) = self.entry_table() else {
+            return;
+        };
+        let Some(r) = t.records.get(self.entry_row_cursor) else {
+            self.message = String::from("その記録はありません");
+            return;
+        };
+        if self.entry_has_chance() && self.entry_field == 1 {
+            self.pending_text = Some((TEXT_REWARD_PROB, alloc::format!("{}", r.slot)));
+        } else {
+            self.pending_text = Some((TEXT_REWARD_COUNT, alloc::format!("{}", r.count)));
+        }
+    }
+
+    /// The io layer's answer to [R] on a reward row.
+    ///
+    /// A chance is clamped to 0..=100 and a count to 0..=99, the same ceilings
+    /// the row prints; letters are refused with a message instead of silently
+    /// doing nothing.
+    pub fn apply_reward_text(&mut self, text: &str) -> bool {
+        let digits: alloc::string::String = text
+            .chars()
+            .skip_while(|c| c.is_ascii_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let Ok(v) = digits.parse::<i64>() else {
+            self.message = String::from("数字を入力してください");
+            return false;
+        };
+        let chance = self.entry_has_chance() && self.entry_field == 1;
+        self.store_entry_number(v, chance).is_some()
     }
 
     /// Write one item id into the reward record the picker is aimed at.
@@ -11155,32 +11411,44 @@ impl Editor {
                                     push(
                                         &mut out,
                                         format!(
-                                            "{} records of {} slots",
+                                            "{} records of {} slots  {}",
                                             t.records.len(),
-                                            t.capacity
+                                            t.capacity,
+                                            self.entry_reward_sub()
                                         ),
                                         false,
                                         false,
                                     );
                                     for (i, r) in t.records.iter().take(18).enumerate() {
+                                        // A reward row has a chance; a supply
+                                        // row's fourth byte is a display slot
+                                        // and is printed as one.
+                                        let fourth = if t.is_reward_table() {
+                                            alloc::format!(" {:>3}%", r.slot)
+                                        } else {
+                                            alloc::format!(" slot {}", r.slot)
+                                        };
                                         push(
                                             &mut out,
                                             format!(
-                                                "  {:>2}  {:<6} x{:<3} slot {}  {}",
+                                                "  {:>2}  {:<6} x{:<3}{}  {}",
                                                 i,
                                                 r.item,
                                                 r.count,
-                                                r.slot,
+                                                fourth,
                                                 item_name_of(r.item)
                                             ),
                                             true,
                                             i == self.entry_row_cursor,
                                         );
                                     }
+                                    for w in self.entry_reward_warnings() {
+                                        push(&mut out, format!("  ! {}", w), false, false);
+                                    }
                                     push(
                                         &mut out,
                                         String::from(
-                                            "  Up/Down row  A change item  X write .arc  B back",
+                                            "  Up/Down row  Left/Right value  - count/chance  A item  R type  X write .arc  B back",
                                         ),
                                         false,
                                         false,

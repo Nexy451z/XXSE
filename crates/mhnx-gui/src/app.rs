@@ -6450,12 +6450,48 @@ impl MhnxEditor {
                         return;
                     }
                 };
+                let is_rem = table.is_reward_table();
                 ui.label(format!(
                     "アイテム {} 件 / 収容 {} 件（{}）",
                     table.records.len(),
                     table.capacity,
-                    if ext == "sup" { "支給品" } else { "報酬" }
+                    if is_rem { "報酬" } else { "支給品" }
                 ));
+                // Each group is rolled on its own, so each prints its own
+                // total: 「合計 100% / 6枠」. A total that is not 100 is shown
+                // in amber and never corrected (one official table is 104%).
+                let groups = table.groups();
+                if is_rem {
+                    for (line, warn) in reward_group_lines(&groups) {
+                        if warn {
+                            ui.colored_label(egui::Color32::from_rgb(240, 170, 80), line);
+                        } else {
+                            ui.label(line);
+                        }
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "「確率 %」はその枠が出る割合です。合計が 100% を超えても自動では直しません",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(
+                            "支給品 (.sup) は確率 (%) を使いません。4 バイト目は表示スロットです",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                }
+                // Which group each row belongs to, for the separator rows.
+                let mut group_of = vec![0usize; table.records.len()];
+                for (gi, g) in groups.iter().enumerate() {
+                    for k in g.start..(g.start + g.len).min(group_of.len()) {
+                        group_of[k] = gi;
+                    }
+                }
                 let mut changed = false;
                 // Drop a selection left over from a bigger table: it matched
                 // no row here, so neither the highlight nor the picker showed
@@ -6469,11 +6505,43 @@ impl MhnxEditor {
                             .striped(true)
                             .num_columns(4)
                             .show(ui, |ui| {
-                                for h in ["#", "個数", "スロット", "アイテム名"] {
+                                for h in [
+                                    "#",
+                                    "個数",
+                                    if is_rem { "確率 %" } else { "スロット" },
+                                    "アイテム名",
+                                ] {
                                     ui.strong(h);
                                 }
                                 ui.end_row();
-                                for (i, r) in table.records.iter_mut().enumerate() {
+                                for i in 0..table.records.len() {
+                                    // A separator names the group that starts
+                                    // here, with the total it carries.
+                                    if is_rem
+                                        && groups.len() > 1
+                                        && i > 0
+                                        && group_of.get(i) != group_of.get(i - 1)
+                                    {
+                                        let gi = group_of[i];
+                                        let (total, len) = groups
+                                            .get(gi)
+                                            .map(|g| (g.total, g.len))
+                                            .unwrap_or((0, 0));
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "— グループ{} 合計 {}% / {}枠 —",
+                                                gi + 1,
+                                                total,
+                                                len
+                                            ))
+                                            .weak()
+                                            .small(),
+                                        );
+                                        ui.label("");
+                                        ui.label("");
+                                        ui.label("");
+                                        ui.end_row();
+                                    }
                                     if ui
                                         .selectable_label(
                                             sel == Some(i),
@@ -6483,29 +6551,39 @@ impl MhnxEditor {
                                     {
                                         sel = Some(i);
                                     }
-                                    let mut c = r.count as i32;
+                                    let mut c = table.records[i].count as i32;
                                     if ui
                                         .add(egui::DragValue::new(&mut c).range(0..=99))
                                         .changed()
                                     {
-                                        r.count = c as u8;
+                                        table.records[i].count = c as u8;
                                         changed = true;
                                     }
-                                    let mut s = r.slot as i32;
+                                    // The fourth byte is the chance on a reward
+                                    // row and the display slot on a supply, so
+                                    // both the heading and the ceiling follow
+                                    // the file. A chance is clamped by the core.
+                                    let max: i32 = if is_rem { 100 } else { 255 };
+                                    let mut p = table.records[i].slot as i32;
                                     if ui
-                                        .add(egui::DragValue::new(&mut s).range(0..=255))
+                                        .add(egui::DragValue::new(&mut p).range(0..=max))
                                         .changed()
                                     {
-                                        r.slot = s as u8;
+                                        if is_rem {
+                                            table.set_probability(i, p as u8);
+                                        } else {
+                                            table.records[i].slot = p as u8;
+                                        }
                                         changed = true;
                                     }
                                     // The name is the thing people click to
                                     // mean "change this one", so it selects the
                                     // row that the picker below acts on.
+                                    let item = table.records[i].item;
                                     if ui
                                         .selectable_label(
                                             sel == Some(i),
-                                            format!("{:<6} {}", r.item, item_name(r.item)),
+                                            format!("{:<6} {}", item, item_name(item)),
                                         )
                                         .clicked()
                                     {
@@ -15249,6 +15327,42 @@ impl MhnxEditor {
     }
 }
 
+/// The chance totals the reward table prints above its rows.
+///
+/// One line per roll group, e.g. 「グループ1（フラグ 1）: 合計 100% / 6枠」.
+/// The flag is true when the group does not add up to the 100% every shipped
+/// table uses: that is reported for the user to fix, never rescaled here,
+/// because the game rolls each row on its own chance and one official table
+/// really does add up to 104%.
+fn reward_group_lines(groups: &[mhnx_core::quest::RewardGroup]) -> Vec<(String, bool)> {
+    let total = mhnx_core::quest::REWARD_PROB_TOTAL;
+    groups
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let warn = g.total != total;
+            let tail = if g.total > total {
+                " — 100% を超えています（自動補正はしません）"
+            } else if warn {
+                " — 100% に届いていません（自動補正はしません）"
+            } else {
+                ""
+            };
+            (
+                format!(
+                    "グループ{}（フラグ {}）: 合計 {}% / {}枠{}",
+                    i + 1,
+                    g.flag,
+                    g.total,
+                    g.len,
+                    tail
+                ),
+                warn,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! The write paths are the part of this file that can destroy a save, so
@@ -15333,6 +15447,30 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, &data).expect("write the MHGU fixture");
         path
+    }
+
+    #[test]
+    fn a_reward_group_line_names_its_total_and_flags_a_bad_one() {
+        use mhnx_core::quest::RewardGroup;
+        let ok = RewardGroup {
+            start: 0,
+            len: 6,
+            flag: 1,
+            total: 100,
+        };
+        let over = RewardGroup {
+            start: 6,
+            len: 5,
+            flag: 3,
+            total: 104,
+        };
+        let lines = reward_group_lines(&[ok, over]);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].0, "グループ1（フラグ 1）: 合計 100% / 6枠");
+        assert!(!lines[0].1, "100% must not be flagged");
+        assert!(lines[1].1, "104% must be flagged");
+        assert!(lines[1].0.contains("104%"), "{}", lines[1].0);
+        assert!(lines[1].0.contains("自動補正"), "{}", lines[1].0);
     }
 
     #[test]

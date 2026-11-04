@@ -1154,6 +1154,14 @@ impl GuiState {
                 scroll_active_cursor(ed, d);
                 return;
             }
+            // A reward / supply row holds numbers, and [R] is the key that
+            // types one instead of stepping it - the same job it does in the
+            // item box. [L] still moves the sub-tab, and [R] does too on the
+            // entries that are not a reward table.
+            if key == Key::R && ed.screen == Screen::EntryView && ed.entry_has_numbers() {
+                ed.input(Key::R);
+                return;
+            }
             self.cycle_sub_tab(ed, key == Key::R);
             return;
         }
@@ -2361,9 +2369,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
             let entry = ed.arc.as_ref().and_then(|a| a.entries.get(ed.entry));
             match entry {
                 Some(e) => match extension_for(e.type_hash) {
-                    Some("rem") | Some("sup") => {
-                        ItemTable::parse(&e.data).map(|t| t.records.len()).unwrap_or(0)
-                    }
+                    Some("rem") | Some("sup") => ed.entry_record_count(),
                     Some("sem") => ed.sem_entry_indices().len() * 6,
                     Some("esl") => 1,
                     Some("qdp") => Qdp::parse(&e.data).map(|q| q.flags().len()).unwrap_or(0),
@@ -2758,6 +2764,8 @@ fn supports_direct_input(ed: &Editor) -> bool {
     match ed.screen {
         Screen::Items | Screen::Hunts => true,
         Screen::Guild => ed.guild_view() != GUILD_TAB_ARENA,
+        // A reward / supply row has a number [R] can type.
+        Screen::EntryView => ed.entry_has_numbers(),
         _ => false,
     }
 }
@@ -4652,6 +4660,39 @@ impl GuiState {
                         36,
                         &reset_lbl,
                         UiAction::SemPreset(1),
+                    );
+                } else if ed.entry_has_numbers() {
+                    // The row holds two numbers on a reward table and one on a
+                    // supply box, so the deck names the key that picks between
+                    // them and the key that types one.
+                    let field = ed.entry_field_label();
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        34,
+                        &format!("[-] 編集する項目: {}", field),
+                        UiAction::Key(Key::Minus),
+                    );
+                    cur_y += 38;
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        half_w,
+                        34,
+                        "[R] 数値入力",
+                        UiAction::Key(Key::R),
+                    );
+                    self.draw_tool_button(
+                        c,
+                        ix + 28 + half_w,
+                        cur_y,
+                        half_w,
+                        34,
+                        "[X] 保存",
+                        UiAction::QuickSave,
                     );
                 } else {
                     self.draw_tool_button(
@@ -7015,6 +7056,15 @@ impl GuiState {
         match ext {
             "rem" | "sup" => {
                 if let Ok(tbl) = ItemTable::parse(&entry.data) {
+                    // Which roll group a row belongs to: each group is rolled
+                    // on its own, so the screen names it beside the row.
+                    let groups = tbl.groups();
+                    let mut group_of = alloc::vec![0usize; tbl.records.len()];
+                    for (gi, g) in groups.iter().enumerate() {
+                        for k in g.start..(g.start + g.len).min(group_of.len()) {
+                            group_of[k] = gi;
+                        }
+                    }
                     for (i, rec) in tbl.records.iter().enumerate() {
                         let iname = if rec.item == 0 {
                             String::from("(なし)")
@@ -7022,17 +7072,23 @@ impl GuiState {
                             item_name_of(rec.item)
                         };
                         let sub = if ext == "rem" {
-                            format!("確率/重み: {}% / ID:{}", rec.slot, rec.item)
+                            format!(
+                                "枠{:02} / G{} / ID:{}",
+                                i + 1,
+                                group_of.get(i).copied().unwrap_or(0) + 1,
+                                rec.item
+                            )
                         } else {
-                            format!("Slot: {} / ID:{}", rec.slot, rec.item)
+                            format!("枠{:02} / 表示スロット {} / ID:{}", i + 1, rec.slot, rec.item)
                         };
-                        rows.push((
-                            i,
-                            iname,
-                            sub,
-                            format!("×{}", rec.count),
-                            format!("#{:03}", i + 1),
-                        ));
+                        // Both numbers the row holds are on screen, so the one
+                        // [-] is currently on cannot be mistaken for the other.
+                        let val = if ext == "rem" {
+                            format!("×{}  {}%", rec.count, rec.slot)
+                        } else {
+                            format!("×{}", rec.count)
+                        };
+                        rows.push((i, iname, sub, val, format!("#{:03}", i + 1)));
                     }
                 }
             }
@@ -7154,15 +7210,29 @@ impl GuiState {
             "esl" => "小型配置 (.esl)",
             _ => "エントリ詳細",
         };
-        self.draw_adaptive_rows(
+        // A reward table says what its chances add up to and complains when a
+        // group is not 100%; a supply box says it has no chance column at all.
+        let is_table = matches!(ext, "rem" | "sup");
+        let sub = if is_table {
+            ed.entry_reward_sub()
+        } else {
+            String::new()
+        };
+        let warnings = if is_table {
+            ed.entry_reward_warnings()
+        } else {
+            Vec::new()
+        };
+        self.draw_adaptive_rows_warn(
             c,
             ed,
             hdr,
-            "",
+            &sub,
             &rows,
             ed.entry_row_cursor.min(rows.len().saturating_sub(1)),
             matches!(ext, "rem" | "sup" | "sem" | "esl" | "qdp"),
-            "変更",
+            if is_table { "アイテム" } else { "変更" },
+            &warnings,
         );
     }
 

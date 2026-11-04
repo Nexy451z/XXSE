@@ -1658,6 +1658,165 @@ fn a_reward_count_can_be_changed_from_the_console() {
 }
 
 #[test]
+fn a_reward_chance_can_be_stepped_and_typed_from_the_console() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    ed.cursor = 5; // rem_620114
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::EntryView);
+    assert!(ed.entry_has_chance(), "a .rem carries a chance column");
+    assert_eq!(ed.entry_field_label(), "個数", "◀/▶ starts on the count");
+
+    // [-] moves the key onto the chance column; the guide says which one.
+    ed.input(Key::Minus);
+    assert_eq!(ed.entry_field_label(), "確率%");
+    assert!(ed.message.contains("確率"), "message was {}", ed.message);
+    assert!(ed.entry_reward_sub().contains("編集中: 確率%"), "{}", ed.entry_reward_sub());
+    assert!(ed.entry_reward_sub().contains("合計"), "{}", ed.entry_reward_sub());
+
+    let before = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].slot
+    };
+    assert!(before >= 1 && before < 100, "sample chance {}", before);
+    ed.input(Key::Right);
+    let after = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].slot
+    };
+    assert_eq!(after, before + 1, "right adds the step");
+    assert!(ed.dirty, "the archive must be marked changed");
+    // The sample group adds up to 100, so one more point overshoots and the
+    // press says so instead of quietly rescaling anything.
+    assert!(ed.message.contains("合計"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("100% を超えています"),
+        "message was {}",
+        ed.message
+    );
+    assert!(!ed.entry_reward_warnings().is_empty());
+
+    // [R] types the number; a value over 100 is clamped, letters are refused.
+    ed.input(Key::R);
+    let (idx, initial) = ed.take_text_request().expect("a text request");
+    assert_eq!(idx, mhnx_core::hbedit::TEXT_REWARD_PROB);
+    assert_eq!(initial, format!("{}", after));
+    assert!(ed.apply_reward_text("130"));
+    let typed = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].slot
+    };
+    assert_eq!(typed, 100, "a chance stops at 100");
+    assert!(!ed.apply_reward_text("abc"), "letters are not a chance");
+    assert_eq!(
+        {
+            let e = &ed.arc.as_ref().unwrap().entries[5];
+            mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].slot
+        },
+        100,
+        "a refused answer writes nothing"
+    );
+
+    // [-] goes back to the count, which still moves the count byte.
+    ed.input(Key::Minus);
+    assert_eq!(ed.entry_field_label(), "個数");
+    let count_before = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].count
+    };
+    ed.input(Key::Left);
+    let count_after = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        mhnx_core::entries::ItemTable::parse(&e.data).unwrap().records[0].count
+    };
+    assert_eq!(count_after, count_before.saturating_sub(1));
+}
+
+#[test]
+fn a_supply_row_says_it_has_no_chance() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    // The sample quest's .sup entry.
+    let Some(sup_idx) = ed.arc.as_ref().and_then(|a| {
+        a.entries
+            .iter()
+            .position(|e| extension_for(e.type_hash) == Some("sup"))
+    }) else {
+        return;
+    };
+    ed.cursor = sup_idx;
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::EntryView);
+    assert!(ed.entry_has_numbers(), "a supply row still holds a count");
+    assert!(!ed.entry_has_chance(), "a .sup has no chance column");
+    assert!(ed.entry_reward_sub().contains("確率は使いません"), "{}", ed.entry_reward_sub());
+    assert!(ed.entry_reward_warnings().is_empty());
+    // [-] refuses to switch to a chance the file does not have.
+    ed.input(Key::Minus);
+    assert_eq!(ed.entry_field_label(), "個数");
+    assert!(ed.message.contains("確率を使いません"), "message was {}", ed.message);
+}
+
+/// Change a real quest's chance, write the archive, read it back.
+///
+/// This is the whole path the console and the desktop share: the edit lives in
+/// the entry bytes, X hands the io layer a complete .arc, and parsing those
+/// bytes again must show the new chance with every other byte where it was.
+#[test]
+fn a_reward_chance_survives_a_write_and_a_re_read() {
+    let Some(p) = sample_arc() else { return };
+    let mut ed = Editor::new();
+    let bytes = std::fs::read(&p).unwrap();
+    ed.open_arc_bytes(&p.to_string_lossy(), &bytes);
+    ed.cursor = 5; // rem_620114
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::EntryView);
+    let (name, before_data) = {
+        let e = &ed.arc.as_ref().unwrap().entries[5];
+        (e.name.clone(), e.data.clone())
+    };
+    let before = {
+        let t = mhnx_core::entries::ItemTable::parse(&before_data).unwrap();
+        assert!(!t.records.is_empty());
+        t.records[0].slot
+    };
+    assert!(before >= 1, "the sample row has a chance: {}", before);
+
+    // [-] puts the cursor on the chance column, then one step down.
+    ed.input(Key::Minus);
+    ed.input(Key::Left);
+
+    // X is what hands the archive to the io layer.
+    ed.input(Key::X);
+    let written = match ed.take_write() {
+        Some(Write::File { bytes, .. }) => bytes,
+        other => panic!("expected the archive to be written, got {:?}", other),
+    };
+    assert_ne!(written, bytes, "the write must carry the edit");
+
+    // Re-read it the way the card would.
+    let arc = Arc::parse(&written).expect("the written archive parses");
+    let e = arc
+        .entries
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("{} is gone after the write", name));
+    let after = mhnx_core::entries::ItemTable::parse(&e.data)
+        .expect("the reward table parses")
+        .records[0]
+        .slot;
+    assert_eq!(after, before - 1, "the chance must survive the round trip");
+    let moved: Vec<usize> = (0..before_data.len())
+        .filter(|i| before_data[*i] != e.data[*i])
+        .collect();
+    assert_eq!(moved, vec![0x18 + 3], "one byte: the chance of row 0");
+}
+
+#[test]
 fn a_reward_item_can_be_changed_from_the_console() {
     let Some(p) = sample_arc() else { return };
     let mut ed = Editor::new();

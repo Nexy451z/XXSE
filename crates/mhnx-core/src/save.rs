@@ -67,6 +67,14 @@ pub const DLC_PALICO_ID: usize = 0x5F;
 pub const OFF_NAME: usize = 0x23B7D;
 /// Character name as shown on the save/load screen.
 pub const OFF_NAME_PREVIEW: usize = 0x000;
+/// Bytes the hunter name field occupies, in both copies.
+///
+/// The game keeps one terminator, so a name fills at most
+/// [`NAME_CAPACITY`] of them. The same 32 byte width is used by the palico
+/// name and both my-set names.
+pub const NAME_LEN: usize = 32;
+/// Bytes of a name the field can hold: one short of its width, for the NUL.
+pub const NAME_CAPACITY: usize = NAME_LEN - 1;
 /// Play time in seconds, in-game copy.
 pub const OFF_PLAY_TIME: usize = 0x2248B;
 /// Play time in seconds, save screen copy.
@@ -393,12 +401,17 @@ impl Save {
     /// Read the editable scalar fields of a character slot.
     pub fn read_character(&self, slot: usize) -> Option<Character> {
         let base = self.slot_base(slot)? as usize;
-        let mut name = String::from_utf8_lossy(&self.body[base + OFF_NAME..base + OFF_NAME + 32]).into_owned();
+        let mut name = String::from_utf8_lossy(
+            &self.body[base + OFF_NAME..base + OFF_NAME + NAME_LEN],
+        )
+        .into_owned();
         if let Some(z) = name.find('\0') {
             name.truncate(z);
         }
-        let mut name_preview =
-            String::from_utf8_lossy(&self.body[base + OFF_NAME_PREVIEW..base + OFF_NAME_PREVIEW + 32]).into_owned();
+        let mut name_preview = String::from_utf8_lossy(
+            &self.body[base + OFF_NAME_PREVIEW..base + OFF_NAME_PREVIEW + NAME_LEN],
+        )
+        .into_owned();
         if let Some(z) = name_preview.find('\0') {
             name_preview.truncate(z);
         }
@@ -448,15 +461,21 @@ impl Save {
     /// Values the game keeps in two places (name, play time, funds) are
     /// written to **both** copies so the save screen and the in-game values
     /// stay consistent.
+    ///
+    /// The name is copied byte for byte, line breaks included: this mirrors a
+    /// whole record, and a save whose name holds a character this editor does
+    /// not know must come back unchanged. Use
+    /// [`Save::write_character_checked`] for text a player typed - it refuses
+    /// the controls a name cannot hold before anything is written.
     pub fn write_character(&mut self, c: &Character) -> Result<(), Error> {
         let base = self
             .slot_base(c.slot)
             .ok_or(Error::Parse("character slot has no base offset"))? as usize;
 
-        let mut nb = [0u8; 32];
+        let mut nb = [0u8; NAME_LEN];
         crate::write_name_field(&mut nb, &c.name);
-        self.body[base + OFF_NAME..base + OFF_NAME + 32].copy_from_slice(&nb);
-        self.body[base + OFF_NAME_PREVIEW..base + OFF_NAME_PREVIEW + 32].copy_from_slice(&nb);
+        self.body[base + OFF_NAME..base + OFF_NAME + NAME_LEN].copy_from_slice(&nb);
+        self.body[base + OFF_NAME_PREVIEW..base + OFF_NAME_PREVIEW + NAME_LEN].copy_from_slice(&nb);
 
         self.set_u32_at(base + OFF_PLAY_TIME, c.play_time as u32);
         self.set_u32_at(base + OFF_PLAY_TIME_PREVIEW, c.play_time as u32);
@@ -1239,6 +1258,234 @@ pub fn empty_switch_save() -> Save {
         s.set_u32_at(*off, FIRST_SLOT_BASE + (SLOT_STRIDE * i) as u32);
     }
     s
+}
+
+// ---------------------------------------------------------------------------
+// Names
+//
+// Every editable name is a fixed width run of NUL padded bytes: 32 UTF-8 bytes
+// for the hunter, a palico and both my-set names, 11 and 28 UTF-16LE units for
+// the guild card name and comment. The game itself draws U+000A as a line break
+// (confirmed on hardware), so a name may hold one or more of them and the
+// screen has to render every line the `name_lines` helper returns. A lone NUL
+// still ends the field early, and the other controls 0x00..0x1F have no glyph,
+// so they stay refused: the `*_checked` writers reject them before touching
+// the save.
+//
+// Length is counted in the bytes the field stores - one per UTF-8 byte, two per
+// UTF-16 unit - so the same capacity figure means the same thing on every
+// field. A name that does not fit is cut on a character boundary, and the cut
+// is reported as `NameWarning::TooLong` instead of passing silently.
+// ---------------------------------------------------------------------------
+
+/// How a name field stores its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameUnit {
+    /// UTF-8, one byte per ASCII character and up to four for another.
+    Bytes,
+    /// UTF-16LE, two bytes per unit.
+    Utf16,
+}
+
+impl NameUnit {
+    /// Bytes one stored unit occupies.
+    pub const fn width(self) -> usize {
+        match self {
+            NameUnit::Bytes => 1,
+            NameUnit::Utf16 => 2,
+        }
+    }
+}
+
+/// Why a name edit was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameError {
+    /// A control character the field cannot hold: anything in 0x00..0x1F
+    /// except U+000A, plus DEL and the C1 range. A newline is deliberately not
+    /// one of these - the game draws it as a second line.
+    Control(char),
+    /// The record the edit named does not exist in this save.
+    NoField,
+}
+
+impl core::fmt::Display for NameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            NameError::Control(c) => write!(
+                f,
+                "名前に使えない制御文字が入っています（U+{:04X}）",
+                *c as u32
+            ),
+            NameError::NoField => write!(f, "書き込む欄が見つかりません"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for NameError {}
+
+/// A remark about a name that is still written.
+///
+/// The editor never repairs these on its own: it says what it sees and lets the
+/// writer decide, because a line break where the player put one is not a
+/// mistake the program gets to undo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameWarning {
+    /// The name starts with a line break, so its first line is empty.
+    LeadingNewline,
+    /// The name ends with a line break, so its last line is empty.
+    TrailingNewline,
+    /// Two line breaks in a row; the line at this 0 based index is empty.
+    EmptyLine {
+        /// Index of the empty line.
+        line: usize,
+    },
+    /// The name is longer than the field and the write cuts it.
+    TooLong {
+        /// Length of the name in the field's bytes.
+        len: usize,
+        /// Bytes the field can hold.
+        capacity: usize,
+    },
+}
+
+/// What a name will do to its field, before or after the write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameFit {
+    /// Length of the name in the field's bytes (1 per UTF-8 byte, 2 per
+    /// UTF-16 unit).
+    pub len: usize,
+    /// Bytes the field can hold, terminator excluded.
+    pub capacity: usize,
+    /// Lines the screen has to draw: one plus the number of line breaks.
+    pub lines: usize,
+    /// The name is longer than the field, so the write cuts it.
+    pub clamped: bool,
+    /// Remarks that do not stop the write.
+    pub warnings: Vec<NameWarning>,
+}
+
+impl NameFit {
+    /// Nothing to tell the player about.
+    pub fn is_clean(&self) -> bool {
+        self.warnings.is_empty()
+    }
+
+    /// Does this name carry the warning asked about?
+    pub fn has(&self, warning: NameWarning) -> bool {
+        self.warnings.iter().any(|w| *w == warning)
+    }
+}
+
+/// Is this character one a name field refuses?
+///
+/// Everything `char::is_control` covers is refused except U+000A.
+pub fn is_forbidden_name_char(c: char) -> bool {
+    c.is_control() && c != '\n'
+}
+
+/// The length of a name in the bytes its field stores.
+pub fn name_bytes(name: &str, unit: NameUnit) -> usize {
+    match unit {
+        NameUnit::Bytes => name.len(),
+        NameUnit::Utf16 => name.chars().count() * unit.width(),
+    }
+}
+
+/// The lines a name holds, split at its line breaks.
+///
+/// A name that ends with a line break keeps an empty last line: the game puts
+/// the cursor there, so the screen has to draw it.
+pub fn name_lines(name: &str) -> Vec<&str> {
+    name.split('\n').collect()
+}
+
+/// How many lines a name holds. Never zero - an empty name is one empty line.
+pub fn name_line_count(name: &str) -> usize {
+    name.matches('\n').count() + 1
+}
+
+/// Check a name against a field, without writing anything.
+///
+/// `capacity` is the field's width in bytes, terminator excluded. A name that
+/// does not fit comes back with `clamped` set and `NameWarning::TooLong`;
+/// ragged line breaks come back as warnings. Only a refused character is an
+/// error, so a caller can show the warnings and still write the name.
+pub fn check_name(name: &str, capacity: usize, unit: NameUnit) -> Result<NameFit, NameError> {
+    if let Some(c) = name.chars().find(|c| is_forbidden_name_char(*c)) {
+        return Err(NameError::Control(c));
+    }
+    let len = name_bytes(name, unit);
+    let lines = name_line_count(name);
+    let mut warnings = Vec::new();
+    if name.starts_with('\n') {
+        warnings.push(NameWarning::LeadingNewline);
+    }
+    if name.ends_with('\n') {
+        warnings.push(NameWarning::TrailingNewline);
+    }
+    // An interior empty line is the only one no other warning already names:
+    // the first line is LeadingNewline, the last one TrailingNewline.
+    for (index, line) in name.split('\n').enumerate() {
+        if line.is_empty() && index != 0 && index + 1 != lines {
+            warnings.push(NameWarning::EmptyLine { line: index });
+        }
+    }
+    let clamped = len > capacity;
+    if clamped {
+        warnings.push(NameWarning::TooLong { len, capacity });
+    }
+    Ok(NameFit {
+        len,
+        capacity,
+        lines,
+        clamped,
+        warnings,
+    })
+}
+
+/// Copy a name into a fixed width, NUL padded field, refusing controls.
+///
+/// The same cut as `crate::write_name_field`, after the check: a newline goes
+/// in, a tab does not, and the field is left untouched when the name is
+/// refused.
+pub fn write_name_field_checked(dst: &mut [u8], name: &str) -> Result<NameFit, NameError> {
+    let capacity = dst.len().saturating_sub(1);
+    let fit = check_name(name, capacity, NameUnit::Bytes)?;
+    crate::write_name_field(dst, name);
+    Ok(fit)
+}
+
+impl Character {
+    /// The hunter name split into the lines the screen draws.
+    pub fn name_lines(&self) -> Vec<&str> {
+        name_lines(&self.name)
+    }
+
+    /// How many lines the hunter name takes on screen.
+    pub fn name_line_count(&self) -> usize {
+        name_line_count(&self.name)
+    }
+
+    /// What writing this character's name would do to its field.
+    pub fn name_fit(&self) -> Result<NameFit, NameError> {
+        check_name(&self.name, NAME_CAPACITY, NameUnit::Bytes)
+    }
+}
+
+impl Save {
+    /// Write the character fields back, refusing control characters in the name.
+    ///
+    /// `Save::write_character` copies the name bytes as they come, which is
+    /// what the callers that already validated their text need. This is the
+    /// checked path: the name is verified first, so a refused name leaves the
+    /// save exactly as it was. Both copies of the name (in-game and save
+    /// screen) go through the same check because they are the same text.
+    pub fn write_character_checked(&mut self, c: &Character) -> Result<NameFit, NameError> {
+        let fit = c.name_fit()?;
+        self.write_character(c).map_err(|_| NameError::NoField)?;
+        Ok(fit)
+    }
 }
 
 #[cfg(test)]

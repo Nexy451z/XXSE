@@ -313,6 +313,34 @@ fn check_rewards(r: &Rem, entry: &str, out: &mut Vec<Finding>) {
         }
         total += s.count as u32;
     }
+    // The chance column: every shipped group adds up to 100, so a group that
+    // does not is worth saying out loud. It is a warning, not an error and
+    // never a correction: the game rolls each row on its own percentage, and
+    // one official table (rem_230073) really does add up to 104%.
+    for (g, grp) in r.groups().iter().enumerate() {
+        if grp.total == crate::quest::REWARD_PROB_TOTAL {
+            continue;
+        }
+        let msg = if grp.total > crate::quest::REWARD_PROB_TOTAL {
+            format!(
+                "報酬グループ{} の確率の合計が {}% です（{} 枠）。100% を超えています",
+                g + 1,
+                grp.total,
+                grp.len
+            )
+        } else {
+            format!(
+                "報酬グループ{} の確率の合計が {}% です（{} 枠）。100% に届いていません",
+                g + 1,
+                grp.total,
+                grp.len
+            )
+        };
+        out.push(
+            Finding::new(Severity::Warn, "reward-probability-sum", msg)
+                .at(entry, crate::quest::REWARD_DATA_OFFSET + grp.start * 4 + 3),
+        );
+    }
     if total > 99 * 4 {
         // Only warn well past anything the official quests do; a single
         // official quest already exceeds the "150 total" figure from the guide.

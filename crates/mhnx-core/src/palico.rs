@@ -51,7 +51,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::save::Save;
+use crate::save::{check_name, NameError, NameFit, NameUnit, Save};
 
 /// Offset of the palico roster, relative to the slot base.
 pub const OFF_ROSTER: usize = 0x23BB6;
@@ -63,6 +63,9 @@ pub const SLOTS: usize = 84;
 pub const NAME: usize = 0x00;
 /// Name bytes available.
 pub const NAME_LEN: usize = 32;
+/// Bytes of the name a palico record can hold: one short of the field, for the
+/// NUL the game keeps behind it.
+pub const NAME_CAPACITY: usize = NAME_LEN - 1;
 /// Experience.
 pub const EXP: usize = 0x20;
 /// Level, shown as this plus one.
@@ -280,6 +283,24 @@ impl Palico {
     /// Names of the equipped skills.
     pub fn skill_names(&self) -> Vec<String> {
         self.skills().into_iter().map(skill_name).collect()
+    }
+
+    /// The palico name split into the lines the screen draws.
+    ///
+    /// The game draws U+000A in this field as a second line, so a name holding
+    /// one is still a valid name - the roster shows both lines.
+    pub fn name_lines(&self) -> Vec<&str> {
+        name_lines(&self.name)
+    }
+
+    /// How many lines the palico name takes on screen.
+    pub fn name_line_count(&self) -> usize {
+        name_line_count(&self.name)
+    }
+
+    /// What writing this name would do to the record's field.
+    pub fn name_fit(&self) -> Result<NameFit, NameError> {
+        name_check(&self.name)
     }
 }
 
@@ -682,9 +703,60 @@ pub fn move_warnings(save: &Save, slot: usize, palico: usize) -> Vec<String> {
     out
 }
 
-/// Rename a palico. The name field is fixed width and NUL padded.
-pub fn set_name(save: &mut Save, slot: usize, index: usize, name: &str) -> bool {
+/// Check a palico name against the record's field, without writing.
+///
+/// A line break is allowed (the game draws it as a second line); any other
+/// control character is refused with [`NameError::Control`].
+pub fn name_check(name: &str) -> Result<NameFit, NameError> {
+    check_name(name, NAME_CAPACITY, NameUnit::Bytes)
+}
+
+/// The lines a palico name holds, as the screen draws them.
+pub fn name_lines(name: &str) -> Vec<&str> {
+    crate::save::name_lines(name)
+}
+
+/// How many lines a palico name holds.
+pub fn name_line_count(name: &str) -> usize {
+    crate::save::name_line_count(name)
+}
+
+/// Rename a palico, refusing control characters.
+///
+/// The checked form of [`set_name`]: the name is verified before the record is
+/// touched, so a tab or a NUL leaves the roster exactly as it was. A line break
+/// is written as it is and reported with the warnings
+/// [`check_name`] finds (leading, trailing, doubled), never repaired.
+pub fn set_name_checked(
+    save: &mut Save,
+    slot: usize,
+    index: usize,
+    name: &str,
+) -> Result<NameFit, NameError> {
+    let fit = name_check(name)?;
     if index >= SLOTS {
+        return Err(NameError::NoField);
+    }
+    let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
+        return Err(NameError::NoField);
+    };
+    let at = base + OFF_ROSTER + index * RECORD + NAME;
+    let Some(dst) = save.body_mut().get_mut(at..at + NAME_LEN) else {
+        return Err(NameError::NoField);
+    };
+    crate::write_name_field(dst, name);
+    Ok(fit)
+}
+
+/// Rename a palico. The name field is fixed width and NUL padded.
+///
+/// A line break is written as it stands; any other control character is
+/// refused, so false means the roster is untouched. The name field is 31 bytes
+/// wide and one short of its 32 byte record, so a longer name is cut on a
+/// character boundary. [`set_name_checked`] reports the same write with the
+/// warnings a caller may want to show.
+pub fn set_name(save: &mut Save, slot: usize, index: usize, name: &str) -> bool {
+    if index >= SLOTS || name_check(name).is_err() {
         return false;
     }
     let Some(base) = save.slot_base(slot).map(|b| b as usize) else {
