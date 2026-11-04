@@ -44,10 +44,14 @@ pub enum CsvKind {
 
 impl CsvKind {
     /// What the interface calls this file.
-    pub fn label(self) -> &'static str {
+    //
+    // The name is a catalogue line rather than a literal because the
+    // confirmation dialog and the status line it leaves both say it, and the
+    // dialog is drawn in the language on screen.
+    pub fn label(self, lang: Lang) -> &'static str {
         match self {
-            CsvKind::Items => "アイテムボックスの CSV",
-            CsvKind::Equipment => "装備ボックスの CSV",
+            CsvKind::Items => strings::text(lang, "confirm.csv_kind_items"),
+            CsvKind::Equipment => strings::text(lang, "confirm.csv_kind_equip"),
         }
     }
 
@@ -60,10 +64,19 @@ impl CsvKind {
     }
 
     /// Which box the file describes, for the confirmation line.
-    pub fn target(self, slot: usize) -> String {
+    //
+    // The key is spelled out in each arm rather than taken from a variable: the
+    // test that walks the call sites reads the key out of the source, and a key
+    // behind a variable would be the one place it could not check (see
+    // every_key_the_interface_uses_is_in_the_catalogue).
+    pub fn target(self, slot: usize, lang: Lang) -> String {
         match self {
-            CsvKind::Items => format!("枠 {} のアイテムボックス", slot + 1),
-            CsvKind::Equipment => format!("枠 {} の装備ボックス", slot + 1),
+            CsvKind::Items => {
+                strings::textf(lang, "confirm.csv_target_items", &[&(slot + 1)])
+            }
+            CsvKind::Equipment => {
+                strings::textf(lang, "confirm.csv_target_equip", &[&(slot + 1)])
+            }
         }
     }
 }
@@ -3762,6 +3775,23 @@ impl MhnxEditor {
     /// The tab bar, across the top of the window.
     fn tab_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            // A permanent line above the bar while an MHGU save is open. Four
+            // tabs refuse it by name, but the other twelve draw MHXX offsets
+            // over an MHGU file and look exactly like a save this tool parses;
+            // the banner is the one place that says so on every tab at once
+            // (AUDIT8 §4 N8).
+            if matches!(&self.save, Some(save) if save.kind() == SaveKind::Mhgu) {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(74, 44, 10))
+                    .inner_margin(egui::Margin::symmetric(8, 5))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(strings::text(self.lang, "save.mhgu_banner"))
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 208, 128)),
+                        );
+                    });
+            }
             ui.horizontal_wrapped(|ui| {
                 for (tab, label) in [
                     (Tab::Save, "キャラ"),
@@ -4523,15 +4553,24 @@ impl MhnxEditor {
             // The five pigments are borrowed slot by slot, so the row list is
             // built first: an array literal of `&mut self.edit.armor_colors[i]`
             // would borrow the whole array once per element.
-            let mut rows: Vec<(String, &mut [u8; 4])> = Vec::new();
+            // Read once, so the borrows of self.edit below stay disjoint from
+            // the language the two notes are drawn in.
+            let lang = self.lang;
+            let mut rows: Vec<(String, &mut [u8; 4], bool)> = Vec::new();
             for (i, color) in self.edit.armor_colors.iter_mut().enumerate() {
-                rows.push((format!("色素{}", i + 1), color));
+                rows.push((format!("色素{}", i + 1), color, false));
             }
-            rows.push((String::from("肌"), &mut self.edit.skin_color));
-            rows.push((String::from("髪"), &mut self.edit.hair_color));
-            rows.push((String::from("特徴"), &mut self.edit.features_color));
-            rows.push((String::from("服"), &mut self.edit.clothing_color));
-            for (label, color) in rows {
+            rows.push((String::from("肌"), &mut self.edit.skin_color, false));
+            // The last flag is the note the game's own behaviour earns: the
+            // hair and feature colours are rewritten on every save (a device
+            // probe recorded it; AUDIT8 §4 N2), so the two rows say so. They
+            // stay editable on purpose: the bytes are readable and someone may
+            // still want to write them, but the line has to admit the save
+            // puts them back.
+            rows.push((String::from("髪"), &mut self.edit.hair_color, true));
+            rows.push((String::from("特徴"), &mut self.edit.features_color, true));
+            rows.push((String::from("服"), &mut self.edit.clothing_color, false));
+            for (label, color, overwritten) in rows {
                 ui.horizontal(|ui| {
                     ui.label(format!("{:<4}", label));
                     let mut c = egui::Color32::from_rgba_unmultiplied(color[0], color[1], color[2], color[3]);
@@ -4542,6 +4581,13 @@ impl MhnxEditor {
                         "R{} G{} B{} A{}",
                         color[0], color[1], color[2], color[3]
                     ));
+                    if overwritten {
+                        ui.label(
+                            egui::RichText::new(strings::text(lang, "save.color_overwritten"))
+                                .weak()
+                                .small(),
+                        );
+                    }
                 });
             }
 
@@ -4833,6 +4879,10 @@ impl MhnxEditor {
         // A dedupe that takes items with it is the one dialog that has to look
         // different: the line saying what is lost is drawn in the warning colour.
         let mut warn = false;
+        // The item tab's dialogs were the last sentences of that tab still
+        // written inline; they now come out of the catalogue too, so the whole
+        // screen follows the language chooser (AUDIT8 §4 N1).
+        let lang = self.lang;
         let (title, body, yes) = match &self.confirm {
             Confirm::None => return,
             Confirm::Quit => (
@@ -4909,47 +4959,41 @@ impl MhnxEditor {
                 )
             }
             Confirm::ItemFillAll { changed } => (
-                "全部 99 個にします",
-                format!(
-                    "使っている {} 枠の個数を、すべて 99 個にします。\n\
-                     今の個数は失われます（この操作は元に戻せます）。",
-                    changed
-                ),
-                "99 個にする",
+                strings::text(lang, "confirm.fill_all_title"),
+                strings::textf(lang, "confirm.fill_all_body", &[changed]),
+                strings::text(lang, "confirm.fill_all_yes"),
             ),
             Confirm::ItemDedupe { freed, lost } => {
-                let (line, warning) = Self::dedupe_confirm_text(DedupePreview {
+                let preview = DedupePreview {
                     freed: *freed,
                     lost: *lost,
-                });
+                };
+                let (line, warning) = Self::dedupe_confirm_text(preview, lang);
                 warn = warning;
-                let mut body = String::from("同じアイテムの 2 枠目以降を 1 枠にまとめます。\n");
+                let mut body = String::from(strings::text(lang, "confirm.dedupe_body"));
+                body += "\n";
                 body += &line;
                 body += "\n";
                 if *lost > 0 {
-                    body += "1 枠に 99 個までしか入らないため、あふれた分は失われます。\n";
+                    body += strings::text(lang, "confirm.dedupe_lost");
+                    body += "\n";
                 }
-                body += "この操作は元に戻せます。";
-                ("重複を整理します", body, "整理する")
+                body += strings::text(lang, "confirm.dedupe_undo");
+                (
+                    strings::text(lang, "confirm.dedupe_title"),
+                    body,
+                    strings::text(lang, "confirm.dedupe_yes"),
+                )
             }
             Confirm::ItemCompact { moved } => (
-                "空きを詰めます",
-                format!(
-                    "空き枠を消して、使っている {} 枠を前へ詰めます。\n\
-                     順序が変わります（アイテムと個数はそのままです）。\n\
-                     この操作は元に戻せます。",
-                    moved
-                ),
-                "詰める",
+                strings::text(lang, "confirm.compact_title"),
+                strings::textf(lang, "confirm.compact_body", &[moved]),
+                strings::text(lang, "confirm.compact_yes"),
             ),
             Confirm::ItemClamp { changed } => (
-                "個数を 99 に丸めます",
-                format!(
-                    "99 を超えている {} 枠の個数を 99 に戻します。\n\
-                     超えた分は失われます（この操作は元に戻せます）。",
-                    changed
-                ),
-                "丸める",
+                strings::text(lang, "confirm.clamp_title"),
+                strings::textf(lang, "confirm.clamp_body", &[changed]),
+                strings::text(lang, "confirm.clamp_yes"),
             ),
             Confirm::SetToPouch(n) => {
                 // The name is read now, so the dialog says which set it means.
@@ -4992,7 +5036,11 @@ impl MhnxEditor {
                 warn = report
                     .map(|r| r.skipped > 0 || r.clamped > 0)
                     .unwrap_or(false);
-                ("CSV を読み込みます", self.csv_confirm_text(), "適用する")
+                (
+                    strings::text(lang, "confirm.csv_title"),
+                    self.csv_confirm_text(),
+                    strings::text(lang, "confirm.csv_yes"),
+                )
             }
             Confirm::UnsafeWrite => {
                 // Red: this dialog is the last thing between the user and a
@@ -5657,11 +5705,12 @@ impl MhnxEditor {
     /// The flag says whether that line has to be drawn in the warning colour:
     /// a merge that frees slots but takes items with it is not the harmless
     /// tidy-up the button looks like.
-    fn dedupe_confirm_text(preview: DedupePreview) -> (String, bool) {
+    fn dedupe_confirm_text(preview: DedupePreview, lang: Lang) -> (String, bool) {
         (
-            format!(
-                "{} 枠を解放、{} 個を失います",
-                preview.freed, preview.lost
+            strings::textf(
+                lang,
+                "confirm.dedupe_line",
+                &[&preview.freed, &preview.lost],
             ),
             preview.lost > 0,
         )
@@ -7698,16 +7747,19 @@ impl MhnxEditor {
                 // lines() counts what a spreadsheet of the box would show,
                 // header included; the header is not a record.
                 let rows = text.lines().count().saturating_sub(1);
-                self.message = format!(
-                    "{} を書き出しました: {}（{} 行）",
-                    kind.label(),
-                    path.display(),
-                    rows
+                self.message = strings::textf(
+                    self.lang,
+                    "confirm.csv_written",
+                    &[&kind.label(self.lang), &path.display(), &rows],
                 );
                 true
             }
             Err(e) => {
-                self.message = format!("CSV を書き出せません: {}（{}）", path.display(), e);
+                self.message = strings::textf(
+                    self.lang,
+                    "confirm.csv_write_failed",
+                    &[&path.display(), &e],
+                );
                 false
             }
         }
@@ -7790,10 +7842,11 @@ impl MhnxEditor {
     }
 
     /// The numbers one apply report has to show.
-    fn report_line(report: &ApplyReport) -> String {
-        format!(
-            "書き込み {} 行 / 対象外 {} 行 / 丸め {} 行",
-            report.applied, report.skipped, report.clamped
+    fn report_line(lang: Lang, report: &ApplyReport) -> String {
+        strings::textf(
+            lang,
+            "confirm.csv_report",
+            &[&report.applied, &report.skipped, &report.clamped],
         )
     }
 
@@ -7802,15 +7855,19 @@ impl MhnxEditor {
     /// Every number and every message of the ApplyReport is listed: a row the
     /// file has but the box will not take must not disappear without a word.
     pub fn csv_confirm_text(&self) -> String {
+        let lang = self.lang;
         let Some(pending) = &self.csv_pending else {
-            return String::from("読み込んだ CSV がありません");
+            return String::from(strings::text(lang, "confirm.csv_none"));
         };
-        let mut body = format!(
-            "{} を {} に書き込みます。\n{}（{} 行）\n\n",
-            pending.path.display(),
-            pending.kind.target(self.slot),
-            Self::report_line(&pending.report),
-            pending.rows.len()
+        let mut body = strings::textf(
+            lang,
+            "confirm.csv_body",
+            &[
+                &pending.path.display(),
+                &pending.kind.target(self.slot, lang),
+                &Self::report_line(lang, &pending.report),
+                &pending.rows.len(),
+            ],
         );
         // Bounded: a file that trips every row would otherwise make a window
         // taller than the screen.
@@ -7819,9 +7876,15 @@ impl MhnxEditor {
             body += &format!("・{}\n", m);
         }
         if pending.report.messages.len() > SHOWN {
-            body += &format!("・ほか {} 件\n", pending.report.messages.len() - SHOWN);
+            body += &strings::textf(
+                lang,
+                "confirm.csv_more",
+                &[&(pending.report.messages.len() - SHOWN)],
+            );
+            body += "\n";
         }
-        body += "\n「適用する」でセーブデータに反映します（ファイルへは「上書き保存」で書き込みます）。";
+        body += "\n";
+        body += strings::text(lang, "confirm.csv_note");
         body
     }
 
@@ -7831,10 +7894,15 @@ impl MhnxEditor {
     /// preview: both are computed the same way, and this one is what happened.
     pub fn csv_commit(&mut self) -> Option<ApplyReport> {
         let pending = self.csv_pending.take()?;
+        let lang = self.lang;
         let slot = self.slot;
         let items_file = matches!(pending.kind, CsvKind::Items);
         // One step for the whole file, whichever box it fills.
-        self.push_undo(format!("CSV（{}）の適用", pending.kind.label()));
+        self.push_undo(strings::textf(
+            lang,
+            "confirm.csv_undo",
+            &[&pending.kind.label(lang)],
+        ));
         if items_file {
             // The item tab's 元に戻す has to be able to take the file back.
             self.push_item_undo();
@@ -7853,16 +7921,17 @@ impl MhnxEditor {
             }
         }
         if report.applied == 0 {
-            self.message = format!(
-                "CSV を適用できませんでした: {}",
-                Self::report_line(&report)
+            self.message = strings::textf(
+                lang,
+                "confirm.csv_failed",
+                &[&Self::report_line(lang, &report)],
             );
         } else {
             self.dirty = true;
-            self.message = format!(
-                "{} を適用しました: {}",
-                pending.kind.label(),
-                Self::report_line(&report)
+            self.message = strings::textf(
+                lang,
+                "confirm.csv_applied",
+                &[&pending.kind.label(lang), &Self::report_line(lang, &report)],
             );
         }
         Some(report)
@@ -15639,18 +15708,32 @@ mod tests {
         );
         assert!(!app.dirty, "asking must not write anything");
 
-        let (line, warn) = MhnxEditor::dedupe_confirm_text(DedupePreview {
-            freed: 2,
-            lost: 151,
-        });
+        let (line, warn) = MhnxEditor::dedupe_confirm_text(
+            DedupePreview {
+                freed: 2,
+                lost: 151,
+            },
+            Lang::Ja,
+        );
         assert_eq!(line, "2 枠を解放、151 個を失います");
         assert!(
             warn,
             "a merge that loses items is drawn in the warning colour"
         );
-        let (line, warn) = MhnxEditor::dedupe_confirm_text(DedupePreview { freed: 3, lost: 0 });
+        let (line, warn) =
+            MhnxEditor::dedupe_confirm_text(DedupePreview { freed: 3, lost: 0 }, Lang::Ja);
         assert_eq!(line, "3 枠を解放、0 個を失います");
         assert!(!warn, "a merge that loses nothing needs no warning colour");
+        // The same line in English, so the dialog it feeds follows the
+        // language chooser (AUDIT8 §4 N1).
+        let (line, _) = MhnxEditor::dedupe_confirm_text(
+            DedupePreview {
+                freed: 2,
+                lost: 151,
+            },
+            Lang::En,
+        );
+        assert_eq!(line, "Frees 2 slots and loses 151 items");
 
         // Answering yes merges the three stacks into one capped one.
         assert_eq!(
@@ -19339,6 +19422,64 @@ mod tests {
         );
     }
 
+    /// An MHGU save is refused by four tabs and shown by the other twelve, so
+    /// the one place that admits it is the line above the tab bar: it has to be
+    /// there whichever tab is open (AUDIT8 §4 N8).
+    #[test]
+    fn the_mhgu_banner_sits_above_every_tab() {
+        let dir = Scratch::new("mhgubanner");
+        let path = write_an_mhgu_save(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let banner = strings::text(Lang::Ja, "save.mhgu_banner");
+        assert_ne!(banner, strings::MISSING, "the banner has no catalogue line");
+
+        let ctx = egui::Context::default();
+        for tab in [
+            Tab::Save,
+            Tab::Items,
+            Tab::Quest,
+            Tab::Dlc,
+            Tab::Charm,
+            Tab::Equip,
+            Tab::Hunts,
+            Tab::Guild,
+            Tab::Progress,
+            Tab::Palico,
+            Tab::Sets,
+            Tab::Extras,
+            Tab::SaveMap,
+            Tab::Review,
+            Tab::Database,
+            Tab::About,
+        ] {
+            app.tab = tab;
+            let output = ctx.run(tall_frame_input(), |ctx| app.tab_bar(ctx));
+            let text = drawn_text(&output);
+            assert!(
+                text.contains(banner),
+                "the {:?} tab lost the MHGU banner: {}",
+                tab,
+                text
+            );
+        }
+
+        // The same bar over an MHXX save says nothing about MHGU.
+        let dir = Scratch::new("mhxxbanner");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let output = ctx.run(tall_frame_input(), |ctx| app.tab_bar(ctx));
+        let text = drawn_text(&output);
+        assert!(
+            !text.contains(banner),
+            "an MHXX save was given the MHGU banner: {}",
+            text
+        );
+    }
+
     /// The same name on all three screens that show a difference, for a talisman
     /// edit: 変更一覧's 領域 column, the pre-save review and the snapshot
     /// comparison. The 護石 tab writes the same 36 byte record as the equipment
@@ -19846,6 +19987,231 @@ mod tests {
         assert_eq!(strings::text(Lang::Ja, "tab.items"), "アイテム");
     }
 
+    /// The confirmation dialogs the item tab opens were the last sentences of
+    /// that tab written inline: CSV, 全部 99, dedupe, compact and clamp stayed
+    /// Japanese inside an English frame. They are catalogue keys now, so they
+    /// follow the same chooser the buttons behind them do (AUDIT8 §4 N1).
+    #[test]
+    fn the_item_confirm_dialogs_follow_the_language() {
+        let dir = Scratch::new("confirmlang");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        app.lang = Lang::En;
+
+        let ctx = egui::Context::default();
+        let draw = |confirm: Confirm, app: &mut MhnxEditor| -> String {
+            app.confirm = confirm;
+            // Two frames: a window measures its content on the first and lays
+            // it out on the second.
+            let _ = ctx.run(frame_input(), |ctx| app.confirm_dialog(ctx));
+            let output = ctx.run(frame_input(), |ctx| app.confirm_dialog(ctx));
+            drawn_text(&output)
+        };
+
+        let text = draw(Confirm::ItemFillAll { changed: 3 }, &mut app);
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.fill_all_title")),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains(strings::textf(Lang::En, "confirm.fill_all_body", &[&3usize]).as_str()),
+            "the count is not in the body: {}",
+            text
+        );
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.fill_all_yes")),
+            "{}",
+            text
+        );
+        assert!(
+            !text.contains("全部 99 個にします"),
+            "Japanese survived in an English dialog: {}",
+            text
+        );
+
+        let text = draw(Confirm::ItemDedupe { freed: 2, lost: 151 }, &mut app);
+        assert!(text.contains("Merge duplicates"), "{}", text);
+        assert!(
+            text.contains("Frees 2 slots and loses 151 items"),
+            "the numbers are not in the line: {}",
+            text
+        );
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.dedupe_lost")),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.dedupe_undo")),
+            "{}",
+            text
+        );
+
+        let text = draw(Confirm::ItemCompact { moved: 5 }, &mut app);
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.compact_title")),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains(strings::textf(Lang::En, "confirm.compact_body", &[&5usize]).as_str()),
+            "{}",
+            text
+        );
+
+        let text = draw(Confirm::ItemClamp { changed: 2 }, &mut app);
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.clamp_title")),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains(strings::textf(Lang::En, "confirm.clamp_body", &[&2usize]).as_str()),
+            "{}",
+            text
+        );
+
+        // The CSV dialog names the file and the box it lands in, in English.
+        app.csv_pending = Some(CsvPending {
+            kind: CsvKind::Items,
+            path: PathBuf::from("items.csv"),
+            rows: CsvRows::Items(Vec::new()),
+            report: ApplyReport::default(),
+        });
+        let text = draw(Confirm::CsvApply, &mut app);
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.csv_title")),
+            "{}",
+            text
+        );
+        assert!(
+            text.contains("items.csv is written into the item box of slot 1."),
+            "the body is not in English: {}",
+            text
+        );
+        assert!(
+            text.contains("0 rows applied / 0 skipped / 0 clamped"),
+            "the report line is not in English: {}",
+            text
+        );
+        assert!(
+            text.contains(strings::text(Lang::En, "confirm.csv_note")),
+            "{}",
+            text
+        );
+        app.csv_pending = None;
+
+        // And the same dialogs still speak Japanese on a Japanese screen.
+        app.lang = Lang::Ja;
+        let text = draw(Confirm::ItemDedupe { freed: 2, lost: 151 }, &mut app);
+        assert!(text.contains("重複を整理します"), "{}", text);
+        assert!(text.contains("2 枠を解放、151 個を失います"), "{}", text);
+        assert!(
+            !text.contains(strings::MISSING),
+            "a key was missing from the catalogue: {}",
+            text
+        );
+        let text = draw(Confirm::ItemFillAll { changed: 3 }, &mut app);
+        assert!(
+            !text.contains(strings::MISSING),
+            "a key was missing from the catalogue: {}",
+            text
+        );
+    }
+
+    /// The catalogue and the drawing calls have to name the same keys. KEYS is
+    /// generated from the table the text comes from, so a key a call site uses
+    /// but the table does not hold can only show up as a placeholder on screen;
+    /// this test reads the calls and checks both directions instead (AUDIT8 §4
+    /// N1).
+    #[test]
+    fn every_key_the_interface_uses_is_in_the_catalogue() {
+        let source = include_str!("app.rs");
+        let bytes = source.as_bytes();
+        // Built from pieces so this test does not find its own needles.
+        let text_call = concat!("strings::", "text(");
+        let textf_call = concat!("strings::", "textf(");
+        let mut used: Vec<&str> = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if !source.is_char_boundary(i) {
+                i += 1;
+                continue;
+            }
+            // A comment is prose, not a call.
+            if source[i..].starts_with("//") {
+                i = source[i..]
+                    .find('\n')
+                    .map(|n| i + n + 1)
+                    .unwrap_or(bytes.len());
+                continue;
+            }
+            let needle = if source[i..].starts_with(text_call) {
+                text_call
+            } else if source[i..].starts_with(textf_call) {
+                textf_call
+            } else {
+                i += 1;
+                continue;
+            };
+            // The comma that ends the first argument (the language) opens the
+            // key: every key this crate passes is a literal, so it can be read
+            // straight out of the source.
+            let mut depth = 0i32;
+            let mut comma = None;
+            let mut j = i + needle.len() - 1;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    b',' if depth == 1 => {
+                        comma = Some(j);
+                        break;
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let tail: String = source[i..].chars().take(120).collect();
+            let comma = comma.unwrap_or_else(|| panic!("a catalogue call with no key: {}", tail));
+            let mut k = comma + 1;
+            while k < bytes.len() && (bytes[k] as char).is_whitespace() {
+                k += 1;
+            }
+            assert_eq!(
+                bytes[k], b'"',
+                "the key of a catalogue call has to be a literal: {}",
+                tail
+            );
+            let end = k + 1 + source[k + 1..].find('"').expect("the closing quote");
+            used.push(&source[k + 1..end]);
+            i = end;
+        }
+        assert!(!used.is_empty(), "the scanner found no call site");
+        for key in &used {
+            assert!(
+                strings::has_key(key),
+                "the call site uses {:?}, which KEYS does not hold",
+                key
+            );
+        }
+        for key in strings::KEYS {
+            assert!(
+                used.contains(key),
+                "the catalogue holds {:?}, which no call site draws",
+                key
+            );
+        }
+    }
+
     /// The game's own tables follow the language too: the award names and the
     /// データベース tab read the _eng copy when the interface is English, and
     /// fall back to the only copy there is when the dump has no English one.
@@ -20017,6 +20383,80 @@ mod tests {
                 [base + mhnx_core::save::OFF_ARMOR_COLORS..base + mhnx_core::save::OFF_ARMOR_COLORS + 4],
             &[1, 2, 3, 255]
         );
+    }
+
+    /// The hair and feature colours are rewritten by the game on every save,
+    /// so the two rows have to say so rather than looking like the other seven.
+    /// They stay editable: the note is a warning, not a lock (AUDIT8 §4 N2).
+    #[test]
+    fn the_hair_and_feature_colours_say_the_game_overwrites_them() {
+        let dir = Scratch::new("colournote");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
+        });
+        let text = drawn_text(&output);
+        let note = strings::text(Lang::Ja, "save.color_overwritten");
+        assert_ne!(note, strings::MISSING, "the note has no catalogue line");
+        // Exactly twice: one beside the hair row and one beside the features
+        // row, and nowhere else on the tab.
+        assert_eq!(text.matches(note).count(), 2, "{}", text);
+        let lines: Vec<&str> = text.lines().collect();
+        // The last occurrence: 外見 above draws 服 and 特徴 as id fields, and
+        // the colour rows are the ones further down.
+        let row_of = |label: &str| {
+            lines
+                .iter()
+                .rposition(|line| line.trim() == label)
+                .unwrap_or_else(|| panic!("the {} row is not drawn: {}", label, text))
+        };
+        for label in ["髪", "特徴"] {
+            let row = row_of(label);
+            let beside = lines[row..(row + 4).min(lines.len())]
+                .iter()
+                .any(|line| line.contains(note));
+            assert!(
+                beside,
+                "the {} row carries no note: {:?}",
+                label,
+                &lines[row..(row + 4).min(lines.len())]
+            );
+        }
+        for label in ["肌", "服", "色素1"] {
+            let row = row_of(label);
+            assert!(
+                !lines[row..(row + 4).min(lines.len())]
+                    .iter()
+                    .any(|line| line.contains(note)),
+                "the {} row carries a note it should not",
+                label
+            );
+        }
+
+        // A warning, not a lock: the two pickers still write the bytes, because
+        // the value is readable and someone may want it written anyway.
+        app.edit.hair_color = [1, 2, 3, 4];
+        app.edit.features_color = [5, 6, 7, 8];
+        app.apply_to_save();
+        let stored = app.save.as_ref().expect("save").read_character(0).expect("a slot");
+        assert_eq!(stored.hair_color, [1, 2, 3, 4]);
+        assert_eq!(stored.features_color, [5, 6, 7, 8]);
+
+        // The note is a sentence of the interface, so it follows the chooser
+        // like the rest of the character tab.
+        app.lang = Lang::En;
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
+        });
+        let text = drawn_text(&output);
+        let english = strings::text(Lang::En, "save.color_overwritten");
+        assert_eq!(text.matches(english).count(), 2, "{}", text);
+        assert!(!text.contains(note), "the Japanese note survived at English: {}", text);
     }
 
     /// The guild tab edits the name the card carries, and the field is the

@@ -774,6 +774,152 @@ pub const TEXT_JEWEL_FILTER: usize = usize::MAX - 6;
 /// reads one contiguous range as palico names ("TEXT_PALICO_NAME or above");
 /// a sentinel above it would be answered as a palico that does not exist.
 pub const TEXT_SET_NAME: usize = usize::MAX - 1_001;
+/// Sentinel id for "ask for an arena time as `m:ss.cc`".
+///
+/// Below `TEXT_PALICO_NAME` for the reason TEXT_SET_NAME is: the console layer
+/// reads one contiguous range as palico names, so a sentinel above it would be
+/// answered as a palico that does not exist.
+pub const TEXT_ARENA_TIME: usize = usize::MAX - 1_002;
+
+// ---------------------------------------------------------------------------
+// 闘技大会 (the arena log): the guild screen's second view
+// ---------------------------------------------------------------------------
+//
+// The log is part of the guild card (guildcard::OFF_ARENA, 17 arenas of five
+// ranked entries, four bytes each) and the card is one screen, so the arena
+// log is a *view* of the guild screen and not a screen of its own: the sub-tab
+// bar names the two views and L / R walk them, exactly the way the progress
+// screen carries its three views. No offset is invented here - every row is an
+// entry guildcard::arena already reads and guildcard::set_arena_time already
+// writes, and the panel the PC build has on the ギルド tab is the same one.
+
+/// View 0 of the guild screen: the card itself (rank, clock, comment).
+pub const GUILD_TAB_CARD: usize = 0;
+/// View 1 of the guild screen: the arena log.
+pub const GUILD_TAB_ARENA: usize = 1;
+/// Views the guild screen has.
+pub const GUILD_TABS: usize = 2;
+
+/// Arena rows the view lists: one per arena of the log.
+pub const ARENA_ROWS: usize = crate::guildcard::ARENA_COUNT;
+/// Rank columns the view lists: the five the card keeps, best first.
+pub const ARENA_COLUMNS: usize = crate::guildcard::ARENA_RANKS;
+/// Parts of one time, in the order Left / Right walks them.
+pub const ARENA_PARTS: usize = 3;
+/// The minutes part.
+pub const ARENA_PART_MIN: usize = 0;
+/// The seconds part.
+pub const ARENA_PART_SEC: usize = 1;
+/// The hundredths part.
+pub const ARENA_PART_CS: usize = 2;
+
+/// Names of the arena log's rows.
+///
+/// The log keeps seventeen arenas and MHXX's 闘技大会 has exactly seventeen
+/// arena quests, so the row is named after the quest. The list is the one the
+/// game's own quest list shows (ホロロホルル討伐 first, ババコンガ討伐 last);
+/// the slot-to-quest order is **not** verified on hardware yet, which is why
+/// every row also prints its number. `""` for a row past the end.
+pub const ARENA_NAMES: [&str; ARENA_ROWS] = [
+    "ホロロホルル",
+    "フルフル",
+    "ガララアジャラ",
+    "リオレウス",
+    "ケチャワチャ",
+    "ガノトトス",
+    "ブラキディオス",
+    "ベリオロス",
+    "イャンガルルガ",
+    "ウラガンキン",
+    "セルレギオス",
+    "ドスマッカォ",
+    "ゲリョス",
+    "鳥竜種2種",
+    "ボルボロス",
+    "テツカブラ",
+    "ババコンガ",
+];
+
+/// Quest name of one arena row, or "" past the end.
+pub fn arena_name(arena: usize) -> &'static str {
+    match ARENA_NAMES.get(arena) {
+        Some(s) => s,
+        None => "",
+    }
+}
+
+/// Name of one part of a time.
+pub fn arena_part_name(part: usize) -> &'static str {
+    match part {
+        ARENA_PART_MIN => "分",
+        ARENA_PART_SEC => "秒",
+        _ => "1/100",
+    }
+}
+
+/// How a rank column is written on screen: 1位 .. 5位.
+pub fn arena_rank_name(rank: usize) -> &'static str {
+    match rank {
+        0 => "1位",
+        1 => "2位",
+        2 => "3位",
+        3 => "4位",
+        4 => "5位",
+        _ => "?",
+    }
+}
+
+/// An arena time the way the game shows it: `m:ss.cc`.
+pub fn arena_clock(centis: u16) -> alloc::string::String {
+    let total = centis as u32;
+    alloc::format!(
+        "{}:{:02}.{:02}",
+        total / 6000,
+        (total / 100) % 60,
+        total % 100
+    )
+}
+
+/// Read a time typed into the arena editor.
+///
+/// `9:35.44` is minutes, seconds and hundredths; `35.44` is seconds and
+/// hundredths; a bare number is the raw count of hundredths the save holds, so
+/// a value copied out of another tool round-trips unchanged. `0` is the empty
+/// entry, which is also how the game erases a record. Anything that does not
+/// parse returns None, which leaves the entry as it was.
+pub fn arena_clock_value(text: &str) -> Option<u16> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (has_colon, minutes, rest) = match t.split_once(':') {
+        Some((m, r)) => (true, m.trim().parse::<u64>().ok()?, r.trim()),
+        None => (false, 0, t),
+    };
+    if !has_colon && !rest.contains('.') {
+        return rest.parse::<u64>().ok().map(|v| v.min(u16::MAX as u64) as u16);
+    }
+    let (secs, frac) = match rest.split_once('.') {
+        Some((s, f)) => (s.trim(), Some(f.trim())),
+        None => (rest, None),
+    };
+    let secs: u64 = secs.parse().ok()?;
+    let frac: u64 = match frac {
+        None => 0,
+        Some("") => return None,
+        Some(f) => {
+            // .4 is 40 hundredths and .456 is 45: the field has two digits.
+            let mut f = String::from(f);
+            f.truncate(2);
+            while f.len() < 2 {
+                f.push('0');
+            }
+            f.parse().ok()?
+        }
+    };
+    let total = minutes * 6000 + secs * 100 + frac;
+    Some(total.min(u16::MAX as u64) as u16)
+}
 
 /// How many terminal cells one character takes.
 ///
@@ -815,6 +961,39 @@ fn pad_cells(s: &str, cells: usize) -> alloc::string::String {
     while used < cells {
         out.push(' ');
         used += 1;
+    }
+    out
+}
+
+/// The same padding, on the left: numbers line up under a right-aligned column.
+///
+/// The arena grid prints one column of times per rank, and a time changes width
+/// with its minutes ("9:35.44" is seven cells, "10:55.35" eight), so the column
+/// is padded, not counted on: every cell is exactly `cells` wide, which is what
+/// keeps the five columns from walking into each other on the console.
+fn pad_cells_left(s: &str, cells: usize) -> alloc::string::String {
+    // Measure first: the padding is what the text does not fill, and a wide
+    // character that would cross the edge is dropped rather than half drawn.
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let w = char_cells(ch);
+        if used + w > cells {
+            break;
+        }
+        used += w;
+    }
+    let mut out = alloc::string::String::new();
+    for _ in used..cells {
+        out.push(' ');
+    }
+    let mut room = cells - used;
+    for ch in s.chars() {
+        let w = char_cells(ch);
+        if w > room {
+            break;
+        }
+        out.push(ch);
+        room -= w;
     }
     out
 }
@@ -2125,6 +2304,24 @@ pub struct Editor {
     pub roster_field: usize,
     /// Which guild card field (rank, clock, comment) is being changed.
     pub guild_field: usize,
+    /// Which view of the guild screen is showing.
+    ///
+    /// GUILD_TAB_CARD is the card itself, GUILD_TAB_ARENA the arena log. A view,
+    /// not a screen: both read the same card and the same slot.
+    pub guild_tab: usize,
+    /// Arena row under the cursor on the arena view (0..ARENA_ROWS).
+    pub arena_row: usize,
+    /// Rank column under the cursor (0 is 1位; 0..ARENA_COLUMNS).
+    pub arena_rank: usize,
+    /// Which part of the selected time the editor steps (分 / 秒 / 1/100).
+    pub arena_part: usize,
+    /// Is the time editor armed? [A] starts it, [A] and [B] end it.
+    ///
+    /// A mode, not a screen: while it is on, Left / Right walk the three parts
+    /// and Up / Down change the one under the cursor. The rest of the view - the
+    /// arena and the rank - stays put so the number being changed cannot move
+    /// out from under the press.
+    pub arena_edit: bool,
     /// Which view of the progress screen is showing.
     ///
     /// One of PROGRESS_AWARDS / PROGRESS_REQUESTS / PROGRESS_QUESTS. The three
@@ -2343,6 +2540,11 @@ impl Editor {
             roster_cursor: 0,
             roster_field: 0,
             guild_field: 0,
+            guild_tab: GUILD_TAB_CARD,
+            arena_row: 0,
+            arena_rank: 0,
+            arena_part: ARENA_PART_CS,
+            arena_edit: false,
             progress_tab: 0,
             award_cursor: 0,
             request_cursor: 0,
@@ -2494,6 +2696,211 @@ impl Editor {
         }
         self.dirty = true;
         self.message = String::from("コメントを変更しました（[X] でセーブ保存）");
+        true
+    }
+
+    // ------------------------------------------------------- arena log view
+
+    /// Which view of the guild screen is showing.
+    pub fn guild_view(&self) -> usize {
+        if self.guild_tab < GUILD_TABS {
+            self.guild_tab
+        } else {
+            GUILD_TAB_CARD
+        }
+    }
+
+    /// Show one view of the guild screen.
+    ///
+    /// The time editor is a mode of the arena view, so a view change ends it;
+    /// the cursors are clamped rather than cleared so a return to the arena
+    /// view lands on the row the user was reading.
+    pub fn set_guild_view(&mut self, view: usize) {
+        self.guild_tab = view.min(GUILD_TABS - 1);
+        self.arena_edit = false;
+        self.arena_row = self.arena_row.min(ARENA_ROWS.saturating_sub(1));
+        self.arena_rank = self.arena_rank.min(ARENA_COLUMNS.saturating_sub(1));
+        self.message = if self.guild_tab == GUILD_TAB_ARENA {
+            String::from("闘技大会: ▲▼ アリーナ / ◀▶ 順位 / [A] 編集 / [Y] 直接入力 / [X] 保存")
+        } else {
+            String::from("ギルドカード: ▼ 項目 / ◀▶ 増減 / [A] コメント / [-] 進行状況 / [X] 保存")
+        };
+    }
+
+    /// The arena log, one row per arena and one column per rank.
+    ///
+    /// Read in one pass: guildcard::arena decodes all 85 entries of the slot, so
+    /// a row-at-a-time caller would decode it 85 times per frame.
+    pub fn arena_grid(&self) -> Vec<Vec<u16>> {
+        let mut grid = alloc::vec![alloc::vec![0u16; ARENA_COLUMNS]; ARENA_ROWS];
+        let Some(save) = &self.save else {
+            return grid;
+        };
+        for e in crate::guildcard::arena(save, self.slot) {
+            if let Some(row) = grid.get_mut(e.arena) {
+                if let Some(cell) = row.get_mut(e.rank) {
+                    *cell = e.centis;
+                }
+            }
+        }
+        grid
+    }
+
+    /// One stored time, 0 when the entry is empty or no save is open.
+    pub fn arena_centis_at(&self, arena: usize, rank: usize) -> u16 {
+        if arena >= ARENA_ROWS || rank >= ARENA_COLUMNS {
+            return 0;
+        }
+        match &self.save {
+            Some(save) => crate::guildcard::arena(save, self.slot)
+                .into_iter()
+                .find(|e| e.arena == arena && e.rank == rank)
+                .map(|e| e.centis)
+                .unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    /// The arena and rank the view is on, clamped to what the log holds.
+    pub fn arena_selected(&self) -> (usize, usize) {
+        (
+            self.arena_row.min(ARENA_ROWS.saturating_sub(1)),
+            self.arena_rank.min(ARENA_COLUMNS.saturating_sub(1)),
+        )
+    }
+
+    /// The time under the cursor, in hundredths.
+    pub fn arena_centis(&self) -> u16 {
+        let (a, r) = self.arena_selected();
+        self.arena_centis_at(a, r)
+    }
+
+    /// The time under the cursor as minutes, seconds and hundredths.
+    pub fn arena_parts(&self) -> (u16, u8, u8) {
+        let total = self.arena_centis() as u32;
+        (
+            (total / 6000) as u16,
+            ((total / 100) % 60) as u8,
+            (total % 100) as u8,
+        )
+    }
+
+    /// One part of the time under the cursor.
+    pub fn arena_part_value(&self, part: usize) -> u16 {
+        let (m, s, cs) = self.arena_parts();
+        match part {
+            ARENA_PART_MIN => m,
+            ARENA_PART_SEC => s as u16,
+            _ => cs as u16,
+        }
+    }
+
+    /// Write one arena entry, as one undo step.
+    ///
+    /// Only the two time bytes move (guildcard::set_arena_time), and 0 empties
+    /// the entry - the game's own "no record". A press that would write the
+    /// value that is already there writes nothing and pushes nothing: holding
+    /// Up at 0:00.00 must not fill the undo stack with identical saves.
+    pub fn set_arena_time_at(&mut self, arena: usize, rank: usize, centis: u16) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        if arena >= ARENA_ROWS || rank >= ARENA_COLUMNS {
+            self.message = alloc::format!("アリーナ {} / {} 位はありません", arena + 1, rank + 1);
+            return false;
+        }
+        let current = self.arena_centis_at(arena, rank);
+        if current == centis {
+            self.message = alloc::format!(
+                "{} {} はすでに {} です",
+                arena_name(arena),
+                arena_rank_name(rank),
+                arena_clock(centis)
+            );
+            return false;
+        }
+        self.push_undo(alloc::format!("闘技大会 {}", arena + 1));
+        let slot = self.slot;
+        let Some(save) = &mut self.save else {
+            return false;
+        };
+        if !crate::guildcard::set_arena_time(save, slot, arena, rank, centis) {
+            self.message = alloc::format!(
+                "アリーナ {} の {} には書けません",
+                arena + 1,
+                arena_rank_name(rank)
+            );
+            return false;
+        }
+        self.dirty = true;
+        self.message = alloc::format!(
+            "{} {} を {} にしました（[X] でセーブ保存）",
+            arena_name(arena),
+            arena_rank_name(rank),
+            arena_clock(centis)
+        );
+        true
+    }
+
+    /// Step one part of the time under the cursor by `delta`.
+    pub fn adjust_arena_part(&mut self, delta: i64) -> bool {
+        let (a, r) = self.arena_selected();
+        let (m, s, cs) = self.arena_parts();
+        let part = self.arena_part.min(ARENA_PARTS - 1);
+        let (mut m, mut s, mut cs) = (m as i64, s as i64, cs as i64);
+        match part {
+            // 65,535 hundredths is 10:55.35, so ten minutes is the ceiling the
+            // two stored bytes allow; the seconds a minute holds are 0..=59.
+            ARENA_PART_MIN => m = (m + delta).clamp(0, (u16::MAX as i64) / 6000),
+            ARENA_PART_SEC => s = (s + delta).clamp(0, 59),
+            _ => cs = (cs + delta).clamp(0, 99),
+        }
+        let total = (m * 6000 + s * 100 + cs).clamp(0, u16::MAX as i64) as u16;
+        let ok = self.set_arena_time_at(a, r, total);
+        if !ok && self.arena_centis_at(a, r) == total {
+            // Already at the end of the part's range: say so once, write nothing.
+            self.message = alloc::format!(
+                "{} はこれ以上 {} できません",
+                arena_part_name(part),
+                if delta > 0 { "増やせ" } else { "減らせ" }
+            );
+        }
+        ok
+    }
+
+    /// Read a typed time into the entry under the cursor.
+    pub fn apply_arena_time(&mut self, text: &str) -> bool {
+        let (a, r) = self.arena_selected();
+        match arena_clock_value(text) {
+            Some(centis) => {
+                let ok = self.set_arena_time_at(a, r, centis);
+                if !ok && self.arena_centis_at(a, r) == centis {
+                    self.message = alloc::format!(
+                        "{} {} はすでに {} です",
+                        arena_name(a),
+                        arena_rank_name(r),
+                        arena_clock(centis)
+                    );
+                }
+                ok
+            }
+            None => {
+                self.message =
+                    String::from("m:ss.cc の形で入力してください（例 9:35.44 / 0:00.00 で消去）");
+                false
+            }
+        }
+    }
+
+    /// Ask the I/O layer for the time under the cursor, as text.
+    pub fn ask_arena_time(&mut self) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let cur = arena_clock(self.arena_centis());
+        self.pending_text = Some((TEXT_ARENA_TIME, cur));
         true
     }
 
@@ -3630,6 +4037,9 @@ impl Editor {
     /// on the next press. Selections are clamped instead of cleared so the user
     /// stays where they were looking.
     fn after_undo(&mut self) {
+        // The arena editor points at a time of the save that was just
+        // replaced, so it is put away with the other forms.
+        self.arena_edit = false;
         self.charm_edit = None;
         self.equip_edit = None;
         self.equip_delete_armed = None;
@@ -4560,10 +4970,18 @@ impl Editor {
     }
 
     fn input_guild(&mut self, key: Key) {
+        // The guild screen carries two views. The arena log is the second one,
+        // and while it is showing it owns every key: the card's fields are not
+        // on screen, so a press must not reach them.
+        if self.guild_view() == GUILD_TAB_ARENA {
+            return self.input_arena(key);
+        }
         // Field 0 is the rank, 1 is the card's own clock, 2 the comment.
         match key {
             Key::Up => self.guild_field = (self.guild_field + 2) % 3,
-            Key::Down | Key::X => self.guild_field = (self.guild_field + 1) % 3,
+            // [X] is the save key on every screen, so it is no longer a second
+            // "next field" here (it used to be, and nothing said so).
+            Key::Down => self.guild_field = (self.guild_field + 1) % 3,
             Key::Left | Key::Right => {
                 let up = key == Key::Right;
                 let slot = self.slot;
@@ -4609,6 +5027,7 @@ impl Editor {
             // slot. [-] rather than a new screen-wide key, because A / Y / L /
             // R on the card already mean something.
             Key::Minus => self.open_progress(),
+            Key::X => self.request_write_save(),
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
@@ -4616,6 +5035,118 @@ impl Editor {
             Key::Plus => self.quit = true,
             _ => {}
         }
+    }
+
+    /// The arena view: 17 rows of five ranked times, one of them editable.
+    ///
+    /// Two modes, because the four directions have to mean two different things
+    /// on one grid:
+    ///
+    /// * list mode - Up / Down walk the arenas, Left / Right walk the ranks
+    ///   (1位 .. 5位), [A] arms the time editor, [Y] asks for the time as text.
+    /// * edit mode - Left / Right walk the parts of the time (分 / 秒 / 1/100)
+    ///   and Up / Down step the part under the cursor, [A] and [B] leave it.
+    ///
+    /// [X] saves in both, [-] opens the progress screen like the card view does.
+    fn input_arena(&mut self, key: Key) {
+        let (row, rank) = self.arena_selected();
+        if self.arena_edit {
+            match key {
+                Key::Left => self.arena_part = (self.arena_part + ARENA_PARTS - 1) % ARENA_PARTS,
+                Key::Right => self.arena_part = (self.arena_part + 1) % ARENA_PARTS,
+                Key::Up => {
+                    self.adjust_arena_part(1);
+                }
+                Key::Down => {
+                    self.adjust_arena_part(-1);
+                }
+                Key::A | Key::B => {
+                    self.arena_edit = false;
+                    self.message = alloc::format!(
+                        "{} {} は {}（[A] でまた編集できます）",
+                        arena_name(row),
+                        arena_rank_name(rank),
+                        arena_clock(self.arena_centis())
+                    );
+                }
+                Key::Y => {
+                    self.ask_arena_time();
+                }
+                Key::X => self.request_write_save(),
+                Key::Minus => {
+                    // The editor is a mode of the view, and the progress screen
+                    // is not it: leaving it armed would put a stepping cursor
+                    // on a screen with no time to step.
+                    self.arena_edit = false;
+                    self.open_progress();
+                }
+                Key::Plus => self.quit = true,
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            Key::Up => {
+                self.arena_row = (row + ARENA_ROWS - 1) % ARENA_ROWS;
+                self.describe_arena_row();
+            }
+            Key::Down => {
+                self.arena_row = (row + 1) % ARENA_ROWS;
+                self.describe_arena_row();
+            }
+            Key::Left => {
+                self.arena_rank = (rank + ARENA_COLUMNS - 1) % ARENA_COLUMNS;
+                self.describe_arena_row();
+            }
+            Key::Right => {
+                self.arena_rank = (rank + 1) % ARENA_COLUMNS;
+                self.describe_arena_row();
+            }
+            Key::A => {
+                if self.save.is_none() {
+                    self.message = String::from("先にセーブを開いてください");
+                    return;
+                }
+                self.arena_edit = true;
+                self.message = alloc::format!(
+                    "編集中 {} {} — [◀▶] {} / [▲▼] 増減 / [A] 終了 / [Y] 直接入力{}",
+                    arena_name(row),
+                    arena_rank_name(rank),
+                    arena_part_name(self.arena_part.min(ARENA_PARTS - 1)),
+                    if self.arena_centis_at(row, rank) == 0 {
+                        "（空き枠。0:00.00 のままなら無記録）"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Key::Y => {
+                self.ask_arena_time();
+            }
+            Key::X => self.request_write_save(),
+            Key::Minus => self.open_progress(),
+            Key::B => {
+                // Back to the card: the arena log is a view of this screen, so
+                // one press goes one level up and the card's own B goes to the
+                // slot list.
+                self.set_guild_view(GUILD_TAB_CARD);
+            }
+            Key::Plus => self.quit = true,
+            _ => {}
+        }
+    }
+
+    /// Put the row and rank the cursor is on into the status line.
+    fn describe_arena_row(&mut self) {
+        let (row, rank) = self.arena_selected();
+        self.message = alloc::format!(
+            "{} ({}/{}) {} {} 編集: [A] / 直接入力: [Y] / 保存: [X]",
+            arena_name(row),
+            row + 1,
+            ARENA_ROWS,
+            arena_rank_name(rank),
+            arena_clock(self.arena_centis_at(row, rank))
+        );
     }
 
 
@@ -9064,10 +9595,89 @@ impl Editor {
                     false,
                 );
             }
+            Screen::Guild if self.guild_view() == GUILD_TAB_ARENA => {
+                // The same seventeen rows the canvas draws: one row per arena,
+                // one ten-cell column per rank, the cursor cell bracketed. Every
+                // cell is padded to a fixed width so a "10:55.35" cannot push
+                // the columns after it out of line.
+                push(
+                    &mut out,
+                    alloc::format!("ARENA LOG   slot {}   view 2/2 闘技大会", self.slot + 1),
+                    false,
+                    false,
+                );
+                if self.save.is_none() {
+                    push(&mut out, String::from("  no save"), false, false);
+                    return out;
+                }
+                let grid = self.arena_grid();
+                let (cur_row, cur_rank) = self.arena_selected();
+                let mut head = alloc::format!(
+                    "  {} {}",
+                    pad_cells("#", 2),
+                    pad_cells("名前", 20)
+                );
+                for r in 0..ARENA_COLUMNS {
+                    head.push_str(&pad_cells_left(arena_rank_name(r), 10));
+                }
+                push(&mut out, head, false, false);
+                for a in 0..ARENA_ROWS {
+                    let mut line = alloc::format!(
+                        "{} {} {}",
+                        if a == cur_row { ">" } else { " " },
+                        pad_cells(&alloc::format!("{:02}", a + 1), 2),
+                        pad_cells(arena_name(a), 20)
+                    );
+                    for r in 0..ARENA_COLUMNS {
+                        let centis = grid.get(a).and_then(|row| row.get(r)).copied().unwrap_or(0);
+                        let text = if centis == 0 {
+                            alloc::string::String::from("-")
+                        } else {
+                            arena_clock(centis)
+                        };
+                        let padded = pad_cells_left(&text, 8);
+                        if a == cur_row && r == cur_rank {
+                            line.push_str(&alloc::format!("[{}]", padded));
+                        } else {
+                            line.push_str(&alloc::format!(" {} ", padded));
+                        }
+                    }
+                    push(&mut out, line, true, a == cur_row);
+                }
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "  {} {} : {}   ［{}］{}",
+                        arena_name(cur_row),
+                        arena_rank_name(cur_rank),
+                        arena_clock(self.arena_centis()),
+                        arena_part_name(self.arena_part.min(ARENA_PARTS - 1)),
+                        if self.arena_edit { " 編集中" } else { "" }
+                    ),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    String::from(
+                        "  Up/Down アリーナ  Left/Right 順位  A 編集  Y 直接入力  X save  B カードへ",
+                    ),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    String::from(
+                        "  編集中: Left/Right 分・秒・1/100  Up/Down 増減  A 終了  Y 直接入力",
+                    ),
+                    false,
+                    false,
+                );
+            }
             Screen::Guild => {
                 push(
                     &mut out,
-                    alloc::format!("GUILD CARD   slot {}", self.slot + 1),
+                    alloc::format!("GUILD CARD   slot {}   view 1/2", self.slot + 1),
                     false,
                     false,
                 );
@@ -11004,6 +11614,232 @@ mod tests {
         // B leaves for the guild card, the record this screen continues.
         ed.input(Key::B);
         assert_eq!(ed.screen, Screen::Guild);
+    }
+
+    // ------------------------------------------------- 闘技大会 (arena log)
+
+    /// An editor sitting on the arena view of the guild screen.
+    fn editor_on_the_arena_view() -> Editor {
+        let mut ed = editor_on_a_used_slot();
+        ed.screen = Screen::Guild;
+        ed.set_guild_view(GUILD_TAB_ARENA);
+        ed
+    }
+
+    #[test]
+    fn the_arena_view_lists_every_recorded_time_and_edits_the_one_under_the_cursor() {
+        let mut ed = editor_on_the_arena_view();
+        // Two recorded times, written through the function the PC build uses.
+        let slot = ed.slot;
+        {
+            let save = ed.save.as_mut().expect("a save");
+            assert!(crate::guildcard::set_arena_time(save, slot, 0, 0, 57_544));
+            assert!(crate::guildcard::set_arena_time(save, slot, 10, 2, 2_348));
+        }
+
+        // The grid the view draws is the log itself: one row per arena, one
+        // column per rank, and nothing invented.
+        let grid = ed.arena_grid();
+        assert_eq!(grid.len(), ARENA_ROWS);
+        assert_eq!(ARENA_ROWS, crate::guildcard::ARENA_COUNT);
+        assert_eq!(grid[0].len(), ARENA_COLUMNS);
+        assert_eq!(ARENA_COLUMNS, crate::guildcard::ARENA_RANKS);
+        assert_eq!(grid[0][0], 57_544);
+        assert_eq!(grid[10][2], 2_348);
+        assert_eq!(grid[1][0], 0, "an unrecorded entry stays 0");
+
+        // Up / Down walk the arenas, Left / Right the ranks, and both wrap.
+        ed.arena_row = 0;
+        ed.arena_rank = 0;
+        ed.input(Key::Up);
+        assert_eq!(ed.arena_selected(), (ARENA_ROWS - 1, 0));
+        ed.input(Key::Down);
+        assert_eq!(ed.arena_selected(), (0, 0));
+        ed.input(Key::Left);
+        assert_eq!(ed.arena_selected(), (0, ARENA_COLUMNS - 1));
+        ed.input(Key::Right);
+        assert_eq!(ed.arena_selected(), (0, 0));
+        // Moving the cursor writes nothing and records nothing.
+        assert!(!ed.dirty);
+        assert_eq!(ed.undo_depth(), 0);
+
+        // [A] arms the editor; from then on Left / Right pick the part.
+        ed.input(Key::A);
+        assert!(ed.arena_edit, "{}", ed.message);
+        assert_eq!(ed.arena_part, ARENA_PART_CS);
+        ed.input(Key::Right);
+        assert_eq!(ed.arena_part, ARENA_PART_MIN);
+        ed.input(Key::Left);
+        assert_eq!(ed.arena_part, ARENA_PART_CS);
+        // The hundredths of 9:35.44 against 9:35.45, as one undo step.
+        ed.input(Key::Up);
+        assert_eq!(ed.arena_centis(), 57_545);
+        assert!(ed.dirty);
+        assert_eq!(ed.undo_depth(), 1);
+        assert_eq!(ed.undo_label(), Some("闘技大会 1"));
+        let save = ed.save.as_ref().expect("a save");
+        let entry = crate::guildcard::arena(save, 0)
+            .into_iter()
+            .find(|e| e.arena == 0 && e.rank == 0)
+            .expect("the entry");
+        assert_eq!(entry.centis, 57_545);
+        // The two bytes behind the time are not the editor's business.
+        assert_eq!(entry.extra, [0, 0]);
+
+        // The minutes step by a minute: 9:35.45 -> 10:35.45.
+        ed.arena_part = ARENA_PART_MIN;
+        ed.input(Key::Up);
+        assert_eq!(ed.arena_centis(), 63_545);
+        // The seconds step by a second.
+        ed.arena_part = ARENA_PART_SEC;
+        ed.input(Key::Down);
+        assert_eq!(ed.arena_centis(), 63_445);
+
+        // [A] leaves the editor and the cursor stays on the same cell.
+        ed.input(Key::A);
+        assert!(!ed.arena_edit);
+        assert_eq!(ed.arena_selected(), (0, 0));
+
+        // [X] is the save key here like everywhere else.
+        ed.input(Key::X);
+        assert!(ed.take_write().is_some(), "X must ask for the save to be written");
+    }
+
+    #[test]
+    fn an_arena_time_typed_as_a_clock_lands_in_the_entry_under_the_cursor() {
+        // The formatter and the parser are each other's inverse on everything
+        // the two stored bytes can hold.
+        assert_eq!(arena_clock(57_544), "9:35.44");
+        assert_eq!(arena_clock(0), "0:00.00");
+        assert_eq!(arena_clock(2_348), "0:23.48");
+        assert_eq!(arena_clock(u16::MAX), "10:55.35");
+        assert_eq!(arena_clock_value("9:35.44"), Some(57_544));
+        assert_eq!(arena_clock_value(" 0:23.48 "), Some(2_348));
+        assert_eq!(arena_clock_value("35.4"), Some(3_540));
+        assert_eq!(arena_clock_value("9:35"), Some(57_500));
+        assert_eq!(arena_clock_value("57544"), Some(57_544));
+        assert_eq!(arena_clock_value(""), None);
+        assert_eq!(arena_clock_value("abc"), None);
+        assert_eq!(arena_clock_value("9:"), None);
+        assert_eq!(arena_clock_value("999:00.00"), Some(u16::MAX));
+        for c in [0u16, 1, 2_348, 57_544, 60_000, u16::MAX] {
+            assert_eq!(arena_clock_value(&arena_clock(c)), Some(c), "{}", c);
+        }
+
+        let mut ed = editor_on_the_arena_view();
+        ed.arena_row = 2;
+        ed.arena_rank = 1;
+        // [Y] asks the I/O layer for the cell as text, seeded with what it is.
+        ed.input(Key::Y);
+        assert_eq!(
+            ed.take_text_request(),
+            Some((TEXT_ARENA_TIME, String::from("0:00.00")))
+        );
+        // The answer comes back as typed text.
+        assert!(ed.apply_arena_time("9:35.44"), "{}", ed.message);
+        assert_eq!(ed.arena_centis(), 57_544);
+        assert_eq!(ed.arena_rank, 1, "the typed value went into the cell");
+        assert!(ed.dirty);
+        assert!(ed.message.contains("9:35.44"), "{}", ed.message);
+
+        // A text that is not a time leaves the entry alone and says the shape.
+        ed.dirty = false;
+        let depth = ed.undo_depth();
+        assert!(!ed.apply_arena_time("9:xx"));
+        assert!(ed.message.contains("m:ss.cc"), "{}", ed.message);
+        assert!(!ed.dirty);
+        assert_eq!(ed.undo_depth(), depth);
+
+        // 0:00.00 is how the game stores "no record", so it erases one.
+        assert!(ed.apply_arena_time("0:00.00"));
+        assert_eq!(ed.arena_centis(), 0);
+        assert!(ed.dirty);
+        assert_eq!(ed.undo_depth(), depth + 1);
+    }
+
+    #[test]
+    fn the_arena_view_undo_puts_the_time_back_and_the_stack_sees_it() {
+        let mut ed = editor_on_the_arena_view();
+        ed.arena_row = 3;
+        ed.arena_rank = 0;
+        assert!(ed.set_arena_time_at(3, 0, 12_345));
+        assert_eq!(ed.arena_centis_at(3, 0), 12_345);
+        assert_eq!(ed.undo_label(), Some("闘技大会 4"));
+
+        assert!(ed.undo_last(), "{}", ed.message);
+        assert_eq!(ed.arena_centis_at(3, 0), 0);
+        assert!(ed.message.contains("元に戻しました: 闘技大会 4"), "{}", ed.message);
+        assert!(!ed.arena_edit, "the undo leaves the editor on the cell");
+
+        // A press that would write what is already there writes nothing, so a
+        // held key cannot fill the four-step stack with identical saves.
+        ed.arena_edit = true;
+        ed.arena_part = ARENA_PART_CS;
+        ed.input(Key::Down);
+        assert_eq!(ed.undo_depth(), 0);
+        assert_eq!(ed.arena_centis_at(3, 0), 0);
+        assert!(ed.message.contains("これ以上"), "{}", ed.message);
+    }
+
+    #[test]
+    fn the_guild_screen_carries_the_arena_log_as_its_second_view() {
+        let mut ed = editor_on_a_used_slot();
+        ed.screen = Screen::Guild;
+        // A view of the same screen, not a screen of its own: the progress
+        // screen's B still lands on Guild, and the slot base is the same.
+        assert_eq!(ed.guild_view(), GUILD_TAB_CARD);
+        ed.set_guild_view(GUILD_TAB_ARENA);
+        assert_eq!(ed.guild_view(), GUILD_TAB_ARENA);
+        assert_eq!(ed.screen, Screen::Guild);
+
+        // The rows are the game's arena quests, and the console fallback prints
+        // one fixed-width row per arena: five ten-cell columns after a 20-cell
+        // name column, so 75 cells at most.
+        assert_eq!(ARENA_NAMES.len(), ARENA_ROWS);
+        assert_eq!(arena_name(0), "ホロロホルル");
+        assert_eq!(arena_name(ARENA_ROWS - 1), "ババコンガ");
+        assert_eq!(arena_name(ARENA_ROWS), "");
+        assert_eq!(arena_rank_name(0), "1位");
+        assert_eq!(arena_rank_name(4), "5位");
+        assert_eq!(arena_part_name(ARENA_PART_MIN), "分");
+        assert_eq!(arena_part_name(ARENA_PART_SEC), "秒");
+        assert_eq!(arena_part_name(ARENA_PART_CS), "1/100");
+
+        let lines = ed.lines();
+        let text = lines
+            .iter()
+            .map(|l| l.text.clone())
+            .collect::<Vec<_>>()
+            .join("
+");
+        assert!(text.contains("ARENA LOG"), "{}", text);
+        for name in ARENA_NAMES {
+            assert!(text.contains(name), "{} is missing:\n{}", name, text);
+        }
+        // One selectable line per arena and exactly one cursor.
+        assert_eq!(lines.iter().filter(|l| l.selectable).count(), ARENA_ROWS);
+        assert_eq!(lines.iter().filter(|l| l.cursor).count(), 1);
+        // Nothing runs past the console's eighty cells.
+        for line in &lines {
+            let cells: usize = line.text.chars().map(char_cells).sum();
+            assert!(cells <= 80, "{} cells: {}", cells, line.text);
+        }
+
+        // B steps back one level at a time: the log -> the card -> the slots.
+        ed.input(Key::B);
+        assert_eq!(ed.guild_view(), GUILD_TAB_CARD);
+        assert_eq!(ed.screen, Screen::Guild);
+        // [X] is the save key on the card too, not a second "next field": the
+        // field did not move and a write was asked for.
+        let field = ed.guild_field;
+        ed.input(Key::X);
+        assert_eq!(ed.guild_field, field);
+        assert!(
+            ed.take_write().is_some(),
+            "X on the card must ask for the save to be written"
+        );
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::Slots);
     }
 
     #[test]

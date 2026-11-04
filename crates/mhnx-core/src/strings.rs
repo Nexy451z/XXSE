@@ -376,8 +376,55 @@ catalogue! {
     "items.clamp_done", "{0} 枠の個数を 99 に丸めました（元に戻せます）", "Capped {0} slots at 99 (undo is available)";
     "items.undo_label", "アイテムボックス", "Item box";
 
+    // The confirmation dialogs of the same tab. They are separate keys from the
+    // buttons that open them: a button is a label and a dialog is a sentence
+    // with the numbers in it, and a translation may word the two apart. The
+    // audit found these five dialogs still spoken in Japanese inside an English
+    // frame (AUDIT8 §4 N1), which is why they live here now.
+    "confirm.fill_all_title", "全部 99 個にします", "Set every used slot to 99";
+    "confirm.fill_all_body", "使っている {0} 枠の個数を、すべて 99 個にします。\n今の個数は失われます（この操作は元に戻せます）。", "Set all {0} used slots to 99.\nThe counts they hold now are lost (this can be undone).";
+    "confirm.fill_all_yes", "99 個にする", "Set to 99";
+
+    "confirm.dedupe_title", "重複を整理します", "Merge duplicates";
+    "confirm.dedupe_body", "同じアイテムの 2 枠目以降を 1 枠にまとめます。", "Merge a second stack of the same item into the first.";
+    "confirm.dedupe_line", "{0} 枠を解放、{1} 個を失います", "Frees {0} slots and loses {1} items";
+    "confirm.dedupe_lost", "1 枠に 99 個までしか入らないため、あふれた分は失われます。", "A slot holds at most 99, so anything past that is lost.";
+    "confirm.dedupe_undo", "この操作は元に戻せます。", "This can be undone.";
+    "confirm.dedupe_yes", "整理する", "Merge";
+
+    "confirm.compact_title", "空きを詰めます", "Compact the box";
+    "confirm.compact_body", "空き枠を消して、使っている {0} 枠を前へ詰めます。\n順序が変わります（アイテムと個数はそのままです）。\nこの操作は元に戻せます。", "Drop the empty slots and move the {0} used ones to the front.\nThe order changes (the items and counts do not).\nThis can be undone.";
+    "confirm.compact_yes", "詰める", "Compact";
+
+    "confirm.clamp_title", "個数を 99 に丸めます", "Cap the counts at 99";
+    "confirm.clamp_body", "99 を超えている {0} 枠の個数を 99 に戻します。\n超えた分は失われます（この操作は元に戻せます）。", "Bring the {0} slots above 99 back to 99.\nWhat is above 99 is lost (this can be undone).";
+    "confirm.clamp_yes", "丸める", "Cap";
+
+    "confirm.csv_title", "CSV を読み込みます", "Import the CSV";
+    "confirm.csv_yes", "適用する", "Apply";
+    "confirm.csv_none", "読み込んだ CSV がありません", "No CSV has been read yet";
+    "confirm.csv_body", "{0} を {1} に書き込みます。\n{2}（{3} 行）\n\n", "{0} is written into {1}.\n{2} ({3} rows)\n\n";
+    "confirm.csv_report", "書き込み {0} 行 / 対象外 {1} 行 / 丸め {2} 行", "{0} rows applied / {1} skipped / {2} clamped";
+    "confirm.csv_more", "・ほか {0} 件", "・{0} more";
+    "confirm.csv_note", "「適用する」でセーブデータに反映します（ファイルへは「上書き保存」で書き込みます）。", "Apply changes the save in the editor; Save writes it to the file.";
+    "confirm.csv_kind_items", "アイテムボックスの CSV", "the item box CSV";
+    "confirm.csv_kind_equip", "装備ボックスの CSV", "the equipment box CSV";
+    "confirm.csv_target_items", "枠 {0} のアイテムボックス", "the item box of slot {0}";
+    "confirm.csv_target_equip", "枠 {0} の装備ボックス", "the equipment box of slot {0}";
+    "confirm.csv_written", "{0} を書き出しました: {1}（{2} 行）", "Wrote {0}: {1} ({2} rows)";
+    "confirm.csv_write_failed", "CSV を書き出せません: {0}（{1}）", "The CSV could not be written: {0} ({1})";
+    "confirm.csv_applied", "{0} を適用しました: {1}", "Applied {0}: {1}";
+    "confirm.csv_failed", "CSV を適用できませんでした: {0}", "The CSV could not be applied: {0}";
+    "confirm.csv_undo", "CSV（{0}）の適用", "Applied CSV ({0})";
+
+    // What the character tab says about the two colours the game rewrites on
+    // save (AUDIT8 §4 N2), and the line the MHGU save keeps above the tabs
+    // (AUDIT8 §4 N8).
+    "save.color_overwritten", "ゲームが保存時に上書きします（編集しても反映されません）", "The game overwrites this when it saves (an edit here will not show)";
+    "save.mhgu_banner", "このセーブは MHGU です。MHXX の値として表示しています。保存はできません。", "This save is MHGU. It is shown as MHXX values; it cannot be saved.";
+
     "settings.language", "言語", "Language";
-    "settings.language_hint", "いまはアイテムタブの文言だけが切り替わります。訳の無い文は日本語のまま出ます。", "Only the item tab is translated so far; a line with no translation yet stays in Japanese.";
+    "settings.language_hint", "いまはアイテムタブ・確認ダイアログ・キャラタブの注記が切り替わります。訳の無い文は日本語のまま出ます。", "The item tab, its confirmation dialogs and the character tab's notes follow this choice so far; a line with no translation yet stays in Japanese.";
     "settings.language_saved", "言語を {0} にしました（次回も同じ言語で開きます）", "Language set to {0}; the next run opens with it";
     "settings.language_memory", "言語を {0} にしました（設定を保存できないため、この起動のあいだだけです）", "Language set to {0}; it could not be saved, so this run only";
     "settings.language_failed", "言語を {0} にしました（保存できません: {1}）", "Language set to {0}, but it was not saved: {1}";

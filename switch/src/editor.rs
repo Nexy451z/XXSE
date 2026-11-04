@@ -1039,11 +1039,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         // Minus on the card opens this screen; here the three views are the
         // sub-tabs above, so Y is the second bit of the quest view (seen) and
         // the view key on the other two - the footer names which, per view.
+        // The card's own view: [X] is the save key on every screen, and the
+        // arena log is the other view of this screen, reached with L / R.
         Guild => &[
             ("</>", "値"),
-            ("X", "項目"),
             ("A", "コメント"),
             ("-", "進行状況"),
+            ("L/R", "闘技大会"),
+            ("X", "保存"),
             ("B", "戻る"),
         ],
         Progress => &[
@@ -1168,6 +1171,10 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         if !ed.set_guild_comment(&s) {
             ed.message = String::from("コメントを変更できませんでした");
         }
+    } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
+        // The parser in the core owns the format (and the message a bad one
+        // gets), so the layer only hands the text over.
+        ed.apply_arena_time(&s);
     } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME {
         let which = idx - mhnx_core::hbedit::TEXT_PALICO_NAME;
         let clipped: String = s.chars().take(20).collect();
@@ -1369,6 +1376,10 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("マイセットの名前 (最大31B / 全角10文字)", 31)
         } else if idx == mhnx_core::hbedit::TEXT_GUILD_COMMENT {
             ("ギルドカードのコメント", 54)
+        } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
+            // m:ss.cc is at most "10:55.35" (8 bytes); the keyboard still
+            // allows the raw hundredths form the parser accepts.
+            ("闘技大会のタイム (m:ss.cc 例 9:35.44 / 0:00.00 で消去)", 12)
         } else if idx >= mhnx_core::hbedit::TEXT_PALICO_NAME
             && idx < mhnx_core::hbedit::TEXT_GUILD_COMMENT
         {

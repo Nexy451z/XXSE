@@ -27,11 +27,12 @@ use mhnx_core::check::Severity;
 use mhnx_core::dlcats::{self, Lang};
 use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
-    decoration_name_of, item_name_of, monster_name, palico_part_name, palico_skill_tab_name,
-    Editor, ItemSetOp, Key, PalicoEquipRow, PalicoSkillRow, Screen, CHAR_FIELDS, CONSOLE_SAVE,
-    CSV_DIR, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT, ITEM_OP_DEDUPE, ITEM_OP_UNDO,
-    ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS, PROGRESS_AWARDS,
-    PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
+    arena_clock, arena_name, arena_part_name, arena_rank_name, decoration_name_of, item_name_of,
+    monster_name, palico_part_name, palico_skill_tab_name, Editor, ItemSetOp, Key, PalicoEquipRow,
+    PalicoSkillRow, Screen, ARENA_COLUMNS, ARENA_PARTS, ARENA_ROWS, CHAR_FIELDS, CONSOLE_SAVE,
+    CSV_DIR, GUILD_TAB_ARENA, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT, ITEM_OP_DEDUPE,
+    ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE, PALICO_EQUIP_ROWS,
+    PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS, SET_ROW_NAME, STEPS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -251,6 +252,8 @@ pub enum UiAction {
     SetStep(usize),
     SelectRow(usize),
     ActivateRow(usize),
+    /// One cell of the arena grid: (arena row, rank column).
+    ArenaCell(usize, usize),
     AdjustRow(usize, Key),
     AdjustBy(i64),
     SetRowMax(usize),
@@ -696,21 +699,29 @@ impl GuiState {
                 (labels, active)
             }
             MainSection::PalicoRecord => {
+                // The guild card carries two views of its own - the card and
+                // the arena log it ends with - so the bar names both and the
+                // cursor stays on one Screen. Six tabs still fit between the
+                // L button (60px) and the right-hand tool pills (880px): the
+                // widest label is ギルドカード at 6 CJK glyphs, 102px + 24 of
+                // padding = 126, and 109+109+92+126+92+92 + 5*6 = 650.
                 let labels: &'static [&'static str] = &[
                     "所持オトモ",
                     "配信オトモ",
                     "狩猟記録",
                     "ギルドカード",
+                    "闘技大会",
                     "進行状況",
                 ];
                 let active = match ed.screen {
                     Screen::Roster => 0,
                     Screen::Palico => 1,
                     Screen::Hunts => 2,
+                    Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => 4,
                     Screen::Guild => 3,
                     // The progress screen returns above with its own three
                     // tabs, so this arm is only reached when it is not showing.
-                    _ => 4,
+                    _ => 5,
                 };
                 (labels, active)
             }
@@ -933,6 +944,15 @@ impl GuiState {
                 }
                 3 => {
                     ed.screen = Screen::Guild;
+                    ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_CARD);
+                }
+                4 => {
+                    if ed.save.is_none() {
+                        ed.message = String::from("先にセーブデータを開いてください");
+                        return;
+                    }
+                    ed.screen = Screen::Guild;
+                    ed.set_guild_view(GUILD_TAB_ARENA);
                 }
                 _ => {
                     if ed.save.is_none() {
@@ -1280,6 +1300,9 @@ impl GuiState {
                 }
                 other => ed.input(other),
             },
+            // The arena view of the guild screen owns every key: there [Y] is
+            // the direct time input, not the card's step key.
+            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => ed.input(key),
             Screen::Guild => match key {
                 Key::Y => {
                     ed.step = (ed.step + 1) % STEPS.len();
@@ -1632,6 +1655,13 @@ impl GuiState {
             }
             UiAction::SelectRow(idx) => {
                 set_active_cursor(ed, self, idx);
+            }
+            // A tap on one time cell moves the cursor and nothing else: the
+            // edit still starts with [A], so a tap can never write a time.
+            UiAction::ArenaCell(row, rank) => {
+                ed.arena_row = row.min(ARENA_ROWS.saturating_sub(1));
+                ed.arena_rank = rank.min(ARENA_COLUMNS.saturating_sub(1));
+                ed.arena_edit = false;
             }
             UiAction::ActivateRow(idx) => {
                 set_active_cursor(ed, self, idx);
@@ -2257,7 +2287,13 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::EquipEdit => ed.equip_edit.map(|e| e.field).unwrap_or(0),
         Screen::JewelPick => ed.jewel_pick_cursor,
         Screen::Hunts => ed.hunt_cursor,
-        Screen::Guild => ed.guild_field,
+        Screen::Guild => {
+            if ed.guild_view() == GUILD_TAB_ARENA {
+                ed.arena_row
+            } else {
+                ed.guild_field
+            }
+        }
         // One cursor per view: the screen swaps the list under it.
         Screen::Progress => ed.progress_cursor(),
         // A mode's row while one is open, the list's row otherwise.
@@ -2328,7 +2364,13 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::EquipEdit => ed.equip_edit.map(|e| e.rows()).unwrap_or(0),
         Screen::JewelPick => ed.jewel_pick_matches().len(),
         Screen::Hunts => ed.hunt_rows().len(),
-        Screen::Guild => 3,
+        Screen::Guild => {
+            if ed.guild_view() == GUILD_TAB_ARENA {
+                ARENA_ROWS
+            } else {
+                3
+            }
+        }
         Screen::Progress => ed.progress_len(),
         Screen::Roster => match ed.palico_skill {
             Some(_) => ed.palico_skill_list_len(),
@@ -2482,7 +2524,14 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         }
         Screen::JewelPick => ed.jewel_pick_cursor = clamped,
         Screen::Hunts => ed.hunt_cursor = clamped,
-        Screen::Guild => ed.guild_field = clamped,
+        Screen::Guild => {
+            if ed.guild_view() == GUILD_TAB_ARENA {
+                ed.arena_row = clamped.min(ARENA_ROWS.saturating_sub(1));
+                ed.arena_edit = false;
+            } else {
+                ed.guild_field = clamped;
+            }
+        }
         Screen::Progress => ed.set_progress_cursor(clamped),
         Screen::Roster => {
             if let Some(mut state) = ed.palico_skill {
@@ -3165,6 +3214,24 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, "最大金冠 200%", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::MibPreset(1));
             }
+            // The arena view: the two keys a time that is not being stepped
+            // still needs.
+            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[Y] 直接入力", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Y));
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                let lbl = if ed.arena_edit {
+                    "[A] 編集終了"
+                } else {
+                    "[A] 編集開始"
+                };
+                btn_text(c, 1108, sy, 158, sh, lbl, t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
+            }
             Screen::EntryView => {
                 let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
@@ -3255,6 +3322,18 @@ impl GuiState {
             Screen::Mib => "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存",
             Screen::Gmd => "[A] 文章編集  [L/R] サブタブ  [X] 保存  [B] 戻る",
             Screen::EntryView => "[◀/▶] 座標・数値変更  [Y] 刻み  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            // The guild card's two views: a short form and a grid, so the
+            // chips differ. Both fit the 1262px line at Small: the longest of
+            // them is about 574px, and the status message keeps its own room.
+            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA && ed.arena_edit => {
+                "[◀/▶] 分/秒/1-100  [▲/▼] 増減  [A] 終了  [Y] 直接入力  [X] 保存"
+            }
+            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => {
+                "[▲/▼] アリーナ  [◀/▶] 順位  [A] 編集  [Y] 直接入力  [X] 保存  [B] カードへ"
+            }
+            Screen::Guild => {
+                "[▼] 項目  [◀/▶] 増減  [A] コメント  [-] 進行状況  [L/R] タブ  [X] 保存"
+            }
             _ => "[A] 決定  [◀/▶] 調整  [L/R] サブタブ  [ZL/ZR] セクション  [X] 保存",
         };
         let hint_w = c.text_width_sized(hint, FontSize::Small);
@@ -3439,6 +3518,7 @@ impl GuiState {
             Screen::Roster => self.draw_roster(c, ed),
             Screen::Palico => self.draw_palico(c, ed),
             Screen::Hunts => self.draw_hunts(c, ed),
+            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => self.draw_arena(c, ed),
             Screen::Guild => self.draw_guild(c, ed),
             Screen::Progress => self.draw_progress(c, ed),
             Screen::SaveQuests => self.draw_save_quests(c, ed),
@@ -5893,15 +5973,341 @@ impl GuiState {
                 String::from("#03"),
             ),
         ];
-        self.draw_adaptive_rows(
+        // The card ends with the arena log, so the list says where the other
+        // view is: the user reported the log as missing, and a tab that is only
+        // in the bar is the kind of thing that stays missing.
+        let mut warnings: Vec<String> = Vec::new();
+        warnings.push(String::from("[L/R] 闘技大会タブ: アリーナ 17 × 順位 5 のタイムを編集"));
+        self.draw_adaptive_rows_warn(
             c,
             ed,
             "ギルドカード",
-            "",
             &rows,
             ed.guild_field.min(2),
             true,
             "編集",
+            &warnings,
+        );
+    }
+
+    /// 闘技大会: the arena log at the end of the guild card.
+    ///
+    /// The PC build edits the same entries on its ギルド tab through
+    /// guildcard::set_arena_time; this is the same writer with a pad. The list
+    /// is the overview - every recorded time of the card on one screen, which
+    /// is exactly what the user could not find - and the right panel is the one
+    /// cell the cursor is on, split into 分 / 秒 / 1/100.
+    ///
+    /// Geometry, checked against the three font sizes this build loads
+    /// (Small 17px, Medium 22px, Large 28px; a CJK glyph advances the full
+    /// size, ASCII about half of it, so the widest thing a column can hold is
+    /// what decides its width):
+    ///
+    ///   title     y 102..124 (Medium), clipped to 620 wide from x 24, so it
+    ///             ends by 644; the counter on the right is "17 × 5"
+    ///             (6 ASCII = 54) and starts at 812 - 54 = 758.
+    ///   list      x 20..816, y 132..658.
+    ///     header  y 140..157, rule y 164
+    ///     rows    y 172 + i*28, i in 0..17 -> last row 620..648, panel ends
+    ///             658, so ten pixels of slack.
+    ///     index   right-aligned to x 58 ("17" = 18, so it starts by 40)
+    ///     name    x 60..296 (236 wide; the longest name is 7 CJK = 119)
+    ///     times   x 308 + r*92, 92 wide -> 308/400/492/584/676, the last ends
+    ///             at 768, forty pixels inside the panel's 808 edge. A time is
+    ///             at most "10:55.35", 8 ASCII = 72 at Small, right-aligned to
+    ///             x + 84, so it starts no further left than 92 - 72 = 20 into
+    ///             its cell: no two columns can touch.
+    ///   inspector x 832..1260 (428 wide, 20 and 388 used).
+    ///     y 14  caption (17 tall, ends 31)
+    ///     y 40  arena name (22 tall, ends 62)
+    ///     y 68  rank caption (17, ends 85)
+    ///     y 92  value box 54 tall -> ends 146
+    ///     y 156 parts, 64 tall -> ends 220
+    ///     y 232 rule
+    ///     y 242 hint (17, ends 259)
+    ///     y 268 [A] 44 tall -> ends 312
+    ///     y 322 two buttons 40 tall -> ends 362
+    ///     y 372 [B] 40 tall -> ends 412
+    ///     y 424/448 notes (17 each) -> ends 465, panel ends 658
+    fn draw_arena(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        let grid = ed.arena_grid();
+        let (cur_row, cur_rank) = ed.arena_selected();
+
+        c.text_clipped(
+            MAIN_X + 4,
+            CONTENT_Y,
+            620,
+            &format!("闘技大会の記録  slot {}", ed.slot + 1),
+            t.text_primary,
+            FontSize::Medium,
+        );
+        c.text_right(
+            MAIN_X + V1_LIST_W - 4,
+            CONTENT_Y + 3,
+            &format!("{} × {}", ARENA_ROWS, ARENA_COLUMNS),
+            t.text_secondary,
+            FontSize::Small,
+        );
+
+        let body_y = CONTENT_Y + 30; // 132
+        let body_h = FOOTER_Y - body_y - 10; // 526
+
+        // ---- left: the grid
+        c.round_rect(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, 1, t.border_subtle);
+
+        const IDX_X: i32 = MAIN_X + 16; // 36
+        const NAME_X: i32 = MAIN_X + 40; // 60
+        const TIME_X: i32 = MAIN_X + 288; // 308
+        const TIME_W: i32 = 92;
+        const ROW_H: i32 = 28;
+        let rows_y = body_y + 40;
+
+        c.text_sized(NAME_X, body_y + 8, "アリーナ", t.text_muted, FontSize::Small);
+        for r in 0..ARENA_COLUMNS {
+            let sel = r == cur_rank;
+            c.text_centered(
+                TIME_X + (r as i32) * TIME_W,
+                body_y + 8,
+                TIME_W,
+                18,
+                arena_rank_name(r),
+                if sel { t.accent_primary } else { t.text_muted },
+                FontSize::Small,
+            );
+        }
+        c.hline(MAIN_X + 12, body_y + 32, V1_LIST_W - 24, t.border_subtle);
+
+        for a in 0..ARENA_ROWS {
+            let ry = rows_y + (a as i32) * ROW_H;
+            let is_row = a == cur_row;
+            if is_row {
+                c.round_rect(MAIN_X + 8, ry, V1_LIST_W - 16, ROW_H, 5, t.bg_selected);
+            } else if a % 2 == 1 {
+                c.round_rect(MAIN_X + 8, ry, V1_LIST_W - 16, ROW_H, 5, t.bg_row_odd);
+            }
+            // A tap on the name area moves the row and keeps the rank; the
+            // cells below add their own, narrower hits on top of it.
+            self.add_hit(
+                MAIN_X + 8,
+                ry,
+                TIME_X - MAIN_X - 8,
+                ROW_H,
+                UiAction::ArenaCell(a, cur_rank),
+            );
+            c.text_right(
+                IDX_X + 22,
+                ry + 6,
+                &format!("{:02}", a + 1),
+                if is_row { t.accent_primary } else { t.text_muted },
+                FontSize::Small,
+            );
+            c.text_clipped(
+                NAME_X,
+                ry + 6,
+                236,
+                arena_name(a),
+                if is_row { t.text_primary } else { t.text_secondary },
+                FontSize::Small,
+            );
+            for r in 0..ARENA_COLUMNS {
+                let col_x = TIME_X + (r as i32) * TIME_W;
+                let cell = grid.get(a).and_then(|row| row.get(r)).copied().unwrap_or(0);
+                let sel = is_row && r == cur_rank;
+                self.add_hit(col_x, ry, TIME_W, ROW_H, UiAction::ArenaCell(a, r));
+                if sel {
+                    c.round_rect(col_x + 2, ry + 2, TIME_W - 4, ROW_H - 4, 4, t.bg_val_box);
+                    c.round_rect_border(
+                        col_x + 2,
+                        ry + 2,
+                        TIME_W - 4,
+                        ROW_H - 4,
+                        4,
+                        1,
+                        t.border_focus,
+                    );
+                }
+                let (text, color) = if cell == 0 {
+                    (
+                        String::from("-"),
+                        if sel { t.accent_warn } else { t.text_muted },
+                    )
+                } else {
+                    (
+                        arena_clock(cell),
+                        if sel {
+                            t.accent_primary
+                        } else if is_row {
+                            t.text_primary
+                        } else {
+                            t.text_secondary
+                        },
+                    )
+                };
+                c.text_right(col_x + TIME_W - 8, ry + 6, &text, color, FontSize::Small);
+            }
+        }
+
+        self.draw_arena_inspector(c, ed, body_y, body_h, cur_row, cur_rank);
+    }
+
+    /// The right-hand panel of the arena view: the cell the pad is on.
+    fn draw_arena_inspector(
+        &mut self,
+        c: &mut Canvas,
+        ed: &Editor,
+        iy: i32,
+        ih: i32,
+        cur_row: usize,
+        cur_rank: usize,
+    ) {
+        let t = theme();
+        let ix = V1_INSP_X; // 832
+        let iw = V1_INSP_W; // 428
+        c.round_rect(ix, iy, iw, ih, t.corner_r, t.bg_panel);
+        c.round_rect_border(ix, iy, iw, ih, t.corner_r, 1, t.border_subtle);
+
+        c.text_sized(ix + 20, iy + 14, "選択中", t.accent_primary, FontSize::Small);
+        c.text_right(
+            ix + iw - 20,
+            iy + 14,
+            &format!("#{} / {}", cur_row + 1, ARENA_ROWS),
+            t.text_muted,
+            FontSize::Small,
+        );
+        c.text_clipped(ix + 20, iy + 40, iw - 40, arena_name(cur_row), t.text_primary, FontSize::Medium);
+        c.text_clipped(
+            ix + 20,
+            iy + 68,
+            iw - 40,
+            &format!("{} のタイム", arena_rank_name(cur_rank)),
+            t.text_secondary,
+            FontSize::Small,
+        );
+
+        // The value: the whole time in the largest size the panel has, with the
+        // three parts underneath so a step has somewhere to show.
+        let centis = ed.arena_centis();
+        let value = if centis == 0 {
+            String::from("0:00.00")
+        } else {
+            arena_clock(centis)
+        };
+        c.round_rect(ix + 20, iy + 92, iw - 40, 54, 6, t.bg_val_box);
+        c.round_rect_border(ix + 20, iy + 92, iw - 40, 54, 6, 1, t.border_subtle);
+        btn_text(
+            c,
+            ix + 20,
+            iy + 92,
+            iw - 40,
+            54,
+            &value,
+            if centis == 0 { t.text_muted } else { t.accent_primary },
+            FontSize::Large,
+        );
+
+        let part_w = (iw - 56) / 3; // 124
+        let part = ed.arena_part.min(ARENA_PARTS - 1);
+        for p in 0..ARENA_PARTS {
+            let px = ix + 20 + (p as i32) * (part_w + 8);
+            let active = p == part;
+            let bg = if active { t.bg_selected } else { t.bg_val_box };
+            c.round_rect(px, iy + 156, part_w, 64, 6, bg);
+            c.round_rect_border(
+                px,
+                iy + 156,
+                part_w,
+                64,
+                6,
+                1,
+                if active { t.border_focus } else { t.border_subtle },
+            );
+            c.text_sized(
+                px + 10,
+                iy + 164,
+                arena_part_name(p),
+                if active { t.accent_primary } else { t.text_muted },
+                FontSize::Small,
+            );
+            c.text_right(
+                px + part_w - 10,
+                iy + 186,
+                &format!("{}", ed.arena_part_value(p)),
+                if active { t.accent_primary } else { t.text_primary },
+                FontSize::Medium,
+            );
+        }
+        // The arrow that steps the parts is the one the footer names; the label
+        // above the boxes says which part is under it while editing.
+        c.hline(ix + 16, iy + 232, iw - 32, t.border_subtle);
+        c.text_clipped(
+            ix + 20,
+            iy + 242,
+            iw - 40,
+            if ed.arena_edit {
+                "編集中: [◀/▶] 項目  [▲/▼] 増減  [A] 終了"
+            } else {
+                "[A] で編集開始（分・秒・1/100 を増減）"
+            },
+            if ed.arena_edit { t.accent_warn } else { t.text_muted },
+            FontSize::Small,
+        );
+
+        let a_label = if ed.arena_edit {
+            String::from("[A] 編集を終了")
+        } else {
+            String::from("[A] 編集を開始")
+        };
+        c.round_rect(ix + 20, iy + 268, iw - 40, 44, 6, t.accent_primary);
+        btn_text(
+            c,
+            ix + 20,
+            iy + 268,
+            iw - 40,
+            44,
+            &a_label,
+            white_or_dark(t.accent_primary),
+            FontSize::Medium,
+        );
+        self.add_hit(ix + 20, iy + 268, iw - 40, 44, UiAction::Key(Key::A));
+
+        let half = (iw - 48) / 2; // 190
+        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, "[Y] 直接入力", UiAction::Key(Key::Y));
+        self.draw_tool_button(
+            c,
+            ix + 28 + half,
+            iy + 322,
+            half,
+            40,
+            "[X] 保存",
+            UiAction::QuickSave,
+        );
+        self.draw_tool_button(
+            c,
+            ix + 20,
+            iy + 372,
+            iw - 40,
+            40,
+            "[B] ギルドカードへ",
+            UiAction::Key(Key::B),
+        );
+
+        c.text_clipped(
+            ix + 20,
+            iy + 424,
+            iw - 40,
+            "タイムは 1/100 秒。0:00.00 で記録を消します",
+            t.text_muted,
+            FontSize::Small,
+        );
+        c.text_clipped(
+            ix + 20,
+            iy + 448,
+            iw - 40,
+            "アリーナ名はクエスト一覧の順（実機未確認）",
+            t.text_muted,
+            FontSize::Small,
         );
     }
 

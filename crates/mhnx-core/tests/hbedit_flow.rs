@@ -3135,6 +3135,83 @@ fn the_console_shows_the_guild_card_and_arena() {
     assert_eq!(ed.screen, Screen::Slots);
 }
 
+/// The arena log of the real save, on the view that edits it.
+///
+/// The user reported the records as missing and uneditable, so this drives the
+/// view the console now has: every stored time must be on screen, and one press
+/// must move exactly the two bytes of the entry it names and nothing else.
+#[test]
+fn the_arena_view_finds_the_times_the_real_save_holds() {
+    if !real_save().exists() {
+        return;
+    }
+    let mut ed = Editor::new();
+    open_save(&mut ed);
+    ed.input(Key::Minus);
+    ed.input(Key::L);
+    assert_eq!(ed.screen, Screen::Guild);
+    ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_ARENA);
+    // A view of the guild screen, not a screen of its own.
+    assert_eq!(ed.screen, Screen::Guild);
+
+    // The grid is the log entry for entry.
+    let log = mhnx_core::guildcard::arena(ed.save.as_ref().expect("a save"), ed.slot);
+    let grid = ed.arena_grid();
+    for e in &log {
+        assert_eq!(grid[e.arena][e.rank], e.centis, "arena {} rank {}", e.arena, e.rank);
+    }
+    let recorded = log.iter().filter(|e| !e.is_empty()).count();
+    assert!(recorded > 0, "the sample save records no arena time at all");
+
+    // The console lists the arena by name and its time as a clock.
+    let first = *log.iter().find(|e| !e.is_empty()).expect("one record");
+    let joined = ed
+        .lines()
+        .iter()
+        .map(|l| l.text.clone())
+        .collect::<Vec<_>>()
+        .join("
+");
+    assert!(joined.contains("ARENA LOG"), "{}", joined);
+    assert!(
+        joined.contains(mhnx_core::hbedit::arena_name(first.arena)),
+        "{} is missing from\n{}",
+        mhnx_core::hbedit::arena_name(first.arena),
+        joined
+    );
+    assert!(
+        joined.contains(&mhnx_core::hbedit::arena_clock(first.centis)),
+        "the time {} is missing from\n{}",
+        mhnx_core::hbedit::arena_clock(first.centis),
+        joined
+    );
+
+    // One press moves the two time bytes of that entry and nothing else.
+    ed.arena_row = first.arena;
+    ed.arena_rank = first.rank;
+    let before = ed.save.as_ref().expect("a save").body().to_vec();
+    assert!(
+        ed.set_arena_time_at(first.arena, first.rank, first.centis.saturating_add(1)),
+        "{}",
+        ed.message
+    );
+    let after = ed.save.as_ref().expect("a save").body().to_vec();
+    let changed: Vec<usize> = before
+        .iter()
+        .zip(after.iter())
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(i, _)| i)
+        .collect();
+    assert!(!changed.is_empty(), "the write changed nothing");
+    assert!(changed.len() <= 2, "one time is two bytes, got {:?}", changed);
+
+    // The undo puts the save back byte for byte.
+    assert!(ed.undo_last(), "{}", ed.message);
+    let restored = ed.save.as_ref().expect("a save").body().to_vec();
+    assert_eq!(restored, before, "the undo must restore the save exactly");
+}
+
 #[test]
 fn the_console_lists_the_palicos() {
     if !real_save().exists() {
