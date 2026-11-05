@@ -3731,7 +3731,7 @@ fn the_console_entry_is_labelled_in_the_list() {
 // ===========================================================================
 
 /// Every Screen variant, so the reachability test cannot miss a new one.
-const AUDIT_SCREENS: [Screen; 28] = [
+const AUDIT_SCREENS: [Screen; 29] = [
     Screen::SaveList,
     Screen::Slots,
     Screen::Char,
@@ -3743,6 +3743,7 @@ const AUDIT_SCREENS: [Screen; 28] = [
     Screen::Equip,
     Screen::EquipEdit,
     Screen::JewelPick,
+    Screen::EquipPick,
     Screen::QuestEquip,
     Screen::Hunts,
     Screen::Guild,
@@ -3786,6 +3787,7 @@ fn audit_screen_name(s: Screen) -> &'static str {
         Screen::Equip => "Equip",
         Screen::EquipEdit => "EquipEdit",
         Screen::JewelPick => "JewelPick",
+        Screen::EquipPick => "EquipPick",
         Screen::QuestEquip => "QuestEquip",
         Screen::Hunts => "Hunts",
         Screen::Guild => "Guild",
@@ -4003,6 +4005,20 @@ fn audit_every_screen_is_reachable_by_keys() {
     );
     press!(Key::Y);
     assert_eq!(ed.screen, Screen::JewelPick);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::EquipEdit);
+    // The form's other name picker: [Y] on the ID row lists the equipment
+    // names, which is the screen the hardware report was about.
+    for _ in 0..3 {
+        press!(Key::Down);
+    }
+    assert_eq!(
+        ed.equip_edit.map(|e| e.field),
+        Some(8),
+        "the cursor must land on the ID row"
+    );
+    press!(Key::Y);
+    assert_eq!(ed.screen, Screen::EquipPick);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::EquipEdit);
     press!(Key::B);
@@ -4818,7 +4834,7 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
         .collect();
     assert_eq!(
         arms.len(),
-        28,
+        29,
         "arms: {:?}",
         arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     );

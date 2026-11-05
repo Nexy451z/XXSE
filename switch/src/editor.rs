@@ -45,8 +45,11 @@ const BTN_LEFT: u64 = (1 << 12) | (1 << 16);
 const BTN_UP: u64 = (1 << 13) | (1 << 17);
 const BTN_RIGHT: u64 = (1 << 14) | (1 << 18);
 const BTN_DOWN: u64 = (1 << 15) | (1 << 19);
-// Right Stick Up/Down for fast page scrolling
+// Right stick: the stick's two vertical pseudo-buttons turn pages, and its two
+// horizontal ones jump to the ends of the list (services/hid.h, StickR*).
+const BTN_RSTICK_LEFT: u64 = 1 << 20;
 const BTN_RSTICK_UP: u64 = 1 << 21;
+const BTN_RSTICK_RIGHT: u64 = 1 << 22;
 const BTN_RSTICK_DOWN: u64 = 1 << 23;
 // Only directional buttons auto-repeat when held so action buttons (A/B/X/Y/L/R) never misfire.
 const BTN_REPEATABLE: u64 = BTN_LEFT | BTN_UP | BTN_RIGHT | BTN_DOWN;
@@ -81,9 +84,10 @@ const QUEST_DIRS: [&CStr; 7] = [
 /// produces, with room for other kinds of output later.
 pub const OUT_QUEST_DIR: &str = "/switch/XXSE/mhxx/quest/arc";
 
-/// Repeating a held button would be nicer, but edge triggered keeps the code
-/// simple and predictable. This many frames must pass before a repeat.
-const REPEAT_DELAY: u32 = 12;
+// The auto-repeat timing itself lives in mhnx_core::hbedit::KeyRepeat, with
+// tests: 8 frames to the first repeat (133ms), then every 4, then every 3 once
+// the button has been held for a while. The old 12 / 4 cadence moved a 340 row
+// list 15 rows a second and felt like it had not heard the press.
 
 // ---------------------------------------------------------------------------
 // file helpers
@@ -1013,6 +1017,7 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Equip => "装備",
         EquipEdit => "装備編集",
         JewelPick => "装飾品を選ぶ",
+        EquipPick => "装備を名前で選ぶ",
         QuestEquip => "クエスト装備",
         SaveQuests => "クエスト (セーブ内)",
         ArcList => "クエスト (.arc)",
@@ -1123,10 +1128,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("R", "オトモ"),
             ("B", "戻る"),
         ],
+        // [Y] is the name picker on every row of this form that has a name
+        // behind it: the three sockets open the decoration list, 種別 / ID the
+        // equipment list. [R] types the id of the 種別 / ID row.
         EquipEdit => &[
             ("A", "反映/作成"),
             ("</>", "値"),
-            ("Y", "装飾品"),
+            ("Y", "装備名/装飾品"),
+            ("R", "ID入力"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1135,6 +1144,18 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("◀/▶", "10件"),
             ("▲/▼", "1件"),
             ("Y", "絞る"),
+            ("X", "クリア"),
+            ("B", "戻る"),
+        ],
+        // The name picker: the same four movement chips as the other pick
+        // lists, plus [-] for the type filter and the hex note, because the id
+        // this list prints is the one it searches.
+        EquipPick => &[
+            ("A", "決定"),
+            ("◀/▶", "10件"),
+            ("▲/▼", "1件"),
+            ("Y", "名前で絞る"),
+            ("-", "種別"),
             ("X", "クリア"),
             ("B", "戻る"),
         ],
@@ -1297,6 +1318,14 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.apply_equip_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
         ed.apply_jewel_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
+        // Through the editor: an empty answer is the whole list again, which is
+        // the same rule the item picker's filter follows.
+        ed.apply_equip_pick_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_EQUIP_ID {
+        // Hex or decimal, and the row re-spells what it took so a wrong
+        // reading is on screen before anything is written.
+        ed.apply_equip_id_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
         // The parser in the core owns the format (and the message a bad one
         // gets), so the layer only hands the text over.
@@ -1552,6 +1581,19 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("装備名か種類で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
             ("装飾品名で絞り込み", 60)
+        } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
+            // Which of the two searches the picker will run: the names when
+            // this build has them, the hex ids when it does not. The state
+            // machine answers the same question (equip_pick_names_available),
+            // so the keyboard title and the list cannot promise different
+            // things.
+            if ed.equip_pick_names_available() {
+                ("装備名で絞り込み（部分一致 / 種別名でも可）", 60)
+            } else {
+                ("装備IDで絞り込み（名前が読めません 16進 例: 28）", 60)
+            }
+        } else if idx == mhnx_core::hbedit::TEXT_EQUIP_ID {
+            ("装備ID（16進 0x28 / 10進 40）", 8)
         } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
             // m:ss.cc is at most "10:55.35" (8 bytes); the keyboard still
             // allows the raw hundredths form the parser accepts.
@@ -1622,8 +1664,10 @@ pub fn run() -> i32 {
         ed.arc_files.len()
     );
 
+    // The direction held down and the repeat timer that goes with it. The timer
+    // is the core's, so the frames it fires on are pinned by a host test.
     let mut held: u64 = 0;
-    let mut hold_frames: u32 = 0;
+    let mut key_repeat = mhnx_core::hbedit::KeyRepeat::new();
     // L: held for the undo, tapped for the sub-tab.
     //
     // L is the sub-tab key on every screen, so the undo cannot be a plain L
@@ -1654,19 +1698,18 @@ pub fn run() -> i32 {
             let cur_dir = cur & BTN_REPEATABLE;
             let mut repeated = false;
             if cur_dir != held {
-                hold_frames = 0;
+                // A new direction is answered by its own edge press, and the
+                // repeat timer starts again from zero.
                 held = cur_dir;
+                key_repeat.press();
             } else if key.is_none() && cur_dir != 0 {
-                hold_frames += 1;
-                if hold_frames >= REPEAT_DELAY {
-                    hold_frames = if hold_frames > REPEAT_DELAY + 18 {
-                        REPEAT_DELAY - 2
-                    } else {
-                        REPEAT_DELAY - 4
-                    };
+                if key_repeat.tick(true) {
                     key = key_from(cur_dir);
                     repeated = true;
                 }
+            } else if key.is_none() {
+                // Nothing held: the timer is idle, not paused.
+                key_repeat.tick(false);
             }
             // One gesture, one undo step: the first press opens it, the repeats
             // this flag marks fold into it (Editor::push_undo), and the release
@@ -1693,10 +1736,16 @@ pub fn run() -> i32 {
                 l_pending = false;
                 l_fired = false;
                 if down & BTN_RSTICK_UP != 0 {
-                    painter.gui.scroll_mib_picker(-8);
+                    painter.gui.page_by(&mut ed, -1);
                     need_draw = true;
                 } else if down & BTN_RSTICK_DOWN != 0 {
-                    painter.gui.scroll_mib_picker(8);
+                    painter.gui.page_by(&mut ed, 1);
+                    need_draw = true;
+                } else if down & BTN_RSTICK_LEFT != 0 {
+                    painter.gui.jump_end(&mut ed, false);
+                    need_draw = true;
+                } else if down & BTN_RSTICK_RIGHT != 0 {
+                    painter.gui.jump_end(&mut ed, true);
                     need_draw = true;
                 }
                 if let Some(k) = key {
@@ -1761,12 +1810,24 @@ pub fn run() -> i32 {
                     need_draw = true;
                 }
 
-                // Right stick Up/Down scrolls lists by 8 rows
+                // The right stick is the coarse scroll input: up / down turn a
+                // page - as many rows as the screen shows - and left / right
+                // jump to the ends of the list. It is the one input that was
+                // free for it: ZL / ZR are the section keys, L / R the sub-tabs,
+                // and [＋] / [－] are a tool of their own on most screens. It was
+                // already the scroll key; it just moved a fixed eight rows,
+                // which is not a page on any screen that shows nine.
                 if down & BTN_RSTICK_UP != 0 {
-                    painter.gui.page_scroll(&mut ed, -8);
+                    painter.gui.page_by(&mut ed, -1);
                     need_draw = true;
                 } else if down & BTN_RSTICK_DOWN != 0 {
-                    painter.gui.page_scroll(&mut ed, 8);
+                    painter.gui.page_by(&mut ed, 1);
+                    need_draw = true;
+                } else if down & BTN_RSTICK_LEFT != 0 {
+                    painter.gui.jump_end(&mut ed, false);
+                    need_draw = true;
+                } else if down & BTN_RSTICK_RIGHT != 0 {
+                    painter.gui.jump_end(&mut ed, true);
                     need_draw = true;
                 }
 
@@ -1836,6 +1897,9 @@ pub fn run() -> i32 {
                     // Don't double-send Key::Z when ZR was already used for tab cycling,
                     // and Key::L is answered above (tap on release, hold for undo).
                     if k != Key::Z && k != Key::L {
+                        // A key press takes the list back from a coasting flick:
+                        // the two must never move the cursor at the same time.
+                        painter.gui.stop_fling();
                         l_clean = false;
                         // Some other key means the offer is gone: it has to be
                         // asked for again rather than waiting for the next

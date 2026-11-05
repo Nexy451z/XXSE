@@ -5,6 +5,17 @@
 //!   - `L / R`: Cycle the Sub-Tabs of the current Section (NEVER switches character slot unexpectedly!).
 //!   - `A`: Always Open / Edit / Choose from list (unified across every screen, never deletes!).
 //!   - `◀ / ▶`: Always adjust numeric values (`±step`).
+//!   - `右スティック`: `▲ / ▼` turn a page (as many rows as the screen shows),
+//!     `◀ / ▶` jump to the first / last row. It is the one input the rest of the
+//!     map left free: ZL / ZR are the sections, L / R the sub-tabs, and the
+//!     shoulders are already scrolling on the pick lists.
+//!   - Dragging a finger over the rows scrolls them (one row per row of travel,
+//!     with the flick coasting on after the finger lifts).
+//!   - The right hand scrollbar of every list can be dragged as well: the thumb
+//!     moves the window and the cursor keeps its place inside it, and a tap on
+//!     the bar - above or below the thumb - turns one page. The bar is 6px wide
+//!     and answers a finger within 20px (`hbedit::SCROLL_HIT_W`), and the row's
+//!     value stops 8px short of it, so no text and no tap can land on the other.
 //!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `お守り反映`).
 //!   - `Y`: Secondary tool action (`刻み幅切替` / `検索` / `スキル選択` / `2段階確認削除`).
 //!   - 護石の `[A]` は行ごとの操作（種類/スロット/スキル選択/数値/BOXへ反映）で、
@@ -37,6 +48,8 @@ use mhnx_core::hbedit::{
     ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE,
     PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_REQUESTS, SET_EDIT_ROWS,
     SET_ROW_NAME, STEPS,
+    // The scroll model: see mhnx_core::hbedit for the arithmetic and its tests.
+    list_end, page_move, scroll_track, ScrollBar,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -178,6 +191,23 @@ const V1_LIST_W: i32 = 796;
 const V1_INSP_X: i32 = MAIN_X + V1_LIST_W + 16; // 832
 const V1_INSP_W: i32 = 1280 - V1_INSP_X - 20; // 428
 
+// Scrolling. The arithmetic lives in `mhnx_core::hbedit` (ScrollBar, page_move,
+// scroll_track, KeyRepeat) because it is the one part of this that a host test
+// can pin; these are only the pixel numbers this screen draws with.
+/// Rows the MIB picker modal shows at once, and the step its paging keys take.
+const MIB_PICKER_VISIBLE: usize = 10;
+/// Distance between two rows of the MIB picker, in pixels (46 + 4).
+const MIB_PICKER_PITCH: i32 = 50;
+/// One row of a list, in pixels.
+const LIST_ROW_H: i32 = 56;
+/// Pixels a finger has to travel to scroll one row when it drags the list.
+/// Equal to the row height on purpose: the rows move with the finger.
+const DRAG_ROW_PX: i32 = LIST_ROW_H;
+/// Flick velocity is counted in this many units per row per frame.
+const FLING_UNIT: i32 = 64;
+/// How far a finger may wander and still count as a tap, in pixels.
+const TAP_SLOP_PX: i32 = 18;
+
 // ---------------------------------------------------------------------------
 // 6 Top-Level Sections (ZL / ZR) & In-Section Sub-Tabs (L / R)
 // ---------------------------------------------------------------------------
@@ -216,6 +246,7 @@ pub fn section_of(screen: Screen) -> MainSection {
         | Screen::Equip
         | Screen::EquipEdit
         | Screen::JewelPick
+        | Screen::EquipPick
         | Screen::Sets => MainSection::Gear,
         // The progress screen is the fifth tab of the records section: awards,
         // requests and quest bits are what the character has done, the same
@@ -363,6 +394,49 @@ impl HitBox {
     }
 }
 
+/// What the last frame put on screen for one list's scrollbar.
+///
+/// The row ids are kept here on purpose. The list itself is rebuilt from the
+/// save on every frame, so by the time a finger has dragged the thumb there is
+/// no way back from a pixel to a row id except this: the same ids, in the same
+/// order, that the rows were drawn from. They are only kept while the list can
+/// actually scroll, which is the only time the bar is drawn or dragged.
+#[derive(Clone)]
+struct BarState {
+    /// The screen the bar belongs to: a bar left over from another screen is
+    /// never allowed to move this one's cursor.
+    screen: Screen,
+    track_y: i32,
+    track_h: i32,
+    /// The area that answers a finger, wider than the bar.
+    hit_x: i32,
+    hit_w: i32,
+    scroll: ScrollBar,
+    /// Every row id of the list, in the order the list shows them.
+    ids: Vec<usize>,
+    /// The MIB picker's bar rather than a list's: a drag writes its cursor.
+    picker: bool,
+}
+
+/// The thumb drag in progress.
+#[derive(Clone, Copy)]
+struct BarDrag {
+    /// Where inside the thumb the finger landed, in pixels.
+    grab: i32,
+    /// The row the cursor held inside the window when the drag started, so
+    /// dragging the bar moves the view and not the selection to the top.
+    inside: usize,
+    /// Where the finger went down, so a tap that never moves is not a drag.
+    start_y: i32,
+    /// The finger has moved far enough to be dragging.
+    moved: bool,
+    /// The finger went down on the thumb itself rather than beside it.
+    on_thumb: bool,
+    /// The finger went down above the thumb (the rest of the bar is below it).
+    above: bool,
+    picker: bool,
+}
+
 pub struct GuiState {
     hits: Vec<HitBox>,
     was_touching: bool,
@@ -393,6 +467,14 @@ pub struct GuiState {
     undo_press: mhnx_core::confirm::ConfirmPress,
     /// The roster's bulk MAX asked for once, waiting for the second answer.
     roster_max: mhnx_core::confirm::ConfirmPress,
+    /// The scrollbar the last frame drew, with the row ids behind it.
+    bar: Option<BarState>,
+    /// The thumb being dragged, if a finger is on one right now.
+    bar_drag: Option<BarDrag>,
+    /// Rows a flick still owes the list, in FLING_UNIT units per row.
+    fling: i32,
+    /// Rows the finger moved on the last drag frame: the speed a flick starts at.
+    drag_rows: i32,
 }
 
 impl GuiState {
@@ -420,6 +502,10 @@ impl GuiState {
             pending_snapshot: None,
             undo_press: mhnx_core::confirm::ConfirmPress::new(),
             roster_max: mhnx_core::confirm::ConfirmPress::new(),
+            bar: None,
+            bar_drag: None,
+            fling: 0,
+            drag_rows: 0,
         }
     }
 
@@ -741,7 +827,8 @@ impl GuiState {
                 let active = match ed.screen {
                     Screen::Charms => 0,
                     Screen::CharmEdit | Screen::SkillPick => 1,
-                    Screen::Equip | Screen::EquipEdit | Screen::JewelPick => 2,
+                    Screen::Equip | Screen::EquipEdit | Screen::JewelPick
+                    | Screen::EquipPick => 2,
                     Screen::Sets => 3,
                     _ => 0,
                 };
@@ -1069,6 +1156,267 @@ impl GuiState {
         scroll_active_cursor(ed, delta);
     }
 
+    /// How many rows the list on screen shows at once.
+    ///
+    /// Read off the bar the last frame drew, because it is the one place that
+    /// knows both the row count and the row a warning strip took away. A page
+    /// key and the scrollbar therefore cannot disagree about the size of a page.
+    fn page_rows(&self) -> usize {
+        match &self.bar {
+            Some(bar) if bar.scroll.active() => bar.scroll.visible(),
+            _ => 9,
+        }
+    }
+
+    /// One page up ([dir] < 0) or down on whatever list is showing.
+    ///
+    /// A page is what the screen shows, not a fixed eight rows: the equipment
+    /// box shows nine and a warning strip costs one, and paging by a number the
+    /// user cannot see is how a list skips entries it was asked to show.
+    pub fn page_by(&mut self, ed: &mut Editor, dir: i32) {
+        if dir == 0 {
+            return;
+        }
+        if self.mib_picker.is_some() {
+            self.scroll_mib_picker(dir * MIB_PICKER_VISIBLE as i32);
+            return;
+        }
+        // The my-sets form has no page to turn, and the list under it must not
+        // move while the form is open.
+        if ed.screen == Screen::Sets && ed.set_editor_open() {
+            return;
+        }
+        let len = list_len_of(ed, self);
+        if len == 0 {
+            return;
+        }
+        let cur = active_cursor_of(ed, self);
+        let next = page_move(cur, len, self.page_rows(), dir);
+        if next != cur {
+            set_active_cursor(ed, self, next);
+        }
+    }
+
+    /// Jump to the first row, or to the last one.
+    ///
+    /// The end of a 340 row list was reachable only by holding a direction key
+    /// down, which is the same as not being reachable.
+    pub fn jump_end(&mut self, ed: &mut Editor, forward: bool) {
+        if let Some(picker) = self.mib_picker.as_mut() {
+            picker.cursor = list_end(picker.items.len(), forward);
+            return;
+        }
+        if ed.screen == Screen::Sets && ed.set_editor_open() {
+            return;
+        }
+        let len = list_len_of(ed, self);
+        if len == 0 {
+            return;
+        }
+        let next = list_end(len, forward);
+        if next != active_cursor_of(ed, self) {
+            set_active_cursor(ed, self, next);
+        }
+    }
+
+    /// Draw one list's scrollbar and remember it for the touch handler.
+    ///
+    /// A list that fits draws nothing: a thumb that cannot move would claim the
+    /// table is longer than it is. The bar is 6px, the area that answers a
+    /// finger is 20px (hbedit::SCROLL_HIT_W), and the row value stops 8px short
+    /// of the bar, so the two never meet on screen.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_list_bar(
+        &mut self,
+        c: &mut Canvas,
+        ed: &Editor,
+        panel_x: i32,
+        panel_w: i32,
+        track_y: i32,
+        track_h: i32,
+        scroll: ScrollBar,
+        ids: &[usize],
+        picker: bool,
+    ) {
+        let t = theme();
+        let track = scroll_track(panel_x, panel_w);
+        let active = scroll.active();
+        self.bar = Some(BarState {
+            screen: ed.screen,
+            track_y,
+            track_h,
+            hit_x: track.hit_x,
+            hit_w: track.hit_w,
+            scroll,
+            ids: if active { ids.to_vec() } else { Vec::new() },
+            picker,
+        });
+        if !active {
+            return;
+        }
+        // The groove, then the thumb. The thumb turns amber while it is being
+        // dragged, so a finger knows it is holding the bar and not a row.
+        c.round_rect(
+            track.bar_x,
+            track_y,
+            track.bar_w,
+            track_h,
+            track.bar_w / 2,
+            t.bg_btn,
+        );
+        let dragging = matches!(&self.bar_drag, Some(d) if d.picker == picker);
+        let thumb_col = if dragging {
+            t.accent_secondary
+        } else {
+            t.accent_primary
+        };
+        let thumb = scroll.thumb_len(track_h);
+        let off = scroll.thumb_offset(track_h);
+        c.round_rect(
+            track.bar_x,
+            track_y + off,
+            track.bar_w,
+            thumb,
+            track.bar_w / 2,
+            thumb_col,
+        );
+    }
+
+    /// Does a finger at this point take hold of the scrollbar? Start a drag if
+    /// so, and answer true: nothing under the bar may also answer this tap.
+    fn begin_bar_drag(&mut self, ed: &Editor, tx: i32, ty: i32) -> bool {
+        let Some(bar) = self.bar.as_ref() else {
+            return false;
+        };
+        if bar.screen != ed.screen || !bar.scroll.active() {
+            return false;
+        }
+        if tx < bar.hit_x || tx >= bar.hit_x + bar.hit_w {
+            return false;
+        }
+        if ty < bar.track_y || ty >= bar.track_y + bar.track_h {
+            return false;
+        }
+        let thumb = bar.scroll.thumb_len(bar.track_h);
+        let off = bar.scroll.thumb_offset(bar.track_h);
+        // Where the finger landed inside the thumb. A finger that landed beside
+        // it takes hold of the nearest end instead of teleporting the list, and
+        // a tap that never moves is a page rather than a drag (the thumb itself
+        // is not a page button, so that case does nothing).
+        let landed = ty - bar.track_y - off;
+        let grab = landed.clamp(0, (thumb - 1).max(0));
+        let cur = active_cursor_of(ed, self);
+        let inside = bar
+            .ids
+            .iter()
+            .position(|&id| id == cur)
+            .unwrap_or(0)
+            .saturating_sub(bar.scroll.start());
+        let picker = bar.picker;
+        self.bar_drag = Some(BarDrag {
+            grab,
+            inside,
+            start_y: ty,
+            moved: false,
+            on_thumb: landed >= 0 && landed < thumb,
+            above: landed < 0,
+            picker,
+        });
+        true
+    }
+
+    /// The row a thumb at this height points at, and the row the cursor is on.
+    fn bar_target(&self, ed: &Editor, ty: i32, drag: BarDrag) -> Option<(usize, usize)> {
+        let bar = self.bar.as_ref()?;
+        if !bar.scroll.active() {
+            return None;
+        }
+        let offset = ty - drag.grab - bar.track_y;
+        let start = bar.scroll.start_for_offset(bar.track_h, offset);
+        let pos = (start + drag.inside).min(bar.scroll.total().saturating_sub(1));
+        let target = bar.ids.get(pos).copied().unwrap_or(pos);
+        let cur = if drag.picker {
+            self.mib_picker.as_ref().map(|p| p.cursor).unwrap_or(0)
+        } else {
+            active_cursor_of(ed, self)
+        };
+        Some((target, cur))
+    }
+
+    /// Follow a dragged thumb: the cursor lands on the row the bar now shows,
+    /// keeping its place inside the window so the list scrolls rather than
+    /// dragging the selection to the top.
+    fn drag_bar(&mut self, ed: &mut Editor, ty: i32) -> bool {
+        let Some(mut drag) = self.bar_drag else {
+            return false;
+        };
+        if !drag.moved {
+            // A finger that has not moved yet is a tap, not a drag: a tap on
+            // the bar scrolls a page (see handle_touch) and must not throw the
+            // list to wherever the finger landed.
+            if (ty - drag.start_y).abs() < 4 {
+                return false;
+            }
+            drag.moved = true;
+            self.bar_drag = Some(drag);
+        }
+        let Some((target, cur)) = self.bar_target(ed, ty, drag) else {
+            return false;
+        };
+        if target == cur {
+            return false;
+        }
+        if drag.picker {
+            let Some(mut picker) = self.mib_picker.take() else {
+                return false;
+            };
+            picker.cursor = target.min(picker.items.len().saturating_sub(1));
+            self.mib_picker = Some(picker);
+            return true;
+        }
+        set_active_cursor(ed, self, target);
+        true
+    }
+
+    /// The coast after a flick: keep moving at the speed the finger left with,
+    /// losing a quarter of it a frame until there is nothing left to give.
+    fn tick_fling(&mut self, ed: &mut Editor) -> bool {
+        if self.fling == 0 {
+            return false;
+        }
+        if self.mib_picker.is_some() || self.osk.is_some() || ed.review_open() {
+            self.fling = 0;
+            return false;
+        }
+        let rows = self.fling / FLING_UNIT;
+        self.fling = self.fling * 3 / 4;
+        if self.fling.abs() < FLING_UNIT / 2 {
+            self.fling = 0;
+        }
+        if rows == 0 {
+            return false;
+        }
+        self.page_scroll(ed, rows);
+        true
+    }
+
+    /// Stop a coasting list: a pad press has taken over from the flick.
+    pub fn stop_fling(&mut self) {
+        self.fling = 0;
+    }
+
+    /// Drop every gesture in progress.
+    ///
+    /// Used when a modal takes the screen: a flick that started before the
+    /// dialog opened must not keep scrolling the list under it.
+    fn cancel_gestures(&mut self) {
+        self.bar_drag = None;
+        self.fling = 0;
+        self.drag_rows = 0;
+        self.dragged = false;
+        self.pending_activate_row = None;
+    }
+
     pub fn scroll_mib_picker(&mut self, delta: i32) {
         if let Some(picker) = &mut self.mib_picker {
             let len = picker.items.len();
@@ -1169,7 +1517,7 @@ impl GuiState {
             // how one route used to page and the next one not.
             if matches!(
                 ed.screen,
-                Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
+                Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
             ) {
                 ed.input(if key == Key::R { Key::Right } else { Key::Left });
                 return;
@@ -1192,7 +1540,7 @@ impl GuiState {
         // to Y instead.
         let x_is_the_screens = matches!(
             ed.screen,
-            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
+            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
         );
         if key == Key::X && !x_is_the_screens {
             self.apply_action(ed, UiAction::QuickSave);
@@ -1621,8 +1969,11 @@ impl GuiState {
     // -----------------------------------------------------------------------
     pub fn handle_touch(&mut self, ed: &mut Editor, touching: bool, tx: i32, ty: i32) -> bool {
         // The save review is modal: while it is open only its two buttons
-        // answer a tap, never the list or the bar underneath.
+        // answer a tap, never the list or the bar underneath. A gesture that
+        // was running when it opened is dropped rather than paused, so the
+        // list cannot coast on under a dialog.
         if ed.review_open() {
+            self.cancel_gestures();
             if touching && !self.was_touching {
                 let hit = self
                     .hits
@@ -1647,10 +1998,23 @@ impl GuiState {
         let mut changed = false;
 
         if touching && !self.was_touching {
+            // A new touch cancels the coast: the finger has taken over.
+            self.fling = 0;
+            self.drag_rows = 0;
             self.drag_start_y = ty;
             self.last_drag_y = ty;
             self.dragged = false;
             self.pending_activate_row = None;
+
+            // A finger that lands on the scrollbar drives the bar, and nothing
+            // else answers: a drag on the thumb must not also tick the row
+            // that happens to be under it. The keyboard is modal, so its band
+            // is exempt.
+            if self.osk.is_none() && self.begin_bar_drag(ed, tx, ty) {
+                self.dragged = true;
+                self.was_touching = touching;
+                return true;
+            }
 
             let hit = self.hits.iter().rev().find(|h| h.contains(tx, ty)).copied();
             if let Some(h) = hit {
@@ -1676,43 +2040,77 @@ impl GuiState {
                 }
             }
         } else if touching && self.was_touching {
-            if self.mib_picker.is_some() {
+            if self.bar_drag.is_some() {
+                // The thumb follows the finger, the window follows the thumb,
+                // and the cursor keeps the place it held inside the window.
+                if self.drag_bar(ed, ty) {
+                    changed = true;
+                }
+            } else if self.mib_picker.is_some() {
                 let dy = ty - self.last_drag_y;
-                if (ty - self.drag_start_y).abs() > 18 {
+                if (ty - self.drag_start_y).abs() > TAP_SLOP_PX {
                     self.dragged = true;
                     self.pending_activate_row = None;
                 }
-                let step_px = 36;
-                if dy.abs() >= step_px {
-                    let rows = -dy / step_px;
-                    self.last_drag_y += -rows * step_px;
+                // The speed a flick starts at is what the finger did on the
+                // frame it left, so a finger that stopped before lifting does
+                // not throw the list onwards.
+                self.drag_rows = 0;
+                if dy.abs() >= MIB_PICKER_PITCH {
+                    let rows = -dy / MIB_PICKER_PITCH;
+                    self.last_drag_y += -rows * MIB_PICKER_PITCH;
                     self.scroll_mib_picker(rows);
+                    self.drag_rows = rows;
                     changed = true;
                 }
             // The keyboard is modal too: a finger dragged over the band it
             // leaves open must not page the list underneath.
             } else if self.osk.is_none() && ty >= CONTENT_Y && ty < FOOTER_Y {
                 let dy = ty - self.last_drag_y;
-                if (ty - self.drag_start_y).abs() > 18 {
+                if (ty - self.drag_start_y).abs() > TAP_SLOP_PX {
                     self.dragged = true;
                     self.pending_activate_row = None;
                 }
-                let step_px = 36;
-                if dy.abs() >= step_px {
-                    let rows = -dy / step_px;
-                    self.last_drag_y += -rows * step_px;
+                // One row of travel per row drawn: the rows move with the
+                // finger instead of running away from it. A frame with no
+                // travel is not a speed: a finger that stopped before it lifted
+                // must not throw the list onwards.
+                self.drag_rows = 0;
+                if dy.abs() >= DRAG_ROW_PX {
+                    let rows = -dy / DRAG_ROW_PX;
+                    self.last_drag_y += -rows * DRAG_ROW_PX;
                     self.page_scroll(ed, rows);
+                    self.drag_rows = rows;
                     changed = true;
                 }
             }
         } else if !touching && self.was_touching {
-            if !self.dragged {
+            if let Some(drag) = self.bar_drag.take() {
+                // A tap that never became a drag is a page: it is the one thing
+                // a scrollbar does when it is not being held, and it gives the
+                // bar a use that cannot be mistaken for a row tap.
+                if !drag.moved && !drag.on_thumb {
+                    self.page_by(ed, if drag.above { -1 } else { 1 });
+                    changed = true;
+                }
+                // Letting go of the thumb ends the gesture where it is: no row
+                // is ticked and nothing coasts onwards, because the finger was
+                // holding the view and not flicking it.
+                self.dragged = true;
+            } else if !self.dragged {
                 if let Some(idx) = self.pending_activate_row.take() {
                     self.apply_action(ed, UiAction::ActivateRow(idx));
                     changed = true;
                 }
+            } else if self.osk.is_none() && self.mib_picker.is_none() {
+                // The flick: the list keeps the speed the finger left with and
+                // gives it back a quarter a frame (tick_fling).
+                self.fling = self.drag_rows.clamp(-6, 6) * FLING_UNIT;
             }
             self.pending_activate_row = None;
+        } else if self.tick_fling(ed) {
+            // No finger on the glass: the list coasts to a stop by itself.
+            changed = true;
         }
 
         self.was_touching = touching;
@@ -2271,6 +2669,7 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Equip => ed.equip_cursor,
         Screen::EquipEdit => ed.equip_edit.map(|e| e.field).unwrap_or(0),
         Screen::JewelPick => ed.jewel_pick_cursor,
+        Screen::EquipPick => ed.equip_pick_cursor,
         Screen::Hunts => ed.hunt_cursor,
         Screen::Guild => {
             if ed.guild_view() == GUILD_TAB_ARENA {
@@ -2348,6 +2747,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         // renderer can never disagree about it.
         Screen::EquipEdit => ed.equip_edit.map(|e| e.rows()).unwrap_or(0),
         Screen::JewelPick => ed.jewel_pick_matches().len(),
+        Screen::EquipPick => ed.equip_pick_choices().len(),
         Screen::Hunts => ed.hunt_rows().len(),
         Screen::Guild => {
             if ed.guild_view() == GUILD_TAB_ARENA {
@@ -2506,6 +2906,14 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
             }
         }
         Screen::JewelPick => ed.jewel_pick_cursor = clamped,
+        Screen::EquipPick => {
+            // The row is an index into the filtered list, so a tap lands on
+            // the row it drew; the scene it draws from is the state machine's.
+            let n = ed.equip_pick_choices().len();
+            if n > 0 {
+                ed.equip_pick_cursor = clamped.min(n - 1);
+            }
+        }
         Screen::Hunts => ed.hunt_cursor = clamped,
         Screen::Guild => {
             if ed.guild_view() == GUILD_TAB_ARENA {
@@ -2785,12 +3193,16 @@ fn max_is_available(ed: &Editor, row: usize) -> bool {
 }
 
 /// Screens where [R] types a number instead of stepping it.
-fn supports_direct_input(ed: &Editor) -> bool {
+fn supports_direct_input(ed: &Editor, row: usize) -> bool {
     match ed.screen {
         Screen::Items | Screen::Hunts => true,
         Screen::Guild => ed.guild_view() != GUILD_TAB_ARENA,
         // A reward / supply row has a number [R] can type.
         Screen::EntryView => ed.entry_has_numbers(),
+        // The equipment form's two id rows: the number a user knows and
+        // cannot reach by stepping. The level and the sockets are not numbers
+        // anyone types, so the pill is not drawn on them.
+        Screen::EquipEdit => matches!(row, 1 | 8),
         _ => false,
     }
 }
@@ -3032,7 +3444,7 @@ impl GuiState {
             self.add_hit(0, 0, 1280, 720, UiAction::ModalBlank);
         }
         if self.mib_picker.is_some() {
-            self.draw_mib_picker(c);
+            self.draw_mib_picker(c, ed);
         }
         if self.osk.is_some() {
             self.draw_osk(c);
@@ -3327,23 +3739,21 @@ impl GuiState {
         }
     }
 
+    /// The footer is two lines and only two: the keys on the first, the status
+    /// message on the second.
+    ///
+    /// Line 1: the whole-save undo pill on the left - both numbers the audit
+    /// asked for, how many steps are left of four and what one step costs, and
+    /// the touch target for it - and the screen's key guide on the right.
+    /// Line 2: the dirty dot, the message, and the one touch rule that is
+    /// invisible until it bites.
     fn draw_footer(&mut self, c: &mut Canvas, ed: &Editor) {
         let t = theme();
         c.rect(0, FOOTER_Y, 1280, FOOTER_H, t.bg_footer);
         c.hline(0, FOOTER_Y, 1280, t.border_subtle);
 
-        // Right: the key guide, built by the state machine (hbedit::Editor::
-        // footer_hint). A key guide is a claim about what the keys do, so the
-        // one place that dispatches them is the one place that writes it; the
-        // review found three screens where the two had drifted apart, and the
-        // table that used to live here was a fourth.
-        let hint = ed.footer_hint();
-        c.text_right(1262, FOOTER_Y + 9, &hint, t.text_secondary, FontSize::Small);
-
-        // Left, top row: the whole-save undo. Both numbers the audit asked for
-        // are on screen at all times - how many steps are left of four and what
-        // one step costs - and the pill is the touch target for it as well.
-        // The key is L held down: a plain L is the sub-tab key everywhere.
+        // Line 1, left: the whole-save undo. The key is L held down; a plain L
+        // is the sub-tab key everywhere.
         let undo = format!("[L長押し] {}", ed.undo_line());
         let undo_w = (c.text_width_sized(&undo, FontSize::Small) + 22).min(470);
         let has_undo = ed.undo_depth() > 0;
@@ -3358,8 +3768,33 @@ impl GuiState {
         c.text_clipped(24, FOOTER_Y + 9, undo_w - 12, &undo, undo_fg, FontSize::Small);
         self.add_hit(14, FOOTER_Y + 2, undo_w, 30, UiAction::Undo);
 
-        // Left, bottom row: the status message. It is clipped before the right
-        // hand key guide so the two can never overlap, whatever it says.
+        // Line 1, right: the key guide, built by the state machine
+        // (hbedit::Editor::footer_hint). A key guide is a claim about what the
+        // keys do, so the one place that dispatches them is the one place that
+        // writes it. It is measured before it is drawn: a guide longer than the
+        // room the pill leaves is clipped at the pill's edge instead of being
+        // drawn over it, which is what a bare right-aligned draw did.
+        let hint = ed.footer_hint();
+        let hint_left = 14 + undo_w + 12;
+        let hint_room = 1262 - hint_left;
+        let hint_w = c.text_width_sized(&hint, FontSize::Small);
+        if hint_room > 120 {
+            if hint_w <= hint_room {
+                c.text_right(1262, FOOTER_Y + 9, &hint, t.text_secondary, FontSize::Small);
+            } else {
+                c.text_clipped(
+                    hint_left,
+                    FOOTER_Y + 9,
+                    hint_room,
+                    &hint,
+                    t.text_secondary,
+                    FontSize::Small,
+                );
+            }
+        }
+
+        // Line 2: the status message. It is clipped before the touch rule so
+        // the two can never overlap, whatever the message says.
         let msg = if ed.message.is_empty() {
             "Ready"
         } else {
@@ -3368,7 +3803,7 @@ impl GuiState {
         // Touch has one rule that is invisible until it bites: the first tap
         // only selects a row, the second one runs it. It is printed here rather
         // than in a help screen nobody opens.
-        let tap_note = "[タップ] 1回目=選択 / 2回目=決定（ドラッグでスクロール）";
+        let tap_note = "[タップ] 1回=選択・2回=決定  [ドラッグ] スクロール";
         let tap_w = c.text_width_sized(tap_note, FontSize::Small);
         c.text_right(1262, FOOTER_Y + 30, tap_note, t.text_muted, FontSize::Small);
         let max_msg_w = (1262 - tap_w - 60).max(160);
@@ -3530,6 +3965,7 @@ impl GuiState {
             Screen::Equip => self.draw_equip(c, ed),
             Screen::EquipEdit => self.draw_equip_edit(c, ed),
             Screen::JewelPick => self.draw_jewel_pick(c, ed),
+            Screen::EquipPick => self.draw_equip_pick(c, ed),
             Screen::Sets => self.draw_sets(c, ed),
             Screen::Csv => self.draw_csv(c, ed),
             // The palico equipment panel is a mode of the two palico screens,
@@ -3605,6 +4041,30 @@ impl GuiState {
         let t = theme();
         let total = rows.len();
 
+        // Geometry first. The header now repeats facts that come off the window
+        // (how many rows fit, and therefore whether there is a page to turn),
+        // so it cannot be laid out before the window is known.
+        let body_y = CONTENT_Y + 30; // 132
+        let body_h = FOOTER_Y - body_y - 10; // 526
+
+        // A warning strip needs one or two lines under the list, so the list
+        // gives up a row rather than drawing text over the last entry.
+        let warn_lh = c.line_height_sized(FontSize::Small).max(16);
+        let warn_reserve = if warnings.is_empty() {
+            0
+        } else {
+            warnings.len().min(2) as i32 * warn_lh + 16
+        };
+        let row_h = LIST_ROW_H;
+        let rows_that_fit = ((body_h - 10 - warn_reserve).max(row_h)) / row_h;
+        let vis = (rows_that_fit.max(1) as usize).min(9);
+        let vis = if warnings.is_empty() { vis } else { vis.min(8) };
+        let cur_pos = rows
+            .iter()
+            .position(|r| r.0 == active_row_idx)
+            .unwrap_or(0);
+        let start = window_start(cur_pos, total, vis);
+
         // Compact Section Title Line (y = 100..130) — No redundant explanation string!
         let title_w = c.text_width_sized(header_title, FontSize::Medium);
         c.text_clipped(
@@ -3616,44 +4076,75 @@ impl GuiState {
             FontSize::Medium,
         );
 
+        // The right hand end of this line holds the three facts a long list has
+        // to state on screen at all times: where the window is (12 / 340 件),
+        // whether a filter is narrowing it, and the keys that move by a page.
+        // They are laid out right to left from the panel's edge, and the
+        // subtitle only gets what is left, so however long any of these strings
+        // get they cannot be drawn on top of one another.
+        let mut right_limit = MAIN_X + V1_LIST_W - 8;
+        if total > 0 {
+            let counter = format!("{} / {} 件", cur_pos + 1, total);
+            let counter_w = c.text_width_sized(&counter, FontSize::Small);
+            c.text_right(
+                right_limit,
+                CONTENT_Y + 3,
+                &counter,
+                t.text_secondary,
+                FontSize::Small,
+            );
+            right_limit -= counter_w + 14;
+        }
+        if let Some(chip) = filter_chip(ed) {
+            let chip_w = c.text_width_sized(&chip, FontSize::Small).min(200);
+            if right_limit - chip_w > MAIN_X + 4 + title_w + 18 {
+                c.text_clipped(
+                    right_limit - chip_w,
+                    CONTENT_Y + 3,
+                    chip_w,
+                    &chip,
+                    t.accent_secondary,
+                    FontSize::Small,
+                );
+                right_limit -= chip_w + 14;
+            }
+        }
+        if total > vis {
+            // Named only where the key does something: a list that fits has no
+            // page to turn, and a key guide that lies is worse than none.
+            let keys = "[Rスティック] 1頁 / 端";
+            let keys_w = c.text_width_sized(keys, FontSize::Small).min(260);
+            if right_limit - keys_w > MAIN_X + 4 + title_w + 18 {
+                c.text_clipped(
+                    right_limit - keys_w,
+                    CONTENT_Y + 3,
+                    keys_w,
+                    keys,
+                    t.text_muted,
+                    FontSize::Small,
+                );
+                right_limit -= keys_w + 14;
+            }
+        }
+
         // The subtitle sits on the same line, right of the title. Screens that
         // have a second fact worth saying at all times (the talisman form's
         // measured ceiling) put it here: the list itself only draws a row's
         // title and value, so a fact put in a row's meta column would only be
-        // visible in the inspector of the selected row. The budget stops short
-        // of the "n / m" counter on the right, which is why the two can never
-        // collide however long the text is.
+        // visible in the inspector of the selected row.
         if !sub.is_empty() {
             let note_x = MAIN_X + 4 + title_w + 18;
-            let note_right = MAIN_X + V1_LIST_W - 96;
-            c.text_clipped(
-                note_x,
-                CONTENT_Y + 4,
-                (note_right - note_x).max(80),
-                sub,
-                t.text_secondary,
-                FontSize::Small,
-            );
+            if note_x + 60 <= right_limit {
+                c.text_clipped(
+                    note_x,
+                    CONTENT_Y + 4,
+                    right_limit - note_x,
+                    sub,
+                    t.text_secondary,
+                    FontSize::Small,
+                );
+            }
         }
-
-        let cur_pos = rows
-            .iter()
-            .position(|r| r.0 == active_row_idx)
-            .unwrap_or(0);
-
-        if total > 0 {
-            let pos_txt = format!("{} / {}", cur_pos + 1, total);
-            c.text_right(
-                MAIN_X + V1_LIST_W - 4,
-                CONTENT_Y + 3,
-                &pos_txt,
-                t.text_secondary,
-                FontSize::Small,
-            );
-        }
-
-        let body_y = CONTENT_Y + 30; // 132
-        let body_h = FOOTER_Y - body_y - 10; // 526
 
         if total == 0 {
             c.round_rect(MAIN_X, body_y, MAIN_W, 120, t.corner_r, t.bg_panel);
@@ -3673,20 +4164,6 @@ impl GuiState {
         // Left List Panel (x = 20, y = 132, w = 796, h = 526)
         c.round_rect(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, t.bg_panel);
         c.round_rect_border(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, 1, t.border_subtle);
-
-        // A warning strip needs one or two lines under the list, so the list
-        // gives up a row rather than drawing text over the last entry.
-        let warn_lh = c.line_height_sized(FontSize::Small).max(16);
-        let warn_reserve = if warnings.is_empty() {
-            0
-        } else {
-            warnings.len().min(2) as i32 * warn_lh + 16
-        };
-        let row_h = 56i32;
-        let rows_that_fit = ((body_h - 10 - warn_reserve).max(row_h)) / row_h;
-        let vis = (rows_that_fit.max(1) as usize).min(9);
-        let vis = if warnings.is_empty() { vis } else { vis.min(8) };
-        let start = window_start(cur_pos, total, vis);
 
         for i in 0..vis {
             let Some((r_idx, title, _meta, val, badge)) = rows.get(start + i) else {
@@ -3772,6 +4249,23 @@ impl GuiState {
                 c.text_clipped(tx, ry + 16, max_title_w, title, title_col, FontSize::Medium);
             }
         }
+
+        // The scrollbar, drawn in the panel's right hand padding. The row ids go
+        // with it: they are what turns a drag on the thumb into a row, and the
+        // list itself is rebuilt from the save every frame, so this is the only
+        // place that knows which row a pixel of the bar means.
+        let ids: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        self.draw_list_bar(
+            c,
+            ed,
+            MAIN_X,
+            V1_LIST_W,
+            body_y + 10,
+            (vis as i32) * row_h,
+            ScrollBar::new(total, vis, start),
+            &ids,
+            false,
+        );
 
         // Amber warning strip, pinned to the bottom of the list panel.
         if !warnings.is_empty() {
@@ -4177,7 +4671,7 @@ impl GuiState {
             c.text_sized(ix + 20, cur_y + 4, &step_lbl, t.text_secondary, FontSize::Small);
             // [R] 数値入力: the three screens that hold a number a user would
             // rather type than step (個数 / HR / 時間 / 狩猟数).
-            if supports_direct_input(ed) {
+            if supports_direct_input(ed, row_idx) {
                 let rw = 116i32;
                 let rx = ix + iw - 20 - rw;
                 c.round_rect(rx, cur_y, rw, 24, 4, t.bg_btn);
@@ -5524,10 +6018,13 @@ impl GuiState {
         for (i, eq) in all.iter().enumerate() {
             let tname = mhnx_core::equip::type_name(eq.kind);
             let ename = mhnx_core::equip::name(eq).to_string();
+            // The name leads and the id is beside it, in hex: the spelling
+            // every equipment row uses. The decimal number is nowhere on this
+            // screen, so a reader who copies an id off it can type it back.
             rows.push((
                 i,
                 ename,
-                format!("枠 #{:04} / {}", eq.index, tname),
+                format!("枠 #{:04} / {} / ID 0x{:02X}", eq.index, tname, eq.id),
                 format!("Lv{}", eq.level),
                 tname.to_string(),
             ));
@@ -5610,8 +6107,12 @@ impl GuiState {
                 (
                     1,
                     String::from("アイテムID"),
-                    String::from("◀ ▶ で増減 / 武器・防具のID"),
-                    format!("{}", ee.id),
+                    String::from("[Y] 名前で選ぶ / [R] ID を入力 / ◀ ▶ で増減"),
+                    format!(
+                        "{}  {}",
+                        mhnx_core::hbedit::equip_choice_name(ee.kind, ee.id),
+                        mhnx_core::hbedit::EquipChoice { kind: ee.kind, id: ee.id }.hex()
+                    ),
                     String::from("#02"),
                 ),
                 (
@@ -5706,8 +6207,12 @@ impl GuiState {
             (
                 8,
                 String::from("アイテムID"),
-                String::from("◀ ▶ で増減 / 変えると差し替え"),
-                format!("{}", ee.id),
+                String::from("[Y] 名前で選ぶ / [R] ID 入力 / 変えると差し替え"),
+                format!(
+                    "{}  {}",
+                    mhnx_core::hbedit::equip_choice_name(ee.kind, ee.id),
+                    mhnx_core::hbedit::EquipChoice { kind: ee.kind, id: ee.id }.hex()
+                ),
                 String::from("#09"),
             ),
         ];
@@ -5778,6 +6283,48 @@ impl GuiState {
             ed.jewel_pick_cursor.min(rows.len().saturating_sub(1)),
             false,
             "決定",
+        );
+    }
+
+    /// Equipment name picker, opened from the form's 種別 / ID row with [Y].
+    ///
+    /// The row is the name with the id beside it - 「爆砕の大剣  0x28」 - and the
+    /// id is hex because that is what the box, the form and this list print;
+    /// no screen in this build spells an equipment id in decimal. The type goes
+    /// on the inspector's meta line, which only the selected row draws, so a
+    /// list of 6,435 rows does not build 6,435 of those strings.
+    fn draw_equip_pick(&mut self, c: &mut Canvas, ed: &Editor) {
+        let choices = ed.equip_pick_choices();
+        let sel = ed.equip_pick_cursor;
+        let mut rows = Vec::with_capacity(choices.len());
+        for (i, ch) in choices.iter().enumerate() {
+            let meta = if i == sel {
+                format!(
+                    "{} / {} / ID {}",
+                    mhnx_core::equip::type_name(ch.kind),
+                    ed.equip_pick_scope.label(),
+                    ch.hex()
+                )
+            } else {
+                String::new()
+            };
+            rows.push((i, ch.name().to_string(), meta, ch.hex(), String::new()));
+        }
+        // What the list is narrowed to and what is left: "検索: 大剣（137件）",
+        // "全 1,606件", or the notice that this build can only search ids. The
+        // state machine words it, so the drawn header and the status line say
+        // the same thing.
+        let hdr = format!("装備を名前で選ぶ（{}）", ed.equip_pick_kind_label());
+        let sub = ed.equip_pick_search_line(choices.len());
+        self.draw_adaptive_rows(
+            c,
+            ed,
+            &hdr,
+            &sub,
+            &rows,
+            sel.min(rows.len().saturating_sub(1)),
+            false,
+            "この装備を選ぶ",
         );
     }
 
@@ -6831,7 +7378,7 @@ impl GuiState {
             self.draw_adaptive_rows(
                 c,
                 ed,
-                "セーブ内クエスト",
+                &format!("セーブ内クエスト ({})", rows.len()),
                 "",
                 &rows,
                 ed.save_quest_cursor.min(rows.len().saturating_sub(1)),
@@ -6853,22 +7400,16 @@ impl GuiState {
                     format!("#{:03}", i + 1),
                 ));
             }
+            // The count is the list's own length, not the table's: with a
+            // filter on, the list is shorter and this heading used to keep
+            // claiming the whole table.
             let hdr = if self.quest_tab == 1 {
-                "公式イベントクエスト (189)"
+                format!("公式イベントクエスト ({})", rows.len())
             } else {
-                "没クエスト (34)"
+                format!("没クエスト ({})", rows.len())
             };
             let cur = self.quest_cat_cursor[self.quest_tab].min(rows.len().saturating_sub(1));
-            self.draw_adaptive_rows(
-                c,
-                ed,
-                hdr,
-                "",
-                &rows,
-                cur,
-                false,
-                "導入/解除",
-            );
+            self.draw_adaptive_rows(c, ed, &hdr, "", &rows, cur, false, "導入/解除");
         }
     }
 
@@ -7371,7 +7912,7 @@ impl GuiState {
     // -----------------------------------------------------------------------
     // Modal Overlays: MIB Picker & Built-in OSK
     // -----------------------------------------------------------------------
-    fn draw_mib_picker(&mut self, c: &mut Canvas) {
+    fn draw_mib_picker(&mut self, c: &mut Canvas, ed: &Editor) {
         let Some(picker) = self.mib_picker.clone() else {
             return;
         };
@@ -7396,7 +7937,7 @@ impl GuiState {
         c.hline(mx + 16, my + 52, mw - 32, t.border_subtle);
 
         let total = picker.items.len();
-        let visible = 10;
+        let visible = MIB_PICKER_VISIBLE;
         let start = window_start(picker.cursor, total, visible);
         let row_h = 46;
         let list_x = mx + 24;
@@ -7434,7 +7975,10 @@ impl GuiState {
             );
 
             if selected {
-                let bx = list_x + list_w - 108;
+                // The button stops 14px short of the bar's touch area: the
+                // right hand 20px of the row belongs to the scrollbar now, and
+                // a tap that aimed at 決定 must not grab the thumb instead.
+                let bx = list_x + list_w - 128;
                 c.round_rect(bx, ry + 6, 94, 34, 5, t.accent_primary);
                 btn_text(
                     c,
@@ -7450,11 +7994,28 @@ impl GuiState {
             self.add_hit(list_x, ry, list_w, row_h, UiAction::MibPickerSelect(idx));
         }
 
+        // The picker's own bar. The monster table runs to sixty entries, and a
+        // modal that leaves the reader no way to see where in it the cursor is
+        // has the same complaint the lists had. Its rows are 50px apart, so the
+        // track is measured from the row pitch rather than from a grown thumb.
+        let ids: Vec<usize> = (0..total).collect();
+        self.draw_list_bar(
+            c,
+            ed,
+            list_x,
+            list_w,
+            list_y0,
+            (visible as i32 - 1) * MIB_PICKER_PITCH + row_h,
+            ScrollBar::new(total, visible, start),
+            &ids,
+            true,
+        );
+
         let foot_y = my + mh - 50;
         c.text_sized(
             mx + 24,
             foot_y + 10,
-            &format!("{} / {}", picker.cursor + 1, total),
+            &format!("{} / {} 件", picker.cursor + 1, total),
             t.text_secondary,
             FontSize::Small,
         );
@@ -7673,6 +8234,36 @@ fn draw_name_box(
     }
     (shown as i32) * line_h
 }
+/// The filter state a screen keeps in its header, when it is not already in the
+/// title.
+///
+/// A narrowed list used to look exactly like a short table: twelve rows, and no
+/// word anywhere about the other three hundred. The pickers and the equipment
+/// box already carry their filter word in the title ("検索: ほげ（12 件）",
+/// "装備BOX（絞り込み: …）"), so they are not repeated here; the item box's
+/// hide-empty toggle is the one state nothing else on the screen names.
+fn filter_chip(ed: &Editor) -> Option<String> {
+    match ed.screen {
+        Screen::Items => Some(String::from(if ed.show_empty {
+            "空きも表示"
+        } else {
+            "空き非表示"
+        })),
+        // The quest filter narrows both the save's list and the two bundles,
+        // and neither heading named it: a filtered list that says nothing is
+        // the bug this chip exists for.
+        Screen::SaveQuests => {
+            let needle = ed.quest_filter.trim();
+            if needle.is_empty() {
+                None
+            } else {
+                Some(format!("絞込: {}", needle))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn window_start(cursor: usize, total: usize, visible: usize) -> usize {
     if total <= visible {
         return 0;

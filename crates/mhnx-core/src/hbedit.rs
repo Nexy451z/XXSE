@@ -77,6 +77,14 @@ pub enum Screen {
     EquipEdit,
     /// Decoration name picker, opened from the equipment form with Y.
     JewelPick,
+    /// Equipment name picker, opened from the form's 種別 / ID row with Y.
+    ///
+    /// The box's ID row used to be a number the user stepped with the arrow
+    /// keys, which is 1,606 weapons and 6,435 armour pieces of blind hunting.
+    /// This screen lists the game's own names for the half of the box the form
+    /// is on, narrows them by type and by a typed word, and writes the type and
+    /// the id back into the form with [A].
+    EquipPick,
     /// The 45 quest-equipment entries the DLC section carries.
     QuestEquip,
     /// Monster hunt, capture and size records.
@@ -1217,6 +1225,328 @@ pub fn decoration_name_of(id: u16) -> alloc::string::String {
     alloc::format!("#{}", id)
 }
 
+// ---------------------------------------------------------------------------
+// Equipment names, for the picker the ID row opens
+// ---------------------------------------------------------------------------
+//
+// The names are the game's own: crate::equipnames carries the two tables the
+// box already prints from (weapons indexed by type and id, armour indexed by
+// series * 5 + part), and gamedata carries the talisman list. Nothing new is
+// written down here, so the name on a picker row and the name in the box
+// cannot disagree - they are the same string.
+//
+// The measurement the picker is built around: 1,606 named weapons over the 14
+// types the box stores, and 6,435 named armour pieces over the five parts. The
+// old ID row made the user count through those with [◀] / [▶].
+
+/// The weapon types in box order: 7..=21 without 12, the hole the JP weapon
+/// numbering leaves (see equip::type_name).
+pub const WEAPON_KINDS: [u8; 14] = [7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+/// The five armour parts, in the order the form cycles them.
+pub const ARMOR_KINDS: [u8; 5] = [1, 2, 3, 4, 5];
+/// The talisman, the only kind of its family.
+pub const TALISMAN_KINDS: [u8; 1] = [6];
+
+/// Which half of the box a name pick is looking through.
+///
+/// A scope, not a kind: the 1,606 weapons are one list whichever of the 14
+/// types the form happens to be on, and the type is a filter inside it. That
+/// is what makes "検索: 大剣（137件）" and "全 1,606件" the same list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EquipScope {
+    /// The 14 weapon types (1,606 names).
+    Weapons,
+    /// The five armour parts (6,435 names).
+    Armor,
+    /// The talisman list.
+    Talismans,
+}
+
+impl EquipScope {
+    /// The scope a record of this type belongs to.
+    ///
+    /// An unknown type (a corrupt record, or one of the palico kinds the box
+    /// never holds) is listed with the weapons rather than refused: the picker
+    /// must always have a list, and the form is where the type is corrected.
+    pub fn of_kind(kind: u8) -> Self {
+        match kind {
+            1..=5 => EquipScope::Armor,
+            6 => EquipScope::Talismans,
+            _ => EquipScope::Weapons,
+        }
+    }
+
+    /// The word the header uses for this half of the box.
+    pub fn label(self) -> &'static str {
+        match self {
+            EquipScope::Weapons => "武器",
+            EquipScope::Armor => "防具",
+            EquipScope::Talismans => "護石",
+        }
+    }
+
+    /// The kinds inside this scope, in the game's own type order.
+    pub fn kinds(self) -> &'static [u8] {
+        match self {
+            EquipScope::Weapons => &WEAPON_KINDS,
+            EquipScope::Armor => &ARMOR_KINDS,
+            EquipScope::Talismans => &TALISMAN_KINDS,
+        }
+    }
+}
+
+/// One row of a name pick: a type and an id.
+///
+/// Both halves are needed - id 40 is 爆砕の大剣 as a 大剣 and something else as
+/// a 太刀 - so a picked row writes both back into the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquipChoice {
+    /// Equipment type, 1..=21 (see equip::type_name).
+    pub kind: u8,
+    /// Weapon, armour or talisman id.
+    pub id: u16,
+}
+
+impl EquipChoice {
+    /// The id as the screens write it: "0x28".
+    ///
+    /// Hexdigits, not decimal, because that is the spelling the box's ID rows
+    /// print; the decimal number the game's own menus show is not written
+    /// anywhere in this interface.
+    pub fn hex(self) -> String {
+        format!("0x{:02X}", self.id)
+    }
+
+    /// "爆砕の大剣  0x28": the name first, the id beside it.
+    pub fn label(self) -> String {
+        format!("{}  {}", self.name(), self.hex())
+    }
+
+    /// The game's name for this row, or "-" when no table can name it.
+    pub fn name(self) -> &'static str {
+        equip_choice_name(self.kind, self.id)
+    }
+}
+
+/// The name one (kind, id) pair carries, out of the compiled tables.
+///
+/// The indexing is equip::name's: a weapon id indexes its own type's table, an
+/// armour id is a series (the part is the low digit of `series * 5 + part`),
+/// and the talisman has a list of its own. The picker and the box therefore
+/// read the same row.
+pub fn equip_choice_name(kind: u8, id: u16) -> &'static str {
+    use crate::equipnames::{ARMOR_NAMES, WEAPON_NAMES};
+    match kind {
+        1..=5 => {
+            let part = (kind - 1) as usize;
+            ARMOR_NAMES.get(id as usize * 5 + part).copied().unwrap_or("-")
+        }
+        7..=21 => {
+            let t = match kind as usize - 7 {
+                5 => return "(未使用)",
+                n => n,
+            };
+            WEAPON_NAMES
+                .get(t)
+                .and_then(|tbl| tbl.get(id as usize))
+                .copied()
+                .unwrap_or("-")
+        }
+        6 => {
+            #[cfg(feature = "gamedata")]
+            {
+                crate::gamedata::EQUIP_TALISMAN_NAMES
+                    .get(id as usize)
+                    .copied()
+                    .unwrap_or("-")
+            }
+            #[cfg(not(feature = "gamedata"))]
+            {
+                "-"
+            }
+        }
+        _ => "-",
+    }
+}
+
+/// Is there a name table for this scope in this build?
+///
+/// The weapons and the armour are compiled in unconditionally (crate::equipnames
+/// is not behind a feature); the talismans come from gamedata. A build without
+/// them still gets the picker - it searches ids - which is the fallback the
+/// header names.
+pub fn equip_names_available(scope: EquipScope) -> bool {
+    match scope {
+        // "装備なし" is the first row of every weapon table, so a table that
+        // names nothing at all has length 0.
+        EquipScope::Weapons => crate::equipnames::WEAPON_NAMES
+            .iter()
+            .any(|t| t.len() > 1),
+        EquipScope::Armor => crate::equipnames::ARMOR_NAMES.len() > 5,
+        EquipScope::Talismans => {
+            #[cfg(feature = "gamedata")]
+            {
+                !crate::gamedata::EQUIP_TALISMAN_NAMES.is_empty()
+            }
+            #[cfg(not(feature = "gamedata"))]
+            {
+                false
+            }
+        }
+    }
+}
+
+/// Every (kind, id) the name tables of one scope hold, in type then id order.
+///
+/// The rows are the tables themselves, id 0 included: the measured volume of
+/// the game's own data is 1,606 weapons over 14 types and 6,435 armour pieces
+/// over five parts, and those are the numbers the header counts. A hole in a
+/// table (the game leaves "装備なし" where a series has no piece) is a row too,
+/// because id 0 is a value the record can hold and the box prints it.
+///
+/// The list is rebuilt per frame, so it carries no names - a row looks its name
+/// up when it is drawn (EquipChoice::name).
+pub fn equip_choices(scope: EquipScope) -> Vec<EquipChoice> {
+    let mut out = Vec::new();
+    match scope {
+        EquipScope::Weapons => {
+            for &kind in WEAPON_KINDS.iter() {
+                let Some(table) = crate::equipnames::WEAPON_NAMES.get(kind as usize - 7) else {
+                    continue;
+                };
+                for id in 0..table.len() {
+                    out.push(EquipChoice {
+                        kind,
+                        id: id as u16,
+                    });
+                }
+            }
+        }
+        EquipScope::Armor => {
+            // ARMOR_NAMES is series * 5 + part, so the series count is a fifth
+            // of it and the part picks the row inside the block.
+            let series = crate::equipnames::ARMOR_NAMES.len() / 5;
+            for &kind in ARMOR_KINDS.iter() {
+                let part = (kind - 1) as usize;
+                for s in 0..series {
+                    // A table short of 5 * series rows names nothing for the
+                    // tail rather than pointing past its end.
+                    if crate::equipnames::ARMOR_NAMES.get(s * 5 + part).is_none() {
+                        continue;
+                    }
+                    out.push(EquipChoice {
+                        kind,
+                        id: s as u16,
+                    });
+                }
+            }
+        }
+        EquipScope::Talismans => {
+            #[cfg(feature = "gamedata")]
+            {
+                for id in 0..crate::gamedata::EQUIP_TALISMAN_NAMES.len() {
+                    out.push(EquipChoice {
+                        kind: 6,
+                        id: id as u16,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Does an id's hex spelling contain the needle (already lowercased)?
+///
+/// The fallback search and the "type the id you can see" case both go through
+/// this: the row prints 0x28, so 28 has to find it. The "0x" a user may copy
+/// from the screen is dropped by pick_needle, so both spellings work.
+fn hex_digits_contain(id: u16, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if !needle.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let mut digits = [0u8; 4];
+    let mut n = id;
+    let mut len = 0;
+    loop {
+        digits[len] = b"0123456789abcdef"[(n & 0xF) as usize];
+        n >>= 4;
+        len += 1;
+        if n == 0 || len == digits.len() {
+            break;
+        }
+    }
+    if needle.len() > len {
+        return false;
+    }
+    // The digits are least significant first, so the spelling is the reverse.
+    (0..=len - needle.len()).any(|start| {
+        (0..needle.len())
+            .all(|k| digits[len - 1 - (start + k)] == needle.as_bytes()[k])
+    })
+}
+
+/// Does one row answer the needle (already lowercased and trimmed)?
+///
+/// Three things answer it, and all three are on the screen: the name, the type
+/// ("大剣" finds all 137 of them), and the hex id the row prints. A build with
+/// no name table for the scope answers the id alone, which is the fallback the
+/// header announces.
+pub fn equip_choice_matches(choice: EquipChoice, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if equip_names_available(EquipScope::of_kind(choice.kind)) {
+        let name = choice.name();
+        // Same test name_matches makes, with the lowercased half kept for the
+        // names that can actually have a capital in them: this runs over 6,435
+        // rows every frame the picker is open, and a Japanese name has no case
+        // to fold.
+        if name.contains(needle)
+            || (name.bytes().any(|b| b.is_ascii_uppercase())
+                && name.to_lowercase().contains(needle))
+        {
+            return true;
+        }
+        // The type name answers "大剣" for all 137 of them. It is Japanese (or
+        // "(未使用)"), so there is no case to fold here either.
+        if crate::equip::type_name(choice.kind).contains(needle) {
+            return true;
+        }
+    }
+    hex_digits_contain(choice.id, needle)
+}
+
+/// The needle a name pick compares with: trimmed, lowercased, and with the
+/// "#" / "0x" a user may copy from the screen taken off the front.
+pub fn pick_needle(text: &str) -> String {
+    let t = filter_needle(text);
+    match t.strip_prefix("0x") {
+        Some(rest) => alloc::string::ToString::to_string(rest),
+        None => t,
+    }
+}
+
+/// "1,606": a count with the thousands grouped.
+///
+/// The lists this picker shows are four digits long, and 6435 with no break in
+/// it is not a number anyone reads at a glance.
+pub fn grouped_count(n: usize) -> String {
+    let digits = format!("{}", n);
+    let mut out = String::new();
+    let len = digits.len();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Sentinel id for "ask for an item name to filter the picker by".
 pub const TEXT_ITEM_FILTER: usize = usize::MAX - 1;
 /// Sentinel id for "ask for a skill name to filter the picker by".
@@ -1268,6 +1598,17 @@ pub const TEXT_REWARD_PROB: usize = usize::MAX - 1_007;
 pub const TEXT_REWARD_COUNT: usize = usize::MAX - 1_008;
 /// Sentinel id for "ask for the guild card name" (the card's own copy).
 pub const TEXT_CARD_NAME: usize = usize::MAX - 1_010;
+/// Sentinel id for "ask for a name to filter the equipment picker by".
+///
+/// Below `TEXT_PALICO_NAME` for the reason TEXT_SET_NAME is: the console layer
+/// reads one contiguous range above that base as palico names.
+pub const TEXT_EQUIP_PICK_FILTER: usize = usize::MAX - 1_011;
+/// Sentinel id for "ask for an equipment id to type into the form".
+///
+/// Below `TEXT_PALICO_NAME` as well. This is the row that used to be stepped
+/// with the arrow keys only, and it is the fallback when a build has no name
+/// tables at all.
+pub const TEXT_EQUIP_ID: usize = usize::MAX - 1_012;
 /// Sentinel base for "ask for the name of item set N": N is added to this.
 ///
 /// The two my-set names sit in one field of the same width, so the base is
@@ -2016,6 +2357,27 @@ fn parse_leading_u32(text: &str) -> Option<u32> {
         return None;
     }
     digits.parse::<u32>().ok()
+}
+
+/// An equipment id typed by hand: "0x28" in hex, "40" in decimal.
+///
+/// Hex is the spelling every screen prints for an equipment id, so a number
+/// copied off the row works as it stands. A bare number is read as decimal
+/// because that is what a bare number means everywhere else in this interface,
+/// and `apply_equip_id_text` always re-spells what it took and names it, so a
+/// wrong reading is on screen before the write.
+fn parse_equip_id(text: &str) -> Option<u16> {
+    let t = text.trim();
+    let (body, radix) = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => (hex, 16),
+        None => (t, 10),
+    };
+    if body.is_empty() || body.len() > 5 {
+        return None;
+    }
+    u32::from_str_radix(body, radix)
+        .ok()
+        .map(|v| v.min(u16::MAX as u32) as u16)
 }
 
 /// `H:MM` (or a plain second count) as seconds.
@@ -3281,6 +3643,21 @@ pub struct Editor {
     pub jewel_pick_filter: String,
     /// Cursor inside the filtered decoration list.
     pub jewel_pick_cursor: usize,
+    /// Name filter used by the equipment picker.
+    pub equip_pick_filter: String,
+    /// The half of the box the equipment picker is listing.
+    ///
+    /// Fixed when the picker opens, from the type the form is on: narrowing
+    /// from 大剣 to 頭 is a change of record, not a search, and the form is
+    /// where that belongs.
+    pub equip_pick_scope: EquipScope,
+    /// The type inside that scope the list is narrowed to, or 0 for all of it.
+    ///
+    /// [-] walks this: every type of the scope, then the scope's first type,
+    /// round again. Zero is what makes the header read "全 1,606件".
+    pub equip_pick_kind: u8,
+    /// Cursor inside the filtered equipment picker list.
+    pub equip_pick_cursor: usize,
     /// Quest id / title filter for the save's quest list.
     pub quest_filter: String,
     /// Skill name filter used by the picker.
@@ -3529,6 +3906,10 @@ impl Editor {
             equip_delete_armed: None,
             jewel_pick_filter: String::new(),
             jewel_pick_cursor: 0,
+            equip_pick_filter: String::new(),
+            equip_pick_scope: EquipScope::Weapons,
+            equip_pick_kind: 0,
+            equip_pick_cursor: 0,
             item_pick_mode: 0,
             entry_item_row: 0,
             entry_row_cursor: 0,
@@ -4118,10 +4499,19 @@ impl Editor {
                 "[A] 編集  [▲/▼] 行  [Y] 絞る/解除  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
             }
             Screen::EquipEdit => {
-                "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品  [X] 保存  [B] 戻る"
+                "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装備名/装飾品  [R] ID入力  [X] 保存  [B] 戻る"
             }
             Screen::JewelPick => {
                 "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [X] クリア  [B] 戻る"
+            }
+            // One line for the name picker: the id is printed in hex
+            // everywhere, so the guide says "名前か 16進ID" rather than
+            // leaving the reader to guess which of the two the box takes.
+            Screen::EquipPick if self.equip_pick_kind != 0 => {
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [-] 種別を全種  [X] クリア  [B] 戻る"
+            }
+            Screen::EquipPick => {
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [-] 種別で絞る  [X] クリア  [B] 戻る"
             }
             Screen::Sets if self.set_edit.is_some() => {
                 "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 外す（2回）  [Y] 警告  [X] 保存  [B] 一覧"
@@ -5389,6 +5779,7 @@ impl Editor {
             Screen::Equip => self.input_equip(key),
             Screen::EquipEdit => self.input_equip_edit(key),
             Screen::JewelPick => self.input_jewel_pick(key),
+            Screen::EquipPick => self.input_equip_pick(key),
             Screen::QuestEquip => self.input_quest_equip(key),
             Screen::Hunts => self.input_hunts(key),
             Screen::Guild => self.input_guild(key),
@@ -10565,6 +10956,12 @@ impl Editor {
                     }
                 }
             }
+            // [Y] is "pick the row by name" on this form, and it means the same
+            // thing on all four rows that have a name behind them: the three
+            // sockets open the decoration picker, 種別 / ID open the equipment
+            // picker. It used to answer "先に装飾品の行へ移動してください" on
+            // the two rows that name the record itself, which is the row the
+            // hardware report was about.
             Key::Y => {
                 if e.decoration_socket(e.field).is_some() {
                     self.equip_edit = Some(e);
@@ -10572,12 +10969,31 @@ impl Editor {
                     self.jewel_pick_cursor = 0;
                     self.screen = Screen::JewelPick;
                     self.message = self.pick_key_hint();
+                } else if self.equip_id_field(e.field) {
+                    self.equip_edit = Some(e);
+                    self.open_equip_picker();
+                    return;
                 } else if e.new {
                     self.message =
                         String::from("装飾品は作成後に選べます（[A] で作成してから編集）");
                 } else {
-                    self.message = String::from("先に装飾品の行へ移動してください");
+                    self.message = String::from(
+                        "装備名は 種別・ID の行で [Y] / 装飾品は装飾品の行で [Y] を押してください",
+                    );
                 }
+            }
+            // [R] types the number of the row instead of stepping it - the same
+            // job it does on the item box, the guild card and the hunt record.
+            // On 種別 / ID it is the fallback for an id the name tables do not
+            // carry (and for a build that has no tables at all).
+            Key::R => {
+                if self.equip_id_field(e.field) {
+                    self.equip_edit = Some(e);
+                    self.request_equip_id_text();
+                    return;
+                }
+                self.message =
+                    String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [Y]）");
             }
             Key::X => self.step = (self.step + 1) % STEPS.len(),
             Key::A => {
@@ -10600,6 +11016,250 @@ impl Editor {
             _ => {}
         }
         self.equip_edit = Some(e);
+    }
+
+    // -----------------------------------------------------------------------
+    // The equipment picker: the ID row answered with names
+    // -----------------------------------------------------------------------
+
+    /// Is this form row one of the two that name the record?
+    ///
+    /// Creating: 0 種別 / 1 ID. Editing: 7 種別 / 8 ID. Both pairs are the only
+    /// rows with a name table behind them.
+    fn equip_id_field(&self, field: usize) -> bool {
+        if self.equip_edit.map(|e| e.new).unwrap_or(false) {
+            field == 0 || field == 1
+        } else {
+            field == 7 || field == 8
+        }
+    }
+
+    /// The rows the picker offers, after its type and word filters.
+    ///
+    /// Rebuilt every frame the picker is open, the way the item picker is, so
+    /// the list cannot fall behind the form it writes into.
+    pub fn equip_pick_choices(&self) -> Vec<EquipChoice> {
+        let needle = pick_needle(&self.equip_pick_filter);
+        let mut out = Vec::new();
+        for c in equip_choices(self.equip_pick_scope) {
+            if self.equip_pick_kind != 0 && c.kind != self.equip_pick_kind {
+                continue;
+            }
+            if !equip_choice_matches(c, &needle) {
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
+    /// Can this build put a name to the rows the picker is listing?
+    pub fn equip_pick_names_available(&self) -> bool {
+        equip_names_available(self.equip_pick_scope)
+    }
+
+    /// The line under the picker's title: what narrows it and what is left.
+    ///
+    /// "検索: 大剣（137件）" while the type filter is on, "全 1,606件" when it
+    /// is not, the word the user typed beside either, and the id-search notice
+    /// when this build has no names to search. The console draws this verbatim,
+    /// so the drawn header and the status line cannot word it differently.
+    pub fn equip_pick_search_line(&self, matches: usize) -> String {
+        if !self.equip_pick_names_available() {
+            return format!("名前が読めないので ID（16進）で検索します（{}件）", matches);
+        }
+        let needle = self.equip_pick_filter.trim();
+        let mut title = String::new();
+        if self.equip_pick_kind != 0 {
+            title.push_str(crate::equip::type_name(self.equip_pick_kind));
+        }
+        if !needle.is_empty() {
+            if !title.is_empty() {
+                title.push_str(" + ");
+            }
+            title.push_str(needle);
+        }
+        if title.is_empty() {
+            format!("全 {}件", grouped_count(matches))
+        } else {
+            format!("検索: {}（{}件）", title, matches)
+        }
+    }
+
+    /// What the type filter is on, for the header and the footer.
+    pub fn equip_pick_kind_label(&self) -> &'static str {
+        if self.equip_pick_kind == 0 {
+            self.equip_pick_scope.label()
+        } else {
+            crate::equip::type_name(self.equip_pick_kind)
+        }
+    }
+
+    /// Open the name picker on the record the form is holding.
+    ///
+    /// The type filter starts on the form's own type, so the first screen reads
+    /// "検索: 大剣（137件）" rather than all 1,606 weapons; [-] widens it to the
+    /// rest of the scope and back. The cursor starts on the id the form already
+    /// has, so opening the picker twice does not lose the row. Returns false
+    /// (with a message) when no form is open or the cursor is on a row that is
+    /// not 種別 / ID.
+    pub fn open_equip_picker(&mut self) -> bool {
+        let Some(e) = self.equip_edit else {
+            self.message = String::from("装備の編集中に開いてください");
+            return false;
+        };
+        if !self.equip_id_field(e.field) {
+            self.message = String::from("種別・ID の行で [Y] を押してください");
+            return false;
+        }
+        let scope = EquipScope::of_kind(e.kind);
+        self.equip_pick_scope = scope;
+        // A type outside the scope (the unused 12, or one of the palico kinds a
+        // corrupt record can hold) is no filter at all rather than a filter
+        // that matches nothing.
+        self.equip_pick_kind = if scope.kinds().contains(&e.kind) { e.kind } else { 0 };
+        self.equip_pick_filter.clear();
+        let choices = self.equip_pick_choices();
+        self.equip_pick_cursor = choices
+            .iter()
+            .position(|c| c.kind == e.kind && c.id == e.id)
+            .unwrap_or(0);
+        self.screen = Screen::EquipPick;
+        self.message = self.equip_pick_search_line(choices.len());
+        true
+    }
+
+    /// The io layer answers a filter request with this.
+    ///
+    /// An empty string is the whole list again, which is what [Y] + 決定 with
+    /// the box cleared does: there is no separate "clear" gesture to learn.
+    pub fn apply_equip_pick_filter(&mut self, text: String) {
+        self.equip_pick_filter = text;
+        self.equip_pick_cursor = 0;
+        let n = self.equip_pick_choices().len();
+        self.message = self.equip_pick_search_line(n);
+    }
+
+    /// [-]: walk the type filter - 全種, then every type of the scope, round.
+    pub fn cycle_equip_pick_kind(&mut self) {
+        let kinds = self.equip_pick_scope.kinds();
+        self.equip_pick_kind = match kinds.iter().position(|k| *k == self.equip_pick_kind) {
+            None => kinds.first().copied().unwrap_or(0),
+            Some(i) if i + 1 < kinds.len() => kinds[i + 1],
+            Some(_) => 0,
+        };
+        self.equip_pick_cursor = 0;
+        let n = self.equip_pick_choices().len();
+        self.message = self.equip_pick_search_line(n);
+    }
+
+    /// The name picker's keys: the pick lists' movement, a word, and the type.
+    fn input_equip_pick(&mut self, key: Key) {
+        // The pick lists' one rule: [▲] / [▼] one row, [◀] / [▶] ten
+        // (hbedit::pick_move). The console turns L / R into the same pair.
+        let n = self.equip_pick_choices().len();
+        if pick_move(&mut self.equip_pick_cursor, n, key) {
+            self.message = self.equip_pick_search_line(n);
+            return;
+        }
+        match key {
+            Key::Y => {
+                self.pending_text =
+                    Some((TEXT_EQUIP_PICK_FILTER, self.equip_pick_filter.clone()));
+                if !self.equip_pick_names_available() {
+                    self.message =
+                        String::from("名前が読めないので ID（16進）で検索します（例: 28）");
+                }
+            }
+            Key::X => {
+                self.equip_pick_filter.clear();
+                self.equip_pick_cursor = 0;
+                let n = self.equip_pick_choices().len();
+                self.message = self.equip_pick_search_line(n);
+            }
+            // The type filter is the other axis of the same question, and [-]
+            // is the one key this modal screen has spare.
+            Key::Minus => self.cycle_equip_pick_kind(),
+            Key::A => {
+                let choices = self.equip_pick_choices();
+                if let Some(c) = choices.get(self.equip_pick_cursor).copied() {
+                    // A picked row writes both halves: id 40 is 爆砕の大剣 as a
+                    // 大剣 and a different weapon as a 太刀, so the type has to
+                    // come with the id.
+                    if let Some(e) = &mut self.equip_edit {
+                        e.kind = c.kind;
+                        e.id = c.id;
+                    }
+                    self.message = format!("{} を選びました（[A] で書き込み）", c.label());
+                    self.screen = Screen::EquipEdit;
+                } else {
+                    // Nothing to pick: stay on the list so the word can be
+                    // retyped, rather than closing onto a form that did not
+                    // change.
+                    self.message =
+                        String::from("選べる装備がありません（[Y] で検索し直してください）");
+                }
+            }
+            Key::B => self.screen = Screen::EquipEdit,
+            Key::Plus => {
+                self.press_quit();
+            }
+            _ => {}
+        }
+    }
+
+    /// [R] on 種別 / ID: type the id instead of paging to it.
+    pub fn request_equip_id_text(&mut self) -> bool {
+        let Some(e) = self.equip_edit else {
+            self.message = String::from("装備の編集中に開いてください");
+            return false;
+        };
+        if !self.equip_id_field(e.field) {
+            self.message = String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [Y]）");
+            return false;
+        }
+        self.pending_text = Some((TEXT_EQUIP_ID, EquipChoice { kind: e.kind, id: e.id }.hex()));
+        true
+    }
+
+    /// The io layer answers the [R] request with this.
+    ///
+    /// "0x28" is read as hex and "40" as decimal, which is the one place this
+    /// interface accepts a decimal id; the form re-spells it in hex and names
+    /// it, so a wrong reading is visible on the next frame. An id the name
+    /// table does not carry is accepted and said out loud rather than refused:
+    /// the save format allows it, and the user may know an id this build does
+    /// not.
+    pub fn apply_equip_id_text(&mut self, text: &str) -> bool {
+        let Some(mut e) = self.equip_edit else {
+            self.message = String::from("装備の編集中に開いてください");
+            return false;
+        };
+        if !self.equip_id_field(e.field) {
+            self.message = String::from("[R] は 種別・ID の行で使います");
+            return false;
+        }
+        let Some(id) = parse_equip_id(text) else {
+            self.message = String::from("ID を入力してください（16進は 0x28 / 10進は 40）");
+            return false;
+        };
+        e.id = id;
+        self.equip_edit = Some(e);
+        let name = equip_choice_name(e.kind, id);
+        self.message = if name == "-" || name == "(未使用)" {
+            format!(
+                "{} {} にしました（名前表に無い ID です / [A] で書き込み）",
+                crate::equip::type_name(e.kind),
+                EquipChoice { kind: e.kind, id }.hex()
+            )
+        } else {
+            format!(
+                "{} {} にしました（[A] で書き込み）",
+                name,
+                EquipChoice { kind: e.kind, id }.hex()
+            )
+        };
+        true
     }
 
     /// Write the form's values for an existing record, replacing it when its
@@ -13079,7 +13739,14 @@ impl Editor {
                             String::from("種別"),
                             format!("{}  {}", e.kind, crate::equip::type_name(e.kind)),
                         ),
-                        (String::from("ID"), format!("{}", e.id)),
+                        (
+                            String::from("ID"),
+                            format!(
+                                "{}  {}",
+                                equip_choice_name(e.kind, e.id),
+                                EquipChoice { kind: e.kind, id: e.id }.hex()
+                            ),
+                        ),
                         (String::from("レベル"), format!("{}", e.level)),
                     ];
                     for (i, (k, v)) in rows.iter().enumerate() {
@@ -13087,7 +13754,9 @@ impl Editor {
                     }
                     push(
                         &mut out,
-                        String::from("  Up/Down row  Left/Right value  A 作成  B 戻る"),
+                        String::from(
+                            "  Up/Down row  Left/Right value  Y 名前で選ぶ  R ID入力  A 作成  B 戻る",
+                        ),
                         false,
                         false,
                     );
@@ -13136,14 +13805,23 @@ impl Editor {
                             String::from("種別"),
                             format!("{}  {}", e.kind, crate::equip::type_name(e.kind)),
                         ),
-                        (String::from("ID"), format!("{}", e.id)),
+                        (
+                            String::from("ID"),
+                            format!(
+                                "{}  {}",
+                                equip_choice_name(e.kind, e.id),
+                                EquipChoice { kind: e.kind, id: e.id }.hex()
+                            ),
+                        ),
                     ];
                     for (i, (k, v)) in rows.iter().enumerate() {
                         push(&mut out, format!("  {:<14} {}", k, v), true, i == e.field);
                     }
                     push(
                         &mut out,
-                        String::from("  Up/Down row  Left/Right value  Y 装飾品  X 刻み  A 反映/差し替え  B 戻る"),
+                        String::from(
+                            "  Up/Down row  Left/Right value  Y 装備名/装飾品  R ID入力  X 刻み  A 反映/差し替え  B 戻る",
+                        ),
                         false,
                         false,
                     );
@@ -13181,6 +13859,45 @@ impl Editor {
                     &mut out,
                     String::from(
                         "  A choose  Y type filter  X clear  Up/Down 1  Left/Right 10  B back",
+                    ),
+                    false,
+                    false,
+                );
+            }
+            Screen::EquipPick => {
+                let choices = self.equip_pick_choices();
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "PICK EQUIPMENT   {}   {}",
+                        self.equip_pick_scope.label(),
+                        self.equip_pick_search_line(choices.len())
+                    ),
+                    false,
+                    false,
+                );
+                if choices.is_empty() {
+                    push(&mut out, String::from("  (nothing matches)"), false, false);
+                }
+                let mut start = self.equip_pick_cursor.saturating_sub(8);
+                if start + 16 > choices.len() {
+                    start = choices.len().saturating_sub(16);
+                }
+                for (i, c) in choices.iter().enumerate().skip(start).take(16) {
+                    push(
+                        &mut out,
+                        // The name first, the id beside it - the same shape the
+                        // drawn row uses, and hex because that is the spelling
+                        // every equipment id in this interface has.
+                        alloc::format!("  {}  {}", c.name(), c.hex()),
+                        true,
+                        i == self.equip_pick_cursor,
+                    );
+                }
+                push(
+                    &mut out,
+                    String::from(
+                        "  A choose  Y name filter  - type filter  X clear  Up/Down 1  Left/Right 10  B back",
                     ),
                     false,
                     false,
@@ -13733,6 +14450,276 @@ impl Editor {
             }
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scrolling: the geometry and the timing every list shares
+// ---------------------------------------------------------------------------
+//
+// A list here is a window of rows over a table that can be a thousand entries
+// long, and it is driven by four inputs that never see each other: the pad's
+// direction keys (with their auto-repeat), the right stick, a finger on the
+// rows and a finger on the scrollbar. If any two of them disagree about where
+// the window is, one of them scrolls to a place the bar does not show. So the
+// arithmetic lives here once, with tests, and the Switch layer only draws what
+// these functions answer.
+
+/// The shortest a scrollbar thumb is ever drawn, in pixels.
+///
+/// A 340 row list in a 500px track would give a 13px thumb, and a 13px thumb is
+/// not something a finger can hold. Below this the thumb stops shrinking and
+/// the bar keeps the minimum.
+pub const SCROLL_MIN_THUMB: i32 = 16;
+
+/// The visible width of a list scrollbar.
+///
+/// Six pixels because a wider bar is loud next to a 796px list, and the row
+/// under it has already spent the right hand 22px of the panel on its value.
+pub const SCROLL_BAR_W: i32 = 6;
+
+/// The width of the area that answers a finger: wider than the bar on purpose.
+///
+/// A finger is not 6px wide and does not land where it aimed. The bar is what
+/// the eye reads; this is what the hand hits.
+pub const SCROLL_HIT_W: i32 = 20;
+
+/// Where a list panel's right hand scrollbar and its touch area sit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollTrack {
+    /// Left edge of the drawn bar.
+    pub bar_x: i32,
+    /// Width of the drawn bar.
+    pub bar_w: i32,
+    /// Left edge of the area that answers a touch.
+    pub hit_x: i32,
+    /// Width of that area.
+    pub hit_w: i32,
+}
+
+impl ScrollTrack {
+    /// Does a point fall in the bar's touch area?
+    #[inline]
+    pub fn hits(&self, px: i32) -> bool {
+        px >= self.hit_x && px < self.hit_x + self.hit_w
+    }
+}
+
+/// Lay the scrollbar out against the right edge of a list panel.
+///
+/// The bar keeps 8px clear of the panel edge so it reads as part of the panel
+/// rather than as its border, and the touch area straddles it: 14px of the 20
+/// sit to the left of the bar and 6px to the right, which keeps the whole area
+/// inside the panel while still catching a finger that aimed at the bar and
+/// landed on the row's padding.
+pub fn scroll_track(panel_x: i32, panel_w: i32) -> ScrollTrack {
+    let bar_x = panel_x + panel_w - 8 - SCROLL_BAR_W;
+    let hit_x = panel_x + panel_w - SCROLL_HIT_W;
+    ScrollTrack {
+        bar_x,
+        bar_w: SCROLL_BAR_W,
+        hit_x,
+        hit_w: SCROLL_HIT_W,
+    }
+}
+
+/// One list's window: how long the table is, how much of it is on screen, and
+/// which row the window starts at.
+///
+/// The visible count is the number of rows the screen actually draws, not the
+/// number it could: a warning strip under the list costs a row, and the bar has
+/// to be the share of the list that is really visible or it points at the wrong
+/// place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollBar {
+    total: usize,
+    visible: usize,
+    start: usize,
+}
+
+impl ScrollBar {
+    /// A window over a table of this many rows, this many of them at a time,
+    /// starting at this row.
+    ///
+    /// The window is normalised here rather than at every call site: the
+    /// visible count is at least one, and a window that would hang off the end
+    /// of the table is pulled back so the last screen is full.
+    pub fn new(total: usize, visible: usize, start: usize) -> Self {
+        let visible = visible.max(1);
+        let start = if total <= visible {
+            0
+        } else {
+            start.min(total - visible)
+        };
+        ScrollBar {
+            total,
+            visible,
+            start,
+        }
+    }
+
+    #[inline]
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    #[inline]
+    pub fn visible(&self) -> usize {
+        self.visible
+    }
+
+    #[inline]
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Is there anything to scroll? A list that fits gets no bar at all: a
+    /// thumb that never moves claims the table is longer than it is.
+    #[inline]
+    pub fn active(&self) -> bool {
+        self.total > self.visible
+    }
+
+    /// Thumb length in pixels for a track this tall.
+    pub fn thumb_len(&self, track_h: i32) -> i32 {
+        if track_h <= 0 {
+            return 0;
+        }
+        if !self.active() {
+            return track_h;
+        }
+        let share = (track_h as i64) * (self.visible as i64) / (self.total as i64);
+        (share as i32).clamp(SCROLL_MIN_THUMB, track_h)
+    }
+
+    /// How far the top of the thumb sits from the top of the track, in pixels.
+    pub fn thumb_offset(&self, track_h: i32) -> i32 {
+        if !self.active() {
+            return 0;
+        }
+        let usable = track_h - self.thumb_len(track_h);
+        if usable <= 0 {
+            return 0;
+        }
+        let span = (self.total - self.visible) as i64;
+        let off = (usable as i64) * (self.start as i64) / span;
+        off.clamp(0, usable as i64) as i32
+    }
+
+    /// The other direction: the row the window starts at when the top of the
+    /// thumb is dragged this many pixels down the track.
+    ///
+    /// This is what turns a finger into a scroll. A thumb shorter than its
+    /// share of the track cannot name every row, so the answer is rounded to
+    /// the nearest reachable one and the two ends stay reachable exactly.
+    pub fn start_for_offset(&self, track_h: i32, offset: i32) -> usize {
+        if !self.active() {
+            return 0;
+        }
+        let usable = track_h - self.thumb_len(track_h);
+        if usable <= 0 {
+            return 0;
+        }
+        let span = (self.total - self.visible) as i64;
+        let usable = usable as i64;
+        let off = (offset as i64).clamp(0, usable);
+        let start = (off * span + usable / 2) / usable;
+        start.clamp(0, span) as usize
+    }
+}
+
+/// Move a list cursor by whole pages, clamped to the ends.
+///
+/// A page is what the screen shows, not a fixed eight rows: the equipment box
+/// shows nine and a warning strip takes one, and paging by a number the user
+/// cannot see is how a list skips entries.
+pub fn page_move(cursor: usize, total: usize, visible: usize, dir: i32) -> usize {
+    if total == 0 || dir == 0 {
+        return cursor.min(total.saturating_sub(1));
+    }
+    let page = visible.max(1) as i64;
+    let cur = cursor.min(total - 1) as i64;
+    let next = if dir < 0 { cur - page } else { cur + page };
+    next.clamp(0, total as i64 - 1) as usize
+}
+
+/// The first or the last row of a list.
+pub fn list_end(total: usize, forward: bool) -> usize {
+    if total == 0 {
+        0
+    } else if forward {
+        total - 1
+    } else {
+        0
+    }
+}
+
+/// Auto-repeat timing for a held direction button.
+///
+/// The console polls at 60Hz. The old cadence (12 frames to the first repeat,
+/// then every 4) moved a 340 row list one row per press for the first fifth of
+/// a second and then 15 rows a second, which is not scrolling, it is waiting.
+/// This is the same idea tuned: 8 frames to the first repeat (133ms), then
+/// every 4, and every 3 once the button has been held for a while, so a long
+/// list crosses the screen in about a second without the first tap feeling
+/// late.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyRepeat {
+    frames: u32,
+    emitted: u32,
+}
+
+impl KeyRepeat {
+    /// Frames a held direction waits before its first repeat.
+    pub const FIRST: u32 = 8;
+    /// Frames between repeats at first.
+    pub const NEXT: u32 = 4;
+    /// Frames between repeats once the button has been held a while.
+    pub const FAST: u32 = 3;
+    /// Repeats before the faster cadence takes over.
+    pub const RAMP: u32 = 10;
+
+    pub const fn new() -> Self {
+        KeyRepeat {
+            frames: 0,
+            emitted: 0,
+        }
+    }
+
+    /// A fresh press: the timer starts again, and the first repeat is the slow
+    /// one.
+    pub fn press(&mut self) {
+        self.frames = 0;
+        self.emitted = 0;
+    }
+
+    /// How many repeats this hold has already produced.
+    #[inline]
+    pub fn emitted(&self) -> u32 {
+        self.emitted
+    }
+
+    /// One frame of a hold. Returns true when this frame is a repeat.
+    pub fn tick(&mut self, held: bool) -> bool {
+        if !held {
+            self.press();
+            return false;
+        }
+        self.frames += 1;
+        let wait = if self.emitted == 0 {
+            Self::FIRST
+        } else if self.emitted >= Self::RAMP {
+            Self::FAST
+        } else {
+            Self::NEXT
+        };
+        if self.frames >= wait {
+            self.frames = 0;
+            self.emitted = self.emitted.saturating_add(1);
+            true
+        } else {
+            false
+        }
     }
 }
 

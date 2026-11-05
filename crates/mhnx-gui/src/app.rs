@@ -900,6 +900,9 @@ pub struct MhnxEditor {
     pub mib: Option<Mib>,
     /// Editable copy of the 249 MIB bytes.
     pub mib_bytes: Vec<u8>,
+    /// Search text of the five monster-name pickers of the .mib panel, one per
+    /// slot: each of them narrows the name list on its own.
+    pub mib_mob_search: [String; 5],
     pub gmd: Option<Gmd>,
     /// Problems found by the quest checker.
     pub findings: Vec<Finding>,
@@ -957,6 +960,16 @@ pub struct MhnxEditor {
     pub palico_deco_search: [String; 3],
     /// Search text of the three decoration pickers, one per socket.
     pub equip_deco_search: [String; 3],
+    /// Search text of the item pickers of the マイセット tab (the thirty-two
+    /// rows of an item set and the thirty-two of the pouch). One box serves
+    /// them all: only one popup can be open at a time.
+    pub item_row_search: String,
+    /// Search text of the three equipment-name pickers of the 装備 tab: 新規作成,
+    /// 差し替え and 着せ替え. Each names the piece it will write instead of
+    /// asking for a number.
+    pub equip_new_search: String,
+    pub equip_rep_search: String,
+    pub equip_transmog_search: String,
     /// Type, id and level the "空き枠に作成" row is set to.
     pub equip_new_kind: u8,
     pub equip_new_id: u16,
@@ -1196,6 +1209,13 @@ impl Default for MhnxEditor {
             arc_from_save: None,
             mib: None,
             mib_bytes: Vec::new(),
+            mib_mob_search: [
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
             gmd: None,
             findings: Vec::new(),
             cat_lang: 0,
@@ -1225,6 +1245,10 @@ impl Default for MhnxEditor {
                 String::new(),
             ],
             equip_deco_search: [String::new(), String::new(), String::new()],
+            item_row_search: String::new(),
+            equip_new_search: String::new(),
+            equip_rep_search: String::new(),
+            equip_transmog_search: String::new(),
             palico_selected: None,
             palico_gear_selected: None,
             palico_gear_filter: String::new(),
@@ -6201,6 +6225,8 @@ impl MhnxEditor {
                 parts.serial
             ));
             ui.separator();
+            self.mib_monster_panel(ui);
+            ui.separator();
 
             ui.label(egui::RichText::new("フィールド (Quedixx 対応表)").strong());
             ui.label(
@@ -6266,8 +6292,23 @@ impl MhnxEditor {
                                         }
                                     });
                             } else if f.kind == FieldKind::Bytes {
-                                // Byte blobs (the five monster slots and the
-                                // rest) are not numbers: a 64 bit shift used to
+                                // A monster slot is not a byte blob to anyone
+                                // reading the list: it is one monster, and the
+                                // name is what says which. The hex dump stays
+                                // for the regions that have no name.
+                                if f.key.starts_with("mob_slot[") && f.size == MIB_MOB_SLOT {
+                                    let id = mib_mob_id(&self.mib_bytes, f.offset);
+                                    ui.label(monster_label(id));
+                                    ui.label(
+                                        egui::RichText::new("上の「大型モンスター」で編集できます")
+                                            .small()
+                                            .weak(),
+                                    );
+                                    ui.end_row();
+                                    continue;
+                                }
+                                // Byte blobs (the regions with no known fields)
+                                // are not numbers: a 64 bit shift used to
                                 // panic here in a debug build and render ten
                                 // controls that could never write anything.
                                 let mut s = String::new();
@@ -6446,6 +6487,128 @@ impl MhnxEditor {
         }
     }
 
+    /// The five large-monster slots of the open .mib, by name and by number.
+    ///
+    /// The slot used to be thirteen hex bytes and nothing else, which is why
+    /// 体力 could not be changed from this window at all. Each row names the
+    /// monster and edits its numbers. The values are the bytes the game stores,
+    /// so the widget covers the whole storage range and the measured range is
+    /// shown on hover: an upper bound nobody measured is not written into the
+    /// UI, and 0 is offered because real quests carry 0 in every one of these
+    /// fields.
+    fn mib_monster_panel(&mut self, ui: &mut egui::Ui) {
+        let offsets = mib_mob_slot_offsets();
+        if offsets.is_empty() {
+            return;
+        }
+        ui.label(egui::RichText::new("大型モンスター（5 枠）").strong());
+        ui.label(
+            egui::RichText::new(
+                "数値はスロットの生バイトです。枠にマウスを乗せると、実測した範囲が出ます。モンスターは名前から選べます。",
+            )
+            .weak()
+            .small(),
+        );
+        // Taken out of self so the grid can borrow the bytes and the search
+        // boxes at the same time; both go back when the grid is drawn.
+        let mut bytes = std::mem::take(&mut self.mib_bytes);
+        let mut search = std::mem::take(&mut self.mib_mob_search);
+        let mut changed = false;
+        egui::ScrollArea::horizontal()
+            .id_salt("mibmobscroll")
+            .show(ui, |ui| {
+                egui::Grid::new("mibmob")
+                    .num_columns(2 + MIB_MOB_FIELDS.len())
+                    .spacing([8.0, 3.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("枠").strong());
+                        ui.label(egui::RichText::new("モンスター").strong());
+                        for f in MIB_MOB_FIELDS {
+                            ui.label(egui::RichText::new(f.ja).strong());
+                        }
+                        ui.end_row();
+                        for (slot, off) in offsets.iter().enumerate() {
+                            let id = mib_mob_id(&bytes, *off);
+                            ui.label(format!("{}", slot + 1));
+                            let mut picked: Option<u16> = None;
+                            egui::ComboBox::from_id_salt(("mibmobname", slot))
+                                .selected_text(monster_label(id))
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut search[slot])
+                                            .hint_text("モンスター名・IDで検索")
+                                            .desired_width(240.0),
+                                    );
+                                    if ui.small_button("クリア").clicked() {
+                                        search[slot].clear();
+                                    }
+                                    if id != 0 && ui.small_button("空きにする").clicked() {
+                                        picked = Some(0);
+                                    }
+                                    let needle = search[slot].trim().to_lowercase();
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(("mibmoblist", slot))
+                                        .max_height(260.0)
+                                        .show(ui, |ui| {
+                                            for (mid, name) in monster_choices() {
+                                                if !needle.is_empty()
+                                                    && !name.to_lowercase().contains(&needle)
+                                                    && !format!("{}", mid).contains(&needle)
+                                                {
+                                                    continue;
+                                                }
+                                                if ui
+                                                    .selectable_label(
+                                                        id == mid,
+                                                        format!("{}（ID {}）", name, mid),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    picked = Some(mid);
+                                                }
+                                            }
+                                        });
+                                });
+                            if let Some(mid) = picked {
+                                if mib_mob_set_id(&mut bytes, *off, mid) {
+                                    changed = true;
+                                }
+                            }
+                            for f in MIB_MOB_FIELDS {
+                                let mut v = mib_mob_read(&bytes, *off, f).unwrap_or(0) as i64;
+                                let hi = if f.size == 2 { 0xFFFF } else { 0xFF };
+                                // Keyed by the field name: five slots draw the
+                                // same eight widgets and position alone is not
+                                // an identity when a slot is emptied.
+                                let resp = ui
+                                    .push_id((*off, f.key), |ui| {
+                                        ui.add_enabled(
+                                            id != 0,
+                                            egui::DragValue::new(&mut v).range(0..=hi).speed(1.0),
+                                        )
+                                    })
+                                    .inner
+                                    .on_hover_text(format!(
+                                        "実測 {}..{}（{} バイト。0 も実在します）",
+                                        f.observed.0, f.observed.1, f.size
+                                    ));
+                                if resp.changed() && mib_mob_write(&mut bytes, *off, f, v as u32) {
+                                    changed = true;
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.mib_bytes = bytes;
+        self.mib_mob_search = search;
+        if changed {
+            self.dirty = true;
+        }
+    }
+
     /// Editors for .rem / .sup / .sem / .esl / .qdp / .qdl.
 ///
 /// Every table here can be written back: seeds, counts, slots and the items
@@ -6454,7 +6617,7 @@ impl MhnxEditor {
     /// The layouts come from measuring real quests; the .rem and .sup record
     /// lists are editable, the rest are shown as they are.
     fn entry_panel(&mut self, ui: &mut egui::Ui) {
-        use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink, SemEntry};
+        use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 
         let Some(arc) = &self.arc else {
             return;
@@ -6731,24 +6894,10 @@ impl MhnxEditor {
                 }
             }
             "sem" => {
-                ui.label("モンスター配置 (.sem, 32 バイト単位)");
-                egui::Grid::new("semg")
-                    .striped(true)
-                    .num_columns(3)
-                    .show(ui, |ui| {
-                        for h in ["#", "位置 (x, y, z)", "有効"] {
-                            ui.strong(h);
-                        }
-                        ui.end_row();
-                        for (i, c) in data.chunks_exact(32).enumerate() {
-                            let s = SemEntry { raw: c.to_vec() };
-                            let (x, y, z, _) = s.position();
-                            ui.label(format!("{}", i));
-                            ui.label(format!("{:.1}, {:.1}, {:.1}", x, y, z));
-                            ui.label(if s.is_dummy() { "ダミー" } else { "実体" });
-                            ui.end_row();
-                        }
-                    });
+                // A quest carries one .sem per large monster, and the panel
+                // edits all of them: the selected entry is only which row was
+                // clicked last, not the thing being edited.
+                self.sem_panel(ui);
             }
             "esl" => match Esl::parse(&data) {
                 Ok(l) => {
@@ -6797,6 +6946,165 @@ impl MhnxEditor {
             other => {
                 ui.label(format!("このエントリ型 (.{}) は未対応です", other));
             }
+        }
+    }
+
+    /// Every .sem of the open archive: what monster it places, and where.
+    ///
+    /// A .sem is 32 bytes and the panel used to show one row of it, as three
+    /// numbers and the word 実体. The placement is now named after the monster
+    /// in the entry's own file name and every field is editable: the area and
+    /// the wave at +0x08 / +0x0C and the position and rotation as four floats
+    /// from +0x10. The ranges are the storage's; the measured ones are on hover
+    /// (4416 placements of a retail dump: エリア 0..11, ウェーブ 0..2).
+    fn sem_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(arc) = &self.arc else {
+            return;
+        };
+        // Copied out of the archive so the grid can draw while the writes are
+        // collected; the arc is borrowed again once the row loop is done.
+        let mut rows: Vec<(usize, String, [u8; 32])> = Vec::new();
+        for (i, e) in arc.entries.iter().enumerate() {
+            if extension_for(e.type_hash) == Some("sem") && e.data.len() == 32 {
+                let mut raw = [0u8; 32];
+                raw.copy_from_slice(&e.data);
+                rows.push((i, e.name.clone(), raw));
+            }
+        }
+        if rows.is_empty() {
+            ui.label(
+                egui::RichText::new("このアーカイブに .sem（モンスター配置）はありません")
+                    .weak(),
+            );
+            return;
+        }
+        ui.label(format!(
+            "モンスター配置 (.sem, 32 バイト単位) / {} 件",
+            rows.len()
+        ));
+        ui.label(
+            egui::RichText::new(
+                "モンスター名は .sem のファイル名（…em080_00.sem）から読んでいます。座標と角度はゲーム内の単位そのままです。",
+            )
+            .weak()
+            .small(),
+        );
+        // (entry index, offset inside the 32 bytes, the four bytes to write)
+        let mut writes: Vec<(usize, usize, [u8; 4])> = Vec::new();
+        egui::ScrollArea::horizontal()
+            .id_salt("semscroll")
+            .show(ui, |ui| {
+                egui::Grid::new("semg")
+                    .striped(true)
+                    .num_columns(8)
+                    .spacing([8.0, 3.0])
+                    .show(ui, |ui| {
+                        for h in [
+                            "モンスター", "エリア", "ウェーブ", "X", "Y", "Z", "角度", "状態",
+                        ] {
+                            ui.strong(h);
+                        }
+                        ui.end_row();
+                        for (entry, name, raw) in rows.iter_mut() {
+                            let id = monster_id_from_sem_name(name).unwrap_or(0);
+                            let dummy = id == 0 || name.to_ascii_lowercase().contains("em000");
+                            ui.vertical(|ui| {
+                                // Named on the first line and the file it came
+                                // from on the second. Both are extended rather
+                                // than wrapped: a two word monster name broken
+                                // over three lines made the row 60 points tall.
+                                ui.add(
+                                    egui::Label::new(if dummy {
+                                        String::from("（ダミー）")
+                                    } else {
+                                        monster_label(id)
+                                    })
+                                    .extend(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(
+                                            name.rsplit(|c| c == '/' || c == '\\')
+                                                .next()
+                                                .unwrap_or(name),
+                                        )
+                                        .weak()
+                                        .small(),
+                                    )
+                                    .extend(),
+                                );
+                            });
+                            let raw: &mut [u8; 32] = raw;
+                            let mut area = sem_u32_at(&raw[..], 0x0C).unwrap_or(0);
+                            let resp = ui
+                                .add(egui::DragValue::new(&mut area).range(0..=255).speed(1.0))
+                                .on_hover_text("初期エリア番号（実測 0..11）");
+                            if resp.changed() && sem_set_u32(raw, 0x0C, area) {
+                                writes.push((*entry, 0x0C, area.to_le_bytes()));
+                                // A placement with an area but a zero weight is
+                                // what the console build avoids writing too: the
+                                // game skips the row.
+                                if area > 0 && sem_f32(&raw[..], 0x00).unwrap_or(0.0) == 0.0 {
+                                    if sem_set_f32(raw, 0x00, 1.0) {
+                                        writes.push((*entry, 0x00, 1.0f32.to_le_bytes()));
+                                    }
+                                    if sem_set_u32(raw, 0x04, 1) {
+                                        writes.push((*entry, 0x04, 1u32.to_le_bytes()));
+                                    }
+                                }
+                            }
+                            let mut wave = sem_u32_at(&raw[..], 0x08).unwrap_or(0);
+                            let resp = ui
+                                .add(egui::DragValue::new(&mut wave).range(0..=255).speed(1.0))
+                                .on_hover_text("出現ウェーブ（実測 0..2）");
+                            if resp.changed() && sem_set_u32(raw, 0x08, wave) {
+                                writes.push((*entry, 0x08, wave.to_le_bytes()));
+                            }
+                            for (label, off) in
+                                [("X", 0x10usize), ("Y", 0x14), ("Z", 0x18), ("角度", 0x1C)]
+                            {
+                                let mut v = sem_f32(&raw[..], off).unwrap_or(0.0);
+                                let resp = ui
+                                    .add(
+                                        egui::DragValue::new(&mut v)
+                                            .speed(1.0)
+                                            // A coordinate is not a whole
+                                            // number: -147.07 printed as -147
+                                            // hid the part a placement is
+                                            // adjusted by.
+                                            .max_decimals(2),
+                                    )
+                                    .on_hover_text(format!(
+                                        "{}（32 ビット浮動小数点）",
+                                        match label {
+                                            "X" => "X 座標（実測 -179..289）",
+                                            "Y" => "Y 座標（高さ）",
+                                            "Z" => "Z 座標",
+                                            _ => "向き角度 W（実測 -6000..16592）",
+                                        }
+                                    ));
+                                if resp.changed() && sem_set_f32(raw, off, v) {
+                                    writes.push((*entry, off, v.to_le_bytes()));
+                                }
+                            }
+                            ui.label(if dummy { "ダミー" } else { "実体" });
+                            ui.end_row();
+                        }
+                    });
+            });
+        if !writes.is_empty() {
+            if let Some(arc) = &mut self.arc {
+                for (entry, off, bytes) in writes {
+                    if let Some(e) = arc.entries.get_mut(entry) {
+                        if off + 4 <= e.data.len() {
+                            e.data[off..off + 4].copy_from_slice(&bytes);
+                        }
+                    }
+                }
+            }
+            self.dirty = true;
+            self.message =
+                String::from("配置を書き換えました（.arc を保存すると書き出します）");
         }
     }
 
@@ -7151,17 +7459,17 @@ impl MhnxEditor {
         });
         ui.add_space(4.0);
         ui.label(egui::RichText::new("中身（32 枠）").strong())
-            .on_hover_text("ID 0 は空きです。個数は 99 まで。ID を 0 にすると空きに戻ります。");
+            .on_hover_text("アイテム名を押すと、名前で選び直せます。個数は 99 まで。");
         let mut action: Option<(usize, u16, u16)> = None;
         egui::ScrollArea::vertical()
             .id_salt(("itemsetitems", index))
             .max_height(180.0)
             .show(ui, |ui| {
                 egui::Grid::new(("itemsetgrid", index))
-                    .num_columns(5)
+                    .num_columns(4)
                     .spacing([6.0, 2.0])
                     .show(ui, |ui| {
-                        for t in ["#", "ID", "名前", "個数", ""] {
+                        for t in ["#", "アイテム（名前で選択）", "個数", ""] {
                             ui.label(egui::RichText::new(t).weak().small());
                         }
                         ui.end_row();
@@ -7170,20 +7478,15 @@ impl MhnxEditor {
                             ui.label(format!("{}", entry));
                             let mut id = item.id;
                             let mut count = item.count;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut id)
-                                        .range(0..=LAST_ITEM_ID as u16)
-                                        .speed(1.0),
-                                )
-                                .changed()
+                            // A number in this cell meant the user had to know
+                            // that 9 is 回復薬 before a set could be filled; the
+                            // row now names the item and the list is searched by
+                            // name (with the id still in the label).
+                            if let Some(picked) =
+                                Self::item_id_picker(ui, ("setitem", entry), id, &mut self.item_row_search)
                             {
+                                id = picked;
                                 action = Some((entry, id, if id == 0 { 0 } else { count }));
-                            }
-                            if id == 0 {
-                                ui.label(egui::RichText::new("（空き）").weak());
-                            } else {
-                                ui.label(item_name(id));
                             }
                             if ui
                                 .add(egui::DragValue::new(&mut count).range(0..=MAX_COUNT))
@@ -7262,10 +7565,10 @@ impl MhnxEditor {
             .max_height(165.0)
             .show(ui, |ui| {
                 egui::Grid::new("pouchgrid")
-                    .num_columns(5)
+                    .num_columns(4)
                     .spacing([6.0, 2.0])
                     .show(ui, |ui| {
-                        for t in ["#", "ID", "名前", "個数", ""] {
+                        for t in ["#", "アイテム（名前で選択）", "個数", ""] {
                             ui.label(egui::RichText::new(t).weak().small());
                         }
                         ui.end_row();
@@ -7273,20 +7576,13 @@ impl MhnxEditor {
                             ui.label(format!("{}", entry));
                             let mut id = item.id;
                             let mut count = item.count;
-                            if ui
-                                .add(
-                                    egui::DragValue::new(&mut id)
-                                        .range(0..=LAST_ITEM_ID as u16)
-                                        .speed(1.0),
-                                )
-                                .changed()
+                            // Same picker as the item set rows: the pouch is the
+                            // same thirty-two slots and the same complaint.
+                            if let Some(picked) =
+                                Self::item_id_picker(ui, ("pouchitem", entry), id, &mut self.item_row_search)
                             {
+                                id = picked;
                                 action = Some((entry, id, if id == 0 { 0 } else { count }));
-                            }
-                            if id == 0 {
-                                ui.label(egui::RichText::new("（空き）").weak());
-                            } else {
-                                ui.label(item_name(id));
                             }
                             if ui
                                 .add(egui::DragValue::new(&mut count).range(0..=MAX_COUNT))
@@ -10579,11 +10875,14 @@ impl MhnxEditor {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("新規作成").strong());
             Self::equip_kind_combo(ui, "equipnewkind", &mut self.equip_new_kind);
-            ui.label("ID");
-            ui.add(
-                egui::DragValue::new(&mut self.equip_new_id)
-                    .range(0..=0xFFFF)
-                    .speed(1.0),
+            // The id is chosen by name: a number here meant the user had to
+            // know that 40 is 爆砕の大剣 before anything could be created.
+            Self::equip_id_picker(
+                ui,
+                "equipnewid",
+                self.equip_new_kind,
+                &mut self.equip_new_id,
+                &mut self.equip_new_search,
             );
             ui.label("Lv");
             ui.add(egui::DragValue::new(&mut self.equip_new_level).range(1..=32));
@@ -10797,12 +11096,18 @@ impl MhnxEditor {
         ui.label(egui::RichText::new("着せ替え").strong());
         let mut remove = false;
         ui.horizontal_wrapped(|ui| {
-            ui.label("ID");
             let mut id = eq.transmog;
-            if ui
-                .add(egui::DragValue::new(&mut id).range(0..=0xFFFF).speed(1.0))
-                .changed()
-            {
+            // Same rule as 新規作成: the layered piece is picked by name. Its id
+            // is looked up in the same table the label uses, so what the list
+            // says is what the record will show.
+            let picked = Self::equip_id_picker(
+                ui,
+                "equiptransmog",
+                eq.kind,
+                &mut id,
+                &mut self.equip_transmog_search,
+            );
+            if picked {
                 let lv = mhnx_core::equip::decode_record(index, &rec)
                     .map(|e| e.transmog_level)
                     .unwrap_or(1);
@@ -10879,11 +11184,12 @@ impl MhnxEditor {
         ui.label(egui::RichText::new("差し替え").strong());
         ui.horizontal_wrapped(|ui| {
             Self::equip_kind_combo(ui, "equiprepkind", &mut self.equip_rep_kind);
-            ui.label("ID");
-            ui.add(
-                egui::DragValue::new(&mut self.equip_rep_id)
-                    .range(0..=0xFFFF)
-                    .speed(1.0),
+            Self::equip_id_picker(
+                ui,
+                "equiprepid",
+                self.equip_rep_kind,
+                &mut self.equip_rep_id,
+                &mut self.equip_rep_search,
             );
             ui.label("Lv");
             ui.add(egui::DragValue::new(&mut self.equip_rep_level).range(1..=32));
@@ -11051,6 +11357,161 @@ impl MhnxEditor {
                     ui.selectable_value(kind, k, mhnx_core::equip::type_name(k));
                 }
             });
+    }
+
+    /// Item ids and names that match a needle, in id order.
+    ///
+    /// Bounded so an empty search box cannot build three thousand rows in one
+    /// frame; the line above the list says how many were found.
+    fn item_matches(needle: &str, limit: usize) -> Vec<(u16, String)> {
+        let mut out: Vec<(u16, String)> = Vec::new();
+        for id in 1..=LAST_ITEM_ID as u16 {
+            let name = item_name(id);
+            if !needle.is_empty()
+                && !name.to_lowercase().contains(needle)
+                && !format!("{}", id).contains(needle)
+            {
+                continue;
+            }
+            out.push((id, name));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Searchable item picker for one row of the pouch or of an item set.
+    ///
+    /// Shows the name and keeps the id in brackets, which is the shape the rest
+    /// of the window uses. Some(0) means "leave the slot empty"; None means
+    /// nothing was picked this frame.
+    fn item_id_picker(
+        ui: &mut egui::Ui,
+        salt: (&'static str, usize),
+        id: u16,
+        search: &mut String,
+    ) -> Option<u16> {
+        let mut picked: Option<u16> = None;
+        let shown = if id == 0 {
+            String::from("（空き）")
+        } else {
+            format!("{}（ID {}）", item_name(id), id)
+        };
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(shown)
+            .width(210.0)
+            .show_ui(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(search)
+                        .hint_text("アイテム名・IDで検索")
+                        .desired_width(240.0),
+                );
+                if ui.small_button("クリア").clicked() {
+                    search.clear();
+                }
+                if id != 0 && ui.small_button("空きにする").clicked() {
+                    picked = Some(0);
+                }
+                let needle = search.trim().to_lowercase();
+                let hits = Self::item_matches(&needle, 200);
+                // Say "200+" only when the cut really happened: printing
+                // "200 件" for a search that has three thousand would be a lie.
+                let count = if hits.len() >= 200 {
+                    String::from("先頭 200 件を表示（絞り込みで減らせます）")
+                } else {
+                    format!("{} 件", hits.len())
+                };
+                ui.label(egui::RichText::new(count).weak().small());
+                egui::ScrollArea::vertical()
+                    .id_salt((salt, "list"))
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        for (mid, name) in &hits {
+                            if ui
+                                .selectable_label(id == *mid, format!("{}（ID {}）", name, mid))
+                                .clicked()
+                            {
+                                picked = Some(*mid);
+                            }
+                        }
+                    });
+            });
+        if picked.is_some() {
+            search.clear();
+        }
+        picked
+    }
+
+    /// Searchable equipment-id picker: the names of one type, not its numbers.
+    ///
+    /// The list is the same table the label is read from
+    /// ([equip_name_choices] mirrors [mhnx_core::equip::name]), so a row in the
+    /// popup and the text in the closed box always agree. A type with no name
+    /// table (the palico kinds) falls back to the raw id, which is the only
+    /// honest answer when nothing can be named.
+    ///
+    /// Returns true when the id changed this frame.
+    fn equip_id_picker(
+        ui: &mut egui::Ui,
+        salt: &str,
+        kind: u8,
+        id: &mut u16,
+        search: &mut String,
+    ) -> bool {
+        let mut changed = false;
+        egui::ComboBox::from_id_salt(salt)
+            .selected_text(equipment_name_of(kind, *id))
+            // Narrow enough for the 360 point editor beside the list; the
+            // popup itself is as wide as the names need.
+            .width(240.0)
+            .show_ui(ui, |ui| {
+                let choices = equip_name_choices(kind);
+                if choices.is_empty() {
+                    ui.label(
+                        egui::RichText::new("この種別の名前表がありません（ID を直接入力）")
+                            .weak()
+                            .small(),
+                    );
+                    changed = ui
+                        .add(egui::DragValue::new(id).range(0..=0xFFFF).speed(1.0))
+                        .changed();
+                    return;
+                }
+                ui.add(
+                    egui::TextEdit::singleline(search)
+                        .hint_text("装備名で検索（部分一致・大文字小文字を問いません）")
+                        .desired_width(300.0),
+                );
+                if ui.small_button("クリア").clicked() {
+                    search.clear();
+                }
+                let needle = search.trim().to_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt((salt, "list"))
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for (cid, name) in &choices {
+                            if !needle.is_empty()
+                                && !name.to_lowercase().contains(&needle)
+                                && !format!("{}", cid).contains(&needle)
+                            {
+                                continue;
+                            }
+                            if ui
+                                .selectable_label(*id == *cid, format!("{}（ID {}）", name, cid))
+                                .clicked()
+                            {
+                                *id = *cid;
+                                changed = true;
+                            }
+                        }
+                    });
+            });
+        if changed {
+            search.clear();
+        }
+        changed
     }
 
     /// Searchable decoration picker: item ids 2638 + k, named from gamedata.
@@ -21595,6 +22056,251 @@ mod tests {
         assert_eq!(app.tab, Tab::Items);
         assert!(app.message.contains("所持 0"), "{}", app.message);
     }
+
+    #[test]
+    fn a_monster_id_is_named_from_the_game_table() {
+        // 80 is ディノバルド in the id space the quest archives use (em080).
+        assert_eq!(monster_id_name(80), Some("ディノバルド"));
+        // 6 does not exist in that space, so 7 has to be ディアブロス. Indexing
+        // the name table with the id instead gets this row wrong, which is the
+        // mistake the first version of this made.
+        assert_eq!(monster_id_name(7), Some("ディアブロス"));
+        assert_eq!(monster_id_name(85), Some("ドスマッカォ"));
+        assert_eq!(monster_id_name(86), Some("バルファルク"));
+        assert_eq!(monster_id_name(1303), Some("激昂ラージャン"));
+        // Ids the table has no row for are named as ids, not guessed at.
+        assert_eq!(monster_id_name(269), None);
+        assert_eq!(monster_label(0), "（空き）");
+        assert_eq!(monster_label(80), "ディノバルド（ID 80）");
+        assert_eq!(monster_label(269), "#269（名前不明）");
+        // The picker offers each monster once, and never id 0.
+        let choices = monster_choices();
+        assert!(choices.len() > 100, "{}", choices.len());
+        let mut ids: Vec<u16> = choices.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), choices.len());
+        assert!(choices.iter().all(|(id, name)| *id != 0 && !name.is_empty()));
+    }
+
+    #[test]
+    fn the_large_monster_slots_of_a_mib_round_trip() {
+        let mut mib = vec![0u8; 249];
+        let offsets = mib_mob_slot_offsets();
+        // The five slots are exactly the ones the field table documents.
+        assert_eq!(offsets, vec![100, 113, 126, 139, 152]);
+        let off = offsets[2];
+        assert!(mib_mob_set_id(&mut mib, off, 85));
+        assert_eq!(mib_mob_id(&mib, off), 85);
+        assert_eq!(u16::from_le_bytes([mib[off], mib[off + 1]]), 85);
+        // Every editable number survives a write and a read.
+        let mut written: Vec<(&'static str, u32)> = Vec::new();
+        for (i, f) in MIB_MOB_FIELDS.iter().enumerate() {
+            let v = (i as u32 * 13 + 5) % if f.size == 2 { 1000 } else { 200 };
+            assert!(mib_mob_write(&mut mib, off, f, v), "{}", f.key);
+            written.push((f.key, v));
+        }
+        for (key, v) in written {
+            let f = MIB_MOB_FIELDS.iter().find(|f| f.key == key).expect("field");
+            assert_eq!(mib_mob_read(&mib, off, f), Some(v), "{}", key);
+        }
+        // The two bytes no field owns are left alone.
+        assert_eq!(mib[off + 2], 0);
+        assert_eq!(mib[off + 12], 0);
+        // A short buffer is a None, not a panic.
+        assert_eq!(mib_mob_read(&mib[..10], off, &MIB_MOB_FIELDS[0]), None);
+        assert!(!mib_mob_set_id(&mut mib[..1], off, 1));
+        assert!(!mib_mob_write(&mut mib[..off], off, &MIB_MOB_FIELDS[0], 1));
+        // A two byte field saturates instead of wrapping.
+        assert!(mib_mob_write(&mut mib, off, &MIB_MOB_FIELDS[3], 0x1_0000));
+        assert_eq!(mib_mob_read(&mib, off, &MIB_MOB_FIELDS[3]), Some(0xFFFF));
+    }
+
+    #[test]
+    fn a_sem_entry_name_names_its_monster() {
+        assert_eq!(
+            monster_id_from_sem_name("quest/boss/setEmMain/b_m01em080_00"),
+            Some(80)
+        );
+        assert_eq!(monster_id_from_sem_name("b_m01em085_00.sem"), Some(85));
+        assert_eq!(monster_id_from_sem_name("b_m17em1303_00"), Some(1303));
+        // The dummy placement is id 0: the game puts one in almost every quest.
+        assert_eq!(monster_id_from_sem_name("b_m00em000_00"), Some(0));
+        // "setEmMain" carries an "em" of its own but no digits after it.
+        assert_eq!(monster_id_from_sem_name("quest/boss/setEmMain"), None);
+        assert_eq!(monster_id_from_sem_name(""), None);
+    }
+
+    #[test]
+    fn the_sem_placement_fields_round_trip() {
+        let mut entry = [0u8; 32];
+        assert!(sem_set_u32(&mut entry, 0x0C, 5));
+        assert!(sem_set_u32(&mut entry, 0x08, 2));
+        assert!(sem_set_f32(&mut entry, 0x10, -147.5));
+        assert!(sem_set_f32(&mut entry, 0x14, 1172.5));
+        assert!(sem_set_f32(&mut entry, 0x18, 171.0));
+        assert!(sem_set_f32(&mut entry, 0x1C, 90.0));
+        assert_eq!(sem_u32_at(&entry, 0x0C), Some(5));
+        assert_eq!(sem_u32_at(&entry, 0x08), Some(2));
+        assert_eq!(sem_f32(&entry, 0x10), Some(-147.5));
+        assert_eq!(sem_f32(&entry, 0x14), Some(1172.5));
+        assert_eq!(sem_f32(&entry, 0x18), Some(171.0));
+        assert_eq!(sem_f32(&entry, 0x1C), Some(90.0));
+        // The four fields sit where the layout says and do not overlap.
+        assert_eq!(u32::from_le_bytes(entry[0x0C..0x10].try_into().unwrap()), 5);
+        // Values that would corrupt a float are refused.
+        assert!(!sem_set_f32(&mut entry, 0x10, f32::NAN));
+        assert_eq!(sem_f32(&entry, 0x10), Some(-147.5));
+        // So is a write that would run past the record.
+        assert!(!sem_set_u32(&mut entry, 0x1E, 1));
+        assert_eq!(sem_f32(&entry[..3], 0), None);
+    }
+
+
+    /// The item search behind the pouch and item-set rows.
+    #[test]
+    fn the_item_search_takes_a_name_a_partial_and_an_id() {
+        // An empty box shows the first rows, bounded so a frame cannot build
+        // three thousand of them.
+        let first = MhnxEditor::item_matches("", 5);
+        assert_eq!(first.len(), 5);
+        assert_eq!(first[0].0, 1);
+
+        // A name keeps every row that holds it, and nothing else.
+        let potion = MhnxEditor::item_matches("回復薬", 50);
+        assert!(
+            potion.iter().any(|(id, name)| *id == 9 && name == "回復薬"),
+            "{:?}",
+            potion
+        );
+        assert!(potion.iter().any(|(id, _)| *id == 10), "回復薬グレート is missing");
+        assert!(potion.iter().all(|(_, name)| name.contains("回復薬")));
+
+        // The id is searchable too, so a user who knows the number still gets
+        // there; that row needs no name to contain the digits.
+        let by_id = MhnxEditor::item_matches("9", 200);
+        assert!(by_id.iter().any(|(id, _)| *id == 9));
+        assert!(by_id
+            .iter()
+            .all(|(id, name)| name.contains('9') || id.to_string().contains('9')));
+
+        // A word that names no item matches nothing rather than everything.
+        assert!(MhnxEditor::item_matches("そんなアイテムはない", 10).is_empty());
+    }
+
+    /// The quest tab draws the monster names it now edits.
+    ///
+    /// This is the check that the .mib slots and the .sem placements actually
+    /// reach the screen as names: the helpers can be right and the panel still
+    /// forget to call them, which is the bug the user reported twice over.
+    #[test]
+    fn the_quest_tab_draws_the_monster_names_it_edits() {
+        // A .mib with a quest id and two monsters, plus the .sem of one of them.
+        let mut mib = vec![0u8; mhnx_core::quest::MIB_SIZE];
+        mib[0..4].copy_from_slice(&[0x00, 0x00, b'K', b'C']);
+        mib[4..8].copy_from_slice(&1u32.to_le_bytes());
+        mib[12..16].copy_from_slice(&1010001u32.to_le_bytes());
+        let offs = mib_mob_slot_offsets();
+        assert!(mib_mob_set_id(&mut mib, offs[0], 80));
+        assert!(mib_mob_set_id(&mut mib, offs[1], 85));
+        assert!(mib_mob_write(&mut mib, offs[0], &MIB_MOB_FIELDS[0], 120));
+
+        let mut mib_entry = mhnx_core::arc::ArcEntry::default();
+        mib_entry.name = String::from("quest\\questData\\questData_1010001");
+        mib_entry.type_hash = 0x1BBF_D18E;
+        mib_entry.data = mib;
+
+        let mut sem = [0u8; 32];
+        assert!(sem_set_f32(&mut sem, 0x00, 1.0));
+        assert!(sem_set_u32(&mut sem, 0x0C, 2));
+        assert!(sem_set_f32(&mut sem, 0x10, -147.0));
+        let mut sem_entry = mhnx_core::arc::ArcEntry::default();
+        sem_entry.name = String::from("quest\\boss\\setEmMain\\b_m01em080_00");
+        sem_entry.type_hash = 0x2553_701D;
+        sem_entry.data = sem.to_vec();
+
+        let mut arc = Arc::default();
+        arc.entries.push(mib_entry);
+        arc.entries.push(sem_entry);
+        arc.entries.push({
+            let mut rest = mhnx_core::arc::ArcEntry::default();
+            rest.name = String::from("quest\\boss\\setEmMain\\b_m00em000_00");
+            rest.type_hash = 0x2553_701D;
+            rest.data = vec![0u8; 32];
+            rest
+        });
+
+        let mut app = MhnxEditor::default();
+        app.arc = Some(arc);
+        app.load_arc_entry(0);
+        assert!(app.mib.is_some(), "the .mib did not load");
+
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1180.0, 740.0),
+        ));
+        let output = ctx.run(input.clone(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_tab_body(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(
+            text.contains("ディノバルド"),
+            "the mib panel did not name slot 1:\n{}",
+            text
+        );
+        assert!(
+            text.contains("ドスマッカォ"),
+            "the mib panel did not name slot 2:\n{}",
+            text
+        );
+        assert!(text.contains("体力"), "the slot numbers are missing");
+        assert!(text.contains("（空き）"), "the empty slots are not marked");
+
+        // The .sem panel names the placement, marks the dummy and shows the
+        // coordinates of the row it drew.
+        app.load_arc_entry(1);
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_tab_body(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(
+            text.contains("b_m01em080_00"),
+            "the sem panel did not list the placement:\n{}",
+            text
+        );
+        assert!(text.contains("ディノバルド"), "the sem row is unnamed:\n{}", text);
+        assert!(text.contains("（ダミー）"), "the dummy placement is not marked");
+    }
+
+    #[test]
+    fn every_equipment_type_lists_its_names() {
+        // 大剣 (7): the picker and the label read the same table.
+        let swords = equip_name_choices(7);
+        assert!(swords.len() > 50, "{}", swords.len());
+        for (id, name) in swords.iter().take(5) {
+            assert_eq!(mhnx_core::equip::name(&equipment_for(7, *id)), *name);
+            assert_eq!(equipment_name_of(7, *id), format!("{}（ID {}）", name, id));
+        }
+        // Armour ids are series ids, and the list has to agree with that.
+        let heads = equip_name_choices(1);
+        assert!(!heads.is_empty());
+        for (series, head) in heads.iter().take(5) {
+            assert_eq!(mhnx_core::equip::name(&equipment_for(1, *series)), *head);
+        }
+        // No id is offered twice.
+        let mut ids: Vec<u16> = swords.iter().map(|(id, _)| *id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), swords.len());
+        // 12 is the hole in the weapon numbering: nothing to name.
+        assert!(equip_name_choices(12).is_empty());
+        // A type with no table falls back to the number, and id 0 is "none".
+        assert_eq!(equipment_name_of(22, 3), "#3（名前不明）");
+        assert_eq!(equipment_name_of(7, 0), "（なし）");
+        assert_eq!(equipment_name_of(7, 1), mhnx_core::equip::name(&equipment_for(7, 1)).to_owned() + "（ID 1）");
+    }
 }
 
 
@@ -21717,5 +22423,301 @@ fn item_name(id: u16) -> String {
     #[cfg(not(feature = "gamedata"))]
     {
         format!("#{}", id)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Monster names
+// ---------------------------------------------------------------------------
+
+/// Size of one large-monster slot inside a .mib.
+pub const MIB_MOB_SLOT: usize = 13;
+
+/// One editable number of a .mib monster slot.
+///
+/// The offsets are the ones the console build has always used, and every range
+/// marked `observed` was measured on the 1859 quest archives of a retail dump
+/// (2676 filled slots): no upper bound is guessed from what the game "should"
+/// do, and 0 is allowed everywhere because real quests carry it.
+pub struct MibMobField {
+    /// Machine readable key.
+    pub key: &'static str,
+    /// Japanese label.
+    pub ja: &'static str,
+    /// Byte offset inside the 13 byte slot.
+    pub offset: usize,
+    /// Width in bytes; 1 or 2.
+    pub size: usize,
+    /// The range the shipped quests were measured in (min, max).
+    pub observed: (u32, u32),
+}
+
+/// The editable numbers of a large-monster slot, in display order.
+///
+/// Slot layout, measured: `+0x00` id (u16), `+0x02` unknown flag, `+0x03`
+/// 獰猛/特殊, `+0x04` 出現数, `+0x05` 体力, `+0x06` 攻撃力, `+0x07` 防御力,
+/// `+0x08` スタミナ, `+0x09` サイズ% (u16), `+0x0B` 変動幅, `+0x0C` unknown.
+pub const MIB_MOB_FIELDS: &[MibMobField] = &[
+    MibMobField { key: "hp", ja: "体力", offset: 5, size: 1, observed: (0, 135) },
+    MibMobField { key: "attack", ja: "攻撃力", offset: 6, size: 1, observed: (0, 135) },
+    MibMobField { key: "defense", ja: "防御力", offset: 7, size: 1, observed: (0, 118) },
+    MibMobField { key: "size", ja: "サイズ%", offset: 9, size: 2, observed: (0, 150) },
+    MibMobField { key: "count", ja: "出現数", offset: 4, size: 1, observed: (0, 99) },
+    MibMobField { key: "stamina", ja: "スタミナ", offset: 8, size: 1, observed: (0, 2) },
+    MibMobField { key: "variance", ja: "変動幅", offset: 11, size: 1, observed: (0, 51) },
+    MibMobField { key: "deviant", ja: "獰猛/特殊", offset: 3, size: 1, observed: (0, 1) },
+];
+
+/// Where the five monster slots of a .mib start.
+///
+/// Read out of [mhnx_core::questfields::MIB_FIELDS] rather than written here, so
+/// a regenerated field table cannot move a slot past this editor.
+pub fn mib_mob_slot_offsets() -> Vec<usize> {
+    mhnx_core::questfields::MIB_FIELDS
+        .iter()
+        .filter(|f| f.key.starts_with("mob_slot[") && f.size == MIB_MOB_SLOT)
+        .map(|f| f.offset)
+        .collect()
+}
+
+/// Read one number of one monster slot, or None when the bytes are too short.
+pub fn mib_mob_read(bytes: &[u8], slot_offset: usize, f: &MibMobField) -> Option<u32> {
+    let off = slot_offset.checked_add(f.offset)?;
+    match f.size {
+        1 => bytes.get(off).map(|b| *b as u32),
+        2 => {
+            let a = *bytes.get(off)?;
+            let b = *bytes.get(off + 1)?;
+            Some(u16::from_le_bytes([a, b]) as u32)
+        }
+        _ => None,
+    }
+}
+
+/// Write one number of one monster slot. False when the bytes are too short.
+pub fn mib_mob_write(bytes: &mut [u8], slot_offset: usize, f: &MibMobField, value: u32) -> bool {
+    let Some(off) = slot_offset.checked_add(f.offset) else {
+        return false;
+    };
+    match f.size {
+        1 => match bytes.get_mut(off) {
+            Some(b) => {
+                *b = value as u8;
+                true
+            }
+            None => false,
+        },
+        2 => {
+            if off + 1 >= bytes.len() {
+                return false;
+            }
+            let v = u16::try_from(value).unwrap_or(u16::MAX);
+            bytes[off..off + 2].copy_from_slice(&v.to_le_bytes());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The monster id of one slot.
+pub fn mib_mob_id(bytes: &[u8], slot_offset: usize) -> u16 {
+    match (bytes.get(slot_offset), bytes.get(slot_offset + 1)) {
+        (Some(a), Some(b)) => u16::from_le_bytes([*a, *b]),
+        _ => 0,
+    }
+}
+
+/// Point one slot at another monster. False when the bytes are too short.
+pub fn mib_mob_set_id(bytes: &mut [u8], slot_offset: usize, id: u16) -> bool {
+    if slot_offset + 1 >= bytes.len() {
+        return false;
+    }
+    bytes[slot_offset..slot_offset + 2].copy_from_slice(&id.to_le_bytes());
+    true
+}
+
+/// The `mons_` row a monster id names.
+///
+/// The id space is the one the archives use (`em001`..`em1351`), which is *not*
+/// dense: 6, 26 and 28..31 do not exist, so the id is looked up in the game's
+/// own id column (`ENUM_MINT_`) and the name taken from the row beside it. Doing
+/// it the other way round - indexing `ENUM_MONS_` with the id - names ディアブロス
+/// as イャンクック, which is what the first attempt did.
+pub fn monster_table_index(id: u16) -> Option<usize> {
+    if id == 0 {
+        return None;
+    }
+    mhnx_core::questfields::ENUM_MINT_
+        .iter()
+        .position(|s| s.parse::<u16>().ok() == Some(id))
+}
+
+/// Japanese name of a monster id, or None when the table has no row for it.
+pub fn monster_id_name(id: u16) -> Option<&'static str> {
+    monster_table_index(id).and_then(|i| mhnx_core::questfields::ENUM_MONS_.get(i).copied())
+}
+
+/// What the interface calls a monster id.
+///
+/// The name when the table has one, `#id（名前不明）` otherwise: a number alone is
+/// what the window used to show and is no use to someone editing a quest.
+pub fn monster_label(id: u16) -> String {
+    if id == 0 {
+        return String::from("（空き）");
+    }
+    match monster_id_name(id) {
+        Some(name) if !name.is_empty() => format!("{}（ID {}）", name, id),
+        _ => format!("#{}（名前不明）", id),
+    }
+}
+
+/// Every monster the name table knows, as (id, name), for the pickers.
+pub fn monster_choices() -> Vec<(u16, &'static str)> {
+    let mut out: Vec<(u16, &'static str)> = Vec::new();
+    for (i, text) in mhnx_core::questfields::ENUM_MINT_.iter().enumerate() {
+        let Ok(id) = text.parse::<u16>() else {
+            continue;
+        };
+        if id == 0 || out.iter().any(|(seen, _)| *seen == id) {
+            continue;
+        }
+        if let Some(name) = mhnx_core::questfields::ENUM_MONS_.get(i) {
+            if !name.is_empty() {
+                out.push((id, name));
+            }
+        }
+    }
+    out
+}
+
+/// The monster id carried by the file name of a .sem entry.
+///
+/// A .sem is a placement, not a container: which monster it places is nowhere in
+/// its 32 bytes and only the name the archive gives it says, `b_m01em080_00`
+/// placing `em080`. The path in front of the file name also contains "em"
+/// (`setEmMain`), so only an "em" that is followed by digits counts, and the last
+/// one wins.
+pub fn monster_id_from_sem_name(name: &str) -> Option<u16> {
+    let lower = name.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut found: Option<u16> = None;
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'e' && bytes[i + 1] == b'm' && bytes[i + 2].is_ascii_digit() {
+            let mut end = i + 2;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if let Ok(id) = lower[i + 2..end].parse::<u16>() {
+                found = Some(id);
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// .sem placements
+// ---------------------------------------------------------------------------
+
+/// Read a little endian f32 out of a .sem placement.
+pub fn sem_f32(data: &[u8], off: usize) -> Option<f32> {
+    let b = data.get(off..off + 4)?;
+    Some(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Write a little endian f32 into a .sem placement.
+pub fn sem_set_f32(data: &mut [u8], off: usize, value: f32) -> bool {
+    if off + 4 > data.len() || !value.is_finite() {
+        return false;
+    }
+    data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    true
+}
+
+/// Read a little endian u32 out of a .sem placement.
+pub fn sem_u32_at(data: &[u8], off: usize) -> Option<u32> {
+    let b = data.get(off..off + 4)?;
+    Some(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// Write a little endian u32 into a .sem placement.
+pub fn sem_set_u32(data: &mut [u8], off: usize, value: u32) -> bool {
+    if off + 4 > data.len() {
+        return false;
+    }
+    data[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Equipment names
+// ---------------------------------------------------------------------------
+
+/// Every (id, name) of one equipment type, for a picker.
+///
+/// The lookup mirrors [mhnx_core::equip::name]: a weapon id indexes its own
+/// table, an armour id is a *series* id (`series * 5 + part`), and a talisman
+/// uses its own list. The picker and the label therefore cannot disagree about
+/// what "ID 40" is.
+pub fn equip_name_choices(kind: u8) -> Vec<(u16, &'static str)> {
+    use mhnx_core::equipnames::{ARMOR_NAMES, WEAPON_NAMES};
+    let mut out: Vec<(u16, &'static str)> = Vec::new();
+    match kind {
+        1..=5 => {
+            let part = (kind - 1) as usize;
+            for series in 0..(ARMOR_NAMES.len() / 5) {
+                if let Some(name) = ARMOR_NAMES.get(series * 5 + part) {
+                    if series > 0 && !name.is_empty() && *name != "装備なし" {
+                        out.push((series as u16, name));
+                    }
+                }
+            }
+        }
+        7..=21 => {
+            // 12 is the hole the JP numbering leaves in this range.
+            if kind == 12 {
+                return out;
+            }
+            if let Some(table) = WEAPON_NAMES.get(kind as usize - 7) {
+                for (id, name) in table.iter().enumerate() {
+                    if id > 0 && !name.is_empty() && *name != "装備なし" {
+                        out.push((id as u16, name));
+                    }
+                }
+            }
+        }
+        6 => {
+            #[cfg(feature = "gamedata")]
+            {
+                for (id, name) in mhnx_core::gamedata::EQUIP_TALISMAN_NAMES.iter().enumerate() {
+                    if id > 0 && !name.is_empty() {
+                        out.push((id as u16, name));
+                    }
+                }
+            }
+            #[cfg(not(feature = "gamedata"))]
+            {
+                let _ = &mut out;
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// "名前（ID n）" for one equipment id, or a numbered fallback.
+pub fn equipment_name_of(kind: u8, id: u16) -> String {
+    if id == 0 {
+        return String::from("（なし）");
+    }
+    let name = mhnx_core::equip::name(&equipment_for(kind, id));
+    if name.is_empty() || name == "-" {
+        format!("#{}（名前不明）", id)
+    } else {
+        format!("{}（ID {}）", name, id)
     }
 }
