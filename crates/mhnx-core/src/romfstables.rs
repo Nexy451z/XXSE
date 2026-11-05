@@ -66,6 +66,60 @@
 //! Five strings per record, in record order: name, reward, and three filler
 //! slots ("dummy" in most rows). 184 x 5 = 920 strings. Only the first column
 //! is a name, so `request_names` returns one string per record.
+//!
+//! ## `ot_skl_jpn.gmd` — the otomon skills (術)
+//!
+//! 192 strings: one name and one description per skill, 96 of each, in the
+//! game's own skill-id order. Measured on a retail Japanese dump: all 96 names
+//! are **identical, position for position**, to `gamedata::PALICO_SKILL_NAMES`
+//! entries 0..96 (that table carries one extra "?" row at 96 whose skill the
+//! file does not name). Every name is one line, none is empty, and the
+//! descriptions wrap where the names do not, so the two columns cannot be
+//! confused.
+//!
+//! The file is therefore a verified source for the **skill** names and not for
+//! the 58 support actions: none of `gamedata::PALICO_SUPPORT_MOVES` is a whole
+//! string of it. Eleven of them do occur *inside* the descriptions
+//! ("笛上手の術" mentions 回復笛, "ビースト延長の術" mentions ビースト変化, ...),
+//! which is why the column is read by stride and never by searching the file:
+//! a search would hand back a support action as if it were a skill.
+//!
+//! ## `catSkillData_jpn.gmd` — the 66 cat skills
+//!
+//! 198 strings: a name and two note columns per row, 66 rows. The names are
+//! unique and are the ネコの… set ("ネコの解体術【大】", "ネコの医療術", ...),
+//! which is **not** the table the editor shows: `PALICO_SKILL_NAMES` holds the
+//! 96 術 names above, and the only string the two lists have in common is the
+//! "スキル無し" placeholder. The reader is kept so the table list shows the names
+//! of this file; they are not adopted as an editor name column.
+//!
+//! ## `HN_MonsterListMsg_jpn.gmd` — the hunter's note monster list
+//!
+//! 220 strings: ten interface labels ("モンスターリスト", "狩猟数(捕獲数)",
+//! "最大記録", "未登録", "%d(%d)", ...) followed by 105 pairs of description and
+//! hunting tip, in the hunter's note order - the Deviants come first, so it is
+//! not the save's hunt-record order either.
+//!
+//! **The file holds no monster names at all**, and neither does any other table
+//! of the dump. Measured over all 388 `.gmd` files of a retail Japanese dump
+//! (129 real names of the hunt record, the seven 不明 rows and "ROBOT" left out):
+//!
+//! * 73 of the 129 occur as a whole string somewhere, but no file holds more
+//!   than 57 of them - `GC_Title_1_jpn` 57 (guild-card titles),
+//!   `MonsterDemo_jpn` 43, `GC_background_jpn` 10, `OtMenuMsg_jpn` 2. A 137 row
+//!   name table is not among them.
+//! * 52 more occur only inside longer strings (item names such as
+//!   "リオレイア希少種の鱗", this file's descriptions, ...), where taking them out
+//!   again would be guessing which part is the name.
+//! * 4 occur nowhere at all: 怒り喰らうイビルジョー, ミラボレアス【紅龍】,
+//!   ミラボレアス【祖龍】, 猛り爆ぜるブラキディオス - the editor composes those
+//!   from a base name and a variant word, and the dump does not spell them out.
+//!
+//! The only list of names is `MonsterDemo_jpn.gmd`: 96 strings in 48 pairs of an
+//! alias and a name, covering 48 monsters, which is neither the 137 rows of the
+//! save nor their order. The monster names therefore stay on the bundled table;
+//! this parser exists to read the descriptions, not to replace the names with
+//! something the dump does not say.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -278,4 +332,88 @@ pub fn request_names(gmd: &[u8]) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// Skills named by `ot_skl_jpn.gmd` (96 on a retail Japanese dump).
+pub const OTOMO_SKILL_COUNT: usize = 96;
+/// Strings per otomon skill: its name, then its description.
+pub const OTOMO_SKILL_STRIDE: usize = 2;
+
+/// The otomon skill names of `ot_skl_jpn.gmd` (or another language's
+/// `ot_skl`), in the game's own skill-id order.
+///
+/// The file is a name and a description per skill, so the names are every
+/// other string from the first. A file whose string count is not exactly
+/// `OTOMO_SKILL_COUNT` skills is refused whole rather than half read: a table
+/// with a different number of rows would put a description where a name
+/// belongs, and every id past the first would silently shift.
+///
+/// Verified against a retail Japanese dump: the 96 names are identical, one for
+/// one, to `gamedata::PALICO_SKILL_NAMES` 0..96. This is the **skill** table
+/// (`体力強化の術【小】`, ...), not the 58 support actions: none of those is a
+/// whole string of the file (eleven are mentioned inside the descriptions, which
+/// is why the names must be read by stride and never by searching).
+pub fn otomo_skill_names(gmd: &[u8]) -> Vec<String> {
+    let strings = gmd_strings(gmd);
+    if strings.len() != OTOMO_SKILL_COUNT * OTOMO_SKILL_STRIDE {
+        return Vec::new();
+    }
+    strings.into_iter().step_by(OTOMO_SKILL_STRIDE).collect()
+}
+
+/// Skills named by `catSkillData_jpn.gmd` (66 on a retail Japanese dump).
+pub const CAT_SKILL_COUNT: usize = 66;
+/// Strings per cat skill: its name, then two note columns.
+pub const CAT_SKILL_STRIDE: usize = 3;
+
+/// The cat skill names of `catSkillData_jpn.gmd` (or another language's
+/// `catSkillData`), in file order.
+///
+/// The names are the ネコの… set (`ネコの解体術【大】`, ...), which is not the
+/// table the editor names palico skills with - see the module docs. They are
+/// read here so the table list can show this file's rows, and a file whose
+/// string count is not exactly `CAT_SKILL_COUNT` rows is refused whole.
+pub fn cat_skill_names(gmd: &[u8]) -> Vec<String> {
+    let strings = gmd_strings(gmd);
+    if strings.len() != CAT_SKILL_COUNT * CAT_SKILL_STRIDE {
+        return Vec::new();
+    }
+    strings.into_iter().step_by(CAT_SKILL_STRIDE).collect()
+}
+
+/// Interface labels `HN_MonsterListMsg_jpn.gmd` starts with.
+pub const MONSTER_LIST_HEADER: usize = 10;
+/// Monster entries that follow the labels: a description and a hunting tip each.
+pub const MONSTER_LIST_ROWS: usize = 105;
+
+/// One entry of the hunter's note monster list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonsterListRow {
+    /// What the monster is, as the note's list shows it.
+    pub description: String,
+    /// How to hunt it.
+    pub tip: String,
+}
+
+/// The monster list entries of `HN_MonsterListMsg_jpn.gmd` (or another
+/// language's `HN_MonsterListMsg`), in the order the note lists them.
+///
+/// The file is **not** a name table: ten labels, then a description and a tip
+/// per monster, in the note's own order (the Deviant entries come first, so it
+/// is not the save's hunt-record order either). A file that is not exactly
+/// `MONSTER_LIST_HEADER + MONSTER_LIST_ROWS * 2` strings is refused whole: a
+/// shifted pair would put a tip where a description belongs.
+pub fn monster_list_rows(gmd: &[u8]) -> Vec<MonsterListRow> {
+    let strings = gmd_strings(gmd);
+    if strings.len() != MONSTER_LIST_HEADER + MONSTER_LIST_ROWS * 2 {
+        return Vec::new();
+    }
+    let mut out: Vec<MonsterListRow> = Vec::with_capacity(MONSTER_LIST_ROWS);
+    for pair in strings[MONSTER_LIST_HEADER..].chunks_exact(2) {
+        out.push(MonsterListRow {
+            description: pair[0].clone(),
+            tip: pair[1].clone(),
+        });
+    }
+    out
 }

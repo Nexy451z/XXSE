@@ -49,10 +49,12 @@
 //! weapon00MsgData_jpn.gmd   822 -> 137     six per weapon: three forms, each name + text
 //! otArmorData_jpn.gmd      2108 -> 1054    four per series: head, body, head text, body text
 //! otWeaponData_jpn.gmd     1018 -> 509     name, description, ...
-//! catSkillData_jpn.gmd      198 -> 66      three per skill: name, note, note
-//! ot_skl_jpn.gmd            192 -> 96      name, description, ...
+//! catSkillData_jpn.gmd      198 -> 66      three per row: name, note, note
+//! ot_skl_jpn.gmd            192 -> 96      name, description (the otomon 術)
 //! amuletData_jpn.gmd         22 -> 11      name, description, ...
 //! hunterArtsData_jpn.gmd    764 -> 191     four per art: name twice, description twice
+//! HN_MonsterListMsg_jpn.gmd 220 -> 220     ten labels, then description + tip per monster
+//! MonsterDemo_jpn.gmd        96 -> 96      a flat name list (48 二つ名, 48 names)
 //! `
 //!
 //! Three of them are checked against numbers this crate already relies on:
@@ -61,6 +63,27 @@
 //! `activityData_jpn.gmd` the 184 names [`crate::romfstables::request_names`]
 //! returns. The tests assert all three, so a layout that drifts is caught
 //! rather than merely shown.
+//!
+//! ## Which of them name something the editor shows
+//!
+//! A row in the list is not the same thing as a name a save field is shown by,
+//! and only three files are read as names ([`NameColumn`]):
+//!
+//! * `ot_skl` - 96 otomon skills (術). Read with
+//!   [`crate::romfstables::otomo_skill_names`], whose 96 names are identical to
+//!   `gamedata::PALICO_SKILL_NAMES` 0..96 on a retail dump.
+//! * `catSkillData` - 66 cat skills (ネコの…). Read with
+//!   [`crate::romfstables::cat_skill_names`]. Not adopted as an editor name
+//!   column: the only string it shares with the editor's skill table is the
+//!   `スキル無し` placeholder.
+//! * `HN_MonsterListMsg` - **no names**. Its 105 entries are a description and a
+//!   hunting tip each, in the hunter's note order (Deviants first), which is
+//!   neither the names nor the order the save's hunt record uses. The dump has
+//!   no monster name table at all, so the bundled 137 row table stays.
+//!
+//! A file whose string count disagrees with the measured layout is refused
+//! whole, and the caller keeps the bundled names: renaming half the ids from a
+//! truncated table would be worse than reading none of them.
 //!
 //! Age, quality and completeness of the *text* are the game's business: a table
 //! that names its entries "dummy", "Invalid Message" or "未登録" is shown with
@@ -602,4 +625,138 @@ pub fn read(file: &str, bytes: &[u8]) -> Option<Table> {
         strings,
         rows,
     })
+}
+
+/// One of the dump's tables that carries names the editor shows.
+///
+/// The catalogue lists what a file *is*; this says what can be read out of it
+/// as a name, which is a shorter list: a table of descriptions is not a table
+/// of names, however many rows it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameColumn {
+    /// `ot_skl_jpn.gmd`: the 96 otomon skills (術), in the game's skill-id order.
+    OtomoSkill,
+    /// `catSkillData_jpn.gmd`: the 66 cat skills (ネコの…), in file order.
+    CatSkill,
+    /// `HN_MonsterListMsg_jpn.gmd`: 105 descriptions and hunting tips.
+    ///
+    /// The file holds no monster names at all, and neither does any other table
+    /// of a retail dump, so this column answers with no names rather than with
+    /// the descriptions.
+    MonsterList,
+}
+
+/// Which name column a file holds, when it is one of the three.
+///
+/// The match is on the catalogue's own prefixes, so another language's
+/// `ot_skl_eng.gmd` reaches the same column as the Japanese file. `None`
+/// means the file carries no names the editor shows, and the caller keeps the
+/// bundled table.
+pub fn name_column_for(file: &str) -> Option<NameColumn> {
+    if extension_of(file)? != GMD_EXT {
+        return None;
+    }
+    let stem = stem_of(file).to_ascii_lowercase();
+    if stem.starts_with("ot_skl") {
+        Some(NameColumn::OtomoSkill)
+    } else if stem.starts_with("catskilldata") {
+        Some(NameColumn::CatSkill)
+    } else if stem.starts_with("hn_monsterlistmsg") {
+        Some(NameColumn::MonsterList)
+    } else {
+        None
+    }
+}
+
+/// The names a column holds, or `None` when the bytes are not that table.
+///
+/// A file whose string count disagrees with the measured layout is refused
+/// whole: every id past the first wrong row would be renamed, and the caller
+/// falls back to the bundled names instead.
+pub fn names(column: NameColumn, bytes: &[u8]) -> Option<Vec<String>> {
+    let names = match column {
+        NameColumn::OtomoSkill => romfstables::otomo_skill_names(bytes),
+        NameColumn::CatSkill => romfstables::cat_skill_names(bytes),
+        // The hunter's note file describes monsters; it does not name them.
+        NameColumn::MonsterList => Vec::new(),
+    };
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+/// Where a list of names came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Read out of the user's own dump.
+    Romfs,
+    /// The table bundled with the editor, because the dump had no such table.
+    Bundled,
+}
+
+impl Source {
+    /// The source in the language of the interface, for the status line.
+    pub fn describe(self) -> String {
+        match self {
+            Source::Romfs => String::from("romfs"),
+            Source::Bundled => String::from("同梱の表"),
+        }
+    }
+}
+
+/// The otomon skill names the editor shows, and where they came from.
+///
+/// `bytes` is the caller's own `ot_skl` table, or `None` when the dump
+/// is not there. The dump wins when it reads as the table; otherwise the
+/// bundled table answers and [`Source::Bundled`] says so, which is what the
+/// interface shows (reading it from the game instead of shipping it is the
+/// point of the whole module).
+///
+/// The dump names 96 skills and the bundled table carries a 97th row (`"?"`)
+/// the file has no counterpart for: a caller that looks up id 96 finds no
+/// entry in the dump's list and the placeholder in the fallback. The file says
+/// there is no such name, and refusing to invent one is the point.
+#[cfg(feature = "gamedata")]
+pub fn otomo_skill_names(bytes: Option<&[u8]>) -> (Vec<String>, Source) {
+    if let Some(names) = bytes.and_then(|b| names(NameColumn::OtomoSkill, b)) {
+        return (names, Source::Romfs);
+    }
+    let bundled = crate::gamedata::PALICO_SKILL_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    (bundled, Source::Bundled)
+}
+
+/// The 137 monster names of the save's hunt record, and where they came from.
+///
+/// Always the bundled table, and always [`Source::Bundled`]: no table in the
+/// dump names the hunt-record monsters (see [`crate::romfstables`] for the
+/// scan behind that), so an empty list would be a lie about the dump rather
+/// than a reading of it.
+#[cfg(feature = "gamedata")]
+pub fn monster_hunt_names() -> (Vec<String>, Source) {
+    let bundled = crate::gamedata::MONSTER_HUNT_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    (bundled, Source::Bundled)
+}
+
+/// The 58 support actions, and where they came from.
+///
+/// Always the bundled table, and always [`Source::Bundled`]: the dump names a
+/// support action only inside dialogue (`≪イガグリ大砲≫！` in
+/// `QuestOtMsg_jpn.gmd`), never as a list, so there is no id to read a name
+/// for. The tutorial files do carry `サポート行動：薬草笛の技` lines, one per
+/// lesson, but they are not the 58 rows and have no order the save knows.
+#[cfg(feature = "gamedata")]
+pub fn support_move_names() -> (Vec<String>, Source) {
+    let bundled = crate::gamedata::PALICO_SUPPORT_MOVES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    (bundled, Source::Bundled)
 }

@@ -9,7 +9,9 @@
 use std::path::PathBuf;
 
 use mhnx_core::database::{
-    can_read, filter, normalise, read, spec_for, summary, Layout, Table, ATD_EXT, PREVIEW, TABLES,
+    can_read, filter, monster_hunt_names, name_column_for, names, normalise, otomo_skill_names,
+    read, spec_for, summary, support_move_names, Layout, NameColumn, Source, Table, ATD_EXT,
+    PREVIEW, TABLES,
 };
 
 /// Directory holding the game tables, overridable for another dump.
@@ -83,8 +85,8 @@ fn every_table_file_of_a_dump_reads_as_a_table() {
     for name in &files {
         let path = table_dir().join(name);
         let bytes = std::fs::read(&path).expect("a table file reads");
-        let table = read(name, &bytes)
-            .unwrap_or_else(|| panic!("{} did not read as a table", name));
+        let table =
+            read(name, &bytes).unwrap_or_else(|| panic!("{} did not read as a table", name));
         // A table with no entry is not a table: every layout has to leave one.
         assert!(!table.rows.is_empty(), "{} listed no entry", name);
         // The rows cannot outnumber the strings they were taken from, and a
@@ -207,7 +209,8 @@ fn the_award_and_request_tables_agree_with_romfstables() {
     assert_eq!(medal.rows, awards.names);
     assert_eq!(medal.count(), mhnx_core::romfstables::AWARD_COUNT);
 
-    let request_bytes = std::fs::read(table_dir().join("activityData_jpn.gmd")).expect("request bytes");
+    let request_bytes =
+        std::fs::read(table_dir().join("activityData_jpn.gmd")).expect("request bytes");
     let names = mhnx_core::romfstables::request_names(&request_bytes);
     assert_eq!(requests.rows, names);
     assert_eq!(requests.count(), 184);
@@ -303,6 +306,121 @@ fn a_file_that_is_not_a_table_is_skipped_rather_than_listed_empty() {
     let table = read("GC_Medal_jpn.gmd", &medal).expect("a medal table");
     assert_eq!(table.layout, Layout::FirstHalf);
     assert_eq!(table.rows, ["name1", "name2"]);
+}
+
+/// A .gmd holding `count` rows of `stride` strings, each name unique.
+fn synth_rows(key: &str, count: usize, stride: usize) -> Vec<u8> {
+    let mut owned: Vec<String> = Vec::new();
+    for row in 0..count {
+        owned.push(format!("name{}", row));
+        for col in 1..stride {
+            owned.push(format!("column{} of row{}", col, row));
+        }
+    }
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    synth_gmd(key, &refs)
+}
+
+/// The name columns are the three files the editor names things with, and the
+/// catalogue's own prefixes are what reaches them.
+#[test]
+fn the_name_columns_are_the_three_files_and_a_wrong_count_falls_back() {
+    assert_eq!(
+        name_column_for("ot_skl_jpn.gmd"),
+        Some(NameColumn::OtomoSkill)
+    );
+    assert_eq!(
+        name_column_for("OT_SKL_eng.gmd"),
+        Some(NameColumn::OtomoSkill)
+    );
+    assert_eq!(
+        name_column_for("catSkillData_jpn.gmd"),
+        Some(NameColumn::CatSkill)
+    );
+    assert_eq!(
+        name_column_for("HN_MonsterListMsg_jpn.gmd"),
+        Some(NameColumn::MonsterList)
+    );
+    // Everything else carries no name the editor shows - including the files
+    // that do hold text, and the binary tables with the same stem.
+    assert_eq!(name_column_for("itemData_jpn.gmd"), None);
+    assert_eq!(name_column_for("MonsterDemo_jpn.gmd"), None);
+    assert_eq!(name_column_for("ot_skl_jpn.otil"), None);
+    assert_eq!(name_column_for("ot_skl_jpn"), None);
+
+    // A table of the measured shape reads; a shifted or truncated one does
+    // not, so the caller keeps the bundled names instead of renaming ids.
+    let skills = synth_rows("ot_skl", 96, 2);
+    let read_back = names(NameColumn::OtomoSkill, &skills).expect("96 skills read");
+    assert_eq!(read_back.len(), 96);
+    assert_eq!(read_back[1], "name1");
+    assert!(names(NameColumn::OtomoSkill, &synth_rows("ot_skl", 95, 2)).is_none());
+    assert!(names(NameColumn::OtomoSkill, b"").is_none());
+    let cat = synth_rows("catSkillData", 66, 3);
+    assert_eq!(names(NameColumn::CatSkill, &cat).map(|n| n.len()), Some(66));
+    // The monster list column answers with no names at all, whatever the
+    // bytes are: it describes monsters, it does not name them.
+    assert!(names(
+        NameColumn::MonsterList,
+        &synth_gmd("HN_MonsterListMsg", &["a", "b"])
+    )
+    .is_none());
+}
+
+/// Which of the two sources answered, and that it says so.
+#[test]
+fn the_skill_names_come_from_the_dump_when_it_is_there_and_the_table_when_it_is_not() {
+    // No dump: the bundled table, and the source says so rather than pretending
+    // the names were read from a game that is not there.
+    let (bundled, source) = otomo_skill_names(None);
+    assert_eq!(source, Source::Bundled);
+    assert_eq!(bundled.len(), 97);
+    assert_eq!(bundled[1], "体力強化の術【小】");
+    assert_eq!(bundled[96], "?");
+
+    // Bytes that are not the table are the same as no table.
+    let (given, source) = otomo_skill_names(Some(&b"not a gmd"[..]));
+    assert_eq!(source, Source::Bundled);
+    assert_eq!(given, bundled);
+
+    // The real dump, when this machine has one: 96 names, from the dump.
+    let path = table_dir().join("ot_skl_jpn.gmd");
+    if let Ok(bytes) = std::fs::read(&path) {
+        let (names, source) = otomo_skill_names(Some(&bytes));
+        assert_eq!(source, Source::Romfs, "{}", path.display());
+        assert_eq!(names.len(), 96);
+        assert_eq!(
+            names[..],
+            mhnx_core::gamedata::PALICO_SKILL_NAMES[..96],
+            "the dump and the bundled table agree on every id"
+        );
+        assert!(names.iter().all(|n| n.contains('術') || n == "スキル無し"));
+        assert_eq!(source.describe(), "romfs");
+    } else {
+        eprintln!("skipping the dump case: {} not found", path.display());
+    }
+    assert_eq!(Source::Bundled.describe(), "同梱の表");
+}
+
+/// The two tables the dump cannot answer for keep the bundled names, and say
+/// so: an empty list would be a lie about the dump rather than a reading of it.
+#[test]
+fn the_monster_and_support_move_names_stay_on_the_bundled_table_and_say_so() {
+    let (monsters, source) = monster_hunt_names();
+    assert_eq!(source, Source::Bundled);
+    assert_eq!(monsters.len(), 137, "the save's hunt record has 137 rows");
+    assert_eq!(monsters[0], "リオレイア");
+    // 0x64: the id the save's hunt array is indexed by, which is not the id the
+    // quest files use - the two spaces are different and both are in the table.
+    assert_eq!(monsters[64], "ディノバルド");
+    assert_eq!(monsters[80], "ゲネポス");
+    assert_eq!(monsters, mhnx_core::gamedata::MONSTER_HUNT_NAMES);
+
+    let (moves, source) = support_move_names();
+    assert_eq!(source, Source::Bundled);
+    assert_eq!(moves.len(), 58, "58 support action slots");
+    assert_eq!(moves[1], "薬草笛");
+    assert_eq!(moves, mhnx_core::gamedata::PALICO_SUPPORT_MOVES);
 }
 
 #[test]

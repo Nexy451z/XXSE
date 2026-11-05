@@ -11,10 +11,11 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use mhnx_core::romfstables::{
-    award_names, gmd_strings, request_names, request_records, ATD_ACCEPT_OFFSET,
-    ATD_COMPLETE_OFFSET, ATD_COUNT_OFFSET, ATD_HEADER_SIZE, ATD_KIND_OFFSET, ATD_QUEST_ID_OFFSET,
-    ATD_RECORD_SIZE, AWARD_COUNT, GMD_BLOCK_LEN_OFFSET, GMD_COUNT_OFFSET, GMD_HEADER_SIZE,
-    GMD_MAGIC, REQUEST_STRIDE,
+    award_names, cat_skill_names, gmd_strings, monster_list_rows, otomo_skill_names, request_names,
+    request_records, ATD_ACCEPT_OFFSET, ATD_COMPLETE_OFFSET, ATD_COUNT_OFFSET, ATD_HEADER_SIZE,
+    ATD_KIND_OFFSET, ATD_QUEST_ID_OFFSET, ATD_RECORD_SIZE, AWARD_COUNT, CAT_SKILL_COUNT,
+    GMD_BLOCK_LEN_OFFSET, GMD_COUNT_OFFSET, GMD_HEADER_SIZE, GMD_MAGIC, MONSTER_LIST_HEADER,
+    MONSTER_LIST_ROWS, OTOMO_SKILL_COUNT, OTOMO_SKILL_STRIDE, REQUEST_STRIDE,
 };
 
 /// Strings in GC_Medal: 132 names, then 132 descriptions.
@@ -387,6 +388,298 @@ fn synthetic_tables_parse_to_what_was_written() {
     assert!(award_names(&synth_gmd("GC_Medal", &["a", "b", "c"]))
         .names
         .is_empty());
+}
+
+/// A .gmd holding `count` rows of `stride` strings, each name unique.
+fn synth_rows(key: &str, count: usize, stride: usize) -> Vec<u8> {
+    let mut owned: Vec<String> = Vec::new();
+    for row in 0..count {
+        owned.push(format!("name{}", row));
+        for col in 1..stride {
+            owned.push(format!("column{} of row{}", col, row));
+        }
+    }
+    let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+    synth_gmd(key, &refs)
+}
+
+#[test]
+fn a_skill_table_reads_its_name_column_and_refuses_a_shifted_one() {
+    // ot_skl: a name and a description per skill, so the names are every other
+    // string from the first. The parser must not be able to return descriptions
+    // in their place.
+    let gmd = synth_rows("ot_skl", OTOMO_SKILL_COUNT, OTOMO_SKILL_STRIDE);
+    let names = otomo_skill_names(&gmd);
+    assert_eq!(names.len(), OTOMO_SKILL_COUNT);
+    for (i, name) in names.iter().enumerate() {
+        assert_eq!(name, &format!("name{}", i), "row {}", i);
+        assert!(!name.starts_with("column"), "row {} is a description", i);
+    }
+    // A table with one row too few or too many would put a description where a
+    // name belongs past that point, so it is refused whole, not partly read.
+    assert!(otomo_skill_names(&synth_rows(
+        "ot_skl",
+        OTOMO_SKILL_COUNT - 1,
+        OTOMO_SKILL_STRIDE
+    ))
+    .is_empty());
+    assert!(otomo_skill_names(&synth_rows(
+        "ot_skl",
+        OTOMO_SKILL_COUNT + 1,
+        OTOMO_SKILL_STRIDE
+    ))
+    .is_empty());
+    // A file that is not a .gmd at all yields nothing.
+    assert!(otomo_skill_names(&[]).is_empty());
+    assert!(otomo_skill_names(&[0xAAu8; 512]).is_empty());
+
+    // catSkillData: a name and two note columns per row.
+    let cat = synth_rows("catSkillData", CAT_SKILL_COUNT, 3);
+    let names = cat_skill_names(&cat);
+    assert_eq!(names.len(), CAT_SKILL_COUNT);
+    assert_eq!(names[1], "name1");
+    assert!(cat_skill_names(&synth_rows("catSkillData", CAT_SKILL_COUNT - 1, 3)).is_empty());
+}
+
+#[test]
+fn the_dumps_skill_table_names_the_96_skills_the_editor_shows() {
+    // The measurement this reader is adopted on: ot_skl names the otomon 術, and
+    // it names them exactly where the editor's bundled table has them.
+    let gmd = match read_table("ot_skl_jpn.gmd") {
+        Some(bytes) => bytes,
+        None => return,
+    };
+    let strings = gmd_strings(&gmd);
+    assert_eq!(
+        strings.len(),
+        OTOMO_SKILL_COUNT * OTOMO_SKILL_STRIDE,
+        "96 skills x (name, description)"
+    );
+    let names = otomo_skill_names(&gmd);
+    assert_eq!(names.len(), OTOMO_SKILL_COUNT, "96 skills");
+
+    // Names are one line each; the descriptions wrap. The two columns cannot be
+    // confused by eye or by index.
+    assert!(names
+        .iter()
+        .all(|n| !n.is_empty() && !n.contains('\r') && !n.contains('\n')));
+    assert_eq!(names[0], "スキル無し");
+    assert_eq!(names[1], "体力強化の術【小】");
+
+    // Position for position with the bundled table, 0..96. The bundled table's
+    // 97th row is the "?" placeholder the file has no skill for.
+    let bundled = mhnx_core::gamedata::PALICO_SKILL_NAMES;
+    assert_eq!(
+        names[..],
+        bundled[..OTOMO_SKILL_COUNT],
+        "romfs and bundled agree"
+    );
+    assert_eq!(bundled[OTOMO_SKILL_COUNT], "?");
+
+    // And it is not the support action table: not one of the 58 is a whole
+    // string of the file, so no id of that table can be read from here.
+    for name in mhnx_core::gamedata::PALICO_SUPPORT_MOVES {
+        assert!(
+            !strings.iter().any(|s| s == name),
+            "{} is a support action, not a skill",
+            name
+        );
+        assert!(
+            !names.iter().any(|n| n == name),
+            "{} is not a skill name",
+            name
+        );
+    }
+    // Eleven of them do occur *inside* the descriptions ("笛上手の術" mentions
+    // 回復笛, "ビースト延長の術" mentions ビースト変化, ...). That is exactly why
+    // the column is read by stride and never by searching the file: a search
+    // would return a support action as if it were a skill.
+    let inside = mhnx_core::gamedata::PALICO_SUPPORT_MOVES
+        .iter()
+        .filter(|m| strings.iter().any(|s| s.contains(*m)))
+        .count();
+    assert_eq!(inside, 11, "measured: 11 support actions appear in prose");
+}
+
+#[test]
+fn the_cat_skill_table_is_not_the_table_the_editor_shows() {
+    let gmd = match read_table("catSkillData_jpn.gmd") {
+        Some(bytes) => bytes,
+        None => return,
+    };
+    let names = cat_skill_names(&gmd);
+    assert_eq!(names.len(), CAT_SKILL_COUNT, "66 cat skills");
+    assert!(names
+        .iter()
+        .all(|n| !n.is_empty() && !n.contains('\r') && !n.contains('\n')));
+    assert_eq!(names[0], "スキル無し");
+    assert_eq!(names[1], "ネコの解体術【大】");
+
+    // 66 distinct rows: this file is not a stride misread of something else.
+    let unique: BTreeSet<&String> = names.iter().collect();
+    assert_eq!(unique.len(), CAT_SKILL_COUNT);
+
+    // It is not the editor's skill table, so it is read but not adopted: the
+    // only string the two lists share is the "スキル無し" placeholder.
+    let bundled = mhnx_core::gamedata::PALICO_SKILL_NAMES;
+    let shared: Vec<&String> = names
+        .iter()
+        .filter(|n| bundled.contains(&n.as_str()))
+        .collect();
+    assert_eq!(shared.len(), 1, "only the placeholder is shared");
+    assert_eq!(shared[0], "スキル無し");
+    for name in mhnx_core::gamedata::PALICO_SUPPORT_MOVES {
+        assert!(
+            !names.iter().any(|n| n == name),
+            "{} is not a cat skill",
+            name
+        );
+    }
+}
+
+#[test]
+fn the_monster_list_is_descriptions_and_tips_and_names_nothing() {
+    let gmd = match read_table("HN_MonsterListMsg_jpn.gmd") {
+        Some(bytes) => bytes,
+        None => return,
+    };
+    let strings = gmd_strings(&gmd);
+    assert_eq!(
+        strings.len(),
+        MONSTER_LIST_HEADER + MONSTER_LIST_ROWS * 2,
+        "ten labels, then 105 pairs"
+    );
+    // The labels are interface words, not monsters.
+    assert_eq!(strings[0], "モンスターリスト");
+    assert_eq!(strings[2], "狩猟数(捕獲数)");
+
+    let rows = monster_list_rows(&gmd);
+    assert_eq!(rows.len(), MONSTER_LIST_ROWS, "105 monsters");
+    // The note's order is not the save's, so the two lists cannot be zipped:
+    // the note opens with the Deviants (row 0 is 燼滅刃ディノバルド) while the
+    // hunt record opens with リオレイア, and the note covers 105 monsters
+    // against the record's 137 rows.
+    assert!(
+        rows[0].description.contains("燼滅刃"),
+        "{}",
+        rows[0].description
+    );
+    assert!(rows[0].description.contains("ディノバルド"));
+    assert_eq!(mhnx_core::gamedata::MONSTER_HUNT_NAMES[0], "リオレイア");
+    // Every entry is prose: a description that wraps, and a tip that wraps.
+    assert!(rows.iter().all(|r| r.description.contains("\r\n")));
+    assert!(rows.iter().all(|r| r.tip.contains("\r\n")));
+    // And none of them is a name: not one row is the short one-line string the
+    // hunt record shows for that monster.
+    let monsters = mhnx_core::gamedata::MONSTER_HUNT_NAMES;
+    for row in &rows {
+        assert!(
+            !monsters.contains(&row.description.as_str()),
+            "{} is a monster name, not a description",
+            row.description
+        );
+    }
+    // A file with the wrong count is refused whole: a shifted pair would put a
+    // tip where a description belongs.
+    assert!(monster_list_rows(&synth_gmd("HN_MonsterListMsg", &["a", "b"])).is_empty());
+    assert!(monster_list_rows(&[]).is_empty());
+}
+
+/// Every `.gmd` under a directory, recursively.
+fn gmd_files(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut entries: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            gmd_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("gmd") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn no_table_of_the_dump_names_the_hunt_record_monsters() {
+    // The measurement the bundled 137 row table is kept on. A name table would
+    // have to hold the rows the save indexes; no file of the dump does, and the
+    // few that hold many names hold them as titles or as the 48 monster demo,
+    // neither of which is the hunt record.
+    let dir = table_dir();
+    if !dir.exists() {
+        eprintln!("skipping: {} not found", dir.display());
+        return;
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    gmd_files(&dir, &mut files);
+    if files.is_empty() {
+        return;
+    }
+
+    let names: Vec<&str> = mhnx_core::gamedata::MONSTER_HUNT_NAMES
+        .iter()
+        .copied()
+        .filter(|n| *n != "不明" && *n != "ROBOT" && !n.starts_with("Unknown["))
+        .collect();
+    assert_eq!(
+        names.len(),
+        129,
+        "129 real names, 7 不明 rows and one placeholder"
+    );
+
+    let mut best = (0usize, String::new());
+    let mut whole: BTreeSet<usize> = BTreeSet::new();
+    let mut corpus = String::new();
+    for path in &files {
+        let strings = gmd_strings(&std::fs::read(path).unwrap());
+        if strings.is_empty() {
+            continue;
+        }
+        let set: BTreeSet<&String> = strings.iter().collect();
+        let mut hits = 0usize;
+        for (i, name) in names.iter().enumerate() {
+            if set.iter().any(|s| s.as_str() == *name) {
+                hits += 1;
+                whole.insert(i);
+            }
+        }
+        if hits > best.0 {
+            best = (hits, path.display().to_string());
+        }
+        for s in &strings {
+            corpus.push_str(s);
+            corpus.push('\n');
+        }
+    }
+
+    // No file holds more names than the guild-card title table, and that one
+    // holds 57 of the 129: there is no 105 or 137 row name list to read.
+    assert_eq!(
+        best.0, 57,
+        "measured: {} holds {} of the 129 names",
+        best.1, best.0
+    );
+    assert!(best.1.ends_with("GC_Title_1_jpn.gmd"), "{}", best.1);
+    assert_eq!(whole.len(), 73, "measured: 73 names occur as whole strings");
+    // And four names the editor shows are not in the dump in any form - the
+    // editor composes them from a base name and a variant word.
+    let absent: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !corpus.contains(n))
+        .collect();
+    assert_eq!(
+        absent,
+        vec![
+            "怒り喰らうイビルジョー",
+            "ミラボレアス【紅龍】",
+            "ミラボレアス【祖龍】",
+            "猛り爆ぜるブラキディオス",
+        ],
+        "the four names the dump never spells out"
+    );
 }
 
 #[test]
