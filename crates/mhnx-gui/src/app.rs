@@ -7412,11 +7412,22 @@ impl MhnxEditor {
                             // so a 納品 row cannot read like a monster.
                             let target =
                                 mhnx_core::hbedit::quest_target_info(&self.mib_bytes, f.key);
+                            // 部位破壊: the two bytes the table calls 数 hold a
+                            // part code, so the row is headed 部位 and its value
+                            // is a part, never a count.
+                            let part = mhnx_core::hbedit::quest_part_field(&self.mib_bytes, f.key)
+                                .filter(|p| p.is_part_break);
                             match &target {
                                 Some(info) => ui.label(
                                     egui::RichText::new(info.row_title(f.ja)).color(color),
                                 ),
-                                None => ui.label(egui::RichText::new(f.ja).color(color)),
+                                None => match &part {
+                                    Some(_) => ui.label(
+                                        egui::RichText::new(f.ja.replace("数", "部位"))
+                                            .color(color),
+                                    ),
+                                    None => ui.label(egui::RichText::new(f.ja).color(color)),
+                                },
                             };
                             let cur = mhnx_core::questfields::read_u32(
                                 &self.mib_bytes, f.offset, f.kind,
@@ -7633,6 +7644,66 @@ impl MhnxEditor {
                                             }
                                         }
                                     });
+                            } else if let Some(pf) = part.as_ref() {
+                                // 部位破壊: the list is what the shipped quests
+                                // measured for this monster. A monster nobody
+                                // measured keeps a plain number - the screen says
+                                // 未確定 rather than inventing a part name.
+                                let choices = mhnx_core::hbedit::quest_part_choices(pf.monster);
+                                let mut picked: Option<u16> = None;
+                                if choices.is_empty() {
+                                    ui.label(egui::RichText::new("部位（未確定）").small().weak());
+                                    let mut v = pf.code as i64;
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut v)
+                                                .range(0..=mhnx_core::hbedit::PART_CODE_MAX as i64),
+                                        )
+                                        .changed()
+                                    {
+                                        picked = Some(v as u16);
+                                    }
+                                } else {
+                                    egui::ComboBox::from_id_salt(("mibpart", f.offset))
+                                        .selected_text(pf.label.clone())
+                                        .width(230.0)
+                                        .show_ui(ui, |ui| {
+                                            for choice in &choices {
+                                                if ui
+                                                    .selectable_label(
+                                                        choice.code == pf.code,
+                                                        format!(
+                                                            "{} ({})",
+                                                            choice.label, choice.code
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    picked = Some(choice.code);
+                                                }
+                                            }
+                                            ui.separator();
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "この一覧は出荷クエスト 141 本の実測です。",
+                                                )
+                                                .small()
+                                                .weak(),
+                                            );
+                                        });
+                                }
+                                if let Some(code) = picked {
+                                    mhnx_core::questfields::write_u32(
+                                        &mut self.mib_bytes,
+                                        f.offset,
+                                        f.kind,
+                                        code as u32,
+                                    );
+                                    self.message =
+                                        mhnx_core::hbedit::quest_part_field(&self.mib_bytes, f.key)
+                                            .map(|p| format!("{}: {}", f.ja, p.label))
+                                            .unwrap_or_default();
+                                }
                             } else if f.kind == FieldKind::Bytes {
                                 // A monster slot is not a byte blob to anyone
                                 // reading the list: it is one monster, and the

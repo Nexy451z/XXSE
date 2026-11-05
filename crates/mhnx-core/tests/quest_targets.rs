@@ -102,9 +102,9 @@ fn a_delivery_target_is_an_item_and_a_hunt_target_is_a_monster() {
 
 #[test]
 fn the_kinds_that_carry_no_id_say_so() {
-    // 大連続 / RRP納品 / ネコタク / 乗りダウン: the dump holds 25 + 2 + 2 + 16
-    // rows of these and every one of them stores id 0.
-    for (value, label) in [(3u8, "大連続"), (6, "RRP納品"), (7, "ネコタク"), (9, "乗りダウン")] {
+    // RRP納品 / ネコタク / 乗りダウン: the dump holds 2 + 2 + 16 rows of these
+    // and every one of them stores id 0.
+    for (value, label) in [(6u8, "RRP納品"), (7, "ネコタク"), (9, "乗りダウン")] {
         let mut mib = empty_mib();
         put_u8(&mut mib, "tt1", value);
         let info = quest_target_info(&mib, "com0").expect("a 対象 row");
@@ -116,6 +116,18 @@ fn the_kinds_that_carry_no_id_say_so() {
         assert_eq!(target_id_warning(&mib, "com0"), None);
     }
     assert!(target_row_title("ターゲット1 ID", QuestTargetId::None).contains("使いません"));
+
+    // 大連続 is not "no target": the 25 shipped rows name their monsters in the
+    // five mob_slot rows, so the id row says where the target really is.
+    let mut mib = empty_mib();
+    put_u8(&mut mib, "tt1", 3);
+    let info = quest_target_info(&mib, "com0").expect("a 対象 row");
+    assert_eq!(info.id_kind, QuestTargetId::MobSlots);
+    assert!(info.label.contains("mob_slot"));
+    let title = info.row_title("ターゲット1 ID");
+    assert!(title.contains("出現モンスター（mob_slot）"), "{}", title);
+    assert_eq!(mib_pick_kind(&mib, mib_field_index("com0").unwrap()), MibPickKind::None);
+    assert_eq!(target_id_warning(&mib, "com0"), None);
 }
 
 #[test]
@@ -313,6 +325,7 @@ fn every_delivery_target_of_the_shipped_quests_is_a_named_item() {
                     }
                 }
                 QuestTargetId::None => no_id_rows += 1,
+                QuestTargetId::MobSlots => no_id_rows += 1,
                 QuestTargetId::Unmeasured => no_id_rows += 1,
             }
         }

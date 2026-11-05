@@ -1797,6 +1797,16 @@ impl GuiState {
                     false
                 }
             }
+            // 部位破壊: the list is the parts the shipped quests measured for
+            // the monster of this row, so the part is chosen by name.
+            mhnx_core::hbedit::MibPickKind::Part => {
+                if self.open_mib_picker(ed, field_idx) {
+                    true
+                } else {
+                    ed.message = String::from("部位の一覧を作れません");
+                    false
+                }
+            }
             mhnx_core::hbedit::MibPickKind::None => {
                 ed.message = match ed.mib_target_info(field_idx) {
                     Some(info) => format!(
@@ -8865,7 +8875,12 @@ impl GuiState {
             // 対象アイテム / 対象ID（未確定）. One word, from the 種類 byte.
             let title = match mhnx_core::hbedit::quest_target_info(mib, f.key) {
                 Some(info) => info.row_title(f.ja),
-                None => f.ja.to_string(),
+                // 部位破壊: these bytes are the part, not a count, and the
+                // row must not call them one.
+                None => match mhnx_core::hbedit::quest_part_field(mib, f.key) {
+                    Some(pf) if pf.is_part_break => f.ja.replace("数", "部位"),
+                    _ => f.ja.to_string(),
+                },
             };
             rows.push((i, title, meta, val_str, format!("#{:02}", i + 1)));
         }
@@ -8873,15 +8888,20 @@ impl GuiState {
         let cur = ed.mib_cursor.min(total.saturating_sub(1));
         let a_lbl = match mhnx_core::hbedit::mib_pick_kind(mib, cur) {
             mhnx_core::hbedit::MibPickKind::Item => "アイテム選択",
+            mhnx_core::hbedit::MibPickKind::Part => "部位選択",
             _ if mib_has_picker(mib, cur) => "一覧選択",
             _ => "変更",
         };
+        // A 大連続 names no monster in its 種類 row: the five mob_slot rows are
+        // the target list, and the screen says so instead of leaving the 0
+        // in the id column to be read as "no monster".
+        let sub = ed.quest_mob_slot_note().unwrap_or_default();
 
         self.draw_adaptive_rows(
             c,
             ed,
             "クエスト条件 (.mib)",
-            "",
+            &sub,
             &rows,
             cur,
             true,
@@ -9637,6 +9657,26 @@ fn mib_field_choices(mib: &[u8], field_idx: usize) -> Option<(String, Vec<(u32, 
         return Some((format!("{} (モンスター選択)", f.ja), mib_monster_items(), cur));
     }
 
+    // 部位破壊: the two bytes after the id are a part code, and the shipped
+    // quests name the parts of 34 monsters. Offer exactly those; a monster
+    // nobody measured has no list and the row stays a number.
+    if let Some(pf) = mhnx_core::hbedit::quest_part_field(mib, f.key) {
+        if pf.is_part_break {
+            let items: Vec<(u32, String)> = mhnx_core::hbedit::quest_part_choices(pf.monster)
+                .into_iter()
+                .map(|p| (p.code as u32, format!("{} ({})", p.label, p.code)))
+                .collect();
+            if items.is_empty() {
+                return None;
+            }
+            return Some((
+                format!("{} の部位（{}）", monster_name_for_mint(pf.monster as u32), f.ja),
+                items,
+                pf.code as u32,
+            ));
+        }
+    }
+
     let cur = questfields::read_u32(mib, f.offset, f.kind).unwrap_or(0);
     // A com* row is not "a monster id" by itself: the 種類 byte beside it says
     // whether the game reads the number as a monster or as an item. 納品 and
@@ -9740,6 +9780,13 @@ fn apply_mib_choice(ed: &mut Editor, field_idx: usize, raw_val: u32, label: &str
 /// monster name and falling back to the item name (what this used to do) made
 /// a delivery target read like a monster that happened to share the id.
 fn mib_extra_value_label(mib: &[u8], key: &str, v: u32) -> String {
+    // 部位破壊: the value is a part code and the name comes from the shipped
+    // quests - 「尻尾 (7)」 - never from a guess.
+    if let Some(pf) = mhnx_core::hbedit::quest_part_field(mib, key) {
+        if pf.is_part_break {
+            return pf.label;
+        }
+    }
     if let Some(info) = mhnx_core::hbedit::quest_target_info(mib, key) {
         return format!("{} ({})", info.label, info.kind_label);
     }

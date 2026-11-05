@@ -542,9 +542,14 @@ pub const QUEST_TARGET_PAIRS: [(&str, &str); 10] = [
 /// What the id of one 対象 row means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestTargetId {
-    /// The kind carries no id at all: 大連続 / RRP納品 / ネコタク / 乗りダウン.
+    /// The kind carries no id at all: RRP納品 / ネコタク / 乗りダウン.
     /// (The 数 column is what those rows use - RRP納品 stores the points there.)
     None,
+    /// 大連続: the row names no monster because the targets are the five
+    /// [MOB_SLOT_KEYS] rows of the same .mib. Every one of the 25 shipped
+    /// 大連続 rows stores id 0, and every one of those quests lists its
+    /// stream in those slots (2 to 5 monsters - see [mib_mob_slot_ids]).
+    MobSlots,
     /// A monster id in the `mint_` space, the same space `mob_slot[n]` uses.
     Monster,
     /// An item id.
@@ -581,7 +586,7 @@ pub fn target_id_kind(kind_key: &str, value: u8) -> QuestTargetId {
             0 => QuestTargetId::None,       // なし
             1 => QuestTargetId::Monster,    // 狩猟/討伐 - 97 rows
             2 => QuestTargetId::Monster,    // 捕獲 - 1 row (q1011001: 77 = セルレギオス)
-            3 => QuestTargetId::None,       // 大連続 - 25 rows, every id 0
+            3 => QuestTargetId::MobSlots,   // 大連続 - 25 rows, id 0; targets = mob_slot
             4 => QuestTargetId::Monster,    // 討伐合計 - 3 rows (small monsters)
             5 => QuestTargetId::Item,       // 納品 - 6 rows, every id a named item
             6 => QuestTargetId::None,       // RRP納品 - 2 rows, id 0, 数 = points
@@ -622,6 +627,7 @@ pub fn target_id_word(kind: QuestTargetId) -> &'static str {
         QuestTargetId::Monster => "対象モンスター",
         QuestTargetId::Item => "対象アイテム",
         QuestTargetId::None => "対象ID（この種別では使いません）",
+        QuestTargetId::MobSlots => "対象は出現モンスター（mob_slot）で表します",
         QuestTargetId::Unmeasured => "対象ID（未確定）",
     }
 }
@@ -636,6 +642,7 @@ fn id_space_word(kind: QuestTargetId) -> &'static str {
     match kind {
         QuestTargetId::Monster => "モンスター",
         QuestTargetId::Item => "アイテム",
+        QuestTargetId::MobSlots => "出現モンスター（mob_slot）",
         _ => "対象",
     }
 }
@@ -664,6 +671,15 @@ pub fn target_id_label(kind: QuestTargetId, id: u16) -> String {
                 alloc::format!("使わない 0x{:X}", id)
             }
         }
+        // The id of a 大連続 row is not the target; the mob slots are. Say so
+        // instead of printing a 0 that reads like "no monster".
+        QuestTargetId::MobSlots => {
+            if id == 0 {
+                String::from("mob_slot（出現モンスター）")
+            } else {
+                alloc::format!("mob_slot（0x{:X} は使いません）", id)
+            }
+        }
         QuestTargetId::Unmeasured => alloc::format!("未確定 0x{:X}", id),
     }
 }
@@ -681,7 +697,7 @@ pub fn target_id_fits(kind: QuestTargetId, id: u16) -> bool {
     match kind {
         QuestTargetId::Monster => monster_name_of(id).is_some(),
         QuestTargetId::Item => item_name_or_none(id).is_some(),
-        QuestTargetId::None | QuestTargetId::Unmeasured => true,
+        QuestTargetId::None | QuestTargetId::MobSlots | QuestTargetId::Unmeasured => true,
     }
 }
 
@@ -752,6 +768,13 @@ pub enum MibPickKind {
     Monster,
     /// The item table (a 納品 / 採取 target).
     Item,
+    /// The measured 部位 list of the monster on a 部位破壊 row.
+    ///
+    /// The two bytes after the id of a 部位破壊 target are a part code, not
+    /// a 数 (see [part_code_slots]). Only the monsters the shipped quests
+    /// name have a list to offer; anything else keeps [MibPickKind::None]
+    /// and the row says 未確定.
+    Part,
 }
 
 /// What [A] on one .mib field opens.
@@ -762,11 +785,26 @@ pub fn mib_pick_kind(mib: &[u8], field_idx: usize) -> MibPickKind {
     if f.key.starts_with("mob_slot[") {
         return MibPickKind::Monster;
     }
+    // 部位破壊: the 数 field holds a part code, and a monster the shipped
+    // quests name has a list of parts to choose from. A row of any other
+    // kind keeps a plain 数 (and the count picker is none of this one's
+    // business).
+    if let Some(pf) = quest_part_field(mib, f.key) {
+        if pf.is_part_break {
+            return if quest_part_choices(pf.monster).is_empty() {
+                MibPickKind::None
+            } else {
+                MibPickKind::Part
+            };
+        }
+    }
     match quest_target_info(mib, f.key) {
         Some(info) => match info.id_kind {
             QuestTargetId::Monster => MibPickKind::Monster,
             QuestTargetId::Item => MibPickKind::Item,
-            QuestTargetId::None | QuestTargetId::Unmeasured => MibPickKind::None,
+            QuestTargetId::None | QuestTargetId::MobSlots | QuestTargetId::Unmeasured => {
+                MibPickKind::None
+            }
         },
         None => MibPickKind::None,
     }
@@ -793,6 +831,337 @@ pub fn monster_id_choices() -> Vec<(u16, &'static str)> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// 部位破壊: the two bytes after the id are a 部位 code, not a 数
+// ---------------------------------------------------------------------------
+//
+// A 部位破壊 row stores the monster in `com` and then, in the two bytes the
+// field table calls 数 (`t13` / `t23` / `t33`), the part to break. For this
+// kind the name is wrong, and the value proves it: on the 42 部位破壊 rows of
+// the 141 shipped quests those bytes hold 1, 2, 3, 6, 7, 12, 13, 14, 17, 23,
+// 27, 34, 37, 47, 49 or 57 - never a number of monsters - and every value
+// lines up with the part words of that quest's own text (「尻尾切断」,
+// 「頭部と鼻破壊」, 「両爪とヤド破壊」 …). The same bytes on a 狩猟/討伐 row
+// are a real count (ガブラス１２頭 = 12, ブランゴ２０頭 = 20), so the field means
+// what its 種類 says.
+//
+// The encoding is a combination code over the monster's own part numbers:
+//
+//     0          nothing
+//     1 ..= 11   one part: the monster's part number
+//     12 ..= 66  two parts, p < q, in lexicographic order:
+//                (1,2)=12, (1,3)=13, (1,4)=14 … (1,11)=21, (2,3)=22 … (10,11)=66
+//
+// This is measured, not guessed. It is the only reading that fits all 42 rows:
+// a bit mask cannot (ディノバルド 尻尾切断 = 7 = {1,2,3} and 頭部と背中 = 12 =
+// {2,3} would put the tail under the head's bit), and the two-part order is
+// pinned by the monsters that appear twice - タマミツネ 頭部と尻尾 = 17 = (1,7)
+// and 背ビレと尻尾 = 57 = (7,8) share exactly the 7, so 尻尾 is part 7 of
+// タマミツネ; ラギアクルス 胸部と尻尾 = 37 = (3,10) and 胸部と背中 = 34 =
+// (3,7) share the 3, so 胸部 is part 3; ガムート 頭部と鼻 = 12 = (1,2) and
+// 鼻と脚 = 23 = (2,4) share the 2, so 鼻 is part 2.
+//
+// The part *numbers* belong to the monster, so there is no global 部位 enum to
+// build: part 1 is 頭部 for ディノバルド but 角 for キリン, and part 2 is 鼻 for
+// ガムート but 背中 for バルファルク. What the shipped quests do give is the
+// name of 40 (monster, code) pairs - [QUEST_PARTS] - and that is what the
+// picker offers. Anything else is printed as 「部位N（未確定）」 and never given
+// an invented name.
+
+/// Where the 141 shipped quest archives were read from.
+///
+/// The measurement behind [QUEST_PARTS] and the counts in this section: the
+/// quest dump `mhxx_quetool/quest` (141 `.arc` files). tests/quest_parts.rs
+/// reads the same folder when it is present and re-checks every row against
+/// the quest text, so the table cannot drift from the data it came from.
+pub const QUEST_SOURCE_QUEST_DUMP: &str =
+    "C:\\anyWorkspace\\nx\\mhxx\\save_editor\\mhxx_quetool\\quest";
+
+/// The five 大型モンスター slots of one .mib, in the order the screen shows them.
+///
+/// 大連続 uses them as its target list: the 種類 row names no monster, and the
+/// five slots hold the stream (2 to 5 monsters in the 25 shipped quests).
+pub static MOB_SLOT_KEYS: [&str; 5] = [
+    "mob_slot[0]",
+    "mob_slot[1]",
+    "mob_slot[2]",
+    "mob_slot[3]",
+    "mob_slot[4]",
+];
+
+/// The three (種類, 数) pairs a target row has, in file order.
+///
+/// Only tt1..tt3 have one: the 配置 rows (tt4..tt10) read `syu2_`, which has no
+/// 部位破壊, so their 数 is always a count.
+pub static QUEST_TARGET_COUNTS: [(&str, &str); 3] =
+    [("tt1", "t13"), ("tt2", "t23"), ("tt3", "t33")];
+
+/// The `syu_` value of 部位破壊.
+pub const SYU_PART_BREAK: u8 = 8;
+/// The `syu_` value of 大連続.
+pub const SYU_RENZOKU: u8 = 3;
+
+/// The largest part number a 部位 code can name.
+pub const PART_SLOT_MAX: u16 = 11;
+/// The largest 部位 code: 11 single parts + 55 pairs.
+pub const PART_CODE_MAX: u16 = 66;
+
+/// The part numbers one 部位 code names.
+///
+/// `[n, 0]` for one part, `[p, q]` (p < q) for two, `[0, 0]` for 0 (nothing),
+/// and None for a code the encoding has no room for (67 and up).
+pub fn part_code_slots(code: u16) -> Option<[u8; 2]> {
+    if code == 0 {
+        return Some([0, 0]);
+    }
+    if code <= PART_SLOT_MAX {
+        return Some([code as u8, 0]);
+    }
+    let mut rank = code - PART_SLOT_MAX;
+    for p in 1..=PART_SLOT_MAX {
+        for q in (p + 1)..=PART_SLOT_MAX {
+            rank -= 1;
+            if rank == 0 {
+                return Some([p as u8, q as u8]);
+            }
+        }
+    }
+    None
+}
+
+/// The 部位 code for one part (`q == 0`) or for a pair (`p < q`).
+pub fn part_code(p: u8, q: u8) -> Option<u16> {
+    let (p, q) = (p as u16, q as u16);
+    if q == 0 {
+        // 0 is the "no part" code: a 部位破壊 row that has not been given one.
+        return if p == 0 {
+            Some(0)
+        } else if p <= PART_SLOT_MAX {
+            Some(p)
+        } else {
+            None
+        };
+    }
+    if p == 0 || p >= q || q > PART_SLOT_MAX {
+        return None;
+    }
+    let mut code = PART_SLOT_MAX + 1;
+    for a in 1..=PART_SLOT_MAX {
+        for b in (a + 1)..=PART_SLOT_MAX {
+            if a == p && b == q {
+                return Some(code);
+            }
+            code += 1;
+        }
+    }
+    None
+}
+
+/// One 部位 choice the shipped quests name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuestPart {
+    /// The monster id, in the `mint_` space `com` and `mob_slot` use.
+    pub monster: u16,
+    /// The code stored in the 数 bytes.
+    pub code: u16,
+    /// The part numbers that code names (see [part_code_slots]).
+    pub slots: [u8; 2],
+    /// The words the quest text uses, e.g. 「頭部と鼻」.
+    ///
+    /// The parts of a pair are listed as the quest wrote them. Which of the two
+    /// numbers carries which name cannot be told from one quest alone, and the
+    /// code only ever means the pair, so the pair is what is named here.
+    pub label: &'static str,
+    /// How many of the 141 shipped quests carry this (monster, code).
+    pub count: u8,
+}
+
+/// The 部位 names the 141 shipped quests measure, one row per (monster, code).
+///
+/// Read from the quest text of every 部位破壊 row of
+/// [QUEST_SOURCE_QUEST_DUMP] (42 rows, 34 monsters, 40 distinct pairs).
+/// tests/quest_parts.rs reads the same files
+/// and re-checks every row against its own text, so a wrong code, a wrong
+/// decode or an edited label fails there.
+pub static QUEST_PARTS: &[QuestPart] = &[
+    QuestPart { monster: 1, code: 7, slots: [7, 0], label: "尻尾", count: 1 },
+    QuestPart { monster: 2, code: 7, slots: [7, 0], label: "尻尾", count: 1 },
+    QuestPart { monster: 5, code: 3, slots: [3, 0], label: "胸部", count: 1 },
+    QuestPart { monster: 7, code: 1, slots: [1, 0], label: "両角", count: 2 },
+    QuestPart { monster: 10, code: 23, slots: [2, 4], label: "頭部と背ビレ", count: 1 },
+    QuestPart { monster: 11, code: 1, slots: [1, 0], label: "角", count: 1 },
+    QuestPart { monster: 18, code: 47, slots: [5, 7], label: "背中と尻尾", count: 1 },
+    QuestPart { monster: 19, code: 2, slots: [2, 0], label: "両爪", count: 1 },
+    QuestPart { monster: 19, code: 12, slots: [1, 2], label: "両爪とヤド", count: 1 },
+    QuestPart { monster: 20, code: 49, slots: [5, 9], label: "両爪とヤド", count: 1 },
+    QuestPart { monster: 23, code: 1, slots: [1, 0], label: "角", count: 1 },
+    QuestPart { monster: 24, code: 12, slots: [1, 2], label: "頭部と翼", count: 1 },
+    QuestPart { monster: 24, code: 27, slots: [2, 8], label: "翼と尻尾", count: 1 },
+    QuestPart { monster: 27, code: 12, slots: [1, 2], label: "頭部と翼爪", count: 1 },
+    QuestPart { monster: 32, code: 27, slots: [2, 8], label: "爪と尻尾", count: 1 },
+    QuestPart { monster: 36, code: 12, slots: [1, 2], label: "頭部と背ビレ", count: 1 },
+    QuestPart { monster: 43, code: 1, slots: [1, 0], label: "頭部", count: 1 },
+    QuestPart { monster: 44, code: 6, slots: [6, 0], label: "頭部", count: 1 },
+    QuestPart { monster: 46, code: 34, slots: [3, 7], label: "胸部と背中", count: 1 },
+    QuestPart { monster: 46, code: 37, slots: [3, 10], label: "胸部と尻尾", count: 1 },
+    QuestPart { monster: 56, code: 1, slots: [1, 0], label: "両前脚", count: 1 },
+    QuestPart { monster: 57, code: 13, slots: [1, 3], label: "頭部と前脚", count: 1 },
+    QuestPart { monster: 58, code: 23, slots: [2, 4], label: "両前脚", count: 1 },
+    QuestPart { monster: 63, code: 12, slots: [1, 2], label: "頭部と前脚", count: 1 },
+    QuestPart { monster: 65, code: 23, slots: [2, 4], label: "爪と尻尾", count: 1 },
+    QuestPart { monster: 68, code: 13, slots: [1, 3], label: "頭部と背中", count: 1 },
+    QuestPart { monster: 70, code: 2, slots: [2, 0], label: "毒トゲ", count: 1 },
+    QuestPart { monster: 71, code: 14, slots: [1, 4], label: "触角と翼", count: 1 },
+    QuestPart { monster: 72, code: 13, slots: [1, 3], label: "角と翼", count: 1 },
+    QuestPart { monster: 79, code: 23, slots: [2, 4], label: "翼と尻尾", count: 1 },
+    QuestPart { monster: 80, code: 7, slots: [7, 0], label: "尻尾", count: 2 },
+    QuestPart { monster: 80, code: 12, slots: [1, 2], label: "頭部と背中", count: 1 },
+    QuestPart { monster: 81, code: 23, slots: [2, 4], label: "背中と翼爪", count: 1 },
+    QuestPart { monster: 82, code: 17, slots: [1, 7], label: "頭部と尻尾", count: 1 },
+    QuestPart { monster: 82, code: 57, slots: [7, 8], label: "背ビレと尻尾", count: 1 },
+    QuestPart { monster: 83, code: 12, slots: [1, 2], label: "頭部と鼻", count: 1 },
+    QuestPart { monster: 83, code: 23, slots: [2, 4], label: "鼻と脚", count: 1 },
+    QuestPart { monster: 85, code: 1, slots: [1, 0], label: "頭部", count: 1 },
+    QuestPart { monster: 86, code: 2, slots: [2, 0], label: "背中", count: 1 },
+    QuestPart { monster: 513, code: 12, slots: [1, 2], label: "頭部と翼", count: 1 },
+];
+
+/// The measured 部位 choices of one monster, in code order.
+///
+/// Empty when no shipped quest breaks a part of that monster: the list is a
+/// measurement, so it has nothing to offer rather than a guess.
+pub fn quest_part_choices(monster: u16) -> Vec<&'static QuestPart> {
+    QUEST_PARTS.iter().filter(|p| p.monster == monster).collect()
+}
+
+/// The words the shipped quests use for one (monster, code).
+pub fn quest_part_label(monster: u16, code: u16) -> Option<&'static str> {
+    QUEST_PARTS
+        .iter()
+        .find(|p| p.monster == monster && p.code == code)
+        .map(|p| p.label)
+}
+
+/// One 数 field of a target row, read as what it is under that row's 種類.
+///
+/// On a 部位破壊 row the bytes are a part code and [QuestPartField::label]
+/// names it when the shipped quests measured it; on every other kind they are
+/// a plain count and the label is just the number.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestPartField {
+    /// The 種類 field the row's meaning comes from ("tt1".."tt3").
+    pub kind_key: &'static str,
+    /// The 数 field this was read from ("t13" / "t23" / "t33").
+    pub count_key: &'static str,
+    /// True when the row's 種類 is 部位破壊 (8).
+    pub is_part_break: bool,
+    /// The monster the row names (0 = none).
+    pub monster: u16,
+    /// The two bytes as stored.
+    pub code: u16,
+    /// The part numbers the code names, all zero when the row is not 部位破壊.
+    pub slots: [u8; 2],
+    /// 「尻尾 (7)」 / 「部位3と10（未確定） (37)」 / 「12」 for a plain count.
+    pub label: String,
+    /// The measured words, when the shipped quests name this pair.
+    pub measured: Option<&'static str>,
+}
+
+/// Decode the 数 field of a target row. None when the key is not one of
+/// `t13` / `t23` / `t33`.
+pub fn quest_part_field(mib: &[u8], count_key: &str) -> Option<QuestPartField> {
+    // Take both names from the measured table: the key that came in is the
+    // caller's, and the row it names is what has to be reported back.
+    let (kind_key, count_key) = QUEST_TARGET_COUNTS
+        .iter()
+        .find(|(_, c)| *c == count_key)
+        .copied()?;
+    let (_, id_key) = QUEST_TARGET_PAIRS
+        .iter()
+        .find(|(k, _)| *k == kind_key)
+        .copied()?;
+    let kf = questfields::MIB_FIELDS.iter().find(|f| f.key == kind_key)?;
+    let idf = questfields::MIB_FIELDS.iter().find(|f| f.key == id_key)?;
+    let cf = questfields::MIB_FIELDS.iter().find(|f| f.key == count_key)?;
+    let kind = questfields::read_u32(mib, kf.offset, kf.kind)? as u8;
+    let monster = questfields::read_u32(mib, idf.offset, idf.kind)? as u16;
+    let code = questfields::read_u32(mib, cf.offset, cf.kind)? as u16;
+    let is_part_break = kind == SYU_PART_BREAK;
+    let slots = if is_part_break {
+        part_code_slots(code).unwrap_or([0, 0])
+    } else {
+        [0, 0]
+    };
+    let measured = if is_part_break {
+        quest_part_label(monster, code)
+    } else {
+        None
+    };
+    let label = if !is_part_break {
+        alloc::format!("{}", code)
+    } else if let Some(m) = measured {
+        alloc::format!("{} ({})", m, code)
+    } else if code == 0 {
+        String::from("なし (0)")
+    } else if part_code_slots(code).is_none() {
+        // Past 66: not a code this encoding can read, so no part is claimed.
+        alloc::format!("部位コード範囲外 ({})", code)
+    } else if slots[1] == 0 {
+        alloc::format!("部位{}（未確定） ({})", slots[0], code)
+    } else {
+        alloc::format!("部位{}と{}（未確定） ({})", slots[0], slots[1], code)
+    };
+    Some(QuestPartField {
+        kind_key,
+        count_key,
+        is_part_break,
+        monster,
+        code,
+        slots,
+        label,
+        measured,
+    })
+}
+
+/// The large monsters a .mib lists in its five `mob_slot` rows, in slot order.
+///
+/// This is what a 大連続 row's targets are: 25 of the 25 shipped 大連続 quests
+/// list 2 to 5 monsters here and store id 0 in the 種類 row.
+pub fn mib_mob_slot_ids(mib: &[u8]) -> Vec<u16> {
+    let mut out = Vec::new();
+    for key in MOB_SLOT_KEYS {
+        let Some(f) = questfields::MIB_FIELDS.iter().find(|f| f.key == key) else {
+            continue;
+        };
+        // A mob_slot is a 13 byte record, not a number field: `read_u32`
+        // refuses Bytes, so the id is read from its first two bytes here.
+        if f.offset + 2 > mib.len() {
+            continue;
+        }
+        let id = u16::from_le_bytes([mib[f.offset], mib[f.offset + 1]]);
+        if id != 0 {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// What a 大連続 row's targets are, in one sentence for the screen.
+pub const RENZOKU_TARGET_NOTE: &str = "大連続の対象は出現モンスター（mob_slot）で表します";
+
+/// What [◀] / [▶] did on a 数 field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartStep {
+    /// The row is not 部位破壊: the field is a plain 数 and the caller's own
+    /// numeric step is the right one.
+    NotAPartRow,
+    /// The 部位 code was changed; the message says to what.
+    Stepped,
+    /// The row is 部位破壊 but no shipped quest names this monster's parts, so
+    /// there is no name to offer. The caller still lets the number move.
+    Unmeasured,
 }
 
 /// A button press.
@@ -6793,6 +7162,90 @@ impl Editor {
     /// What [A] opens on the .mib row under the cursor.
     pub fn mib_pick_kind_at_cursor(&self) -> MibPickKind {
         mib_pick_kind(&self.mib_bytes, self.mib_cursor)
+    }
+
+    /// The 数 field of one target row, read as a 部位 code when its 種類 is 部位破壊.
+    pub fn mib_part_field(&self, field_idx: usize) -> Option<QuestPartField> {
+        let f = questfields::MIB_FIELDS.get(field_idx)?;
+        quest_part_field(&self.mib_bytes, f.key)
+    }
+
+    /// [◀] / [▶] on a 数 field of a 部位破壊 row: walk the parts the shipped
+    /// quests measured for that monster, so the part is chosen by name.
+    ///
+    /// A monster no shipped quest breaks has no list to walk; the number stays
+    /// editable and the message says the part is 未確定.
+    pub fn step_mib_part(&mut self, field_idx: usize, forward: bool) -> PartStep {
+        let Some(f) = questfields::MIB_FIELDS.get(field_idx).copied() else {
+            return PartStep::NotAPartRow;
+        };
+        let Some(pf) = quest_part_field(&self.mib_bytes, f.key) else {
+            return PartStep::NotAPartRow;
+        };
+        if !pf.is_part_break {
+            return PartStep::NotAPartRow;
+        }
+        let choices = quest_part_choices(pf.monster);
+        if choices.is_empty() {
+            self.message = alloc::format!(
+                "{}（0x{:X}）の部位は実測できていません（未確定）。値は数として動かします",
+                monster_name_of(pf.monster).unwrap_or("?"),
+                pf.monster
+            );
+            return PartStep::Unmeasured;
+        }
+        let pos = choices.iter().position(|c| c.code == pf.code);
+        let next = match (pos, forward) {
+            (Some(i), true) => (i + 1) % choices.len(),
+            (Some(i), false) => (i + choices.len() - 1) % choices.len(),
+            (None, true) => 0,
+            (None, false) => choices.len() - 1,
+        };
+        let choice = choices[next];
+        if !questfields::write_u32(&mut self.mib_bytes, f.offset, f.kind, choice.code as u32) {
+            return PartStep::NotAPartRow;
+        }
+        self.dirty = true;
+        let row = f.ja.trim_end_matches(" 数");
+        self.message = alloc::format!(
+            "{}の部位: {} ({}) — {} 件のクエストで実測",
+            row, choice.label, choice.code, choice.count
+        );
+        PartStep::Stepped
+    }
+
+    /// The line the .mib screen prints when the open quest is a 大連続.
+    ///
+    /// A 大連続 row names no monster in its id; the five `mob_slot` rows carry
+    /// the stream. This says so and lists them, so the screen cannot leave the
+    /// impression that the target is the 0 in the id column.
+    pub fn quest_mob_slot_note(&self) -> Option<String> {
+        let mut is_renzoku = false;
+        for (k, _) in QUEST_TARGET_PAIRS.iter().take(3) {
+            let Some(f) = questfields::MIB_FIELDS.iter().find(|f| f.key == *k) else {
+                continue;
+            };
+            if questfields::read_u32(&self.mib_bytes, f.offset, f.kind) == Some(SYU_RENZOKU as u32) {
+                is_renzoku = true;
+                break;
+            }
+        }
+        if !is_renzoku {
+            return None;
+        }
+        let ids = mib_mob_slot_ids(&self.mib_bytes);
+        if ids.is_empty() {
+            return Some(alloc::format!("{}（mob_slot は空です）", RENZOKU_TARGET_NOTE));
+        }
+        let names: Vec<&str> = ids
+            .iter()
+            .map(|&id| monster_name_of(id).unwrap_or("?"))
+            .collect();
+        Some(alloc::format!(
+            "{}: {}",
+            RENZOKU_TARGET_NOTE,
+            names.join("、")
+        ))
     }
 
     /// Step one number of the .sem placement that places monster slot sem_k.
@@ -15592,12 +16045,26 @@ impl Editor {
                     self.message = String::from("生バイトの項目です（ここでは編集できません）");
                     return;
                 }
+                // 部位破壊: these two bytes are a part code, not a count, so
+                // [◀] / [▶] walk the parts the shipped quests measured for
+                // that monster. A monster nobody measured keeps the plain
+                // number and the message says the part is 未確定.
+                if self.step_mib_part(self.mib_cursor, key == Key::Right) == PartStep::Stepped {
+                    return;
+                }
                 // One implementation of a .mib step (Editor::step_mib_field):
                 // the クエスト改造 screen's 制限時間 row runs the same
                 // arithmetic, so the two can never drift apart.
                 let d = if key == Key::Right { 1 } else { -1 } * STEPS[self.step] as i32;
                 let stepped_key = fields[self.mib_cursor].key;
                 self.step_mib_field(self.mib_cursor, d);
+                // A 数 field of a 部位破壊 row is a part code: after a numeric
+                // step say which part the new number names.
+                if let Some(pf) = quest_part_field(&self.mib_bytes, stepped_key) {
+                    if pf.is_part_break {
+                        self.message = alloc::format!("{}（部位コード）", pf.label);
+                    }
+                }
                 // A 種類 step changes what the id beside it means. The id
                 // itself is never rewritten: a 種別 picked by accident must
                 // not cost the number the user had.
@@ -16410,7 +16877,13 @@ impl Editor {
                                 Some(t) => {
                                     format!("{} ({})", t.get(v as usize).copied().unwrap_or("?"), v)
                                 }
-                                None => format!("{}", v),
+                                // 部位破壊: the 数 bytes are a part code, and
+                                // the name comes from what the shipped quests
+                                // measured - never from a guess.
+                                None => match quest_part_field(&self.mib_bytes, f.key) {
+                                    Some(pf) if pf.is_part_break => pf.label,
+                                    _ => format!("{}", v),
+                                },
                             }
                         }
                     };
@@ -16421,6 +16894,9 @@ impl Editor {
                         f.kind != FieldKind::Bytes,
                         i == self.mib_cursor,
                     );
+                }
+                if let Some(note) = self.quest_mob_slot_note() {
+                    push(&mut out, format!("  {}", note), false, false);
                 }
             }
             Screen::Gmd => {
