@@ -286,9 +286,12 @@ impl Tab {
             Tab::Progress => "勲章・依頼・クエストの進行状況です。分からないときは右下の [詳細]",
             Tab::Quest => "ファイル単位の編集（上級者向け）。左上の「戻る」でクエスト改造へ",
             Tab::SaveMap => {
-                "読み取り専用です。行を選ぶとその範囲の 16 進ダンプを出します。左上の「戻る」で元の画面へ"
+                "行を選ぶとその範囲の 16 進ダンプ。[編集] で 1 バイトずつ書き換えられます（確認あり・元に戻せます）。左上の「戻る」で元の画面へ"
             }
-            Tab::Review => "保存した内容との違いです。行ごとに 1 項目ずつ戻せます（読み取り専用）",
+            // Not 読み取り専用: every line with a 戻す button puts that one value
+            // back, and the line above used to call the screen read-only while
+            // the screen itself offered the button.
+            Tab::Review => "保存した内容との違いです。行ごとに 1 項目ずつ戻せます（戻すときは確認します）",
             Tab::Database => "ゲームのテーブル（romfs）を読んで表示します。読み取り専用です",
             Tab::Extras => "本体オプション・配信オトモ・キャラの入出力（上級者向け）",
             Tab::About => "このツールの説明と、使う前に読む注意書きです",
@@ -348,6 +351,40 @@ struct RecordDump {
     /// Sixteen bytes a line, the way the whole-row dump draws them.
     lines: Vec<String>,
 }
+
+/// Where a raw byte edit lands, when that place is one the save file itself
+/// uses.
+///
+/// The セーブマップ edit mode changes one byte at a time inside the row the user
+/// picked, and the body header is a row like any other - 画面の明るさ and 振動 are
+/// two of its bytes, and they are ordinary options the 設定/オトモ screen edits.
+/// None of these is forbidden (the whole point of the screen is that an expert
+/// can reach any byte), but each one is worth saying out loud before the byte
+/// changes; [MhnxEditor::raw_edit_warnings] turns this into the sentence the
+/// dialog shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawDanger {
+    /// The body marker and the three slot-used flags: the game's own record of
+    /// which characters exist. A wrong marker makes the whole file unreadable.
+    Marker,
+    /// The download-section pointer and the three slot bases: where every other
+    /// offset of the file is measured from.
+    Pointer,
+    /// The rest of the body header - the two options and the bytes around them.
+    Header,
+}
+
+/// Body bytes holding the marker and the three slot-used flags.
+///
+/// `mhnx_core::save` keeps `OFF_BODY_MARKER`, `OFF_SLOT_USED`, `OFF_DLC_SECTION`
+/// and `OFF_SLOT_BASE` private, so the two ranges below spell the values the
+/// crate documents; `the_raw_editor_names_the_header_bytes` pins them against
+/// the public constants around them (`OFF_BRIGHTNESS`, `OFF_RUMBLE`,
+/// `OFF_DLC_PALICO`), so a layout change fails a test instead of moving the
+/// warning somewhere harmless.
+const RAW_MARKER_BYTES: core::ops::Range<usize> = 0x00..0x0C;
+/// Body bytes holding the download-section pointer and the three slot bases.
+const RAW_POINTER_BYTES: core::ops::Range<usize> = 0x0C..0x1C;
 
 /// Which section of the クエスト改造 screen is on screen.
 ///
@@ -639,6 +676,17 @@ pub enum Confirm {
         /// The line as it was shown, so the dialog says what it is about
         /// without depending on the list still holding that index.
         line: String,
+    },
+    /// One byte of the セーブマップ changed by hand: 「オフセット 0x… を 0x…
+    /// → 0x… に変えます」. The answer runs the same write the dialog described;
+    /// the warning lines for a header or pointer byte are part of the body.
+    RawByte {
+        /// Body offset of the byte.
+        offset: usize,
+        /// What is there now, so the dialog can name both sides.
+        old: u8,
+        /// What it would become.
+        new: u8,
     },
 }
 
@@ -1501,6 +1549,26 @@ pub struct MhnxEditor {
     pub savemap_filter: String,
     /// Row of the save map whose bytes the dump under the list shows.
     pub savemap_selected: Option<usize>,
+    /// Whether the dump under the list is in edit mode (the `編集` button).
+    ///
+    /// The screen was a viewer for three releases and the top line said so; a
+    /// screen reached from every [詳細] button that cannot change the byte it
+    /// just showed is not a detail view, it is a picture of one. Edit mode
+    /// writes one byte at a time inside the selected row and nothing outside
+    /// it: [MhnxEditor::savemap_edit_range] is the only range the cursor and the
+    /// writer ever use.
+    pub savemap_edit: bool,
+    /// Body offset the edit cursor sits on.
+    pub savemap_cursor: usize,
+    /// The two hex digits typed for the cursor byte.
+    pub savemap_value: String,
+    /// Frames left to scroll the セーブマップ list back to the edited row.
+    ///
+    /// The list shrinks to four rows while the editor is open, and the row being
+    /// edited is usually not one of them: the scroll is what puts the row and
+    /// its dump on screen together. A countdown rather than a flag because a
+    /// scroll takes a few frames to settle.
+    pub savemap_scroll: u8,
     /// The row and the record of it a `詳細` button landed on.
     ///
     /// Set by [MhnxEditor::open_detail] and read by the save map, which starts
@@ -1722,6 +1790,10 @@ impl Default for MhnxEditor {
             quest_missing_only: false,
             savemap_filter: String::new(),
             savemap_selected: None,
+            savemap_edit: false,
+            savemap_cursor: 0,
+            savemap_value: String::new(),
+            savemap_scroll: 0,
             detail_focus: None,
             detail_return: None,
             detail_pick: 0,
@@ -4709,11 +4781,14 @@ impl MhnxEditor {
         self.tab = jump.tab;
         self.message = match jump.record {
             Some(record) => format!(
-                "{} の #{} の生のバイトを表示しています（読み取り専用）",
+                "{} の #{} の生のバイトを表示しています（[編集] で書き換えできます）",
                 name,
                 record + 1
             ),
-            None => format!("{} の生のバイトを表示しています（読み取り専用）", name),
+            None => format!(
+                "{} の生のバイトを表示しています（[編集] で書き換えできます）",
+                name
+            ),
         };
     }
 
@@ -5326,6 +5401,27 @@ impl MhnxEditor {
     ///
     /// They used to look exactly like every other button, so the one action
     /// that cannot be undone sat in the same row as the harmless ones.
+    /// The button that empties one cell of a list, in the one word every screen
+    /// uses for it.
+    ///
+    /// The same action used to be 解除 on the item-set, pouch, equipped-part,
+    /// palico-gear and 着せ替え screens and 外す on the decoration and
+    /// second-skill ones, so the same press had two names depending on which
+    /// screen it was on. The column is what is being taken out - 装備, アイテム,
+    /// 装飾品, スキル, 着せ替え - so the label is one word and the hover text
+    /// names the column: 「装備を外す」「アイテムを外す」.
+    ///
+    /// Deleting the record itself is 削除 and goes through
+    /// [MhnxEditor::danger_button]; the two are different actions and the words
+    /// are different for that reason.
+    fn clear_cell_button(ui: &mut egui::Ui, small: bool, enabled: bool, column: &str) -> bool {
+        let button = egui::Button::new("外す");
+        let button = if small { button.small() } else { button };
+        ui.add_enabled(enabled, button)
+            .on_hover_text(format!("この{}を外します（空きに戻します）", column))
+            .clicked()
+    }
+
     fn danger_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
         let fill = egui::Color32::from_rgb(92, 52, 56);
         let stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 142, 142));
@@ -6120,6 +6216,44 @@ impl MhnxEditor {
             // bytes were decided when the list was built; the answer runs that
             // very row again rather than trusting the index alone
             // (restore_review_row re-checks the list is still current).
+            // One byte of the セーブマップ: the offset, both values, and - for a
+            // header or pointer byte - the reason it is worth a second look.
+            // Not the red body on its own: an ordinary byte is an ordinary
+            // question, and a dialog that always looks dangerous is one nobody
+            // reads.
+            Confirm::RawByte { offset, old, new } => {
+                let warnings = match &self.save {
+                    Some(save) => Self::raw_edit_warnings(save, *offset),
+                    None => Vec::new(),
+                };
+                warn = !warnings.is_empty();
+                let mut body = format!(
+                    "オフセット 0x{:06X} を 0x{:02X} → 0x{:02X} に変えます。
+よろしいですか。
+",
+                    offset, old, new
+                );
+                if let Some(save) = self.save.as_ref() {
+                    if let Some(row) = mhnx_core::savemap::row_at(save, *offset) {
+                        body += &format!(
+                            "
+この位置の行: {}（{}）
+",
+                            mhnx_core::savemap::fields()[row].name,
+                            mhnx_core::savemap::region(row)
+                        );
+                    }
+                }
+                for line in &warnings {
+                    body += &format!("
+！ {}
+", line);
+                }
+                body += "
+ファイルにはまだ書かず、アプリの中のセーブだけを変えます。
+                         次の「上書き保存」でディスクに反映されます。元に戻すで取り消せます。";
+                ("1 バイトを書き換えます", body, "書き換える")
+            }
             Confirm::ReviewRestore { line, .. } => (
                 "この項目だけ元に戻します",
                 format!(
@@ -6315,6 +6449,13 @@ impl MhnxEditor {
                             .unwrap_or(row);
                         self.restore_review_row(index);
                     }
+                    // The very byte the dialog named. raw_byte_commit re-checks
+                    // that it is still inside the selected row and still holds
+                    // the value the dialog showed, so a stale answer cannot land
+                    // somewhere else.
+                    Confirm::RawByte { offset, new, .. } => {
+                        self.raw_byte_commit(offset, new);
+                    }
                     Confirm::None => {}
                 }
             }
@@ -6368,8 +6509,40 @@ impl MhnxEditor {
         // Wrapped, because the row is wider than the content area at the
         // default window size and the last buttons fell off the right edge.
         ui.horizontal_wrapped(|ui| {
-            ui.label(strings::text(lang, "items.filter"));
-            Self::filter_edit(ui, &mut self.item_filter, 160.0, "", &mut self.focus_filter);
+            // The word in front of the box is a pill, not a label: clicking it
+            // puts the cursor in the box, which is the same move Ctrl+F makes.
+            // The お守り screen's search is opened from a control like this one;
+            // a box reachable only by a keyboard shortcut is one a mouse or a
+            // finger never opens. The hint names what the box matches - the box
+            // had none, so the search looked like an empty text field.
+            if ui
+                .button(strings::text(lang, "items.filter"))
+                .on_hover_text(strings::text(lang, "items.bulk_guide"))
+                .clicked()
+            {
+                // Only the request, not the Ctrl+F one: the box is drawn on
+                // every frame this screen has items, so it takes the focus in
+                // this very frame and there is nothing to report afterwards.
+                self.focus_filter = true;
+                self.message = String::from("絞り込み欄にカーソルを移しました");
+            }
+            Self::filter_edit(
+                ui,
+                &mut self.item_filter,
+                180.0,
+                strings::text(lang, "items.bulk_search_hint"),
+                &mut self.focus_filter,
+            );
+            // The way out of a filter, in the word the other screens use. The
+            // box had none, so the only way back to the whole 2,300 slot list
+            // was to select the text and delete it.
+            if !self.item_filter.is_empty()
+                && ui
+                    .small_button(strings::text(lang, "items.detail_clear_filter"))
+                    .clicked()
+            {
+                self.item_filter.clear();
+            }
             ui.checkbox(&mut self.item_show_empty, strings::text(lang, "items.show_empty"));
             if ui
                 .add_enabled(
@@ -8008,7 +8181,7 @@ impl MhnxEditor {
                         .show_ui(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut search[slot])
-                                    .hint_text("モンスター名・ID（16 進）で検索")
+                                    .hint_text("モンスター名・ID（16 進）で絞り込み")
                                     .desired_width(230.0),
                             );
                             if ui.small_button("クリア").clicked() {
@@ -8337,7 +8510,7 @@ impl MhnxEditor {
                     ui.label("アイテムを変更");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.qw_item_filter)
-                            .hint_text("アイテム名・ID（16 進）で検索")
+                            .hint_text("アイテム名・ID（16 進）で絞り込み")
                             .desired_width(220.0),
                     );
                     if ui.small_button("クリア").clicked() {
@@ -8690,7 +8863,7 @@ impl MhnxEditor {
                                 .show_ui(ui, |ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut search[slot])
-                                            .hint_text("モンスター名・IDで検索")
+                                            .hint_text("モンスター名・IDで絞り込み")
                                             .desired_width(240.0),
                                     );
                                     if ui.small_button("クリア").clicked() {
@@ -8972,7 +9145,7 @@ impl MhnxEditor {
                             ));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.item_pick_filter)
-                                    .hint_text("アイテム名で検索")
+                                    .hint_text("アイテム名で絞り込み")
                                     .desired_width(180.0),
                             );
                             if ui.small_button("クリア").clicked() {
@@ -9647,11 +9820,7 @@ impl MhnxEditor {
                             {
                                 action = Some((entry, id, count));
                             }
-                            if ui
-                                .add_enabled(id != 0, egui::Button::new("解除"))
-                                .on_hover_text("この枠を空きに戻します（ID と個数が 0 になります）")
-                                .clicked()
-                            {
+                            if Self::clear_cell_button(ui, false, id != 0, "アイテム") {
                                 action = Some((entry, 0, 0));
                             }
                             ui.end_row();
@@ -9743,11 +9912,7 @@ impl MhnxEditor {
                             {
                                 action = Some((entry, id, count));
                             }
-                            if ui
-                                .add_enabled(id != 0, egui::Button::new("解除"))
-                                .on_hover_text("この枠を空きに戻します")
-                                .clicked()
-                            {
+                            if Self::clear_cell_button(ui, false, id != 0, "アイテム") {
                                 action = Some((entry, 0, 0));
                             }
                             ui.end_row();
@@ -10040,14 +10205,7 @@ impl MhnxEditor {
                                 }
                             });
                     });
-                if ui
-                    .add_enabled(
-                        current != mhnx_core::myset::NONE,
-                        egui::Button::new("解除"),
-                    )
-                    .on_hover_text("この部位を空にします（装飾品の写しも 0 になります）")
-                    .clicked()
-                {
+                if Self::clear_cell_button(ui, false, current != mhnx_core::myset::NONE, "部位") {
                     picked = Some(mhnx_core::myset::NONE);
                 }
                 if let Some(p) = picked {
@@ -10070,7 +10228,7 @@ impl MhnxEditor {
                 // The set's own copy at +0x38, which is what a mismatch in the
                 // warnings below is measured against. Shown only when it holds
                 // something: seven lines of "—・—・—" is noise, and the empty
-                // case is what the 解除 button beside it already says.
+                // case is what the 外す button beside it already says.
                 let d = set.decos_of(part).unwrap_or([0; 3]);
                 if d.iter().any(|x| *x != 0) {
                     ui.label(
@@ -10220,7 +10378,7 @@ impl MhnxEditor {
             .get(part)
             .copied()
             .unwrap_or("?");
-        self.push_undo(format!("セット {} の{}を解除", set, name));
+        self.push_undo(format!("セット {} の{}を外す", set, name));
         let Some(save) = &mut self.save else {
             self.message = String::from("セーブが開かれていません");
             return false;
@@ -10228,12 +10386,12 @@ impl MhnxEditor {
         if mhnx_core::myset::clear_part(save, slot, set, part) {
             self.dirty = true;
             self.message = format!(
-                "セット {} の{}を解除しました（装飾品の写しも 0 にしました）",
+                "セット {} の{}を外しました（装飾品の写しも 0 にしました）",
                 set, name
             );
             true
         } else {
-            self.message = format!("セット {} の{}を解除できませんでした", set, name);
+            self.message = format!("セット {} の{}を外せませんでした", set, name);
             false
         }
     }
@@ -11351,7 +11509,7 @@ impl MhnxEditor {
     /// The three gear slots of one palico.
     ///
     /// Picking a row writes its box index into the roster record at +0x100;
-    /// 解除 writes 0xFFFF. The box record itself is never touched: the roster
+    /// 外す writes 0xFFFF. The box record itself is never touched: the roster
     /// names a row, and the game lets two palicos name the same one.
     fn palico_equip_panel(
         &mut self,
@@ -11395,7 +11553,7 @@ impl MhnxEditor {
                             }
                         }
                     });
-                if current != u16::MAX && ui.small_button("解除").clicked() {
+                if Self::clear_cell_button(ui, true, current != u16::MAX, Self::palico_part_name(part)) {
                     release = Some(part);
                 }
             });
@@ -13332,10 +13490,7 @@ impl MhnxEditor {
                     .unwrap_or(0);
                 mhnx_core::equip::set_transmog(&mut rec, cur, tl);
             }
-            remove = ui
-                .small_button("解除")
-                .on_hover_text("着せ替えID を 0 に戻します")
-                .clicked();
+            remove = Self::clear_cell_button(ui, true, true, "着せ替え");
         });
         if remove {
             mhnx_core::equip::set_transmog(&mut rec, 0, 1);
@@ -13344,7 +13499,7 @@ impl MhnxEditor {
         // as it was when the frame started.
         let now = mhnx_core::equip::decode_record(index, &rec).unwrap_or(eq);
         let look = if now.transmog == 0 {
-            String::from("なし（ID 0 で解除）")
+            String::from("なし（ID 0 で外す）")
         } else {
             transmog_label(&now)
         };
@@ -13612,7 +13767,7 @@ impl MhnxEditor {
             .show_ui(ui, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(search)
-                        .hint_text("アイテム名・IDで検索")
+                        .hint_text("アイテム名・IDで絞り込み")
                         .desired_width(240.0),
                 );
                 if ui.small_button("クリア").clicked() {
@@ -13688,7 +13843,7 @@ impl MhnxEditor {
                 }
                 ui.add(
                     egui::TextEdit::singleline(search)
-                        .hint_text("装備名で検索（部分一致・大文字小文字を問いません）")
+                        .hint_text("装備名で絞り込み（部分一致・大文字小文字を問いません）")
                         .desired_width(300.0),
                 );
                 if ui.small_button("クリア").clicked() {
@@ -13746,13 +13901,13 @@ impl MhnxEditor {
             .show_ui(ui, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(search)
-                        .hint_text("装飾品名で検索")
+                        .hint_text("装飾品名で絞り込み")
                         .desired_width(220.0),
                 );
                 if ui.small_button("クリア").clicked() {
                     search.clear();
                 }
-                if current != 0 && ui.small_button("外す").clicked() {
+                if Self::clear_cell_button(ui, true, current != 0, "装飾品") {
                     picked = Some(0);
                 }
                 let needle = search.trim().to_lowercase();
@@ -14193,7 +14348,7 @@ impl MhnxEditor {
                 .show_ui(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(search)
-                            .hint_text("スキル名で検索")
+                            .hint_text("スキル名で絞り込み")
                             .desired_width(240.0),
                     );
                     if ui.small_button("クリア").clicked() {
@@ -14280,7 +14435,16 @@ impl MhnxEditor {
                 self.slot + 1,
                 total
             ));
-            ui.label("絞り込み");
+            // The same pill the アイテム box has: one click puts the cursor in
+            // the box, so the two searches open the same way.
+            if ui
+                .button("絞り込み")
+                .on_hover_text("この一覧をスキル名・番号で絞り込みます（カーソルが入ります）")
+                .clicked()
+            {
+                self.focus_filter = true;
+                self.message = String::from("絞り込み欄にカーソルを移しました");
+            }
             Self::filter_edit(
                 ui,
                 &mut self.charm_filter,
@@ -14288,6 +14452,9 @@ impl MhnxEditor {
                 "スキル名・番号",
                 &mut self.focus_filter,
             );
+            if !self.charm_filter.is_empty() && ui.small_button("クリア").clicked() {
+                self.charm_filter.clear();
+            }
         });
 
         let needle = self.charm_filter.trim().to_lowercase();
@@ -14510,7 +14677,7 @@ impl MhnxEditor {
                                 mhnx_core::charm::kind_name(shown_kind).unwrap_or("?")
                             ),
                         );
-                        if self.charm_skill2 != 0 && ui.small_button("第2スキルを外す").clicked() {
+                        if self.charm_skill2 != 0 && Self::clear_cell_button(ui, true, true, "第2スキル") {
                             self.charm_skill2 = 0;
                             self.charm_points2 = 0;
                         }
@@ -15622,7 +15789,9 @@ impl MhnxEditor {
         ui.horizontal_wrapped(|ui| {
             ui.radio_value(&mut self.recipe_mode, RecipeMode::Product, "生産物 → 必要素材");
             ui.radio_value(&mut self.recipe_mode, RecipeMode::Material, "素材 → 作れるもの");
-            if !self.recipe_filter.is_empty() && ui.small_button("絞り込みを消す").clicked() {
+            // クリア, the word the セーブマップ and 狩猟記録 screens use for the
+            // same button.
+            if !self.recipe_filter.is_empty() && ui.small_button("クリア").clicked() {
                 self.recipe_filter.clear();
             }
         });
@@ -15642,7 +15811,9 @@ impl MhnxEditor {
     /// The 生産物 half: every product a filter lets through, and one's cost.
     fn recipe_product_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("検索");
+            // 絞り込み, the word every other screen puts in front of its box: the
+            // two レシピ lists called it 検索, so the same control had two names.
+            ui.label("絞り込み");
             Self::filter_edit(
                 ui,
                 &mut self.recipe_filter,
@@ -15754,7 +15925,7 @@ impl MhnxEditor {
     /// The 素材 half: every item a recipe asks for, and everything it makes.
     fn recipe_material_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.label("検索");
+            ui.label("絞り込み");
             Self::filter_edit(
                 ui,
                 &mut self.recipe_filter,
@@ -16206,7 +16377,7 @@ impl MhnxEditor {
             }
             if !self.db_tables.is_empty()
                 && ui
-                    .small_button("解除")
+                    .small_button("閉じる")
                     .on_hover_text("読み込んだテーブルを捨てます（セーブは変わりません）")
                     .clicked()
             {
@@ -16226,12 +16397,16 @@ impl MhnxEditor {
     // ------------------------------------------------- save map (セーブマップ)
 
     /// セーブマップ: every named stretch of the save, listed, with a hex dump of
-    /// the selected one.
+    /// the selected one - and, behind the `編集` button, one byte at a time of
+    /// that row changed by hand.
     ///
-    /// Read-only by construction: nothing here reaches a writer, the line under
-    /// the heading says so, and the rows are the core crate's own table
-    /// ([mhnx_core::savemap::fields]), so the list cannot name bytes the other
-    /// tabs do not edit.
+    /// The rows are the core crate's own table ([mhnx_core::savemap::fields]), so
+    /// the list cannot name bytes the other tabs do not edit, and a write goes
+    /// through [MhnxEditor::raw_byte_commit], which refuses anything outside the
+    /// selected row. Every write asks first ([Confirm::RawByte]) and leaves one
+    /// step on the whole-save undo ([MhnxEditor::push_undo]); a byte in the body
+    /// header, a pointer or a slot base gets the warning lines of
+    /// [MhnxEditor::raw_edit_warnings] in the same dialog, but is not refused.
     ///
     /// An MHGU save is refused ([MhnxEditor::save_map_refusal]) for the same
     /// reason 進行状況 / DLC / 変更一覧 refuse it: every row is an MHXX offset.
@@ -16239,7 +16414,7 @@ impl MhnxEditor {
         ui.heading("セーブマップ");
         ui.label(
             egui::RichText::new(
-                "読み取り専用です。ここは一覧と 16 進ダンプだけで、値は書き換えません。",
+                "一覧と 16 進ダンプです。[編集] を押すと、選んだ行の中を 1 バイトずつ書き換えられます（確認のうえ、元に戻せます）。",
             )
             .weak()
             .small(),
@@ -16299,13 +16474,24 @@ impl MhnxEditor {
         // The dump sits under the list, not beside it: the names are long, and
         // a side panel narrow enough to leave the table readable would push the
         // dump's own 16 byte lines into a horizontal scroll.
-        const DUMP_H: f32 = 250.0;
-        let table_h = (ui.available_height() - DUMP_H).max(140.0);
+        // Edit mode needs the room the dump does not: a value row, a warning and
+        // a grid are three blocks, not one page of text. The list keeps four
+        // rows of itself - enough to see which row is being edited - and gives
+        // the rest to the editor, which is where the work is.
+        let table_h = if self.savemap_edit {
+            110.0
+        } else {
+            (ui.available_height() - 250.0).max(140.0)
+        };
         ui.vertical(|ui| {
             ui.set_height(table_h);
             // Only the rows on screen are laid out: the map is 183 rows now
             // and grows with every constant that is added.
-            TableBuilder::new(ui)
+            let mut table = TableBuilder::new(ui)
+                // egui's table keeps at least 200 points for itself (its
+                // ScrollArea's min_scrolled_height), which overrode the height
+                // above and pushed the editor off the bottom of the window.
+                .min_scrolled_height(0.0)
                 .id_salt("savemaplist")
                 .striped(true)
                 .sense(egui::Sense::click())
@@ -16313,7 +16499,17 @@ impl MhnxEditor {
                 .column(Column::exact(84.0))
                 .column(Column::exact(88.0))
                 .column(Column::initial(300.0).clip(true))
-                .column(Column::remainder().clip(true))
+                .column(Column::remainder().clip(true));
+            // Edit mode is entered from the screen the row was picked on, so
+            // the list has to be told which row that is: it is showing four of
+            // two hundred.
+            if self.savemap_scroll > 0 {
+                if let Some(pos) = rows.iter().position(|r| Some(r.index) == selected) {
+                    table = table.scroll_to_row(pos, Some(egui::Align::Center));
+                }
+                self.savemap_scroll -= 1;
+            }
+            table
                 .header(22.0, |mut h| {
                     for t in ["領域", "オフセット", "長さ", "名前", "現在値"] {
                         h.col(|ui| {
@@ -16369,7 +16565,7 @@ impl MhnxEditor {
         let Some(index) = selected else {
             ui.label(
                 egui::RichText::new(
-                    "行をクリックすると、その範囲の 16 進ダンプを表示します（読み取り専用）",
+                    "行をクリックすると、その範囲の 16 進ダンプを表示します（[編集] で 1 バイトずつ書き換え）",
                 )
                 .weak(),
             );
@@ -16379,6 +16575,12 @@ impl MhnxEditor {
             return;
         };
         let offset = mhnx_core::savemap::offset_in(save, index).unwrap_or(field.offset);
+        // The header line is read out of the save, but the 編集 button beside it
+        // changes editor state and the editor below needs the whole editor, so
+        // the borrow `save` is dropped here (NLL ends it at its last use) and
+        // nothing below this point reads the save directly.
+        let value_text = mhnx_core::savemap::value_text(save, index);
+        let mut enter_edit = false;
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new(field.name).strong());
             ui.label(
@@ -16392,10 +16594,27 @@ impl MhnxEditor {
                 .weak()
                 .small(),
             );
-            if let Some(value) = mhnx_core::savemap::value_text(save, index) {
+            if let Some(value) = &value_text {
                 ui.label(egui::RichText::new(format!("現在値: {}", value)).small());
             }
+            // The way into edit mode is a button, not a key: the window has no
+            // gamepad, and a screen whose only way in is a shortcut is one a
+            // mouse-only user never finds.
+            if !self.savemap_edit
+                && ui
+                    .button("編集")
+                    .on_hover_text("この行の中を 1 バイトずつ書き換えます（確認あり・元に戻せます）")
+                    .clicked()
+            {
+                enter_edit = true;
+            }
         });
+        if enter_edit {
+            self.savemap_enter_edit(index);
+        }
+        let Some(save) = self.save.as_ref() else {
+            return;
+        };
         // The record a `詳細` button landed on, while it still names the row
         // that is selected: the dump starts there instead of at the row's first
         // 512 bytes, which for 装備ボックス is the first 14 of 2,000 records.
@@ -16437,6 +16656,14 @@ impl MhnxEditor {
                 focus.record = None;
             }
         }
+        // Edit mode replaces the read-only dump with the same bytes as buttons:
+        // one per byte, so a click picks the byte and the field under the grid
+        // writes it. Reached only through the 編集 button above, which is the
+        // only place that turns [MhnxEditor::savemap_edit] on.
+        if self.savemap_edit {
+            self.savemap_editor(ui, index);
+            return;
+        }
         if dump.is_empty() {
             ui.label(egui::RichText::new("このセーブにはこの範囲がありません").weak());
             return;
@@ -16457,12 +16684,456 @@ impl MhnxEditor {
             });
     }
 
+    // ------------------------------------------------- save map: byte editing
+
+    /// The bytes the edit cursor may move in: the selected row, nothing else.
+    ///
+    /// `None` when no save is open, when the map has no such row, or when the
+    /// save does not hold that range (a slot it does not use). Every reader of
+    /// the edit mode goes through this one function, so the cursor, the page it
+    /// draws and the writer cannot disagree about where the row ends.
+    fn savemap_edit_range(&self, index: usize) -> Option<(usize, usize)> {
+        let save = self.save.as_ref()?;
+        let field = mhnx_core::savemap::fields().get(index)?;
+        // offset_in is the file's own answer: a row resolved through a slot base
+        // the save does not carry has no offset, and a byte written at the
+        // canonical one would land in another slot's data.
+        let start = mhnx_core::savemap::offset_in(save, index)?;
+        Some((start, field.len))
+    }
+
+    /// The byte the cursor points at, or None when it points at nothing.
+    fn savemap_cursor_byte(&self) -> Option<u8> {
+        self.save
+            .as_ref()?
+            .body()
+            .get(self.savemap_cursor)
+            .copied()
+    }
+
+    /// Turn the dump into an editor, with the cursor where the reader was.
+    ///
+    /// A `詳細` jump names a record of the row, so the cursor starts at that
+    /// record rather than at the top of a 72,000 byte box - the same place the
+    /// read-only dump was showing.
+    fn savemap_enter_edit(&mut self, index: usize) {
+        let Some((start, len)) = self.savemap_edit_range(index) else {
+            self.message =
+                String::from("この行はこのセーブに無いので、書き換えられません");
+            return;
+        };
+        let want = self
+            .detail_focus
+            .filter(|f| f.field == index)
+            .and_then(|f| f.record)
+            .and_then(|record| {
+                self.save
+                    .as_ref()
+                    .and_then(|save| Self::record_dump(save, index, record))
+                    .map(|dump| dump.offset)
+            })
+            .unwrap_or(start);
+        let last = start + len.saturating_sub(1);
+        self.savemap_edit = true;
+        self.savemap_cursor = want.clamp(start, last);
+        self.savemap_value.clear();
+        // The list gives its room to the editor, so the row being edited has to
+        // be scrolled to: it is no longer one of the four rows on screen.
+        self.savemap_scroll = 3;
+        self.message = format!(
+            "編集モード: 0x{:06X}–0x{:06X}（{} バイト）の中だけ書き換えられます",
+            start,
+            last,
+            with_commas(len)
+        );
+    }
+
+    /// Keep the cursor inside the selected row.
+    ///
+    /// Called before the grid draws and whenever the row changes: the cursor is
+    /// editor state and survives a row switch, and a byte left over from a
+    /// 72,000 byte row would sit outside a 1 byte one.
+    fn savemap_clamp_cursor(&mut self, index: usize) {
+        if let Some((start, len)) = self.savemap_edit_range(index) {
+            let last = start + len.saturating_sub(1);
+            self.savemap_cursor = self.savemap_cursor.clamp(start, last);
+        }
+    }
+
+    /// Move the cursor by `step` bytes, never off the row.
+    ///
+    /// Every arrow key comes through here, so the "cannot leave the range" rule
+    /// is one clamp rather than four.
+    fn savemap_step(&mut self, step: isize) {
+        let Some(index) = self.savemap_selected else {
+            return;
+        };
+        let Some((start, len)) = self.savemap_edit_range(index) else {
+            return;
+        };
+        let last = start + len.saturating_sub(1);
+        let next = self.savemap_cursor as i64 + step as i64;
+        self.savemap_cursor = next.clamp(start as i64, last as i64) as usize;
+        self.savemap_value.clear();
+    }
+
+    /// Ask before a byte changes: 「オフセット 0x… を 0x… → 0x… に変えます」.
+    ///
+    /// Nothing is written here. The dialog is what the answer runs, and its body
+    /// carries [MhnxEditor::raw_edit_warnings] for a header or pointer byte.
+    fn savemap_ask_byte(&mut self, offset: usize, value: u8) {
+        let Some(old) = self
+            .save
+            .as_ref()
+            .and_then(|save| save.body().get(offset).copied())
+        else {
+            self.message = format!("0x{:06X} はこのセーブにありません", offset);
+            return;
+        };
+        if old == value {
+            self.message = format!("0x{:06X} は既に 0x{:02X} です", offset, value);
+            return;
+        }
+        self.confirm = Confirm::RawByte {
+            offset,
+            old,
+            new: value,
+        };
+    }
+
+    /// Write one byte of the save the editor holds.
+    ///
+    /// The range check is the second half of "編集中は範囲外に出られない": the
+    /// cursor is clamped before the dialog opens, and this refuses an offset
+    /// outside the selected row even when the state was moved by hand. One press
+    /// of 元に戻す puts the byte back, because the step is a whole-save snapshot
+    /// ([MhnxEditor::push_undo]) taken *before* the bytes move.
+    ///
+    /// The working copies are re-read afterwards ([MhnxEditor::reload_from_save]):
+    /// a byte can land in the character record or the item box, and 上書き保存
+    /// writes those copies over the save - leaving them stale would silently
+    /// undo the very byte that was just changed.
+    pub fn raw_byte_commit(&mut self, offset: usize, value: u8) -> bool {
+        let Some(index) = self.savemap_selected else {
+            self.message = String::from("セーブマップの行を選んでください");
+            return false;
+        };
+        let Some((start, len)) = self.savemap_edit_range(index) else {
+            self.message = String::from("この行はこのセーブに無いので、書き換えられません");
+            return false;
+        };
+        if offset < start || offset >= start + len {
+            self.message = format!(
+                "0x{:06X} は選んだ行（0x{:06X}–0x{:06X}）の外なので書き換えません",
+                offset,
+                start,
+                start + len.saturating_sub(1)
+            );
+            return false;
+        }
+        let Some(old) = self
+            .save
+            .as_ref()
+            .and_then(|save| save.body().get(offset).copied())
+        else {
+            self.message = format!("0x{:06X} はこのセーブにありません", offset);
+            return false;
+        };
+        if old == value {
+            self.message = format!("0x{:06X} は既に 0x{:02X} です", offset, value);
+            return false;
+        }
+        // The snapshot first: taken after the write it would hold the edit it is
+        // supposed to take back.
+        self.push_undo(format!("バイト 0x{:06X}", offset));
+        if let Some(save) = self.save.as_mut() {
+            if let Some(byte) = save.body_mut().get_mut(offset) {
+                *byte = value;
+            }
+        }
+        self.dirty = true;
+        self.reload_from_save();
+        self.savemap_value.clear();
+        self.savemap_cursor = offset;
+        self.message = format!(
+            "0x{:06X} を 0x{:02X} → 0x{:02X} に書き換えました（元に戻せます・ファイルへは「上書き保存」で書きます）",
+            offset, old, value
+        );
+        true
+    }
+
+    /// Which header field this body offset is, if it is one.
+    ///
+    /// The body header is 0x00..[mhnx_core::save::OFF_DLC_PALICO]: the marker,
+    /// the three slot-used flags, the download-section pointer, the three slot
+    /// bases, the two options - and then the download-palico records, which is
+    /// where the header stops being a header.
+    fn raw_edit_danger(offset: usize) -> Option<RawDanger> {
+        if RAW_MARKER_BYTES.contains(&offset) {
+            Some(RawDanger::Marker)
+        } else if RAW_POINTER_BYTES.contains(&offset) {
+            Some(RawDanger::Pointer)
+        } else if offset < mhnx_core::save::OFF_DLC_PALICO {
+            Some(RawDanger::Header)
+        } else {
+            None
+        }
+    }
+
+    /// Why this byte deserves a second thought: one sentence per reason.
+    ///
+    /// Empty for an ordinary byte, which is what makes the dialog red only when
+    /// it has to be. The container header's CRC is deliberately not one of the
+    /// reasons: the only checksum in the file is crc32(file_name) in the 36 byte
+    /// Switch header (mhnx-core's lib.rs says the body has none), and
+    /// [Save::refresh_header] rewrites it on every save - so a body byte cannot
+    /// break it. The last line says that instead of pretending otherwise.
+    fn raw_edit_warnings(save: &Save, offset: usize) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        match Self::raw_edit_danger(offset) {
+            Some(RawDanger::Marker) => out.push(
+                "セーブの先頭です（マーカーとスロットの使用フラグ）。ここが変わると、ゲームはこのファイルを別のセーブとして読もうとします。",
+            ),
+            Some(RawDanger::Pointer) => out.push(
+                "ポインタです（DLC セクションと各スロットの開始位置）。値がずれると、キャラクタの全データを別の場所から読むことになります。",
+            ),
+            Some(RawDanger::Header) => out.push(
+                "セーブのヘッダです（本体オプションとその周り）。マーカー・使用フラグ・ポインタと同じ並びにあり、ゲームが管理する領域です。",
+            ),
+            None => {}
+        }
+        if !out.is_empty() && save.kind().has_header() {
+            out.push(
+                "Switch のコンテナヘッダが持つ CRC はファイル名のもので、本文の外にあります（保存のたびに作り直します）。",
+            );
+        }
+        out
+    }
+
+    /// The セーブマップ dump as an editor: one byte at a time, inside the row.
+    ///
+    /// A page of the row is drawn - the same 512 bytes the read-only dump shows,
+    /// and the page follows the cursor, so the whole row stays reachable without
+    /// laying out 72,000 buttons in one frame. The byte under the cursor is the
+    /// one the value field writes, and the warning line under it is the one the
+    /// dialog will repeat.
+    fn savemap_editor(&mut self, ui: &mut egui::Ui, index: usize) {
+        let Some((start, len)) = self.savemap_edit_range(index) else {
+            ui.label(
+                egui::RichText::new("この行はこのセーブにないので、書き換えられません").weak(),
+            );
+            return;
+        };
+        if len == 0 {
+            ui.label(egui::RichText::new("この行は 0 バイトなので、書き換えられません").weak());
+            return;
+        }
+        self.savemap_clamp_cursor(index);
+        let end = start + len;
+        // Arrow keys move the cursor while nothing is being typed: a text field
+        // keeps the arrows for its own caret.
+        if !ui.ctx().memory(|m| m.focused().is_some()) {
+            let step = ui.input(|i| {
+                if i.key_pressed(egui::Key::ArrowRight) {
+                    Some(1isize)
+                } else if i.key_pressed(egui::Key::ArrowLeft) {
+                    Some(-1)
+                } else if i.key_pressed(egui::Key::ArrowDown) {
+                    Some(mhnx_core::savemap::DUMP_COLUMNS as isize)
+                } else if i.key_pressed(egui::Key::ArrowUp) {
+                    Some(-(mhnx_core::savemap::DUMP_COLUMNS as isize))
+                } else {
+                    None
+                }
+            });
+            if let Some(step) = step {
+                self.savemap_step(step);
+            }
+        }
+        let (cursor, page_start) = (self.savemap_cursor, {
+            const PAGE: usize = mhnx_core::savemap::DUMP_BYTES;
+            start + ((self.savemap_cursor - start) / PAGE) * PAGE
+        });
+        let page_end = end.min(page_start + mhnx_core::savemap::DUMP_BYTES);
+        let bytes: Vec<u8> = self
+            .save
+            .as_ref()
+            .and_then(|save| save.body().get(page_start..page_end))
+            .map(|b| b.to_vec())
+            .unwrap_or_default();
+        let current = bytes
+            .get(cursor.wrapping_sub(page_start))
+            .copied()
+            .or_else(|| self.savemap_cursor_byte())
+            .unwrap_or(0);
+
+        let mut leave = false;
+        let mut ask: Option<u8> = None;
+        let mut pick: Option<usize> = None;
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("編集を終了")
+                .on_hover_text("ダンプを表示するだけに戻します（書き換えた内容はそのまま残ります）")
+                .clicked()
+            {
+                leave = true;
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "編集中: 0x{:06X}–0x{:06X} の {} バイト",
+                    start,
+                    end - 1,
+                    with_commas(len)
+                ))
+                .strong()
+                .small(),
+            );
+            ui.label(
+                egui::RichText::new("クリックで選ぶ・値を打って Enter（← → ↑ ↓ でも移動）")
+                    .weak()
+                    .small(),
+            );
+        });
+        if leave {
+            self.savemap_edit = false;
+            self.message = String::from("編集を終えました（書き換えた内容はセーブの中に残っています）");
+            return;
+        }
+        // One scroll for the whole editor: the value row, the warning and the
+        // grid together are taller than what the list leaves of a 740 point
+        // window, and a grid that scrolls inside a block that also scrolls is
+        // two bars for one question.
+        let height = ui.available_height().max(80.0);
+        egui::ScrollArea::vertical()
+            .id_salt("savemapedit")
+            .max_height(height)
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("オフセット");
+                    ui.label(egui::RichText::new(format!("0x{:06X}", cursor)).monospace());
+                    ui.label("値");
+                    ui.label(
+                        egui::RichText::new(format!("0x{:02X}", current))
+                            .monospace()
+                            .strong(),
+                    );
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.savemap_value)
+                            .desired_width(52.0)
+                            .char_limit(2)
+                            .hint_text("00"),
+                    );
+                    let typed = Self::parse_hex_byte(&self.savemap_value);
+                    let write = ui
+                        .add_enabled(
+                            typed.is_some_and(|v| v != current),
+                            egui::Button::new("書き込む"),
+                        )
+                        .on_hover_text("確認のうえ、この 1 バイトを書き換えます");
+                    // A keyboard user types two digits and presses Enter; a
+                    // mouse user types and clicks. Both go through the same
+                    // question.
+                    let entered = write.clicked()
+                        || (resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                    if entered {
+                        if let Some(value) = typed {
+                            ask = Some(value);
+                        }
+                    }
+                    if ui
+                        .add_enabled(current > 0, egui::Button::new("−1"))
+                        .on_hover_text("値を 1 減らします")
+                        .clicked()
+                    {
+                        ask = Some(current.saturating_sub(1));
+                    }
+                    if ui
+                        .add_enabled(current < 0xFF, egui::Button::new("＋1"))
+                        .on_hover_text("値を 1 増やします")
+                        .clicked()
+                    {
+                        ask = Some(current.saturating_add(1));
+                    }
+                });
+                // The warning the dialog will repeat, shown before it is asked:
+                // a byte in the header is not hidden behind a click.
+                if let Some(save) = self.save.as_ref() {
+                    for line in Self::raw_edit_warnings(save, cursor) {
+                        ui.label(
+                            egui::RichText::new(format!("！ {}", line))
+                                .color(warning_color())
+                                .small(),
+                        );
+                    }
+                }
+                ui.label(
+                    egui::RichText::new(format!(
+                        "ページ 0x{:06X}–0x{:06X}（全 {} バイト）",
+                        page_start,
+                        page_end.saturating_sub(1),
+                        with_commas(len)
+                    ))
+                    .weak()
+                    .small(),
+                );
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (line, chunk) in bytes
+                    .chunks(mhnx_core::savemap::DUMP_COLUMNS)
+                    .enumerate()
+                {
+                    let line_start = page_start + line * mhnx_core::savemap::DUMP_COLUMNS;
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(
+                            egui::RichText::new(format!("{:06X}", line_start))
+                                .monospace()
+                                .small()
+                                .weak(),
+                        ));
+                        for (i, byte) in chunk.iter().enumerate() {
+                            let offset = line_start + i;
+                            let here = offset == cursor;
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!("{:02x}", byte))
+                                            .monospace()
+                                            .small(),
+                                    )
+                                    .selected(here),
+                                )
+                                .clicked()
+                            {
+                                pick = Some(offset);
+                            }
+                        }
+                    });
+                }
+            });
+        if let Some(value) = ask {
+            self.savemap_ask_byte(cursor, value);
+        }
+        if let Some(offset) = pick {
+            self.savemap_cursor = offset;
+            self.savemap_value.clear();
+        }
+    }
+
+    /// One or two hex digits, as the value field takes them.
+    fn parse_hex_byte(text: &str) -> Option<u8> {
+        let text = text.trim();
+        if text.is_empty() || text.len() > 2 {
+            return None;
+        }
+        u8::from_str_radix(text, 16).ok()
+    }
+
     /// Why the セーブマップ tab refuses this save, or `None` when the map applies.
     ///
     /// MHGU's slots are 0x1104 bytes longer than MHXX's and every row of the map
     /// was measured on MHXX saves, so the same relative offset names a different
-    /// place in an MHGU file. The tab is read-only either way, but a list of
-    /// rows resolved through the wrong layout looks right and is wrong, which is
+    /// place in an MHGU file. The tab can now write, so a row resolved through
+    /// the wrong layout is worse than a wrong label: a list that looks right and
+    /// is wrong would put the byte somewhere else entirely, which is
     /// the one failure this tool refuses to ship. The wording is the one the
     /// 進行状況 tab uses: the rows were confirmed on MHXX saves.
     fn save_map_refusal(save: &Save) -> Option<&'static str> {
@@ -16829,6 +17500,40 @@ impl MhnxEditor {
         if let Ok(s) = std::env::var("MHNXEDITOR_SAVEMAP_FILTER") {
             self.savemap_filter = s;
         }
+        // Edit mode, for the same harness: the 編集 button needs a click it does
+        // not have. The value is the row index, so a shot can show the editor on
+        // an ordinary row or on the body header (where the warning line is).
+        if let Ok(s) = std::env::var("MHNXEDITOR_SAVEMAP_EDIT") {
+            // A row index, or the row's name: a number is what the tab holds,
+            // and the name is what a person reading the screen can type.
+            let index = s
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .or_else(|| Self::savemap_index_named(s.trim()));
+            if let Some(index) = index {
+                self.savemap_selected = Some(index);
+                self.savemap_enter_edit(index);
+            }
+        }
+        // The byte under the cursor, absolute, so the shot can land on a
+        // specific offset (0x28 is 画面の明るさ, an ordinary header option).
+        if let Ok(s) = std::env::var("MHNXEDITOR_SAVEMAP_CURSOR") {
+            if let Ok(offset) = s.trim().parse::<usize>() {
+                self.savemap_cursor = offset;
+                if let Some(index) = self.savemap_selected {
+                    self.savemap_clamp_cursor(index);
+                }
+            }
+        }
+        // The question itself, for the harness: the write button needs a click
+        // and a typed value, and the dialog is what the screenshot has to show.
+        if let Ok(s) = std::env::var("MHNXEDITOR_SAVEMAP_ASK") {
+            if let Some(value) = Self::parse_hex_byte(&s) {
+                let cursor = self.savemap_cursor;
+                self.savemap_ask_byte(cursor, value);
+            }
+        }
         if let Ok(s) = std::env::var("MHNXEDITOR_PROGRESS_SECTION") {
             self.progress_section = match s.trim() {
                 "requests" | "request" | "依頼" => ProgressSection::Requests,
@@ -17160,7 +17865,7 @@ impl MhnxEditor {
         self.title_table = mhnx_core::guildcard::TitleTable::default();
         self.romfs_dir = None;
         self.romfs_status = String::from("romfs を読み込んでいません");
-        self.message = "romfs の読み込みを解除しました".to_owned();
+        self.message = "romfs を閉じました（読み込んだ名前は捨てました）".to_owned();
     }
 
     // ------------------------------------------- database (データベース)
@@ -17419,7 +18124,7 @@ impl MhnxEditor {
         self.db_dir = None;
         self.clear_recipes();
         self.db_status = String::from("テーブルを読み込んでいません");
-        self.message = "データベースの読み込みを解除しました".to_owned();
+        self.message = "データベースを閉じました（読み込んだ表は捨てました）".to_owned();
     }
 
     /// Drop the recipes and everything cached about them.
@@ -17821,7 +18526,7 @@ impl MhnxEditor {
                 || !self.title_table.is_empty();
             if loaded
                 && ui
-                    .small_button("解除")
+                    .small_button("閉じる")
                     .on_hover_text("読み込んだ名前を捨てます（セーブは変わりません）")
                     .clicked()
             {
@@ -19336,12 +20041,12 @@ mod tests {
             warns
         );
 
-        // 解除 puts the index back to NONE and the copy to zero.
+        // 外す puts the index back to NONE and the copy to zero.
         assert!(app.set_part_clear(set, 1), "{}", app.message);
         let got = set_of(&app, set);
         assert_eq!(got.parts[1], mhnx_core::myset::NONE);
         assert_eq!(got.decos_of(1), Some([0, 0, 0]));
-        assert!(app.message.contains("解除しました"), "{}", app.message);
+        assert!(app.message.contains("外しました"), "{}", app.message);
 
         // A box index that holds nothing cannot be named, so the write is
         // refused and says so rather than writing a dangling index.
@@ -19523,7 +20228,7 @@ mod tests {
         assert!(!app.palico_equip_assign(1, 0, weapon as u16));
         assert!(!app.palico_equip_assign(0, 3, weapon as u16));
 
-        // 解除 writes 0xFFFF, and a second press has nothing to do.
+        // 外す writes 0xFFFF, and a second press has nothing to do.
         assert!(app.palico_equip_assign(0, 1, head as u16), "{}", app.message);
         assert_eq!(
             app.palico_equip_of(0).expect("a palico"),
@@ -20555,7 +21260,7 @@ mod tests {
     }
 
     /// The title tables are read out of the same romfs folder the award names
-    /// come from, and 解除 drops them with the rest.
+    /// come from, and 外す drops them with the rest.
     #[test]
     fn the_title_tables_come_in_with_the_romfs_folder() {
         let dir = Scratch::new("romfstitle");
@@ -22977,6 +23682,301 @@ mod tests {
         );
     }
 
+
+    /// The body header is the one place a raw byte edit can stop the game from
+    /// reading the file at all, so the screen names its parts: marker and slot
+    /// flags, the four pointers, the two options. The ranges are spelled out in
+    /// app.rs because mhnx-core keeps its own constants private, so this test
+    /// pins them against the public ones around them.
+    #[test]
+    fn the_raw_editor_names_the_header_bytes() {
+        assert_eq!(mhnx_core::save::OFF_BRIGHTNESS, 0x28);
+        assert_eq!(mhnx_core::save::OFF_RUMBLE, 0x29);
+        assert_eq!(mhnx_core::save::OFF_DLC_PALICO, 0x2A);
+        assert_eq!(RAW_MARKER_BYTES, 0x00..0x0C);
+        assert_eq!(RAW_POINTER_BYTES, 0x0C..0x1C);
+
+        // The marker and the three slot-used flags.
+        for offset in [0x00usize, 0x04, 0x08, 0x0B] {
+            assert_eq!(
+                MhnxEditor::raw_edit_danger(offset),
+                Some(RawDanger::Marker),
+                "0x{offset:02X} is not named as the marker"
+            );
+        }
+        // The download-section pointer and the three slot bases.
+        for offset in [0x0Cusize, 0x10, 0x14, 0x18, 0x1B] {
+            assert_eq!(
+                MhnxEditor::raw_edit_danger(offset),
+                Some(RawDanger::Pointer),
+                "0x{offset:02X} is not named as a pointer"
+            );
+        }
+        // Both options and the bytes between them and the pointers.
+        for offset in [0x1Cusize, 0x28, 0x29] {
+            assert_eq!(
+                MhnxEditor::raw_edit_danger(offset),
+                Some(RawDanger::Header),
+                "0x{offset:02X} is not named as the header"
+            );
+        }
+        // The download-palico pool is data, not a header field, and everything
+        // after it is ordinary.
+        for offset in [0x2Ausize, 0x2B, 0x100, 0x1_0000] {
+            assert_eq!(
+                MhnxEditor::raw_edit_danger(offset),
+                None,
+                "0x{offset:06X} was called dangerous"
+            );
+        }
+
+        // What the dialog and the line under the editor say: the warning itself,
+        // and the sentence about the container CRC, which a body byte cannot
+        // break (it is crc32 of the file name, recomputed on every save).
+        let save = mhnx_core::save::empty_switch_save();
+        let header = MhnxEditor::raw_edit_warnings(&save, 0x28);
+        assert_eq!(header.len(), 2, "{header:?}");
+        assert!(header[0].contains("ヘッダ"), "{header:?}");
+        assert!(header[1].contains("CRC"), "{header:?}");
+        let pointer = MhnxEditor::raw_edit_warnings(&save, 0x10);
+        assert!(pointer[0].contains("ポインタ"), "{pointer:?}");
+        // An ordinary byte has nothing to say, which is what keeps the dialog
+        // calm on the bytes that are the whole point of the screen.
+        assert!(MhnxEditor::raw_edit_warnings(&save, 0x100).is_empty());
+    }
+
+    /// One hex byte, as the value field takes it: one or two digits, and
+    /// nothing else.
+    #[test]
+    fn a_hex_byte_is_one_or_two_digits() {
+        assert_eq!(MhnxEditor::parse_hex_byte("ff"), Some(0xFF));
+        assert_eq!(MhnxEditor::parse_hex_byte("A"), Some(0x0A));
+        assert_eq!(MhnxEditor::parse_hex_byte(" 0 "), Some(0));
+        assert_eq!(MhnxEditor::parse_hex_byte("7f"), Some(0x7F));
+        assert_eq!(MhnxEditor::parse_hex_byte(""), None);
+        assert_eq!(MhnxEditor::parse_hex_byte("100"), None);
+        assert_eq!(MhnxEditor::parse_hex_byte("zz"), None);
+    }
+
+    /// A raw byte edit asks first, leaves one undo step, and that step puts the
+    /// byte back. The ask itself must not write: the dialog is a question, and
+    /// a question that already changed the save would make 「やめる」 a lie.
+    #[test]
+    fn a_raw_byte_edit_asks_and_one_undo_step_puts_it_back() {
+        let dir = Scratch::new("rawbyte");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let index = MhnxEditor::savemap_index_named("画面の明るさ").expect("the option row");
+        app.savemap_selected = Some(index);
+        let offset = app
+            .savemap_edit_range(index)
+            .expect("the row is in this save")
+            .0;
+        let before = app.save.as_ref().expect("a save").body()[offset];
+
+        app.savemap_ask_byte(offset, 0x7F);
+        match &app.confirm {
+            Confirm::RawByte {
+                offset: at,
+                old,
+                new,
+            } => assert_eq!((*at, *old, *new), (offset, before, 0x7F)),
+            _ => panic!("the byte was not asked about"),
+        }
+        assert_eq!(
+            app.save.as_ref().expect("a save").body()[offset],
+            before,
+            "the question wrote the byte before it was answered"
+        );
+        assert!(app.undo.is_empty(), "the question left an undo step");
+
+        assert!(app.raw_byte_commit(offset, 0x7F), "{}", app.message);
+        assert_eq!(app.save.as_ref().expect("a save").body()[offset], 0x7F);
+        assert!(app.dirty, "the save is not marked as changed");
+        let label = format!("バイト 0x{:06X}", offset);
+        assert_eq!(app.undo.len(), 1, "one operation is one step");
+        assert_eq!(app.undo_label(), Some(label.as_str()));
+
+        app.undo_last();
+        assert_eq!(
+            app.save.as_ref().expect("a save").body()[offset],
+            before,
+            "one 元に戻す did not put the byte back"
+        );
+    }
+
+    /// The byte a raw edit writes is the byte the crate's own reader sees: the
+    /// save is not a copy that this screen alone understands. 所持金 is a little
+    /// endian u32, so its first byte is the low eight bits of the value.
+    #[test]
+    fn a_raw_byte_edit_changes_what_the_getter_reads() {
+        let dir = Scratch::new("rawgetter");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let index = MhnxEditor::savemap_index_named("所持金").expect("the funds row");
+        app.savemap_selected = Some(index);
+        let offset = app
+            .savemap_edit_range(index)
+            .expect("the row is in this save")
+            .0;
+        app.savemap_cursor = offset;
+        // The fixture starts at 0, so the low byte is the whole value.
+        assert_eq!(
+            app.save
+                .as_ref()
+                .expect("a save")
+                .read_character(0)
+                .expect("slot 0")
+                .funds,
+            0
+        );
+        assert!(app.raw_byte_commit(offset, 0x39), "{}", app.message);
+        assert_eq!(
+            app.save
+                .as_ref()
+                .expect("a save")
+                .read_character(0)
+                .expect("slot 0")
+                .funds,
+            0x39,
+            "the crate's own reader did not see the byte"
+        );
+        // ... and the working copy was re-read, so 上書き保存 writes what is on
+        // screen instead of the value it held before the byte changed.
+        assert_eq!(app.edit.funds, 0x39);
+    }
+
+    /// The cursor and the writer both stop at the end of the row: "編集中は範囲
+    /// 外に出られない" is the range, not the grid, so a cursor moved by hand and
+    /// an offset from a stale answer are refused by the same check.
+    #[test]
+    fn the_raw_editor_cannot_leave_the_row() {
+        let dir = Scratch::new("rawrange");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // A one byte row: the cursor has nowhere to go but its own byte.
+        let index = MhnxEditor::savemap_index_named("画面の明るさ").expect("the option row");
+        app.savemap_selected = Some(index);
+        let (start, len) = app.savemap_edit_range(index).expect("in this save");
+        assert_eq!(len, 1);
+        let before = app.save.as_ref().expect("a save").body()[start];
+
+        app.savemap_cursor = start + 50;
+        app.savemap_clamp_cursor(index);
+        assert_eq!(app.savemap_cursor, start, "the cursor stayed outside the row");
+        app.savemap_step(1);
+        assert_eq!(app.savemap_cursor, start, "the cursor ran off the end");
+        app.savemap_step(-1);
+        assert_eq!(app.savemap_cursor, start, "the cursor ran off the front");
+
+        // The writer refuses an offset outside the row even when the state was
+        // moved by hand, and says where the row ends.
+        assert!(!app.raw_byte_commit(start + 1, 0xFF));
+        assert!(app.message.contains("外"), "{}", app.message);
+        assert_eq!(
+            app.save.as_ref().expect("a save").body()[start],
+            before,
+            "a refused write changed a byte"
+        );
+
+        // A 72,000 byte row keeps the cursor at its far end rather than past it.
+        let index = MhnxEditor::savemap_index_named("装備ボックス").expect("the box row");
+        app.savemap_selected = Some(index);
+        let (start, len) = app.savemap_edit_range(index).expect("in this save");
+        app.savemap_cursor = start + len - 1;
+        app.savemap_step(16);
+        assert_eq!(app.savemap_cursor, start + len - 1);
+        app.savemap_cursor = start;
+        app.savemap_step(-1);
+        assert_eq!(app.savemap_cursor, start);
+    }
+
+    /// The dialog says the offset and both values, and repeats the header
+    /// warning: a byte in the header is not changed behind a click.
+    #[test]
+    fn the_byte_dialog_says_the_offset_and_both_values() {
+        let dir = Scratch::new("rawdialog");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let index = MhnxEditor::savemap_index_named("画面の明るさ").expect("the option row");
+        app.savemap_selected = Some(index);
+        let offset = app.savemap_edit_range(index).expect("in this save").0;
+        let old = app.save.as_ref().expect("a save").body()[offset];
+        app.savemap_ask_byte(offset, 0x7F);
+
+        // Two frames: a window measures its content on the first and lays it
+        // out on the second, the way the other dialog test does.
+        let ctx = egui::Context::default();
+        let _ = ctx.run(frame_input(), |ctx| app.confirm_dialog(ctx));
+        let output = ctx.run(frame_input(), |ctx| app.confirm_dialog(ctx));
+        let text = drawn_text(&output);
+        assert!(
+            text.contains(&format!(
+                "オフセット 0x{:06X} を 0x{:02X} → 0x{:02X} に変えます",
+                offset, old, 0x7F
+            )),
+            "the offset or the values are missing: {text}"
+        );
+        assert!(text.contains("書き換える"), "no answer on the dialog: {text}");
+        assert!(text.contains("やめる"), "no way out of the dialog: {text}");
+        assert!(
+            text.contains("ヘッダ"),
+            "the header warning is missing from the dialog: {text}"
+        );
+    }
+
+    /// The セーブマップ dump is a viewer until 編集 is pressed and an editor
+    /// after: the grid, the value field and the warning line are drawn on the
+    /// same tab that used to say 読み取り専用.
+    #[test]
+    fn the_save_map_tab_draws_the_byte_editor() {
+        let dir = Scratch::new("drawrawedit");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let index = MhnxEditor::savemap_index_named("画面の明るさ").expect("the option row");
+        app.savemap_selected = Some(index);
+        let ctx = egui::Context::default();
+
+        // The line under the heading no longer claims the screen is read-only.
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(
+            text.contains("1 バイトずつ書き換え"),
+            "the screen still promises nothing but viewing: {text}"
+        );
+        assert!(!text.contains("読み取り専用"), "{text}");
+        assert!(text.contains("編集"), "no way into edit mode: {text}");
+
+        // Edit mode: the grid, the value field, and the header warning, which
+        // 画面の明るさ is a byte of.
+        app.savemap_enter_edit(index);
+        assert!(app.savemap_edit, "{}", app.message);
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("編集を終了"), "{text}");
+        assert!(text.contains("オフセット"), "{text}");
+        assert!(text.contains("書き込む"), "{text}");
+        assert!(
+            text.contains("ヘッダ"),
+            "the header warning is not drawn before the question: {text}"
+        );
+    }
+
     /// An MHGU save is refused by four tabs and shown by the other twelve, so
     /// the one place that admits it is the line above the tab bar: it has to be
     /// there whichever tab is open (AUDIT8 §4 N8).
@@ -23546,6 +24546,120 @@ mod tests {
     /// that tab written inline: CSV, 全部 99, dedupe, compact and clamp stayed
     /// Japanese inside an English frame. They are catalogue keys now, so they
     /// follow the same chooser the buttons behind them do (AUDIT8 §4 N1).
+    /// The アイテム BOX search opens from a pill and closes from one, in the
+    /// same way the お守り screen's does: the box says what it matches (it had no
+    /// hint at all), the word in front of it is a button a mouse or a finger can
+    /// press, and クリア puts the whole list back.
+    #[test]
+    fn the_item_box_search_opens_from_a_pill_and_closes_from_one() {
+        let dir = Scratch::new("itemsearch");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(!app.items.is_empty(), "the box did not load");
+        // One potion in box 1, so a name search has something to find.
+        let (potion, potion_name) = MhnxEditor::item_matches("回復薬", 5)
+            .into_iter()
+            .next()
+            .expect("回復薬 is in the item table");
+        app.items[0] = ItemSlot {
+            id: potion,
+            count: 3,
+        };
+        app.apply_to_save();
+        app.reload_from_save();
+        assert_eq!(app.items[0].id, potion, "{}", app.message);
+
+        let ctx = egui::Context::default();
+        let draw = |app: &mut MhnxEditor| -> String {
+            let output = ctx.run(tall_frame_input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.tab_items(ui));
+            });
+            drawn_text(&output)
+        };
+        // The pill is the word in front of the box, and the box now says what it
+        // searches; the クリア pill is not drawn while there is nothing to clear.
+        let text = draw(&mut app);
+        assert!(
+            text.contains(strings::text(Lang::Ja, "items.filter")),
+            "{text}"
+        );
+        assert!(
+            text.contains(strings::text(Lang::Ja, "items.bulk_search_hint")),
+            "the box still says nothing about what it matches: {text}"
+        );
+        assert!(
+            !text.contains(strings::text(Lang::Ja, "items.detail_clear_filter")),
+            "a clear button with nothing to clear: {text}"
+        );
+
+        // A name narrows the list to the potion, and the clear pill appears.
+        app.item_filter = potion_name.clone();
+        let text = draw(&mut app);
+        assert!(text.contains(&potion_name), "{text}");
+        assert!(
+            text.contains(strings::text(Lang::Ja, "items.detail_clear_filter")),
+            "{text}"
+        );
+
+        // A name that is in no slot leaves the list empty rather than showing
+        // the whole box, which is what a filter that matched nothing used to do.
+        app.item_filter = String::from("そんなアイテムはない");
+        let text = draw(&mut app);
+        assert!(!text.contains(&potion_name), "{text}");
+        assert!(
+            text.contains(&strings::textf(Lang::Ja, "items.count", &[&0usize])),
+            "the count line does not say the list is empty: {text}"
+        );
+    }
+
+    /// One action, one word: emptying a cell is 外す on every screen, and 削除
+    /// is the other action (removing the record itself). The screens used to
+    /// split 解除 / 外す between them, so the same press had two names.
+    #[test]
+    fn one_word_clears_a_cell_and_another_deletes_the_record() {
+        let dir = Scratch::new("oneword");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        // One real record in the box: an all-empty box draws the list and no
+        // editor panel, and the panel is where the two 外す buttons are.
+        assert!(app.equip_create(7, 40, 1), "{}", app.message);
+        // The screen lands on the record it just made, which is what the panel
+        // draws; an empty box has no panel and no 外す button.
+        assert!(app.equip_selected.is_some(), "{}", app.message);
+        app.equip_show_empty = true;
+        let ctx = egui::Context::default();
+        let tabs: [(Tab, fn(&mut MhnxEditor, &mut egui::Ui)); 2] = [
+            (Tab::Sets, MhnxEditor::tab_sets),
+            (Tab::Equip, MhnxEditor::tab_equip),
+        ];
+        for (tab, draw_tab) in tabs {
+            app.tab = tab;
+            let output = ctx.run(tall_frame_input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw_tab(&mut app, ui));
+            });
+            let text = drawn_text(&output);
+            assert!(text.contains("外す"), "{:?} lost the word 外す: {text}", tab);
+            assert!(
+                !text.contains("解除"),
+                "{:?} still calls clearing a cell 解除: {text}",
+                tab
+            );
+        }
+        // The word comes from one function, so a screen cannot spell it another
+        // way without leaving this helper.
+        let output = ctx.run(frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                MhnxEditor::clear_cell_button(ui, false, true, "装備");
+            });
+        });
+        let text = drawn_text(&output);
+        assert_eq!(text.trim(), "外す", "the clear button says: {text}");
+    }
+
     #[test]
     fn the_item_confirm_dialogs_follow_the_language() {
         let dir = Scratch::new("confirmlang");

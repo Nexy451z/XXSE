@@ -1093,7 +1093,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "決定/追加"),
             ("◀/▶", "10件"),
             ("▲/▼", "1件"),
-            ("Y", "名前で絞る"),
+            ("Y", "検索"),
             ("X", "クリア"),
             ("B", "戻る"),
         ],
@@ -1112,7 +1112,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         CharmEdit => &[
             ("A", "行の操作"),
             ("</>", "値"),
-            ("Y", "スキル検索"),
+            ("Y", "検索"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1120,13 +1120,13 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "決定"),
             ("◀/▶", "10件"),
             ("▲/▼", "1件"),
-            ("Y", "絞る"),
+            ("Y", "検索"),
             ("X", "クリア"),
             ("B", "戻る"),
         ],
         Equip => &[
             ("A", "編集"),
-            ("Y", "絞る"),
+            ("Y", "検索"),
             ("-", "削除(2回)"),
             ("+", "新規"),
             ("X", "保存"),
@@ -1141,7 +1141,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         EquipEdit => &[
             ("A", "選ぶ/書き込み"),
             ("</>", "10件/値"),
-            ("Y", "名前で検索"),
+            ("Y", "検索"),
             ("R", "ID入力"),
             ("X", "保存"),
             ("B", "戻る"),
@@ -1150,7 +1150,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "決定"),
             ("◀/▶", "10件"),
             ("▲/▼", "1件"),
-            ("Y", "絞る"),
+            ("Y", "検索"),
             ("X", "クリア"),
             ("B", "戻る"),
         ],
@@ -1161,7 +1161,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "決定"),
             ("◀/▶", "10件"),
             ("▲/▼", "1件"),
-            ("Y", "名前で絞る"),
+            ("Y", "検索"),
             ("-", "種別"),
             ("X", "クリア"),
             ("B", "戻る"),
@@ -1171,7 +1171,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "編集"),
             ("-", "書き出す"),
             ("R", "全部"),
-            ("Y", "絞る"),
+            ("Y", "検索"),
             ("L", "装備"),
             ("B", "戻る"),
         ],
@@ -1242,7 +1242,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Sets => &[
             ("A", "編集"),
             ("</>", "装備を巡回"),
-            ("-", "外す(2回)"),
+            ("-", "解除(2回)"),
             ("Y", "警告/タブ切替"),
             ("X", "保存"),
             ("B", "戻る"),
@@ -1269,11 +1269,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("-", "再読込"),
             ("B", "戻る"),
         ],
-        // 生データ is read-only: the four chips are the whole of it.
+        // 生データ: the list's four keys, plus [A] opening the byte editor.
+        // Inside the editor the four directions belong to the byte; this table
+        // is per screen and static, so the drawn footer takes the editor's own
+        // words from hbedit::Editor::footer_hint (which knows the mode).
         SaveMap => &[
             ("▲/▼", "行"),
             ("◀/▶", "10行"),
-            ("A", "元の領域"),
+            ("A", "編集"),
             ("B", "戻る"),
         ],
     }
@@ -1347,6 +1350,11 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         // The talisman list's name filter: an empty answer is the whole box
         // again, the same rule the equipment box's filter follows.
         ed.apply_charm_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_ITEM_BOX_FILTER {
+        // The item box's name search. It has no key on this build ([-] menu,
+        // [Y] step, [R] picker, [X] save, [L] undo), so it is opened from the
+        // inspector's pill; an empty answer is the whole box.
+        ed.apply_item_box_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
         // Through the editor: an empty answer is the whole list again, which is
         // the same rule the item picker's filter follows.
@@ -1603,26 +1611,35 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             // keyboard title and the list cannot promise different things.
             if ed.item_pick_names_available() {
                 (
-                    "アイテム名で絞り込み（部分一致・英数の大小は無視）",
+                    "アイテム名で検索（部分一致・英数の大小は無視）",
                     60usize,
                 )
             } else {
-                ("アイテムIDで絞り込み（名前が読めません 例: 975）", 60)
+                ("アイテムIDで検索（名前が読めません 例: 975）", 60)
             }
         } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
-            ("スキル名で絞り込み", 60)
+            ("スキル名で検索", 60)
         } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {
-            ("クエストIDかタイトルで絞り込み", 60)
+            ("クエストIDかタイトルで検索", 60)
         } else if idx == mhnx_core::hbedit::TEXT_SAVE_NAME {
             ("書き出すファイル名（拡張子は自動）", 48)
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
-            ("装備名か種類で絞り込み", 60)
+            ("装備名か種類で検索", 60)
         } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
-            ("装飾品名で絞り込み", 60)
+            ("装飾品名で検索", 60)
         } else if idx == mhnx_core::hbedit::TEXT_CHARM_FILTER {
             // A talisman has no name of its own, so the box says what it will
             // match: the kind the game calls it and both skill names.
-            ("護石の種類かスキル名で絞り込み", 60)
+            ("護石の種類かスキル名で検索", 60)
+        } else if idx == mhnx_core::hbedit::TEXT_ITEM_BOX_FILTER {
+            // Which of the two searches this build can run, the same rule the
+            // item picker follows: names when the table is compiled in, ids
+            // when it is not - and the keyboard title says which.
+            if ed.item_pick_names_available() {
+                ("アイテム名で検索（部分一致・英数の大小は無視）", 60)
+            } else {
+                ("アイテムIDで検索（名前が読めません 例: 975）", 60)
+            }
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
             // Which of the two searches the picker will run: the names when
             // this build has them, the hex ids when it does not. The state
@@ -1630,9 +1647,9 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             // so the keyboard title and the list cannot promise different
             // things.
             if ed.equip_pick_names_available() {
-                ("装備名で絞り込み（部分一致 / 種別名でも可）", 60)
+                ("装備名で検索（部分一致 / 種別名でも可）", 60)
             } else {
-                ("装備IDで絞り込み（名前が読めません 16進 例: 28）", 60)
+                ("装備IDで検索（名前が読めません 16進 例: 28）", 60)
             }
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_ID {
             ("装備ID（16進 0x28 / 10進 40）", 8)

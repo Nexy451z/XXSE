@@ -16,7 +16,9 @@
 //!     (`Editor::screen_guide`), so a first-time player is told what `[A]` does.
 //!   - `R 長押し` (or the `[詳細]` pill on the sub-tab bar): the `詳細` view of
 //!     the screen that is showing - the save map row that screen edits, with
-//!     its hex dump (`Screen::SaveMap`). Read-only, and `[B]` comes back.
+//!     its hex dump (`Screen::SaveMap`). `[B]` comes back; inside the screen,
+//!     `[A]` opens the byte editor on the selected row (one byte at a time,
+//!     asked first, one undo step per confirmed change).
 //!   - `A`: Always Open / Edit / Choose from list (unified across every screen, never deletes!).
 //!   - `◀ / ▶`: Always adjust numeric values (`±step`).
 //!   - `右スティック`: `▲ / ▼` turn a page (as many rows as the screen shows),
@@ -35,7 +37,12 @@
 //!   - 装備フォームの `[A]` は行ごとの操作（装備名/装飾品を選ぶ・値・書き込み）で、
 //!     行そのものに「▸ 選ぶ / ▸ 書き込み」と出る（`hbedit::EquipFormAction`）。
 //!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `お守り反映`).
-//!   - `Y`: Secondary tool action (`刻み幅切替` / `検索` / `スキル選択` / `2段階確認削除`).
+//!   - `Y`: Secondary tool action (`刻み` / `検索` / `装備` / `2段階確認削除`).
+//!
+//! The words are one vocabulary, not one screen's habit: 検索 opens a name
+//! search everywhere, 刻み is the step size, 削除 removes a record and 解除
+//! empties a slot. 絞る / 絞り込み / 外す / 刻み幅 are the old synonyms and are
+//! gone from the drawn labels (the key table lives in editor::actions).
 //!   - 護石の `[A]` は行ごとの操作（種類/スロット/スキル選択/数値/BOXへ反映）で、
 //!     フッターと `[A]` ボタンの文言はその行の動作と同じ値から作られる
 //!     （`mhnx_core::hbedit::CharmAction`）。
@@ -430,6 +437,11 @@ pub enum UiAction {
     /// sub-tabs), so unlike the equipment box it has no free key to give the
     /// filter, and the button says [検索] rather than naming one.
     FilterCharms,
+    /// The item box's name search, for the same reason: [Y] is the 空きも表示
+    /// toggle and every other key on that screen is taken, so the search is a
+    /// pill in the inspector. One word for it, the same one the talisman and
+    /// equipment screens use: 検索.
+    FilterItems,
     InstallAllPalicoes,
     TogglePalicoLang,
     ExtractOfficialArcs,
@@ -1146,7 +1158,7 @@ impl GuiState {
                         ed.cursor = pos;
                         ed.entry_row_cursor = 0;
                         ed.screen = Screen::EntryView;
-                        ed.message = String::from("初期配置座標 (.sem): [◀/▶]でエリア・X/Y/Z座標を変更 ([Y]で刻み幅)");
+                        ed.message = String::from("初期配置座標 (.sem): [◀/▶]でエリア・X/Y/Z座標を変更 ([Y]で刻み)");
                     } else {
                         ed.message = String::from("この .arc には .sem (初期配置) が含まれていません");
                     }
@@ -1427,6 +1439,12 @@ impl GuiState {
         if ed.screen == Screen::Sets && ed.set_editor_open() {
             return;
         }
+        // 生データ with the byte editor open: the stick pages the *bytes*, not
+        // the list. The equipment box is 72,000 bytes and the list is one row.
+        if ed.screen == Screen::SaveMap && ed.map_edit_open() {
+            ed.map_edit_page(dir);
+            return;
+        }
         let len = list_len_of(ed, self);
         if len == 0 {
             return;
@@ -1448,6 +1466,12 @@ impl GuiState {
             return;
         }
         if ed.screen == Screen::Sets && ed.set_editor_open() {
+            return;
+        }
+        // The ends of the byte region while the 生データ editor is open, for the
+        // same reason the pages move bytes there.
+        if ed.screen == Screen::SaveMap && ed.map_edit_open() {
+            ed.map_edit_jump(forward);
             return;
         }
         let len = list_len_of(ed, self);
@@ -1884,7 +1908,7 @@ impl GuiState {
     /// | held [L]       | (repeats the ten-row step)            | —                                 | first hold offers 元に戻す, second hold runs it |
     /// | held [R]       | (repeats the ten-row step)            | —                                 | opens 詳細 |
     /// | [A]            | 決定                                  | the row's own action              | the row's own action (equipment / talisman forms: 選ぶ・書き込み・作成) |
-    /// | [Y]            | 名前で絞る (the keyboard)              | the mode's own key                | the row's second action / 検索 / 刻み |
+    /// | [Y]            | 検索 (the keyboard)                    | the mode's own key                | the row's second action / 検索 / 刻み |
     /// | [X]            | クリア／保存 (per screen)              | 保存                              | 保存 (global QuickSave) |
     /// | [－] / [＋]     | 種別 filter / 終了                     | 2-press delete / quit             | the screen's own tool |
     ///
@@ -1954,15 +1978,13 @@ impl GuiState {
         // search filter). The set editor used to take X for its warnings, which
         // cost the pad its only way to save from that screen; the warnings moved
         // to Y instead.
-        // 生データ is read-only: X has no job there, and a global save from a
-        // screen that has nothing to save would be a key that lies.
+        // 生データ used to be read-only and was exempt here for that reason:
+        // a global save from a screen that has nothing to save is a key that
+        // lies. It edits bytes now, so [X] is the save key there like anywhere
+        // else - the header pill says 未保存 the moment a byte changes.
         let x_is_the_screens = matches!(
             ed.screen,
-            Screen::ItemPick
-                | Screen::SkillPick
-                | Screen::JewelPick
-                | Screen::EquipPick
-                | Screen::SaveMap
+            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
         );
         if key == Key::X && !x_is_the_screens {
             self.apply_action(ed, UiAction::QuickSave);
@@ -2018,7 +2040,7 @@ impl GuiState {
                     }
                     Key::Y => {
                         ed.step = (ed.step + 1) % STEPS.len();
-                        ed.message = format!("刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                        ed.message = format!("刻みを ±{} に切り替えました", STEPS[ed.step]);
                     }
                     other => ed.input(other),
                 }
@@ -2035,7 +2057,7 @@ impl GuiState {
                 Key::Y if ed.item_menu_open => {}
                 Key::Y => {
                     ed.step = (ed.step + 1) % STEPS.len();
-                    ed.message = format!("個数の刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                    ed.message = format!("個数の刻みを ±{} に切り替えました", STEPS[ed.step]);
                 }
                 // [R] types the count of the selected slot. It used to open the
                 // same picker [A] opens, so nothing was lost by giving it to the
@@ -2140,7 +2162,7 @@ impl GuiState {
                 Key::A => {
                     ed.step = (ed.step + 1) % HUNT_STEPS.len();
                     ed.message = format!(
-                        "狩猟記録の刻み幅を {} に切り替えました",
+                        "狩猟記録の刻みを {} に切り替えました",
                         if HUNT_STEPS[ed.step] < 0 {
                             String::from("反転（▶で減る）")
                         } else {
@@ -2365,7 +2387,7 @@ impl GuiState {
                     }
                     Key::Y => {
                         ed.step = (ed.step + 1) % STEPS.len();
-                        ed.message = format!("刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                        ed.message = format!("刻みを ±{} に切り替えました", STEPS[ed.step]);
                     }
                     Key::B => {
                         safe_flush_quest_entry(ed);
@@ -2409,7 +2431,7 @@ impl GuiState {
                     }
                     Key::Y => {
                         ed.step = (ed.step + 1) % STEPS.len();
-                        ed.message = format!("刻み幅を ±{} に切り替えました", STEPS[ed.step]);
+                        ed.message = format!("刻みを ±{} に切り替えました", STEPS[ed.step]);
                     }
                     Key::Left | Key::Right
                         if matches!(ext, Some("sem") | Some("esl") | Some("qdp")) =>
@@ -2613,6 +2635,9 @@ impl GuiState {
             UiAction::Quit => {
                 ed.press_quit();
             }
+            UiAction::FilterItems => {
+                ed.request_item_box_filter();
+            }
             UiAction::FilterCharms => {
                 ed.request_charm_filter();
             }
@@ -2647,7 +2672,7 @@ impl GuiState {
             UiAction::SetStep(s) => {
                 if s < STEPS.len() {
                     ed.step = s;
-                    ed.message = format!("刻み幅を ±{} に設定しました", STEPS[s]);
+                    ed.message = format!("刻みを ±{} に設定しました", STEPS[s]);
                 }
             }
             UiAction::SelectRow(idx) => {
@@ -3377,7 +3402,15 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
             }
         }
         Screen::Options => ed.option_cursor = clamped,
-        Screen::SaveMap => ed.map_cursor = clamped,
+        Screen::SaveMap => {
+            // A tap on another row moves the region, and the byte editor
+            // belongs to the row it was opened on: it is put away rather than
+            // following the cursor into a row it never asked about.
+            if ed.map_cursor != clamped {
+                ed.map_edit = None;
+            }
+            ed.map_cursor = clamped;
+        }
         _ => ed.cursor = clamped,
     }
 }
@@ -4168,7 +4201,9 @@ impl GuiState {
             Screen::Charms => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[検索] 絞る", t.text_primary, FontSize::Small);
+                // One word for the action on every screen: 検索. The pill
+                // says what it searches rather than a second verb.
+                btn_text(c, 964, sy, 136, sh, "[検索] 護石", t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::FilterCharms);
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
@@ -4628,24 +4663,27 @@ impl GuiState {
     }
 
     /// 生データ (Screen::SaveMap): the save map's rows on the left, the selected
-    /// row's bytes on the right.
+    /// row's bytes on the right - and, behind [A], the byte editor.
     ///
-    /// Read-only, so the inspector has no stepper and no value box: the only
-    /// things a press can do on this screen are move the cursor and go back -
-    /// and going back is a button as well as [B], because a finger had no way
-    /// out of here at all.
+    /// The screen answers in two modes and says which one it is in: the list
+    /// view (a cursor, and [A] opens the editor) and the editor ([▲/▼] on a
+    /// byte, [◀/▶] on its value, [A] confirms, [B] cancels). The panel's two
+    /// buttons carry the same two keys, so a finger has both - a finger had no
+    /// way out of here at all before the back button existed, and no way into
+    /// the editor before it.
     ///
     /// The split is the one every other screen uses (796 / 428). It used to be
     /// 600 / 626 so a 16 byte hex line would fit whole, which made the
     /// inspector wider than the list - the one screen whose shape said
     /// "different program". The dump is cut to 8 bytes a line instead
     /// (hbedit::rewrap_hex): same bytes, same offsets, in the panel the rest of
-    /// the tool has trained the eye on.
+    /// the tool has trained the eye on. The editor's window follows the caret
+    /// and brackets the byte it is on (hbedit::Editor::map_edit_dump).
     fn draw_save_map(&mut self, c: &mut Canvas, ed: &Editor) {
         let t = theme();
-        let fields = mhnx_core::savemap::fields();
         let rows = ed.save_map_rows();
         let total = rows.len();
+        let editing = ed.map_edit_open();
 
         c.text_clipped(
             MAIN_X + 4,
@@ -4658,7 +4696,15 @@ impl GuiState {
         c.text_right(
             1262,
             CONTENT_Y + 3,
-            &format!("スロット {} / {} 行 / 読み取り専用", ed.slot + 1, total),
+            // 閲覧＋編集: the right panel is a hex dump *and* the byte editor
+            // [A] opens. It said 読み取り専用 while the screen could only read -
+            // the word was true then and is a lie now.
+            &format!(
+                "スロット {} / {} 行 / 閲覧＋編集{}",
+                ed.slot + 1,
+                total,
+                if editing { "（編集中）" } else { "" }
+            ),
             t.text_secondary,
             FontSize::Small,
         );
@@ -4686,7 +4732,6 @@ impl GuiState {
                 break;
             }
             let idx = rows[pos];
-            let f = &fields[idx];
             let ry = body_y + 34 + (i as i32) * ROW_H;
             let selected = pos == ed.map_cursor;
             let bg = if selected {
@@ -4710,12 +4755,15 @@ impl GuiState {
             let title_col = if selected { t.text_primary } else { t.text_secondary };
             // The name leads and the offset follows it: a reader looks for
             // 装備ボックス before whatever lives at 0x62EE.
-            c.text_clipped(MAIN_X + 20, ry + 12, 300, f.name, title_col, FontSize::Medium);
-            let at = ed
-                .save
-                .as_ref()
-                .and_then(|s| mhnx_core::savemap::offset_in(s, idx));
-            let at_text = match at {
+            c.text_clipped(
+                MAIN_X + 20,
+                ry + 12,
+                300,
+                ed.save_map_row_name(idx),
+                title_col,
+                FontSize::Medium,
+            );
+            let at_text = match ed.save_map_row_offset(idx) {
                 Some(o) => format!("+0x{:06X}", o),
                 None => String::from("このセーブに無し"),
             };
@@ -4730,15 +4778,26 @@ impl GuiState {
             c.text_right(
                 track.text_right - 56,
                 ry + 15,
-                &format!("{}B", f.len),
+                &format!("{}B", ed.save_map_row_len(idx)),
                 t.text_secondary,
                 FontSize::Small,
             );
+            // The row being edited is marked in the list as well as in the
+            // panel: "編集中" is the one fact a user scrolls away from.
+            let badge = if idx == ed.save_map_selected().unwrap_or(usize::MAX) && editing {
+                String::from("編集中")
+            } else {
+                format!("#{:03}", pos + 1)
+            };
             c.text_right(
                 track.text_right,
                 ry + 15,
-                &format!("#{:03}", pos + 1),
-                t.text_muted,
+                &badge,
+                if editing && badge == "編集中" {
+                    t.accent_warn
+                } else {
+                    t.text_muted
+                },
                 FontSize::Small,
             );
         }
@@ -4769,28 +4828,50 @@ impl GuiState {
         c.round_rect(insp_x, body_y, insp_w, body_h, t.corner_r, t.bg_panel);
         c.round_rect_border(insp_x, body_y, insp_w, body_h, t.corner_r, 1, t.border_subtle);
 
-        // The way back, drawn before anything that can be missing: this button
-        // belongs to the panel and not to the selected row, so a save whose
-        // rows no longer resolve still offers a way out. [B] did the same
-        // thing, but the screen had no control a finger could press.
-        let back_w = 190;
-        let back_x = insp_x + insp_w - 20 - back_w;
-        let back_y = body_y + body_h - 44;
-        c.round_rect(back_x, back_y, back_w, 34, 5, t.bg_btn);
-        c.round_rect_border(back_x, back_y, back_w, 34, 5, 1, t.border_subtle);
-        btn_text(
-            c,
-            back_x,
-            back_y,
-            back_w,
-            34,
-            "[B] 元の画面へ",
-            t.text_primary,
-            FontSize::Small,
-        );
-        self.add_hit(back_x, back_y, back_w, 34, UiAction::Key(Key::B));
+        // The two controls the panel owns, drawn before anything that can be
+        // missing: they belong to the panel and not to the selected row, so a
+        // save whose rows no longer resolve still offers a way out - and the
+        // editor is the whole reason the pill is on every screen.
+        //
+        // [A] is one button with one meaning at a time: open the editor, write
+        // what it asked for, or close it. [B] is the other half: it drops a
+        // change that is waiting before it drops the screen, which is the
+        // "start / end" shape the arena editor has.
+        let pending = ed.map_edit.and_then(|e| e.pending);
+        let btn_w = (insp_w - 48) / 2;
+        let btn_y = body_y + body_h - 44;
+        let a_x = insp_x + 20;
+        let b_x = a_x + btn_w + 8;
+        let a_label = if pending.is_some() {
+            "[A] 決定"
+        } else if editing {
+            "[A] 編集終了"
+        } else {
+            "[A] 編集する"
+        };
+        let (a_bg, a_fg) = if pending.is_some() {
+            (t.accent_warn, white_or_dark(t.accent_warn))
+        } else if editing {
+            (t.bg_btn, t.accent_primary)
+        } else {
+            (t.bg_btn_primary, white_or_dark(t.bg_btn_primary))
+        };
+        c.round_rect(a_x, btn_y, btn_w, 34, 5, a_bg);
+        c.round_rect_border(a_x, btn_y, btn_w, 34, 5, 1, t.accent_primary);
+        btn_text(c, a_x, btn_y, btn_w, 34, a_label, a_fg, FontSize::Small);
+        self.add_hit(a_x, btn_y, btn_w, 34, UiAction::Key(Key::A));
 
-        let Some(field) = ed.save_map_field() else {
+        let b_label = if pending.is_some() {
+            "[B] 取消"
+        } else {
+            "[B] 元の画面へ"
+        };
+        c.round_rect(b_x, btn_y, btn_w, 34, 5, t.bg_btn);
+        c.round_rect_border(b_x, btn_y, btn_w, 34, 5, 1, t.border_subtle);
+        btn_text(c, b_x, btn_y, btn_w, 34, b_label, t.text_primary, FontSize::Small);
+        self.add_hit(b_x, btn_y, btn_w, 34, UiAction::Key(Key::B));
+
+        let Some(selected) = ed.save_map_selected() else {
             c.text_clipped(
                 insp_x + 20,
                 body_y + 24,
@@ -4805,7 +4886,7 @@ impl GuiState {
             insp_x + 20,
             body_y + 18,
             insp_w - 40,
-            field.name,
+            ed.save_map_row_name(selected),
             t.text_primary,
             FontSize::Medium,
         );
@@ -4834,7 +4915,23 @@ impl GuiState {
         // The dump: 8 bytes a line. 16 was what the wider panel could hold;
         // the inspector here is the standard 428 and 57 characters do not fit
         // it. The bytes and their offsets are untouched (hbedit::rewrap_hex).
-        let dump = mhnx_core::hbedit::Editor::rewrap_hex(&ed.save_map_dump(), 8);
+        // In edit mode the window follows the caret and brackets the byte it
+        // is on, so a 72,000 byte row is not always showing its first line.
+        let line_h = c.line_height_sized(FontSize::Small).max(18);
+        // The two buttons own the bottom 46px, and the lines above them belong
+        // to the caret (edit mode) and the structural-byte warning (edit mode)
+        // or the row counter (view mode). The dump stops above whichever of
+        // those is drawn, so no hex line can land on the words that explain it.
+        let dump_bottom = if editing { body_h - 96 } else { body_h - 70 };
+        let room = ((dump_bottom - 112) / line_h.max(1)).max(1) as usize;
+        let dump: Vec<String> = if editing {
+            ed.map_edit_dump(room)
+        } else {
+            mhnx_core::hbedit::Editor::rewrap_hex(&ed.save_map_dump(), 8)
+                .into_iter()
+                .take(room)
+                .collect()
+        };
         if dump.is_empty() {
             c.text_clipped(
                 insp_x + 20,
@@ -4845,28 +4942,52 @@ impl GuiState {
                 FontSize::Small,
             );
         } else {
-            let line_h = c.line_height_sized(FontSize::Small).max(18);
-            // The back button owns the bottom 46px of this panel.
-            let room = (body_h - 124 - 46) / line_h.max(1);
-            for (i, line) in dump.iter().take(room.max(1) as usize).enumerate() {
+            for (i, line) in dump.iter().enumerate() {
+                let caret_here = editing && line.contains('[');
                 c.text_clipped(
                     insp_x + 20,
                     body_y + 112 + (i as i32) * line_h,
                     insp_w - 40,
                     line,
-                    t.text_primary,
+                    if caret_here { t.accent_warn } else { t.text_primary },
                     FontSize::Small,
                 );
             }
         }
-        c.text_clipped(
-            insp_x + 20,
-            body_y + body_h - 34,
-            back_x - (insp_x + 20) - 12,
-            &format!("{} / {} 行", ed.map_cursor + 1, total),
-            t.text_muted,
-            FontSize::Small,
-        );
+
+        // Line under the dump: where the caret is (edit mode) or where the
+        // list is, and the structural-byte warning when there is one. The
+        // warning is amber and never a refusal: the task asks the editor to say
+        // what it is doing to a byte the format treats as structure.
+        if editing {
+            c.text_clipped(
+                insp_x + 20,
+                body_y + body_h - 70,
+                insp_w - 40,
+                &ed.map_edit_position(),
+                t.text_secondary,
+                FontSize::Small,
+            );
+            if let Some(warning) = ed.map_byte_warning() {
+                c.text_clipped(
+                    insp_x + 20,
+                    body_y + body_h - 92,
+                    insp_w - 40,
+                    &format!("警告: {}", warning),
+                    t.accent_warn,
+                    FontSize::Small,
+                );
+            }
+        } else {
+            c.text_clipped(
+                insp_x + 20,
+                body_y + body_h - 70,
+                insp_w - 40,
+                &format!("{} / {} 行（[A] でこの領域を編集）", ed.map_cursor + 1, total),
+                t.text_muted,
+                FontSize::Small,
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5453,7 +5574,7 @@ impl GuiState {
             cur_y += 8;
             let full_w = iw - 40;
             let half_w = (iw - 48) / 2;
-            c.text_sized(ix + 20, cur_y, "候補をめくる・外す", t.text_muted, FontSize::Small);
+            c.text_sized(ix + 20, cur_y, "候補をめくる・解除", t.text_muted, FontSize::Small);
             cur_y += 24;
             self.draw_tool_button(
                 c,
@@ -5706,14 +5827,34 @@ impl GuiState {
                         UiAction::ItemOp(ITEM_OP_CLAMP),
                     );
                     cur_y += 42;
+                    // The last row is two buttons: the add, and the name search.
+                    // The search has no key of its own on this build - [Y] is
+                    // the step, [R] the picker, [X] the save, [-] the menu and
+                    // [L] the undo - so this pill is its route, the same way
+                    // the talisman list opens its search from a pill. One word
+                    // for it: 検索.
                     self.draw_tool_button(
                         c,
                         ix + 20,
                         cur_y,
-                        full_w,
+                        half_w,
                         36,
-                        "アイテムを追加（個数指定）",
+                        "アイテムを追加",
                         UiAction::ItemOp(ITEM_OP_ADD),
+                    );
+                    let search_lbl = if ed.item_box_filter.trim().is_empty() {
+                        "[検索] アイテム名"
+                    } else {
+                        "[検索] 検索中"
+                    };
+                    self.draw_tool_button(
+                        c,
+                        ix + 28 + half_w,
+                        cur_y,
+                        half_w,
+                        36,
+                        search_lbl,
+                        UiAction::FilterItems,
                     );
                 }
             }
@@ -5758,9 +5899,9 @@ impl GuiState {
                 // The filter is on the heading, and this is the way out of it
                 // for a finger: [X] used to be the clear key and [X] is save.
                 let filter_lbl = if ed.equip_filter.trim().is_empty() {
-                    "[Y] 絞り込み"
+                    "[Y] 検索"
                 } else {
-                    "[Y] 絞り込みを変更 / 空で解除"
+                    "[Y] 検索を変更 / 空で解除"
                 };
                 self.draw_tool_button(
                     c,
@@ -5779,7 +5920,7 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "絞り込みを解除（全件）",
+                        "検索を解除（全件）",
                         UiAction::ClearEquipFilter,
                     );
                 }
@@ -5872,9 +6013,9 @@ impl GuiState {
                     );
                     cur_y += 44;
                     let clear_label = if ed.set_clear_armed.is_some() {
-                        "もう一度タップで部位を外す"
+                        "もう一度タップで部位を解除"
                     } else {
-                        "[-] 部位を外す（2回）"
+                        "[-] 部位を解除（2回）"
                     };
                     self.draw_tool_button(
                         c,
@@ -6646,16 +6787,22 @@ impl GuiState {
             ));
         }
 
-        let hdr = if ed.show_empty {
+        // Three states, one heading: the search result is its own thing, and
+        // the subtitle says what was searched and what it left - the same line
+        // the item picker prints, from the same state machine.
+        let hdr = if !ed.item_box_filter.trim().is_empty() {
+            "アイテムBOX (検索結果)"
+        } else if ed.show_empty {
             "アイテムBOX (全枠)"
         } else {
             "アイテムBOX (所持品)"
         };
+        let sub = ed.item_box_search_line(rows.len());
         self.draw_adaptive_rows(
             c,
             ed,
             hdr,
-            "",
+            &sub,
             &rows,
             ed.cursor.min(rows.len().saturating_sub(1)),
             true,
@@ -7224,7 +7371,7 @@ impl GuiState {
                 meta,
                 ed.set_part_label(part),
                 if armed {
-                    String::from("外す?")
+                    String::from("解除?")
                 } else {
                     format!("#{:02}", row + 1)
                 },
@@ -9218,10 +9365,17 @@ fn draw_name_box(
 /// A narrowed list used to look exactly like a short table: twelve rows, and no
 /// word anywhere about the other three hundred. The pickers and the equipment
 /// box already carry their filter word in the title ("検索: ほげ（12 件）",
-/// "装備BOX（絞り込み: …）"), so they are not repeated here; the item box's
+/// "装備BOX（検索: …）"), so they are not repeated here; the item box's
 /// hide-empty toggle is the one state nothing else on the screen names.
+///
+/// One word describes a narrowed list on every screen: 検索. The verbs 絞る /
+/// 絞り込み used to appear here, on the talisman pill and in two headings for
+/// the same thing, which is the drift the review found.
 fn filter_chip(ed: &Editor) -> Option<String> {
     match ed.screen {
+        // The item box's hide-empty toggle. The name search has its own line:
+        // the heading says 検索結果 and the subtitle carries "検索: …（n 枠）",
+        // so it is not repeated here.
         Screen::Items => Some(String::from(if ed.show_empty {
             "空きも表示"
         } else {
@@ -9235,18 +9389,19 @@ fn filter_chip(ed: &Editor) -> Option<String> {
             if needle.is_empty() {
                 None
             } else {
-                Some(format!("絞込: {}", needle))
+                Some(format!("検索: {}", needle))
             }
         }
-        // The talisman list's name filter. Its heading carries the needle too
+        // The talisman list's name search. Its heading carries the needle too
         // (hbedit::Editor::charm_filter_heading), but the heading is the first
-        // thing clipped on a narrow panel and this chip is not.
+        // thing clipped on a narrow panel and this chip is not. "検索:" is the
+        // same word the pickers and the item box print.
         Screen::Charms => {
             let needle = ed.charm_filter.trim();
             if needle.is_empty() {
                 None
             } else {
-                Some(format!("絞込: {}", needle))
+                Some(format!("検索: {}", needle))
             }
         }
         _ => None,

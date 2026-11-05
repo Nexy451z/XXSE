@@ -144,10 +144,17 @@ pub enum Screen {
     /// right-hand panel is that row's hex dump. It is the binary view the
     /// reference editor calls セーブマップ.
     ///
-    /// Every row is **read-only**: [Editor::input_save_map] moves a cursor and
-    /// nothing else, so no key on this screen can change a byte. [B] goes back
-    /// to the screen 詳細 was pressed on, which is why the screen keeps the name
-    /// of that screen rather than a stack.
+    /// The screen is a viewer **and** an editor. The list moves a cursor and
+    /// the dump shows the selected row's bytes; [A] opens the byte editor on
+    /// that row ([Editor::map_edit_enter]), where one byte at a time may be
+    /// rewritten after the status line spells the change out and a second [A]
+    /// confirms it. Every confirmed change is one whole-save undo step, the
+    /// caret cannot leave the row, and a structural byte (the body header, a
+    /// pointer, a record's size/id pair, a save-screen copy) is warned about
+    /// rather than refused.
+    ///
+    /// [B] goes back to the screen 詳細 was pressed on, which is why the screen
+    /// keeps the name of that screen rather than a stack.
     SaveMap,
 }
 
@@ -170,6 +177,39 @@ pub const PROGRESS_JUMP: usize = 50;
 pub const SAVE_MAP_VISIBLE: usize = 9;
 /// Rows [◀] / [▶] jump on the 生データ list.
 pub const SAVE_MAP_JUMP: usize = 10;
+
+/// The first row of the 生データ list: the save's own body header.
+///
+/// It is not a row of [crate::savemap::fields] - that table names the stretches
+/// the crate's readers and writers know, and the header holds the identifier
+/// and the pointers every one of those stretches is resolved through. It is
+/// still bytes a user may want to look at, and (with a warning) write, so the
+/// list carries it as a row of its own rather than hiding it.
+///
+/// `usize::MAX` is not a valid index into the table, so every accessor that
+/// takes a row has to answer it before it looks anything up; the list itself is
+/// the only place that hands it out.
+pub const MAP_HEADER_ROW: usize = usize::MAX;
+
+/// Bytes the header row covers: body +0x00 .. +0x28.
+///
+/// The identifier at +0x00, the three slot base pointers at +0x04..+0x10, the
+/// download-section pointer at +0x0C, and the reserved bytes up to where the
+/// first named row starts (画面の明るさ at +0x28).
+pub const MAP_HEADER_LEN: usize = 0x28;
+
+/// Bytes one line of the 生データ editing dump shows.
+///
+/// Eight, the same cut the read-only dump was re-cut to (hbedit::rewrap_hex):
+/// the inspector is 428px and sixteen bytes do not fit it.
+pub const MAP_EDIT_LINE: usize = 8;
+
+/// How far the right stick moves the byte cursor inside the region.
+///
+/// One page of the editing dump. The region can be 72,000 bytes (the equipment
+/// box), and holding [▲] over that is minutes; the stick is already this
+/// screen's coarse scroll.
+pub const MAP_EDIT_PAGE: usize = 0x100;
 
 /// The two request flag bands, as `[start, end)` numbers into the flag map.
 ///
@@ -2192,6 +2232,14 @@ pub const TEXT_EQUIP_PICK_FILTER: usize = usize::MAX - 1_011;
 /// with the arrow keys only, and it is the fallback when a build has no name
 /// tables at all.
 pub const TEXT_EQUIP_ID: usize = usize::MAX - 1_012;
+/// Sentinel id for "ask for the item box's name search".
+///
+/// The item box's [Y] is the 空きも表示 toggle and every other key on that
+/// screen is spoken for, so - like the talisman list's search - this one is
+/// opened from a pill rather than a key. Below `TEXT_PALICO_NAME` for the
+/// reason the other one-offs are: the console reads one contiguous range above
+/// that base as palico names.
+pub const TEXT_ITEM_BOX_FILTER: usize = usize::MAX - 1_013;
 /// Sentinel base for "ask for the name of item set N": N is added to this.
 ///
 /// The two my-set names sit in one field of the same width, so the base is
@@ -3158,6 +3206,126 @@ pub struct SaveUndo {
     pub slot: usize,
     /// The save before the edit.
     pub save: Save,
+}
+
+// ---------------------------------------------------------------------------
+// 生データ's byte editor
+// ---------------------------------------------------------------------------
+
+/// The state of [A] on 生データ: which byte of the region the caret is on.
+///
+/// The screen used to be read-only, and the pill on the sub-tab bar promised a
+/// 詳細 settings view a user could not change. This is the editor behind that
+/// promise, and it is deliberately small: one byte at a time, the confirmation
+/// spelled out, and one whole-save undo step per confirmed change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MapEdit {
+    /// Byte index inside the selected region (0 .. len-1).
+    ///
+    /// Never leaves the region: [Editor::map_edit_move] clamps at both ends,
+    /// because a caret outside the row would be writing a byte the row does not
+    /// name and the dump would show it under the wrong offset.
+    pub byte: usize,
+    /// A change that has been asked for and not confirmed yet.
+    ///
+    /// The first [◀] / [▶] only *asks*: nothing is written, and the status line
+    /// spells out what the second press would do. [A] writes it, [B] drops it.
+    pub pending: Option<MapChange>,
+}
+
+/// One byte the 生データ editor proposes to change.
+///
+/// `from` is the byte as it was when the change was armed, so the confirmation
+/// can name both sides even after the proposed value has been stepped further.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapChange {
+    /// Offset in the save **body** (not the row).
+    pub offset: usize,
+    /// The byte as it is now.
+    pub from: u8,
+    /// What it would become.
+    pub to: u8,
+}
+
+impl MapChange {
+    /// The sentence the task asks for, word for word:
+    /// 「オフセット 0x1234 を 0x00 → 0xFF に変えます。よろしいですか」.
+    pub fn line(&self) -> String {
+        format!(
+            "オフセット 0x{:06X} を 0x{:02X} → 0x{:02X} に変えます。よろしいですか（[A] 決定 / [B] 取消）",
+            self.offset, self.from, self.to
+        )
+    }
+}
+
+/// Which structural zone a body offset falls in, when it is one.
+///
+/// The save's body header is not data: +0x00 is the identifier every reader
+/// checks, +0x04..+0x10 are the three slot bases and the download-section
+/// pointer every other offset is resolved through, and +0x10..+0x28 are
+/// reserved. A writer that changes one of them does not edit a record, it
+/// moves the ground the records stand on - which is exactly the warning the
+/// task asks for, and not a refusal.
+pub fn map_offset_zone(body_off: usize) -> Option<&'static str> {
+    match body_off {
+        0x00 => Some("ヘッダ（セーブの識別子）"),
+        0x04..=0x0F => Some("ポインタ（スロット基底 / DLC セクション）"),
+        0x10..=0x27 => Some("ヘッダ（予約領域）"),
+        _ => None,
+    }
+}
+
+/// The container header's file-name CRC, as a **file** offset.
+///
+/// The Switch save's 36 byte header stores crc32(file name) at +0x14; the PC
+/// build and the console both read it back to name the file. It is the other
+/// checksum-ish zone the task names, and it is not part of the body, so it is
+/// classified separately from [map_offset_zone].
+pub const MAP_CRC_FILE_OFFSET: usize = 0x14;
+
+/// Which structural zone a **file** offset falls in, when it is one.
+///
+/// The header itself (0x00..0x24) and, inside it, the file-name CRC.
+pub fn map_file_zone(file_off: usize) -> Option<&'static str> {
+    if file_off == MAP_CRC_FILE_OFFSET {
+        Some("CRC（コンテナヘッダのファイル名）")
+    } else if file_off < crate::save::SWITCH_HEADER_SIZE {
+        Some("ヘッダ（コンテナヘッダ）")
+    } else {
+        None
+    }
+}
+
+/// Hex lines for one stretch of the body, the way [crate::savemap] prints them.
+///
+/// Sixteen bytes a line with the **body** offset in front, a gap after the
+/// eighth byte, and a "… ほか N バイト" tail once the stretch is longer than
+/// [crate::savemap::DUMP_BYTES]. This exists for the stretches the table has no
+/// row for - the body header - and mirrors savemap::hex_lines exactly, because
+/// the header row is drawn in the same panel as the named rows and must not
+/// look like a different kind of thing.
+fn dump_lines(body: &[u8], offset: usize, len: usize, columns: usize) -> Vec<String> {
+    let columns = columns.clamp(1, 32);
+    let shown = len.min(crate::savemap::DUMP_BYTES);
+    let mut out = Vec::with_capacity(shown / columns + 2);
+    for row in (0..shown).step_by(columns) {
+        let n = columns.min(shown - row);
+        let mut line = format!("{:06X}  ", offset + row);
+        for i in 0..n {
+            if i == 8 && n > 8 {
+                line.push(' ');
+            }
+            line.push_str(&format!("{:02x} ", body[offset + row + i]));
+        }
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        out.push(line);
+    }
+    if len > shown {
+        out.push(format!("… ほか {} バイト", len - shown));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -4403,6 +4571,27 @@ pub struct Editor {
     /// The screen [B] returns to from 生データ, i.e. the screen 詳細 was
     /// pressed on.
     pub map_return: Screen,
+    /// 生データ's byte editor while [A] has it open, `None` while the screen
+    /// is the read-only view it used to be.
+    ///
+    /// A mode of the screen, like the arena's edit flag: the list keeps its
+    /// place underneath, and [B] leaves either the change or the mode before it
+    /// leaves the screen.
+    pub map_edit: Option<MapEdit>,
+    /// アイテムBOX name search (Screen::Items).
+    ///
+    /// The talisman and equipment boxes already carry one. The item box's [Y]
+    /// is the 空きも表示 toggle in this state machine and the step on the
+    /// console, and every other key on that screen is taken, so this filter is
+    /// opened from the inspector's pill instead. Empty means the whole box, the
+    /// same rule the other two follow.
+    pub item_box_filter: String,
+    /// Ids the item box search kept, in id order.
+    ///
+    /// Filled when the search is applied, so the per-frame list does not run a
+    /// 2,990 id name comparison for every one of the 1,400 slots: [visible_items]
+    /// binary-searches this instead. Empty when no search is on.
+    item_box_hits: Vec<u16>,
     /// CSV files offered by the I/O layer, in the folder's own order.
     ///
     /// Paths, not contents: a file is read only when the user applies it, and
@@ -4570,6 +4759,9 @@ impl Editor {
             option_cursor: 0,
             map_cursor: 0,
             map_return: Screen::SaveList,
+            map_edit: None,
+            item_box_filter: String::new(),
+            item_box_hits: Vec::new(),
             csv_files: Vec::new(),
             csv_cursor: 0,
             csv_armed: None,
@@ -5117,14 +5309,14 @@ impl Editor {
                 "[◀/▶] 個数±10  [▲/▼] 個数±1  [A] この個数を追加  [B] 選び直す"
             }
             Screen::ItemPick | Screen::SkillPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [X] クリア  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [X] クリア  [B] 戻る"
             }
             // One delete key on every screen: [-] twice.
             Screen::Charms => "[A] 編集  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存",
             // Built by the form, not here: see footer_hint.
             Screen::CharmEdit => "",
             Screen::Equip => {
-                "[A] 編集  [▲/▼] 行  [Y] 絞る/解除  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
+                "[A] 編集  [▲/▼] 行  [Y] 検索/解除  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
             }
             // [A] is the row's own action (hbedit::EquipFormAction): the two
             // rows that name the record open the picker, the sockets open the
@@ -5135,19 +5327,19 @@ impl Editor {
                 "[A] 行の操作  [▲/▼] 行  [◀/▶] 10件/値  [Y] 名前で検索  [R] ID入力  [X] 保存"
             }
             Screen::JewelPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [X] クリア  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [X] クリア  [B] 戻る"
             }
             // One line for the name picker: the id is printed in hex
             // everywhere, so the guide says "名前か 16進ID" rather than
             // leaving the reader to guess which of the two the box takes.
             Screen::EquipPick if self.equip_pick_kind != 0 => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [-] 種別を全種  [X] クリア  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [-] 種別を全種  [X] クリア  [B] 戻る"
             }
             Screen::EquipPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [-] 種別で絞る  [X] クリア  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [-] 種別  [X] クリア  [B] 戻る"
             }
             Screen::Sets if self.set_edit.is_some() => {
-                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 外す（2回）  [Y] 警告  [X] 保存  [B] 一覧"
+                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 解除（2回）  [Y] 警告  [X] 保存  [B] 一覧"
             }
             Screen::Sets if self.item_set_edit.is_some() => {
                 "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込（2回）  [-] ポーチへ（2回）  [B] 一覧"
@@ -5238,11 +5430,14 @@ impl Editor {
             // writing the converted file, so a guide that promised both was
             // three keys wrong on a screen with three working ones.
             Screen::Convert => "[A] 変換出力  [Y] 出力名変更  [B] 戻る",
-            // 生データ: no key writes anything here, so the line says so and
-            // names the two that move the cursor and the one that goes back.
-            Screen::SaveMap => {
-                "[▲/▼] 行  [◀/▶] 10行  [A] 元の領域  [B] 戻る（読み取り専用）"
+            // 生データ: the list is a viewer until [A] opens the byte editor.
+            // Inside it the four directions belong to the byte, so the line
+            // says what they do there rather than what they do to the list -
+            // one screen, two sets of words, both true.
+            Screen::SaveMap if self.map_edit_open() => {
+                "[▲/▼] 1バイト移動  [◀/▶] 値の変更  [A] 決定  [B] 取消/戻る"
             }
+            Screen::SaveMap => "[▲/▼] 行  [◀/▶] 10行  [A] 編集  [B] 戻る"
         };
         base
     }
@@ -6571,7 +6766,7 @@ impl Editor {
         if needle.is_empty() {
             String::from("装備BOX")
         } else {
-            format!("装備BOX（絞り込み: {}）[Y] で変更・空で解除", needle)
+            format!("装備BOX（検索: {}）[Y] で変更・空で解除", needle)
         }
     }
 
@@ -7389,16 +7584,85 @@ impl Editor {
     }
 
     /// Indices of the item slots currently visible.
+    ///
+    /// Two narrowings: the 空きも表示 toggle, and the name search. The search
+    /// wins over the toggle - an empty slot has no name, so it cannot match -
+    /// and it looks its hits up in [Editor::item_box_hits] rather than running
+    /// 2,990 name comparisons for each of the 1,400 slots on every frame.
     pub fn visible_items(&self) -> Vec<usize> {
         let Some(items) = self.save.as_ref().and_then(|s| s.read_item_box(self.slot)) else {
             return Vec::new();
         };
+        let searching = !self.item_box_filter.trim().is_empty();
         items
             .iter()
             .enumerate()
-            .filter(|(_, s)| self.show_empty || s.id != 0)
+            .filter(|(_, s)| {
+                if searching {
+                    s.id != 0 && self.item_box_hits.binary_search(&s.id).is_ok()
+                } else {
+                    self.show_empty || s.id != 0
+                }
+            })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The line the item box prints above its list while a search is on.
+    ///
+    /// "検索: 回復薬（3 枠）", the whole box when it is off (""), and the id
+    /// search notice in a build without the compiled name table - the same
+    /// wording rule the two pickers follow.
+    pub fn item_box_search_line(&self, matches: usize) -> String {
+        let needle = self.item_box_filter.trim();
+        if needle.is_empty() {
+            return String::new();
+        }
+        if self.item_pick_names_available() {
+            alloc::format!("検索: {}（{} 枠）", needle, matches)
+        } else {
+            alloc::format!("検索（ID）: {}（{} 枠）", needle, matches)
+        }
+    }
+
+    /// Ask the I/O layer for the item box's search text.
+    ///
+    /// The pill does not filter by itself: the keyboard is the one place text
+    /// comes from, and the console answers with [Editor::apply_item_box_filter].
+    pub fn request_item_box_filter(&mut self) {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return;
+        }
+        self.pending_text = Some((TEXT_ITEM_BOX_FILTER, self.item_box_filter.clone()));
+        self.message = String::from("アイテム名で検索します（空にすると解除）");
+    }
+
+    /// The I/O layer answers the search with this.
+    ///
+    /// An empty answer is the whole box again, the same rule the talisman and
+    /// equipment filters follow, and the status line says which of the two
+    /// happened.
+    pub fn apply_item_box_filter(&mut self, text: String) {
+        self.item_box_filter = text;
+        self.item_box_hits.clear();
+        if self.item_box_filter.trim().is_empty() {
+            self.cursor = 0;
+            let n = self.visible_items().len();
+            self.message = alloc::format!("検索を解除しました（{} 枠）", n);
+            return;
+        }
+        #[cfg(feature = "gamedata")]
+        let names: Option<&[&str]> = Some(crate::gamedata::ITEM_NAME_LIST);
+        #[cfg(not(feature = "gamedata"))]
+        let names: Option<&[&str]> = None;
+        self.item_box_hits = filter_item_ids_in(&self.item_box_filter, names);
+        self.cursor = 0;
+        let n = self.visible_items().len();
+        self.message = alloc::format!(
+            "{}（[検索] で変更・空にすると解除）",
+            self.item_box_search_line(n)
+        );
     }
 
     // ------------------------------------------------------------- input
@@ -7537,7 +7801,7 @@ impl Editor {
                     String::from("お守りがありません（[＋] で作成 / [A] でも作成できます）");
             } else {
                 self.message = alloc::format!(
-                    "絞り込み「{}」に一致するお守りがありません（[Y] で変える・空で解除）",
+                    "検索「{}」に一致するお守りがありません（[Y] で変える・空で解除）",
                     self.charm_filter.trim()
                 );
             }
@@ -7589,7 +7853,7 @@ impl Editor {
         if needle.is_empty() {
             String::from("護石一覧")
         } else {
-            alloc::format!("護石一覧（絞り込み: {}）[Y] で変更・空で解除", needle)
+            alloc::format!("護石一覧（検索: {}）[Y] で変更・空で解除", needle)
         }
     }
 
@@ -7610,10 +7874,10 @@ impl Editor {
         self.charm_delete_armed = None;
         self.charm_edit = None;
         self.message = if cleared {
-            String::from("絞り込みを解除しました（全件表示）")
+            String::from("検索を解除しました（全件表示）")
         } else {
             alloc::format!(
-                "絞り込み「{}」— {} 件。[Y] で変更、空にすると解除",
+                "検索「{}」— {} 件。[Y] で変更、空にすると解除",
                 self.charm_filter.trim(),
                 self.charms().len()
             )
@@ -8593,6 +8857,10 @@ impl Editor {
         self.item_set_warnings.clear();
         self.item_armed = None;
         self.item_menu_open = false;
+        // The byte editor names an offset in the save the undo just replaced,
+        // so it is put away with the other forms (its caret is not moved: the
+        // list underneath stays where it was).
+        self.map_edit = None;
         self.charm_delete_armed = None;
         self.csv_armed = None;
         self.review = None;
@@ -9248,7 +9516,7 @@ impl Editor {
     /// the moment a route reaches one of them, and it names the same rule the
     /// footer prints.
     pub fn pick_key_hint(&self) -> String {
-        String::from("[◀/▶] 10件送り  [▲/▼] 1件  [Y] 名前で絞る  [X] クリア  [A] 決定")
+        String::from("[◀/▶] 10件送り  [▲/▼] 1件  [Y] 名前で検索  [X] クリア  [A] 決定")
     }
 
     /// The footer line of the add stage: which item and how many.
@@ -10322,12 +10590,13 @@ impl Editor {
 
     /// The label on the one pill every screen carries (drawn by the console).
     ///
-    /// The pill opens a read-only view of the bytes - never an editor - so it
-    /// says 生データ rather than 詳細: a button named 詳細 promises a deeper
-    /// edit screen, and a user who presses one and lands on a hex dump learns
-    /// the wrong thing about the tool. クエスト改造 is the one screen whose
-    /// detail is a *file* list rather than a byte view, so there the same pill
-    /// says ファイル (its row list is files, not bytes).
+    /// The pill opens the byte view of the screen behind it: the save map's
+    /// rows, their dump, and - with [A] - the byte editor. It says 生データ
+    /// rather than 詳細 because that is what the user sees first (the bytes,
+    /// not a form); the editor behind the second press is what makes 詳細's
+    /// promise true. クエスト改造 is the one screen whose detail is a *file*
+    /// list rather than a byte view, so there the same pill says ファイル (its
+    /// row list is files, not bytes).
     pub fn detail_pill_label(&self) -> &'static str {
         if self.screen == Screen::QuestEdit {
             "[ファイル]"
@@ -10342,51 +10611,133 @@ impl Editor {
         Self::save_map_row_named(name, slot)
     }
 
-    /// The save map rows this screen lists: the current slot's, plus the rows
-    /// that belong to the save as a whole (the body and the DLC section).
+    /// The save map rows this screen lists, in the order it draws them.
+    ///
+    /// The save's own body header comes first ([MAP_HEADER_ROW]): it is not a
+    /// row of the table, but it is the one stretch of the save every other row
+    /// is resolved through, so a viewer that hides it leaves the user unable to
+    /// see why a slot base or the download section points where it does.
     pub fn save_map_rows(&self) -> Vec<usize> {
-        savemap::fields()
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| f.slot.is_none() || f.slot == Some(self.slot))
-            .map(|(i, _)| i)
-            .collect()
+        let fields = savemap::fields();
+        let mut rows = Vec::with_capacity(fields.len() + 1);
+        rows.push(MAP_HEADER_ROW);
+        rows.extend(
+            fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.slot.is_none() || f.slot == Some(self.slot))
+                .map(|(i, _)| i),
+        );
+        rows
     }
 
-    /// The [crate::savemap::fields] index under the cursor, if any.
+    /// The row under the cursor, if any.
     pub fn save_map_selected(&self) -> Option<usize> {
         let rows = self.save_map_rows();
         rows.get(self.map_cursor).copied()
     }
 
     /// The row under the cursor, as the table holds it.
+    ///
+    /// `None` for the header row - it is not in the table - and for a save the
+    /// list cannot name. The accessors below answer both kinds of row, so a
+    /// caller that draws the screen never has to special-case the header.
     pub fn save_map_field(&self) -> Option<&'static savemap::Field> {
         let index = self.save_map_selected()?;
         savemap::fields().get(index)
     }
 
-    /// Where the row under the cursor sits inside the open save, or `None`
-    /// when the save does not hold it (no such slot, no DLC section).
+    /// The name the 生データ list prints for one row.
+    pub fn save_map_row_name(&self, row: usize) -> &'static str {
+        if row == MAP_HEADER_ROW {
+            "本体ヘッダ（識別子・ポインタ）"
+        } else {
+            savemap::fields().get(row).map(|f| f.name).unwrap_or("—")
+        }
+    }
+
+    /// How many bytes one row covers.
+    pub fn save_map_row_len(&self, row: usize) -> usize {
+        if row == MAP_HEADER_ROW {
+            MAP_HEADER_LEN
+        } else {
+            savemap::fields().get(row).map(|f| f.len).unwrap_or(0)
+        }
+    }
+
+    /// What the layout calls the row's part of the save.
+    pub fn save_map_row_region(&self, row: usize) -> &'static str {
+        if row == MAP_HEADER_ROW {
+            "本体"
+        } else {
+            savemap::region(row)
+        }
+    }
+
+    /// Where the row sits inside the open save, or `None` when the save does
+    /// not hold it (no such slot, no DLC section).
+    pub fn save_map_row_offset(&self, row: usize) -> Option<usize> {
+        if row == MAP_HEADER_ROW {
+            // The header is the body's own first 0x28 bytes, so it is there
+            // exactly when a save is open.
+            return self.save.as_ref().map(|_| 0);
+        }
+        savemap::offset_in(self.save.as_ref()?, row)
+    }
+
+    /// Where the row under the cursor sits inside the open save.
     pub fn save_map_offset(&self) -> Option<usize> {
-        let index = self.save_map_selected()?;
-        savemap::offset_in(self.save.as_ref()?, index)
+        self.save_map_row_offset(self.save_map_selected()?)
     }
 
     /// The decoded one-line value of the row under the cursor.
+    ///
+    /// The header row has no decoded value of one kind, so it prints the four
+    /// numbers the rest of the tool reads out of it - which is what makes the
+    /// row worth opening at all.
     pub fn save_map_value(&self) -> Option<String> {
-        let index = self.save_map_selected()?;
-        savemap::value_text(self.save.as_ref()?, index)
+        let row = self.save_map_selected()?;
+        let save = self.save.as_ref()?;
+        if row == MAP_HEADER_ROW {
+            let bases = save.slot_bases();
+            return Some(alloc::format!(
+                "識別子 0x{:02X} / スロット基底 0x{:X}, 0x{:X}, 0x{:X} / DLC +0x{:X}",
+                save.body().first().copied().unwrap_or(0),
+                bases[0],
+                bases[1],
+                bases[2],
+                save.dlc_section_offset()
+            ));
+        }
+        savemap::value_text(save, row)
     }
 
     /// The hex dump of the row under the cursor.
+    ///
+    /// Sixteen bytes a line with the body offset in front, and a "… ほか N
+    /// バイト" tail once the row is longer than [savemap::DUMP_BYTES]. A table
+    /// row is dumped by [crate::savemap::dump_for], which resolves it through
+    /// the save's own slot and section pointers; the header row is dumped from
+    /// the body itself, because no table row names it.
     pub fn save_map_dump(&self) -> Vec<String> {
-        let Some(index) = self.save_map_selected() else {
+        let Some(row) = self.save_map_selected() else {
             return Vec::new();
         };
-        self.save
-            .as_ref()
-            .and_then(|s| savemap::dump_for(s, index))
-            .unwrap_or_default()
+        let Some(save) = self.save.as_ref() else {
+            return Vec::new();
+        };
+        let Some(offset) = self.save_map_row_offset(row) else {
+            return Vec::new();
+        };
+        if row == MAP_HEADER_ROW {
+            return dump_lines(
+                save.body(),
+                offset,
+                MAP_HEADER_LEN,
+                savemap::DUMP_COLUMNS,
+            );
+        }
+        savemap::dump_for(save, row).unwrap_or_default()
     }
 
     /// Re-cut a hex dump into `columns` bytes a line.
@@ -10444,19 +10795,24 @@ impl Editor {
     /// The line the 生データ screen prints about the row under the cursor:
     /// where it lives, how long it is and what the table calls it.
     pub fn save_map_meta(&self) -> String {
-        let Some(field) = self.save_map_field() else {
+        let Some(row) = self.save_map_selected() else {
             return String::from("行がありません");
         };
-        let offset = match self.save_map_offset() {
+        let offset = match self.save_map_row_offset(row) {
             Some(o) => alloc::format!("+0x{:06X}", o),
             None => String::from("このセーブに無し"),
         };
+        let kind = if row == MAP_HEADER_ROW {
+            "ヘッダ"
+        } else {
+            self.save_map_field().map(|f| f.kind.label()).unwrap_or("—")
+        };
         alloc::format!(
             "{} / {} / {}B / {}",
-            savemap::region(self.save_map_selected().unwrap_or(0)),
+            self.save_map_row_region(row),
             offset,
-            field.len,
-            field.kind.label()
+            self.save_map_row_len(row),
+            kind
         )
     }
 
@@ -10480,18 +10836,26 @@ impl Editor {
         };
         self.screen = Screen::SaveMap;
         self.map_cursor = 0;
+        // A form left open on the screen that was showing has no meaning here:
+        // the byte editor belongs to the row it was opened on.
+        self.map_edit = None;
         let rows = self.save_map_rows();
         let pos = row
             .or_else(|| Self::detail_row_for(from, self.slot))
             .and_then(|r| rows.iter().position(|&x| x == r))
             .unwrap_or(0);
         self.map_cursor = pos;
-        self.message = match self.save_map_field() {
-            Some(f) => alloc::format!(
-                "生データ: {} の領域です（[▲/▼] 行 / [B] か下のボタンで戻る・読み取り専用）",
-                f.name
-            ),
-            None => String::from("生データを表示できません（セーブを開いてください）"),
+        let name = self
+            .save_map_selected()
+            .map(|r| self.save_map_row_name(r))
+            .unwrap_or("—");
+        self.message = if self.save.is_some() {
+            alloc::format!(
+                "生データ: {} の領域です（[▲/▼] 行 / [A] で編集 / [B] で戻る）",
+                name
+            )
+        } else {
+            String::from("生データを表示できません（セーブを開いてください）")
         };
     }
 
@@ -10510,28 +10874,22 @@ impl Editor {
 
     /// Every key the 生データ screen answers.
     ///
-    /// Read-only on purpose: the screen shows bytes, and nothing here may
-    /// write one. [A] is the way back to the region 詳細 was pressed on, which
-    /// is the one "action" the list has.
+    /// The screen is a viewer **and** an editor: [A] opens the byte editor on
+    /// the row under the cursor, and while it is open the keys belong to the
+    /// byte (see [Editor::input_save_map_edit]). Nothing on this screen writes
+    /// a byte without the confirmation that follows.
     fn input_save_map(&mut self, key: Key) {
+        if self.map_edit.is_some() {
+            self.input_save_map_edit(key);
+            return;
+        }
         match key {
             Key::Up => self.save_map_move(-1),
             Key::Down => self.save_map_move(1),
             Key::Left => self.save_map_move(-(SAVE_MAP_JUMP as i32)),
             Key::Right => self.save_map_move(SAVE_MAP_JUMP as i32),
-            // A is the region the screen 詳細 was pressed on: after scrolling
-            // away it is one press back, and on a row that is already it the
-            // press says where it is.
             Key::A => {
-                if let Some(row) = Self::detail_row_for(self.map_return, self.slot) {
-                    let rows = self.save_map_rows();
-                    if let Some(pos) = rows.iter().position(|&x| x == row) {
-                        self.map_cursor = pos;
-                    }
-                }
-                if let Some(f) = self.save_map_field() {
-                    self.message = alloc::format!("{}: {}", f.name, self.save_map_meta());
-                }
+                self.map_edit_enter();
             }
             Key::B => {
                 self.screen = self.map_return;
@@ -10539,6 +10897,356 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    /// The keys the byte editor answers.
+    ///
+    /// The four directions belong to the byte, not to the list: ▲/▼ move the
+    /// caret (clamped inside the row), ◀/▶ ask for a value one lower / higher.
+    /// [A] writes what was asked for, or - with nothing waiting - closes the
+    /// editor, which is the same start / end shape the arena editor has. [B]
+    /// drops the change it asked for before it drops the screen.
+    fn input_save_map_edit(&mut self, key: Key) {
+        match key {
+            Key::Up => self.map_edit_move(-1),
+            Key::Down => self.map_edit_move(1),
+            Key::Left => {
+                self.map_edit_step(-1);
+            }
+            Key::Right => {
+                self.map_edit_step(1);
+            }
+            Key::A => {
+                if !self.map_edit_confirm() {
+                    self.map_edit_exit();
+                }
+            }
+            Key::B => {
+                if !self.map_change_cancel() {
+                    self.map_edit = None;
+                    self.screen = self.map_return;
+                    self.message = String::from("生データから戻りました");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The region the byte editor works on: its body offset and length.
+    fn map_region(&self) -> Option<(usize, usize)> {
+        let row = self.save_map_selected()?;
+        let offset = self.save_map_row_offset(row)?;
+        let len = self.save_map_row_len(row);
+        if len == 0 {
+            return None;
+        }
+        Some((offset, len))
+    }
+
+    /// Is the byte editor open?
+    pub const fn map_edit_open(&self) -> bool {
+        self.map_edit.is_some()
+    }
+
+    /// [A] on the list: open the byte editor on the row under the cursor.
+    ///
+    /// Refused with a line that says why when the row is not in this save (an
+    /// empty slot, a save with no download section), because an editor whose
+    /// first press writes nothing and says nothing is the "無反応" bug.
+    pub fn map_edit_enter(&mut self) -> bool {
+        if self.map_region().is_none() {
+            self.message = if self.save.is_none() {
+                String::from("生データを編集するには先にセーブを開いてください")
+            } else {
+                String::from("この行はこのセーブに無いので編集できません")
+            };
+            return false;
+        }
+        self.map_edit = Some(MapEdit::default());
+        let row = self.save_map_selected().unwrap_or(MAP_HEADER_ROW);
+        self.message = alloc::format!(
+            "編集モード: {}（[▲/▼] 1バイト移動 / [◀/▶] 値の変更 / [A] 決定 / [B] 戻る）",
+            self.save_map_row_name(row)
+        );
+        true
+    }
+
+    /// Close the byte editor without writing anything.
+    pub fn map_edit_exit(&mut self) -> bool {
+        if self.map_edit.take().is_some() {
+            self.message = String::from("閲覧モードに戻りました（[A] で編集）");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move the caret inside the region, clamped at both ends.
+    ///
+    /// It cannot leave the row: the region is the only thing the row names, and
+    /// a caret past its end would write a byte under an offset the dump does
+    /// not show. Moving drops a change that was waiting on the byte it left,
+    /// the same rule the equipment delete follows when the cursor moves.
+    pub fn map_edit_move(&mut self, delta: i32) {
+        let Some((_, len)) = self.map_region() else {
+            return;
+        };
+        let Some(mut edit) = self.map_edit else {
+            return;
+        };
+        let next = (edit.byte as i64 + delta as i64).clamp(0, len as i64 - 1) as usize;
+        if next == edit.byte {
+            // At the end of the row: still say where the caret is instead of
+            // answering with silence.
+            self.message = self.map_edit_position();
+            return;
+        }
+        edit.byte = next;
+        edit.pending = None;
+        self.map_edit = Some(edit);
+        self.message = self.map_edit_position();
+    }
+
+    /// The right stick's up / down: one page ([MAP_EDIT_PAGE]) of the region.
+    pub fn map_edit_page(&mut self, delta: i32) {
+        self.map_edit_move(delta.saturating_mul(MAP_EDIT_PAGE as i32));
+    }
+
+    /// The right stick's left / right: the start or the end of the region.
+    pub fn map_edit_jump(&mut self, forward: bool) {
+        let Some((_, len)) = self.map_region() else {
+            return;
+        };
+        let Some(mut edit) = self.map_edit else {
+            return;
+        };
+        edit.byte = if forward { len - 1 } else { 0 };
+        edit.pending = None;
+        self.map_edit = Some(edit);
+        self.message = self.map_edit_position();
+    }
+
+    /// [◀] / [▶] on a byte: ask for the value one lower / higher.
+    ///
+    /// Nothing is written here. The press only sets [MapEdit::pending] and the
+    /// status line spells the change out, word for word as the task asks
+    /// ([MapChange::line]); [Editor::map_edit_confirm] is the press that writes
+    /// it. Stepping again while a change waits moves the *proposed* value, so
+    /// one confirmation is still one undo step.
+    pub fn map_edit_step(&mut self, delta: i32) -> bool {
+        let Some((offset, len)) = self.map_region() else {
+            return false;
+        };
+        let Some(edit) = self.map_edit else {
+            return false;
+        };
+        let Some(body) = self.save.as_ref().map(|s| s.body()) else {
+            return false;
+        };
+        let at = offset + edit.byte.min(len - 1);
+        let Some(&current) = body.get(at) else {
+            return false;
+        };
+        // A waiting change steps from what it already proposes, so the pairs the
+        // confirmation shows stay 0x00, 0x01, … 0xFF, 0x00 rather than chasing
+        // the byte that is not written yet.
+        let base = edit.pending.map(|p| p.to).unwrap_or(current);
+        let to = (base as i32 + delta).rem_euclid(256) as u8;
+        self.map_edit = Some(MapEdit {
+            byte: edit.byte,
+            pending: Some(MapChange {
+                offset: at,
+                from: current,
+                to,
+            }),
+        });
+        let mut line = MapChange {
+            offset: at,
+            from: current,
+            to,
+        }
+        .line();
+        if let Some(warning) = self.map_byte_warning() {
+            line = alloc::format!("{} 警告: {}（禁止はしません）", line, warning);
+        }
+        self.message = line;
+        true
+    }
+
+    /// [A] with a change waiting: write it, as one whole-save undo step.
+    ///
+    /// The save is snapshotted **before** the byte is written, so the undo step
+    /// is the state the user saw when they confirmed; one confirmation is one
+    /// step, whatever number of steps the proposal took to reach.
+    pub fn map_edit_confirm(&mut self) -> bool {
+        let Some(edit) = self.map_edit else {
+            return false;
+        };
+        let Some(change) = edit.pending else {
+            return false;
+        };
+        if self.save.is_none() {
+            return false;
+        }
+        self.push_undo("生データのバイト");
+        let Some(save) = self.save.as_mut() else {
+            return false;
+        };
+        let body = save.body_mut();
+        if change.offset >= body.len() {
+            self.message = alloc::format!(
+                "オフセット 0x{:06X} はセーブの外なので書き換えません",
+                change.offset
+            );
+            return false;
+        }
+        body[change.offset] = change.to;
+        self.dirty = true;
+        if let Some(e) = self.map_edit.as_mut() {
+            e.pending = None;
+        }
+        self.message = alloc::format!(
+            "オフセット 0x{:06X} を 0x{:02X} → 0x{:02X} に変えました（[L 長押し] で元に戻せます）",
+            change.offset, change.from, change.to
+        );
+        true
+    }
+
+    /// [B] with a change waiting: drop it. Returns false when nothing was
+    /// waiting, which is how the caller knows the press is the way out.
+    pub fn map_change_cancel(&mut self) -> bool {
+        let Some(mut edit) = self.map_edit else {
+            return false;
+        };
+        if edit.pending.take().is_some() {
+            self.map_edit = Some(edit);
+            self.message = String::from("変更を取り消しました（何も書き換えていません）");
+            true
+        } else {
+            self.map_edit = Some(edit);
+            false
+        }
+    }
+
+    /// "バイト 13 / 512（+0x00000C = 0x1F）" - where the caret is.
+    ///
+    /// The proposed value is shown while a change waits, so the line and the
+    /// dump's bracket always agree.
+    pub fn map_edit_position(&self) -> String {
+        let Some((offset, len)) = self.map_region() else {
+            return String::from("行がありません");
+        };
+        let Some(edit) = self.map_edit else {
+            return String::from("閲覧中");
+        };
+        let at = offset + edit.byte.min(len.saturating_sub(1));
+        let current = self
+            .save
+            .as_ref()
+            .and_then(|s| s.body().get(at))
+            .copied()
+            .unwrap_or(0);
+        let shown = edit.pending.map(|p| p.to).unwrap_or(current);
+        alloc::format!(
+            "バイト {} / {}（+0x{:06X} = 0x{:02X}）",
+            edit.byte + 1,
+            len,
+            at,
+            shown
+        )
+    }
+
+    /// Why the byte under the caret is a structural one, as one short line.
+    ///
+    /// Three kinds of byte the save format treats as structure rather than
+    /// data: the body header and its pointers ([map_offset_zone]), the size /
+    /// id pair at the start of every download-quest record, and the "写し" rows
+    /// the save screen re-merges from the real fields. The container header's
+    /// file-name CRC is classified by [map_file_zone]; it is not part of the
+    /// body, so no row can reach it and nothing here writes it.
+    ///
+    /// A warning, never a refusal: the task asks for the warning, and a user
+    /// who knows what they are doing may still make the change.
+    pub fn map_byte_warning(&self) -> Option<String> {
+        let Some((offset, _)) = self.map_region() else {
+            return None;
+        };
+        let edit = self.map_edit?;
+        let at = offset + edit.byte;
+        if let Some(zone) = map_offset_zone(at) {
+            return Some(String::from(zone));
+        }
+        let row = self.save_map_selected()?;
+        let field = savemap::fields().get(row)?;
+        // The eight byte header of a download-quest record: the length and the
+        // quest id the reader trusts when it walks the array.
+        if let savemap::FieldKind::Record { size, .. } = field.kind {
+            // The array is identified by its record size and its total length,
+            // not by its offset: a [Field] prints the canonical body offset,
+            // while the download section's rows count from a pointer the save
+            // carries, so the table's own constant is not the number to test.
+            if size == dlc::QUEST_SLOT_SIZE
+                && field.len == dlc::QUEST_SLOTS * dlc::QUEST_SLOT_SIZE
+                && (at - offset) % size < 8
+            {
+                return Some(String::from("レコードのヘッダ（サイズ・ID）"));
+            }
+        }
+        // The copies the save screen shows: the game re-merges them from the
+        // real fields, so a hand edit is a value that disagrees with itself.
+        if field.name.contains("写し") {
+            return Some(String::from("セーブ画面の写し（本編の値と食い違います）"));
+        }
+        None
+    }
+
+    /// The window the 生データ editor draws: `max_lines` lines of
+    /// [MAP_EDIT_LINE] bytes around the caret.
+    ///
+    /// The caret byte is bracketed - `[1F]` - and while a change is armed the
+    /// bracket shows what it would become, so the byte the confirmation is
+    /// about is the one the eye lands on. The window follows the caret: the
+    /// equipment box is 72,000 bytes and the old dump always showed its first
+    /// few lines.
+    pub fn map_edit_dump(&self, max_lines: usize) -> Vec<String> {
+        let Some((offset, len)) = self.map_region() else {
+            return Vec::new();
+        };
+        let Some(save) = self.save.as_ref() else {
+            return Vec::new();
+        };
+        let body = save.body();
+        let max_lines = max_lines.max(1);
+        let total = (len + MAP_EDIT_LINE - 1) / MAP_EDIT_LINE;
+        let caret_byte = self.map_edit.map(|e| e.byte).unwrap_or(0).min(len - 1);
+        let caret_line = caret_byte / MAP_EDIT_LINE;
+        let mut first = caret_line.saturating_sub(max_lines / 2);
+        if first + max_lines > total {
+            first = total.saturating_sub(max_lines);
+        }
+        let proposed = self.map_edit.and_then(|e| e.pending);
+        let mut out = Vec::with_capacity(max_lines);
+        for line in first..total.min(first + max_lines) {
+            let from = line * MAP_EDIT_LINE;
+            let n = MAP_EDIT_LINE.min(len - from);
+            let mut text = alloc::format!("{:06X}  ", offset + from);
+            for i in 0..n {
+                if i > 0 {
+                    text.push(' ');
+                }
+                let index = from + i;
+                let at = offset + index;
+                let raw = body.get(at).copied().unwrap_or(0);
+                if index == caret_byte {
+                    let shown = proposed.map(|p| p.to).unwrap_or(raw);
+                    text.push_str(&alloc::format!("[{:02X}]", shown));
+                } else {
+                    text.push_str(&alloc::format!("{:02X}", raw));
+                }
+            }
+            out.push(text);
+        }
+        out
     }
 
     /// The one-line description at the top of the screen.
@@ -10557,13 +11265,13 @@ impl Editor {
             Screen::Slots => "キャラを選んで [A] でこのキャラを編集。[◀/▶] で枠、[Y] で一括MAX。",
             Screen::Char => "行を選んで [◀/▶] で変更、[A] で最大。[生データ] でこの画面のバイト。",
             Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[生データ] でこの画面のバイト。",
-            Screen::ItemPick => "名前で絞って [A] で決定。[B] で元の画面へ。",
-            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[検索] で種類やスキル名から絞れます。",
+            Screen::ItemPick => "名前で検索して [A] で決定。[B] で元の画面へ。",
+            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[検索] で種類やスキル名を検索できます。",
             Screen::CharmEdit => "行ごとに [A] で操作（スキルは一覧）、[◀/▶] で値。[B] で一覧へ。",
-            Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を絞れます。",
-            Screen::Equip => "装備を選んで [A] で編集、[Y] で名前を絞る、[＋] で新規。[生データ] で装備BOXのバイト。",
+            Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を検索できます。",
+            Screen::Equip => "装備を選んで [A] で編集、[Y] で名前を検索、[＋] で新規。[生データ] で装備BOXのバイト。",
             Screen::EquipEdit => "行ごとに [A] で選択、[◀/▶] で10件/値。[B] で一覧へ。",
-            Screen::JewelPick => "装飾品を選んで [A] で決定。[Y] で名前を絞れます。",
+            Screen::JewelPick => "装飾品を選んで [A] で決定。[Y] で名前を検索できます。",
             Screen::EquipPick => "装備を名前で選んで [A] で決定。[-] で種別を切り替え。",
             Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
             Screen::Hunts => "狩猟記録の行を選んで [◀/▶] で増減。[Y] で項目切替。",
@@ -10581,11 +11289,11 @@ impl Editor {
             Screen::QuestEdit => "4つのタブでクエストを作ります。[ファイル] でファイル単位の画面へ。",
             Screen::ArcList => ".arc を選んで [A] で開きます。[Y] でセーブへ導入、[-] で書き出し。",
             Screen::ArcEntries => "クエストの構成ファイルです。[A] で中身、[L/R] でタブ切替。",
-            Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み幅。",
+            Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み。",
             Screen::Mib => "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。",
             Screen::Gmd => "クエストの文章です。[A] でテキスト編集、[X] で保存。",
             Screen::Check => "クエストの検査結果です。[A] で直せる項目を修正します。",
-            Screen::SaveMap => "生データ（セーブマップ）です。読み取り専用で、[B] か下のボタンで元の画面へ。",
+            Screen::SaveMap => "行を選んで [A] で編集、[◀/▶] で値の変更・[▲/▼] で1バイト移動。[B] で戻る。",
         }
     }
 
@@ -12079,7 +12787,7 @@ impl Editor {
         }
         let part = (e.field - 1).min(crate::myset::EQUIP_SET_PARTS - 1);
         alloc::format!(
-            "{} — [◀/▶] 装備BOX を巡回 / [A] 決定 / [-] 2回で外す",
+            "{} — [◀/▶] 装備BOX を巡回 / [A] 決定 / [-] 2回で解除",
             crate::myset::PART_NAMES[part]
         )
     }
@@ -13214,7 +13922,7 @@ impl Editor {
         self.screen = Screen::JewelPick;
         if search {
             self.message = String::from(
-                "装飾品名で絞り込みます（空にすると一覧が戻ります）",
+                "装飾品名で検索します（空にすると一覧が戻ります）",
             );
             self.pending_text = Some((TEXT_JEWEL_FILTER, self.jewel_pick_filter.clone()));
         } else {
@@ -14034,10 +14742,10 @@ impl Editor {
         self.equip_cursor = 0;
         self.equip_delete_armed = None;
         self.message = if cleared {
-            String::from("絞り込みを解除しました（全件表示）")
+            String::from("検索を解除しました（全件表示）")
         } else {
             format!(
-                "絞り込み「{}」— {} 件。[Y] で変更、空にすると解除",
+                "検索「{}」— {} 件。[Y] で変更、空にすると解除",
                 self.equip_filter.trim(),
                 self.equipment().len()
             )
@@ -15266,41 +15974,46 @@ impl Editor {
                 }
             }
             // 詳細: the raw bytes of the screen 詳細 was pressed on, named the
-            // way the save is laid out. Read-only, so nothing here has a value
-            // box to edit.
+            // way the save is laid out. The list is the map; [A] opens the byte
+            // editor, whose caret and pending change are drawn under it.
             Screen::SaveMap => {
                 let rows = self.save_map_rows();
                 push(
                     &mut out,
                     alloc::format!(
-                        "SAVE MAP slot {}  {} rows  read only",
+                        "SAVE MAP slot {}  {} rows  {}{}",
                         self.slot + 1,
-                        rows.len()
+                        rows.len(),
+                        if self.map_edit_open() { "edit" } else { "view + edit" },
+                        ""
                     ),
                     false,
                     false,
                 );
-                let fields = savemap::fields();
                 let start = self.map_cursor.saturating_sub(4).min(rows.len().saturating_sub(1));
                 for (pos, &idx) in rows.iter().enumerate().skip(start).take(SAVE_MAP_VISIBLE) {
-                    let f = &fields[idx];
                     push(
                         &mut out,
                         alloc::format!(
                             "  {:>3}  {:<26} {:>7}B  {}",
                             pos + 1,
-                            f.name,
-                            f.len,
-                            savemap::region(idx)
+                            self.save_map_row_name(idx),
+                            self.save_map_row_len(idx),
+                            self.save_map_row_region(idx)
                         ),
                         true,
                         pos == self.map_cursor,
                     );
                 }
-                if let Some(f) = self.save_map_field() {
+                let selected = self.save_map_selected();
+                if let Some(row) = selected {
                     push(
                         &mut out,
-                        alloc::format!("  {}  {}", f.name, self.save_map_meta()),
+                        alloc::format!(
+                            "  {}  {}",
+                            self.save_map_row_name(row),
+                            self.save_map_meta()
+                        ),
                         false,
                         false,
                     );
@@ -15309,13 +16022,28 @@ impl Editor {
                             push(&mut out, alloc::format!("  = {}", v), false, false);
                         }
                     }
-                    for line in self.save_map_dump().into_iter().take(6) {
+                    let dump = if self.map_edit_open() {
+                        self.map_edit_dump(8)
+                    } else {
+                        self.save_map_dump().into_iter().take(6).collect()
+                    };
+                    for line in dump {
                         push(&mut out, alloc::format!("  {}", line), false, false);
+                    }
+                    if self.map_edit_open() {
+                        push(&mut out, alloc::format!("  {}", self.map_edit_position()), false, false);
+                        if let Some(w) = self.map_byte_warning() {
+                            push(&mut out, alloc::format!("  ! {}", w), false, false);
+                        }
                     }
                 }
                 push(
                     &mut out,
-                    String::from("  Up/Down row  Left/Right 10 rows  A origin  B back"),
+                    String::from(if self.map_edit_open() {
+                        "  Up/Down byte  Left/Right value  A confirm  B cancel/back"
+                    } else {
+                        "  Up/Down row  Left/Right 10 rows  A edit  B back"
+                    }),
                     false,
                     false,
                 );
@@ -15677,7 +16405,7 @@ impl Editor {
                     push(
                         &mut out,
                         String::from(
-                            "  Up/Down 行  Left/Right 装備  A 決定  - 外す(2回)  Y 警告  B 一覧",
+                            "  Up/Down 行  Left/Right 装備  A 決定  - 解除(2回)  Y 警告  B 一覧",
                         ),
                         false,
                         false,
@@ -18847,9 +19575,10 @@ mod tests {
         assert_eq!(ed.save_map_field().map(|f| f.name), Some("勲章（解禁マップ）"));
     }
 
-    /// The 詳細 screen shows the row's bytes and writes none of them.
+    /// The 詳細 screen shows the row's bytes, and the byte editor behind [A]
+    /// writes none of them until the change is confirmed.
     #[test]
-    fn the_detail_screen_is_read_only_and_shows_the_rows_bytes() {
+    fn the_detail_screen_shows_the_rows_bytes_and_writes_none_until_confirmed() {
         let mut ed = editor_with_a_blank_save();
         // A byte nobody else would produce, so a write anywhere shows up.
         let at = ed
@@ -18865,14 +19594,20 @@ mod tests {
         let before = ed.save.as_ref().expect("save").body().to_vec();
         assert_eq!(before[at], 0xAB);
 
-        // Every key the screen answers, and then some.
+        // [A] opens the editor; the four directions then belong to the byte,
+        // and the first ◀/▶ only *asks* for a change.
+        ed.input(Key::A);
+        assert!(ed.map_edit_open(), "{}", ed.message);
+        ed.input(Key::Down);
+        ed.input(Key::Right);
+        assert!(
+            ed.map_edit.and_then(|e| e.pending).is_some(),
+            "the press has to ask: {}",
+            ed.message
+        );
+        // Every other key the screen answers, and then some, before the second
+        // [A] - none of them may write, and none may answer the question.
         for key in [
-            Key::Up,
-            Key::Down,
-            Key::Left,
-            Key::Right,
-            Key::A,
-            Key::B,
             Key::X,
             Key::Y,
             Key::Minus,
@@ -18886,10 +19621,20 @@ mod tests {
         assert_eq!(
             ed.save.as_ref().expect("save").body(),
             before.as_slice(),
-            "nothing on 詳細 may write the save"
+            "nothing on 詳細 may write the save before the confirmation"
         );
         assert!(!ed.dirty);
         assert!(ed.take_write().is_none(), "no write may be queued either");
+
+        // [B] drops the waiting change instead of writing it, and the byte the
+        // change would have touched is still what it was.
+        ed.input(Key::B);
+        assert!(ed.map_edit.and_then(|e| e.pending).is_none());
+        assert_eq!(
+            ed.save.as_ref().expect("save").body(),
+            before.as_slice(),
+            "[B] must not write"
+        );
 
         // The dump is the row's bytes, at the row's offset.
         ed.open_save_map(Screen::Equip);
@@ -18976,8 +19721,13 @@ mod tests {
         let guide = ed.screen_guide();
         assert!(guide.contains("[A]"), "{}", guide);
         assert!(guide.contains("[生データ]"), "{}", guide);
+        // 生データ is a viewer *and* an editor now, and its guide says so: the
+        // screen no longer calls itself 読み取り専用 after the byte editor landed.
         ed.screen = Screen::SaveMap;
-        assert!(ed.screen_guide().contains("読み取り専用"));
+        let guide = ed.screen_guide();
+        assert!(guide.contains("[A]"), "{}", guide);
+        assert!(guide.contains("編集"), "{}", guide);
+        assert!(!guide.contains("読み取り専用"), "{}", guide);
     }
 
     // ---------------------------------------------------------------- the five
@@ -19475,7 +20225,7 @@ mod tests {
         let hits = ed.charms();
         assert_eq!(hits.len(), 1, "only the talisman that carries {needle}");
         assert_eq!(hits[0].index, 1, "the second box record");
-        assert!(ed.charm_filter_heading().contains("絞り込み"), "{}", ed.charm_filter_heading());
+        assert!(ed.charm_filter_heading().contains("検索"), "{}", ed.charm_filter_heading());
         assert_eq!(ed.cursor, 0, "the cursor goes back to the top of the new list");
 
         // An empty answer is the whole box again, and says so.
@@ -19503,5 +20253,310 @@ mod tests {
             Some(TEXT_CHARM_FILTER),
             "the pill asks the I/O layer, it does not filter by itself"
         );
+    }
+
+    // ---------------------------------------------------------------- 生データ
+    // The byte editor: the screen used to be a viewer, and the 詳細 pill
+    // promised a settings view a user could not change. These pin what the
+    // second press does.
+
+    /// The list starts with the body header, which is not a row of the table
+    /// but is the one stretch every other row is resolved through.
+    #[test]
+    fn the_save_map_starts_with_the_body_header_row() {
+        let mut ed = editor_with_a_blank_save();
+        ed.open_save_map(Screen::Equip);
+        let rows = ed.save_map_rows();
+        assert_eq!(rows[0], MAP_HEADER_ROW, "the header is the first row");
+        ed.map_cursor = 0;
+        assert_eq!(
+            ed.save_map_row_name(MAP_HEADER_ROW),
+            "本体ヘッダ（識別子・ポインタ）"
+        );
+        assert_eq!(ed.save_map_row_len(MAP_HEADER_ROW), MAP_HEADER_LEN);
+        assert_eq!(ed.save_map_row_offset(MAP_HEADER_ROW), Some(0));
+        assert_eq!(ed.save_map_offset(), Some(0));
+        assert!(ed.save_map_field().is_none(), "the header is not a table row");
+        assert!(ed.save_map_meta().contains("ヘッダ"), "{}", ed.save_map_meta());
+        let dump = ed.save_map_dump();
+        assert!(!dump.is_empty(), "the header has bytes to dump");
+        assert!(dump[0].starts_with("000000"), "{}", dump[0]);
+        let value = ed.save_map_value().expect("the header prints its four numbers");
+        assert!(value.contains("識別子"), "{}", value);
+        assert!(value.contains("スロット基底"), "{}", value);
+        assert!(value.contains("DLC"), "{}", value);
+        // And it is the save the parser accepted: the identifier is 0xC6.
+        assert_eq!(ed.save.as_ref().expect("save").body()[0], 0xC6);
+    }
+
+    /// [A] opens the editor, [A] again closes it, and [B] takes the change it
+    /// asked for before it takes the screen - a confirmation must not leave
+    /// with the dialog that asked it.
+    #[test]
+    fn a_opens_the_byte_editor_and_b_takes_the_change_or_the_screen_back() {
+        let mut ed = editor_with_a_blank_save();
+        ed.open_save_map(Screen::Equip);
+        ed.input(Key::A);
+        assert!(ed.map_edit_open(), "{}", ed.message);
+        assert_eq!(ed.screen, Screen::SaveMap);
+        // Nothing waiting: [B] is the way back to the screen 詳細 was pressed on.
+        ed.input(Key::B);
+        assert!(!ed.map_edit_open());
+        assert_eq!(ed.screen, Screen::Equip);
+
+        // A second [A] closes the editor without leaving the screen.
+        ed.open_save_map(Screen::Equip);
+        ed.input(Key::A);
+        assert!(ed.map_edit_open());
+        ed.input(Key::A);
+        assert!(!ed.map_edit_open(), "{}", ed.message);
+        assert_eq!(ed.screen, Screen::SaveMap, "the first A only closes the editor");
+
+        // With a change waiting, [B] drops the change and stays - the second
+        // [B] is the one that goes back.
+        ed.input(Key::A);
+        ed.input(Key::Right);
+        assert!(ed.map_edit.and_then(|e| e.pending).is_some());
+        ed.input(Key::B);
+        assert!(ed.map_edit_open(), "the change is dropped, not the screen");
+        assert!(ed.map_edit.and_then(|e| e.pending).is_none());
+        assert!(ed.message.contains("取り消しました"), "{}", ed.message);
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::Equip);
+    }
+
+    /// The caret cannot leave the row: the region is the only thing the row
+    /// names, and a byte past its end would be written under an offset the
+    /// dump does not show.
+    #[test]
+    fn the_byte_caret_never_leaves_the_row() {
+        let mut ed = editor_with_a_blank_save();
+        // 振動 is one byte: there is nowhere to move at all.
+        let row = Editor::save_map_row_named("振動", 0).expect("the one byte row");
+        assert_eq!(ed.save_map_row_len(row), 1);
+        ed.open_save_map_at(Screen::Char, Some(row));
+        ed.input(Key::A);
+        for _ in 0..6 {
+            ed.input(Key::Up);
+            ed.input(Key::Down);
+        }
+        assert_eq!(ed.map_edit.expect("open").byte, 0);
+
+        // 名前 is 32 bytes: the caret stops at the last one and at the first.
+        let row = Editor::save_map_row_named("名前", 0).expect("the name row");
+        assert_eq!(ed.save_map_row_len(row), 32);
+        ed.open_save_map_at(Screen::Char, Some(row));
+        ed.input(Key::A);
+        for _ in 0..40 {
+            ed.input(Key::Down);
+        }
+        assert_eq!(ed.map_edit.expect("open").byte, 31);
+        for _ in 0..40 {
+            ed.input(Key::Up);
+        }
+        assert_eq!(ed.map_edit.expect("open").byte, 0);
+        // The window follows the caret and never names a byte outside the row.
+        let offset = ed.save_map_row_offset(row).expect("the row lands in this save");
+        let lines = ed.map_edit_dump(8);
+        assert_eq!(lines.len(), 4, "32 bytes are four lines of 8");
+        assert!(lines[0].starts_with(&format!("{:06X}", offset)), "{}", lines[0]);
+        let last = &lines[lines.len() - 1];
+        let last_at = usize::from_str_radix(last.split_whitespace().next().unwrap(), 16).unwrap();
+        assert_eq!(last_at, offset + 24, "the last line starts at +24");
+        assert!(
+            lines.iter().all(|l| {
+                let at = usize::from_str_radix(l.split_whitespace().next().unwrap(), 16).unwrap();
+                at >= offset && at < offset + 32
+            }),
+            "every line is inside the row: {:?}",
+            lines
+        );
+    }
+
+    /// One byte, one confirmation, one undo step - and the sentence the task
+    /// quotes, with both sides of the change in hex.
+    #[test]
+    fn a_byte_change_is_asked_for_in_words_and_one_press_writes_it() {
+        let mut ed = editor_with_a_blank_save();
+        let row = Editor::save_map_row_named("画面の明るさ", 0).expect("the brightness row");
+        ed.open_save_map_at(Screen::Char, Some(row));
+        let before = ed.save.as_ref().expect("save").options().brightness;
+        ed.input(Key::A);
+        ed.input(Key::Right);
+
+        // The question, word for word, with the offset and both bytes.
+        let line = ed.message.clone();
+        assert!(
+            line.contains(&format!("オフセット 0x{:06X}", crate::save::OFF_BRIGHTNESS)),
+            "{}",
+            line
+        );
+        assert!(line.contains(&format!("0x{:02X} → 0x{:02X}", before, before.wrapping_add(1))), "{}", line);
+        assert!(line.contains("に変えます。よろしいですか"), "{}", line);
+        assert!(!ed.dirty, "asking is not writing");
+        assert_eq!(ed.undo_depth(), 0);
+
+        // The confirmation writes it, as one step.
+        ed.input(Key::A);
+        assert!(ed.dirty);
+        assert_eq!(ed.undo_depth(), 1);
+        assert_eq!(ed.undo_label(), Some("生データのバイト"));
+        assert!(ed.message.contains("変えました"), "{}", ed.message);
+        assert_eq!(
+            ed.save.as_ref().expect("save").options().brightness,
+            before.wrapping_add(1),
+            "the region's own getter reads the new byte"
+        );
+
+        // Asking again while a change waits moves the proposal, not the stack:
+        // one confirmation is still one step.
+        ed.input(Key::Right);
+        assert_eq!(ed.undo_depth(), 1, "asking never pushes");
+        ed.input(Key::A);
+        assert_eq!(ed.undo_depth(), 2);
+        assert_eq!(
+            ed.save.as_ref().expect("save").options().brightness,
+            before.wrapping_add(2)
+        );
+
+        // The whole-save undo puts the byte, and the getter, back.
+        assert!(ed.undo_last());
+        assert_eq!(
+            ed.save.as_ref().expect("save").options().brightness,
+            before.wrapping_add(1)
+        );
+        assert!(ed.undo_last());
+        assert_eq!(ed.save.as_ref().expect("save").options().brightness, before);
+        assert!(!ed.map_edit_open(), "the undo puts the editor away as well");
+    }
+
+    /// The other getter: a 4 byte field edited one byte at a time still reads
+    /// through its own accessor, and the undo takes it back.
+    #[test]
+    fn a_byte_of_a_u32_changes_what_the_field_getter_reads() {
+        let mut ed = editor_with_a_blank_save();
+        let row = Editor::save_map_row_named("所持金", 0).expect("the funds row");
+        ed.open_save_map_at(Screen::Char, Some(row));
+        let before = ed
+            .save
+            .as_ref()
+            .and_then(|s| s.read_character(0))
+            .map(|c| c.funds)
+            .expect("a character");
+        // The caret starts on the low byte; +1 is +1 zenny.
+        ed.input(Key::A);
+        ed.input(Key::Right);
+        ed.input(Key::A);
+        let after = ed
+            .save
+            .as_ref()
+            .and_then(|s| s.read_character(0))
+            .map(|c| c.funds)
+            .expect("a character");
+        assert_eq!(after, before.wrapping_add(1), "the low byte is +1 zenny");
+        assert!(ed.undo_last());
+        let back = ed
+            .save
+            .as_ref()
+            .and_then(|s| s.read_character(0))
+            .map(|c| c.funds)
+            .expect("a character");
+        assert_eq!(back, before);
+    }
+
+    /// A structural byte is warned about, not refused: the header and the
+    /// pointers, the size / id pair of a download quest record, and the save
+    /// screen's copies. The container header's CRC is classified too, though
+    /// the body editor cannot reach it.
+    #[test]
+    fn editing_a_structural_byte_warns_and_is_still_allowed() {
+        assert!(
+            map_file_zone(MAP_CRC_FILE_OFFSET).unwrap().contains("CRC"),
+            "the file-name CRC is its own zone"
+        );
+        assert!(map_file_zone(0).unwrap().contains("ヘッダ"));
+
+        let mut ed = editor_with_a_blank_save();
+        // The header row: +0x00 is the identifier, +0x04 the first slot base.
+        ed.open_save_map(Screen::Equip);
+        ed.map_cursor = 0;
+        assert!(ed.map_edit_enter(), "{}", ed.message);
+        let warning = ed.map_byte_warning().expect("the identifier is structural");
+        assert!(warning.contains("ヘッダ"), "{}", warning);
+        ed.map_edit_move(4);
+        let warning = ed.map_byte_warning().expect("the slot base is structural");
+        assert!(warning.contains("ポインタ"), "{}", warning);
+        // The step says so beside the question, and the confirmation still
+        // writes: a warning is not a refusal.
+        let before = ed.save.as_ref().expect("save").body()[4];
+        ed.input(Key::Right);
+        assert!(ed.message.contains("警告"), "{}", ed.message);
+        assert!(ed.message.contains("禁止はしません"), "{}", ed.message);
+        ed.input(Key::A);
+        assert_ne!(ed.save.as_ref().expect("save").body()[4], before);
+        assert!(ed.undo_last(), "the change is one step and comes back");
+
+        // The first eight bytes of a download-quest record are its size and id;
+        // the bytes after them are the record's payload and are not warned.
+        let row = Editor::save_map_row_named("DLC クエスト（205 枠）", 0)
+            .expect("the quest array row");
+        ed.open_save_map_at(Screen::Equip, Some(row));
+        assert!(ed.map_edit_enter(), "{}", ed.message);
+        assert_eq!(
+            ed.map_byte_warning().as_deref(),
+            Some("レコードのヘッダ（サイズ・ID）")
+        );
+        ed.map_edit_move(MAP_EDIT_LINE as i32);
+        assert!(ed.map_byte_warning().is_none(), "the payload is ordinary data");
+
+        // Ordinary data never warns.
+        let row = Editor::save_map_row_named("画面の明るさ", 0).expect("the brightness row");
+        ed.open_save_map_at(Screen::Options, Some(row));
+        assert!(ed.map_edit_enter(), "{}", ed.message);
+        assert!(ed.map_byte_warning().is_none());
+    }
+
+    /// アイテムBOX: the name search has no key of its own (Y is the 空きも表示
+    /// toggle), so it is a pill, and an empty answer is the whole box again.
+    #[test]
+    fn the_item_box_can_be_searched_by_name_and_an_empty_answer_clears_it() {
+        let mut save = crate::save::empty_switch_save();
+        save.set_slot_used(0, true);
+        let mut items = save.read_item_box(0).expect("a blank box");
+        items[0] = ItemSlot { id: 1, count: 5 };
+        items[1] = ItemSlot { id: 2, count: 7 };
+        save.write_item_box(0, &items).expect("write the box");
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        ed.screen = Screen::Items;
+
+        // The pill asks the keyboard; the answer narrows the list.
+        ed.request_item_box_filter();
+        assert_eq!(
+            ed.take_text_request().map(|(id, _)| id),
+            Some(TEXT_ITEM_BOX_FILTER),
+            "the pill asks the I/O layer"
+        );
+        let needle = crate::gamedata::ITEM_NAME_LIST[1].to_string();
+        ed.apply_item_box_filter(needle.clone());
+        let visible = ed.visible_items();
+        assert!(visible.contains(&0), "the named item stays: {:?}", visible);
+        assert!(!visible.contains(&1), "the other item is filtered out: {:?}", visible);
+        assert_eq!(ed.cursor, 0, "the cursor goes to the top of the new list");
+        let line = ed.item_box_search_line(visible.len());
+        assert!(line.starts_with("検索: "), "{}", line);
+        assert!(line.contains(&needle), "{}", line);
+        assert!(ed.message.contains("検索"), "{}", ed.message);
+
+        // An empty answer is the whole box again (both stacks: the 空きも表示
+        // toggle is off, so the zero slots are hidden either way).
+        ed.apply_item_box_filter(String::new());
+        assert_eq!(ed.visible_items().len(), 2);
+        assert!(ed.item_box_search_line(2).is_empty());
+        assert!(ed.message.contains("解除"), "{}", ed.message);
+
+        // A word nothing carries is an empty list, not an unfiltered one.
+        ed.apply_item_box_filter(String::from("そんなアイテムはない"));
+        assert!(ed.visible_items().is_empty());
     }
 }

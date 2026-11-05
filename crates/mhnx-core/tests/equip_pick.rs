@@ -315,7 +315,9 @@ fn the_picker_moves_one_row_ten_rows_and_answers_y_and_x() {
     let footer = ed.footer_hint();
     assert!(footer.contains("10件"), "{}", footer);
     assert!(footer.contains("種別"), "{}", footer);
-    assert!(footer.contains("名前で絞る"), "{}", footer);
+    // One word for the action everywhere: 検索 (it used to say 名前で絞る here
+    // and 名前で検索 on the equipment form, for the same key and the same box).
+    assert!(footer.contains("名前で検索"), "{}", footer);
 }
 
 #[test]
