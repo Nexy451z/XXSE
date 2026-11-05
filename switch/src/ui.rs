@@ -1,8 +1,18 @@
 //! Redesigned Switch UI/UX Engine for XXSE (`XXSE-1.nro` & `XXSE-2.nro`).
 //!
 //! Architecture & Ergonomics:
-//!   - `ZL / ZR`: Cycle the 6 top-level Sections (`ファイル`, `ハンター`, `アイテム`, `護石・装備`, `オトモ・記録`, `クエスト`).
+//!   - `ZL / ZR`: Cycle the 7 top-level Sections. Six of them are the work
+//!     (`セーブ`, `キャラ`, `アイテム`, `護石・装備`, `クエスト`, `オトモ・記録`);
+//!     the seventh is `詳細・ツール` and holds the screens that read the file
+//!     rather than the play (`セーブマップ` / `CSV入出力` / `環境設定`).
+//!     Nothing was removed: every screen that used to sit beside the everyday
+//!     ones still exists, one press further to the right.
 //!   - `L / R`: Cycle the Sub-Tabs of the current Section (NEVER switches character slot unexpectedly!).
+//!   - The strip under the sub-tabs is the one-line guide for the screen
+//!     (`Editor::screen_guide`), so a first-time player is told what `[A]` does.
+//!   - `R 長押し` (or the `[詳細]` pill on the sub-tab bar): the `詳細` view of
+//!     the screen that is showing - the save map row that screen edits, with
+//!     its hex dump (`Screen::SaveMap`). Read-only, and `[B]` comes back.
 //!   - `A`: Always Open / Edit / Choose from list (unified across every screen, never deletes!).
 //!   - `◀ / ▶`: Always adjust numeric values (`±step`).
 //!   - `右スティック`: `▲ / ▼` turn a page (as many rows as the screen shows),
@@ -46,7 +56,7 @@ use mhnx_core::hbedit::{
     PalicoEquipRow, PalicoSkillRow, Screen, ARENA_COLUMNS, ARENA_PARTS, ARENA_ROWS, CHAR_FIELDS,
     CHARM_EDIT_ROWS, CONSOLE_SAVE, CSV_DIR, GUILD_TAB_ARENA, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT,
     ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE,
-    PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_REQUESTS, SET_EDIT_ROWS,
+    PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS,
     SET_ROW_NAME, STEPS,
     // The scroll model: see mhnx_core::hbedit for the arithmetic and its tests.
     list_end, page_move, scroll_track, ScrollBar,
@@ -178,14 +188,30 @@ const fn white_or_dark(c: Color) -> Color {
     }
 }
 
-// Layout geometry (1280 x 720) — Full-width 2-tier header + body + footer
+// Layout geometry (1280 x 720) — Full-width 2-tier header + guide + body + footer
 const TOP_SEC_H: i32 = 48;
 const SUB_TAB_Y: i32 = TOP_SEC_H;
 const SUB_TAB_H: i32 = 44;
-const CONTENT_Y: i32 = TOP_SEC_H + SUB_TAB_H + 10; // 102
+/// The one-line guide strip under the sub-tab bar (Editor::screen_guide).
+///
+/// 22px, and CONTENT_Y takes the whole of it rather than adding a gap: that is
+/// what keeps the nine-row list layout every screen is drawn around. The glyphs
+/// of a 17px line are shorter than the line box, so the strip reads as padded
+/// rather than cramped.
+const GUIDE_Y: i32 = SUB_TAB_Y + SUB_TAB_H; // 92
+const GUIDE_H: i32 = 22;
+const CONTENT_Y: i32 = GUIDE_Y + GUIDE_H; // 114
 const FOOTER_Y: i32 = 668;
 const FOOTER_H: i32 = 52;
-const CONTENT_H: i32 = FOOTER_Y - CONTENT_Y - 8; // 558
+const CONTENT_H: i32 = FOOTER_Y - CONTENT_Y - 8; // 546
+
+/// The [詳細] pill on the sub-tab bar: the one button every screen carries.
+///
+/// It sits between the [R] button (which ends at 850 at the widest) and the
+/// screen's own tool pills (which start at 964), so it is in the same band as
+/// the keys and never moves from screen to screen.
+const DETAIL_X: i32 = 856;
+const DETAIL_W: i32 = 100;
 const MAIN_X: i32 = 20;
 const MAIN_W: i32 = 1240;
 
@@ -217,30 +243,41 @@ const TAP_SLOP_PX: i32 = 18;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MainSection {
-    File = 0,
+    /// Opening a save and converting it: the first thing a session does.
+    Save = 0,
     Hunter = 1,
     Items = 2,
     Gear = 3,
-    PalicoRecord = 4,
-    Quest = 5,
+    Quest = 4,
+    PalicoRecord = 5,
+    /// 詳細・ツール: the screens that read the file rather than the play.
+    ///
+    /// It is a section, not a hidden mode, because the two-tier navigation has
+    /// to be able to say where the technical screens went: one press of ZR past
+    /// オトモ・記録 and they are all there. The everyday work never needs it.
+    Tools = 6,
 }
 
-const MAIN_SECTIONS: [(MainSection, &str); 6] = [
-    (MainSection::File, "ファイル"),
-    (MainSection::Hunter, "ハンター"),
+/// The top row, in the order the pad walks it.
+///
+/// The everyday sections come first and the technical one last, which is the
+/// whole shape of the design: a player who never opens 詳細・ツール can still
+/// do every edit, and a player who wants the bytes knows where they are.
+const MAIN_SECTIONS: [(MainSection, &str); 7] = [
+    (MainSection::Save, "セーブ"),
+    (MainSection::Hunter, "キャラ"),
     (MainSection::Items, "アイテム"),
     (MainSection::Gear, "護石・装備"),
-    (MainSection::PalicoRecord, "オトモ・記録"),
     (MainSection::Quest, "クエスト"),
+    (MainSection::PalicoRecord, "オトモ・記録"),
+    (MainSection::Tools, "詳細・ツール"),
 ];
 
 pub fn section_of(screen: Screen) -> MainSection {
     match screen {
-        // The CSV screen is the fourth tab of the file section: it lists a
-        // folder of files, the same kind of thing the save list does.
-        Screen::SaveList | Screen::Convert | Screen::Options | Screen::Csv => {
-            MainSection::File
-        }
+        // Opening a save and converting it are the two file-level jobs a
+        // session starts with; 環境設定 and CSV are tools now.
+        Screen::SaveList | Screen::Convert => MainSection::Save,
         Screen::Slots | Screen::Char => MainSection::Hunter,
         Screen::Items | Screen::ItemPick => MainSection::Items,
         Screen::Charms
@@ -251,12 +288,6 @@ pub fn section_of(screen: Screen) -> MainSection {
         | Screen::JewelPick
         | Screen::EquipPick
         | Screen::Sets => MainSection::Gear,
-        // The progress screen is the fifth tab of the records section: awards,
-        // requests and quest bits are what the character has done, the same
-        // kind of thing the hunt record and the card are.
-        Screen::Roster | Screen::Palico | Screen::Hunts | Screen::Guild | Screen::Progress => {
-            MainSection::PalicoRecord
-        }
         // クエスト改造 is the section's first tab and the screen an opened
         // quest lands on; the file screens behind 詳細 stay in the same
         // section, one press away.
@@ -269,6 +300,15 @@ pub fn section_of(screen: Screen) -> MainSection {
         | Screen::Gmd
         | Screen::EntryView
         | Screen::Check => MainSection::Quest,
+        // The progress screen is the fifth tab of the records section: awards,
+        // requests and quest bits are what the character has done, the same
+        // kind of thing the hunt record and the card are.
+        Screen::Roster | Screen::Palico | Screen::Hunts | Screen::Guild | Screen::Progress => {
+            MainSection::PalicoRecord
+        }
+        // 詳細・ツール: the three screens that read the file rather than the
+        // play. 生データ is the one every record screen's [詳細] lands on.
+        Screen::SaveMap | Screen::Csv | Screen::Options => MainSection::Tools,
     }
 }
 
@@ -277,6 +317,26 @@ fn is_quest_inner(screen: Screen) -> bool {
         screen,
         Screen::ArcEntries | Screen::Mib | Screen::Gmd | Screen::EntryView | Screen::Check
     )
+}
+
+/// Is there a 詳細 view behind this screen?
+///
+/// The pill is drawn on every screen so the bar never changes shape, but it is
+/// only lit where pressing it does something: the record screens (a save map
+/// row), クエスト改造 (its file screens), and the save map itself (which says
+/// it is already showing). 詳細 must never be a button that answers nothing.
+fn detail_available(ed: &Editor) -> bool {
+    // A pick list is a mode of the screen under it, and jumping out of it would
+    // leave a pick half answered: the pill dims rather than refusing a press it
+    // invited.
+    if matches!(
+        ed.screen,
+        Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
+    ) {
+        return false;
+    }
+    matches!(ed.screen, Screen::QuestEdit | Screen::SaveMap)
+        || Editor::detail_field_name(ed.screen).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -338,6 +398,8 @@ pub enum UiAction {
     SemPreset(u8),
     /// クエスト改造 -> the file-by-file screens behind 詳細.
     QuestDetail,
+    /// The `[詳細]` pill / `R 長押し`: the raw bytes behind this screen.
+    OpenDetail,
     InstallAllPalicoes,
     TogglePalicoLang,
     ExtractOfficialArcs,
@@ -643,17 +705,22 @@ impl GuiState {
     // ZL / ZR: Main Section Cycling (6 Top-Level Categories)
     // -----------------------------------------------------------------------
     pub fn cycle_sidebar_tab(&mut self, ed: &mut Editor, forward: bool) {
+        // With no save open only the three sections that work on a card are
+        // offered: the save list, the .arc list, and the tools (the CSV folder
+        // is readable without a save). The four that edit a character slot are
+        // left out rather than opening on "open a save first".
         let allowed: &[MainSection] = if ed.save.is_some() {
             &[
-                MainSection::File,
+                MainSection::Save,
                 MainSection::Hunter,
                 MainSection::Items,
                 MainSection::Gear,
-                MainSection::PalicoRecord,
                 MainSection::Quest,
+                MainSection::PalicoRecord,
+                MainSection::Tools,
             ]
         } else {
-            &[MainSection::File, MainSection::Quest]
+            &[MainSection::Save, MainSection::Quest, MainSection::Tools]
         };
         let cur = section_of(ed.screen);
         let pos = allowed.iter().position(|&s| s == cur).unwrap_or(0);
@@ -707,12 +774,18 @@ impl GuiState {
         // the screen without going through that screen's keys, so without this
         // the menu stayed open over the next screen and came back with it.
         ed.dismiss_item_menu();
-        if sec != MainSection::File && sec != MainSection::Quest && ed.save.is_none() {
+        // The three sections a card can answer without a save are the file
+        // side of the tool (save list, .arc list, CSV folder).
+        let needs_save = !matches!(
+            sec,
+            MainSection::Save | MainSection::Quest | MainSection::Tools
+        );
+        if needs_save && ed.save.is_none() {
             ed.message = String::from("先にセーブデータを開いてください");
             return;
         }
         match sec {
-            MainSection::File => {
+            MainSection::Save => {
                 ed.screen = Screen::SaveList;
                 ed.cursor = 0;
             }
@@ -744,6 +817,17 @@ impl GuiState {
                 } else {
                     ed.screen = Screen::ArcList;
                     ed.cursor = 0;
+                }
+            }
+            // 詳細・ツール opens on 生データ when there is a save to read: the
+            // section's first tab. Without one it opens the CSV folder, which
+            // is the one tool that lists something on a bare card.
+            MainSection::Tools => {
+                if ed.save.is_some() {
+                    let from = ed.screen;
+                    ed.open_save_map(from);
+                } else {
+                    ed.open_csv();
                 }
             }
         }
@@ -796,14 +880,14 @@ impl GuiState {
         }
 
         match section_of(ed.screen) {
-            MainSection::File => {
-                let labels: &'static [&'static str] =
-                    &["セーブ一覧", "形式変換", "環境設定", "CSV入出力"];
+            // セーブ: the two file-level jobs. 環境設定 and CSV moved to
+            // 詳細・ツール, which is what made this row two tabs instead of
+            // four - the everyday row no longer mixes them in.
+            MainSection::Save => {
+                let labels: &'static [&'static str] = &["セーブ一覧", "形式変換"];
                 let active = match ed.screen {
                     Screen::SaveList => 0,
                     Screen::Convert => 1,
-                    Screen::Options => 2,
-                    Screen::Csv => 3,
                     _ => 0,
                 };
                 (labels, active)
@@ -888,7 +972,11 @@ impl GuiState {
                 (labels, active)
             }
             MainSection::Quest => {
+                // クエスト改造 is the section's first tab, because it is the
+                // screen the work is done on: the four list tabs beside it are
+                // where a quest is found, and [A] on one lands on this tab.
                 let labels: &'static [&'static str] = &[
+                    "クエスト改造",
                     "セーブ内",
                     "公式(189)",
                     "没クエ(34)",
@@ -896,9 +984,24 @@ impl GuiState {
                     "固定装備",
                 ];
                 let active = match ed.screen {
-                    Screen::SaveQuests => self.quest_tab.min(2),
-                    Screen::ArcList => 3,
-                    Screen::QuestEquip => 4,
+                    Screen::SaveQuests => 1 + self.quest_tab.min(2),
+                    Screen::ArcList => 4,
+                    Screen::QuestEquip => 5,
+                    // QuestEdit has its own four tabs (基本/モンスター/…), so
+                    // this arm is only reached when it is not showing.
+                    _ => 0,
+                };
+                (labels, active)
+            }
+            // 詳細・ツール: the technical screens, kept out of the everyday
+            // row. セーブマップ is 生データ - the same screen every record
+            // screen's [詳細] opens.
+            MainSection::Tools => {
+                let labels: &'static [&'static str] = &["セーブマップ", "CSV入出力", "環境設定"];
+                let active = match ed.screen {
+                    Screen::SaveMap => 0,
+                    Screen::Csv => 1,
+                    Screen::Options => 2,
                     _ => 0,
                 };
                 (labels, active)
@@ -1001,19 +1104,37 @@ impl GuiState {
         }
 
         match section_of(ed.screen) {
-            MainSection::File => match idx {
+            MainSection::Save => match idx {
                 0 => {
                     ed.screen = Screen::SaveList;
                     ed.cursor = 0;
                 }
-                1 => {
+                _ => {
                     if ed.save.is_none() {
                         ed.message = String::from("変換するには先にセーブデータを開いてください");
                     } else {
                         ed.screen = Screen::Convert;
                     }
                 }
-                2 => {
+            },
+            // 詳細・ツール. The CSV tab lists a folder, so it opens even with
+            // no save loaded: the user may want to see what is on the card
+            // first. The other two need a save and say so.
+            MainSection::Tools => match idx {
+                0 => {
+                    if ed.save.is_none() {
+                        ed.message = String::from("生データを見るには先にセーブデータを開いてください");
+                    } else {
+                        let from = if ed.screen == Screen::SaveMap {
+                            ed.map_return
+                        } else {
+                            ed.screen
+                        };
+                        ed.open_save_map(from);
+                    }
+                }
+                1 => ed.open_csv(),
+                _ => {
                     if ed.save.is_none() {
                         ed.message = String::from("設定を開くには先にセーブデータを開いてください");
                     } else {
@@ -1021,9 +1142,6 @@ impl GuiState {
                         ed.option_cursor = 0;
                     }
                 }
-                // The CSV tab lists a folder, so it opens even with no save
-                // loaded: the user may want to see what is on the card first.
-                _ => ed.open_csv(),
             },
             MainSection::Hunter => match idx {
                 0 => {
@@ -1131,16 +1249,34 @@ impl GuiState {
                 }
             },
             MainSection::Quest => match idx {
-                0..=2 => {
+                // クエスト改造: the screen an opened quest lands on. With no
+                // .arc loaded the tab goes to the list a quest is opened from
+                // and says so, rather than offering a screen with no quest.
+                0 => {
+                    if ed.arc.is_some() {
+                        ed.enter_quest_edit();
+                    } else if ed.save.is_some() {
+                        self.quest_tab = 0;
+                        ed.refresh_quest_titles();
+                        ed.screen = Screen::SaveQuests;
+                        ed.message =
+                            String::from("改造するクエストを選んで [A] で開いてください");
+                    } else {
+                        ed.screen = Screen::ArcList;
+                        ed.cursor = 0;
+                        ed.message = String::from(".arc を選んで [A] で開くと改造画面になります");
+                    }
+                }
+                1..=3 => {
                     if ed.save.is_none() {
                         ed.message = String::from("先にセーブデータを開いてください");
                         return;
                     }
-                    self.quest_tab = idx;
+                    self.quest_tab = idx - 1;
                     ed.refresh_quest_titles();
                     ed.screen = Screen::SaveQuests;
                 }
-                3 => {
+                4 => {
                     ed.screen = Screen::ArcList;
                     ed.cursor = 0;
                 }
@@ -1577,6 +1713,84 @@ impl GuiState {
         ed.message = String::from("詳細: ファイル単位の画面です（[B] でクエスト改造へ戻ります）");
     }
 
+    /// 詳細: the raw bytes behind the screen that is showing.
+    ///
+    /// Every record screen answers this the same way - the save map row for
+    /// the region it edits - which is why the button can sit on all of them
+    /// without a destination per screen. The screens that already *are* a
+    /// detail view answer with a message rather than leaving a dead button.
+    pub fn open_detail(&mut self, ed: &mut Editor) {
+        // クエスト改造's 詳細 is its own set of file screens, not the save map.
+        if ed.screen == Screen::QuestEdit {
+            self.open_quest_detail(ed);
+            return;
+        }
+        if ed.screen == Screen::SaveMap {
+            ed.message = String::from("生データを表示中です（[B] で戻ります）");
+            return;
+        }
+        if matches!(
+            ed.screen,
+            Screen::ArcList
+                | Screen::ArcEntries
+                | Screen::EntryView
+                | Screen::Mib
+                | Screen::Gmd
+                | Screen::Check
+        ) {
+            ed.message = String::from("この画面はクエストの詳細表示です（[B] で戻ります）");
+            return;
+        }
+        // A pick list is a mode of the screen under it: jumping away from it
+        // would leave a pick half answered.
+        if matches!(
+            ed.screen,
+            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
+        ) {
+            ed.message = String::from("選択中は詳細を開けません（[B] で戻ってから）");
+            return;
+        }
+        if ed.save.is_none() {
+            ed.message = String::from("生データを見るには先にセーブデータを開いてください");
+            return;
+        }
+        // A form left open on a screen that is no longer drawn is the trap the
+        // section jumps already close; the same three rules apply here.
+        self.close_set_form(ed);
+        self.close_palico_panel(ed);
+        ed.dismiss_item_menu();
+        let from = ed.screen;
+        // Two screens have one region per view, and the view lives in this
+        // layer, so this is the one place that can resolve them.
+        let row = match from {
+            Screen::Sets => {
+                let name = if self.sets_tab == 0 {
+                    "アイテムマイセット"
+                } else {
+                    "装備マイセット"
+                };
+                Editor::save_map_row_named(name, ed.slot)
+            }
+            Screen::Progress => {
+                let name = match ed.progress_view() {
+                    PROGRESS_REQUESTS => "依頼フラグ",
+                    PROGRESS_QUESTS => "クエスト（クリア）",
+                    _ => "勲章（解禁マップ）",
+                };
+                Editor::save_map_row_named(name, ed.slot)
+            }
+            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => {
+                Editor::save_map_row_named("闘技大会の記録", ed.slot)
+            }
+            _ => Editor::detail_row_for(from, ed.slot),
+        };
+        if row.is_none() {
+            ed.message = String::from("この画面には対応する生データがありません");
+            return;
+        }
+        ed.open_save_map_at(from, row);
+    }
+
     pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
         // Picker screens use L/R for fast ±10 page jump; EVERY other screen uses L/R for Sub-Tab switching!
         if matches!(key, Key::L | Key::R) {
@@ -1641,9 +1855,15 @@ impl GuiState {
         // search filter). The set editor used to take X for its warnings, which
         // cost the pad its only way to save from that screen; the warnings moved
         // to Y instead.
+        // 生データ is read-only: X has no job there, and a global save from a
+        // screen that has nothing to save would be a key that lies.
         let x_is_the_screens = matches!(
             ed.screen,
-            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
+            Screen::ItemPick
+                | Screen::SkillPick
+                | Screen::JewelPick
+                | Screen::EquipPick
+                | Screen::SaveMap
         );
         if key == Key::X && !x_is_the_screens {
             self.apply_action(ed, UiAction::QuickSave);
@@ -2468,6 +2688,7 @@ impl GuiState {
                 }
             }
             UiAction::QuestDetail => self.open_quest_detail(ed),
+            UiAction::OpenDetail => self.open_detail(ed),
             UiAction::OpenMibPicker(field_idx) => {
                 let _ = self.open_mib_picker(ed, field_idx);
             }
@@ -2766,6 +2987,8 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
             None => ed.palico_cursor,
         },
         Screen::Options => ed.option_cursor,
+        // 生データ: a position in the filtered save map, not a body offset.
+        Screen::SaveMap => ed.map_cursor,
         _ => ed.cursor,
     }
 }
@@ -2862,6 +3085,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         },
         Screen::Options => 4,
         Screen::Convert => 0,
+        Screen::SaveMap => ed.save_map_rows().len(),
     }
 }
 
@@ -3024,6 +3248,7 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
             }
         }
         Screen::Options => ed.option_cursor = clamped,
+        Screen::SaveMap => ed.map_cursor = clamped,
         _ => ed.cursor = clamped,
     }
 }
@@ -3490,13 +3715,16 @@ impl GuiState {
         // 1. Top 2-Tier Navigation Header (y = 0..92)
         self.draw_top_nav(c, ed);
 
-        // 2. Main Content Workspace (y = CONTENT_Y..FOOTER_Y)
+        // 2. The one-line guide for this screen (y = 92..114)
+        self.draw_guide(c, ed);
+
+        // 3. Main Content Workspace (y = CONTENT_Y..FOOTER_Y)
         self.draw_content(c, ed);
 
-        // 3. Minimal Unified Footer Bar (y = FOOTER_Y..720)
+        // 4. Minimal Unified Footer Bar (y = FOOTER_Y..720)
         self.draw_footer(c, ed);
 
-        // 4. Modal Overlays (MIB Picker / Built-in OSK)
+        // 5. Modal Overlays (MIB Picker / Built-in OSK)
         //
         // The two panels cover most of the frame but not all of it, and the
         // screen under them still has live tap targets - including the footer's
@@ -3527,6 +3755,42 @@ impl GuiState {
         c.present();
     }
 
+    /// The one-line guide under the sub-tab bar.
+    ///
+    /// It is the sentence a first-time player needs before touching anything:
+    /// what [A] does on this screen, and where the bytes are when they want
+    /// them. The words come from the state machine (Editor::screen_guide), so
+    /// a screen cannot change without its guide following it, and the note on
+    /// the right names the pad route to the same [詳細] pill.
+    fn draw_guide(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        c.rect(0, GUIDE_Y, 1280, GUIDE_H, t.bg_subbar);
+        c.hline(0, GUIDE_Y, 1280, t.border_subtle);
+        // A small accent bar at the left, the same shape the selected sub-tab
+        // has, so the line reads as part of the navigation rather than as a
+        // message from the program.
+        c.rect(MAIN_X - 6, GUIDE_Y + 4, 3, GUIDE_H - 8, t.accent_secondary);
+
+        let mut right = 1262;
+        // Not on 生データ itself: the note would advertise the screen that is
+        // already showing.
+        if detail_available(ed) && ed.screen != Screen::SaveMap {
+            let note = "[R長押し] 詳細";
+            let nw = c.text_width_sized(note, FontSize::Small);
+            c.text_right(right, GUIDE_Y + 2, note, t.text_muted, FontSize::Small);
+            right -= nw + 16;
+        }
+        let room = (right - (MAIN_X + 4)).max(120);
+        c.text_clipped(
+            MAIN_X + 4,
+            GUIDE_Y + 2,
+            room,
+            ed.screen_guide(),
+            t.text_secondary,
+            FontSize::Small,
+        );
+    }
+
     fn draw_top_nav(&mut self, c: &mut Canvas, ed: &Editor) {
         let t = theme();
         let active_sec = section_of(ed.screen);
@@ -3541,26 +3805,32 @@ impl GuiState {
         btn_text(c, 14, 8, 44, 32, "ZL", t.accent_primary, FontSize::Small);
         self.add_hit(14, 8, 44, 32, UiAction::CycleSection(false));
 
-        // 6 Main Sections (x = 66..894)
+        // 7 Main Sections, sized to their own label (x = 66..~785)
+        //
+        // Variable width is what let the seventh section exist: six fixed
+        // 132px tabs fill the row, and the technical section has to be one of
+        // the seven rather than a hidden mode. The labels are short, so the
+        // row ends well before the slot badge and every tab still reads whole.
         let mut sx = 66i32;
-        let sec_w = 132i32;
         for &(sec, label) in MAIN_SECTIONS.iter() {
             let is_active = sec == active_sec;
+            let tw = (c.text_width_sized(label, FontSize::Small) + 22).clamp(64, 132);
             if is_active {
-                c.round_rect(sx, 6, sec_w, 36, 6, t.bg_selected);
-                c.rect(sx + 12, TOP_SEC_H - 3, sec_w - 24, 3, t.accent_primary);
+                c.round_rect(sx, 6, tw, 36, 6, t.bg_selected);
+                c.rect(sx + 10, TOP_SEC_H - 3, tw - 20, 3, t.accent_primary);
             }
             let fg = if is_active { t.text_primary } else { t.text_secondary };
-            btn_text(c, sx, 6, sec_w, 36, label, fg, FontSize::Small);
-            self.add_hit(sx, 6, sec_w, 36, UiAction::GotoSection(sec));
-            sx += sec_w + 6;
+            btn_text(c, sx, 6, tw, 36, label, fg, FontSize::Small);
+            self.add_hit(sx, 6, tw, 36, UiAction::GotoSection(sec));
+            sx += tw + 6;
         }
 
-        // [ZR] button
-        c.round_rect(sx, 8, 44, 32, t.corner_r, t.bg_btn);
-        c.round_rect_border(sx, 8, 44, 32, t.corner_r, 1, t.border_subtle);
-        btn_text(c, sx, 8, 44, 32, "ZR", t.accent_primary, FontSize::Small);
-        self.add_hit(sx, 8, 44, 32, UiAction::CycleSection(true));
+        // [ZR] button, straight after the last section
+        let zr_x = sx;
+        c.round_rect(zr_x, 8, 44, 32, t.corner_r, t.bg_btn);
+        c.round_rect_border(zr_x, 8, 44, 32, t.corner_r, 1, t.border_subtle);
+        btn_text(c, zr_x, 8, 44, 32, "ZR", t.accent_primary, FontSize::Small);
+        self.add_hit(zr_x, 8, 44, 32, UiAction::CycleSection(true));
 
         // Right Status Area: Active Slot badge + [X] Save Pill
         //
@@ -3569,8 +3839,10 @@ impl GuiState {
         // tabs and the save pill is 212, so the one-line badge cut every name
         // to three glyphs and "..". The badge takes the whole gap and puts the
         // slot number on its own line, which leaves the name its full 188px.
-        let slot_x = 900;
-        let slot_w = 208;
+        // The badge takes the gap the sections left, so a wider row of short
+        // labels gives the name more room rather than leaving a hole.
+        let slot_x = (zr_x + 50).min(900).max(zr_x + 48);
+        let slot_w = (1108 - slot_x).max(0);
         let slot_name = ed
             .save
             .as_ref()
@@ -3637,7 +3909,10 @@ impl GuiState {
             let is_active = idx == active_sub;
             let tw = c.text_width_sized(label, FontSize::Small) + 24;
             let w = tw.clamp(84, 156);
-            if sub_x + w > 880 {
+            // 800 rather than 880: the [R] button and the [詳細] pill share the
+            // right end of this bar now, and a label that reached under them
+            // would be a label nobody could tap.
+            if sub_x + w > 800 {
                 break;
             }
             let bg = if is_active { t.bg_selected } else { t.bg_subbar };
@@ -3656,6 +3931,25 @@ impl GuiState {
         c.round_rect_border(sub_x + 2, sy, 40, sh, 6, 1, t.border_subtle);
         btn_text(c, sub_x + 2, sy, 40, sh, "R", t.accent_primary, FontSize::Small);
         self.add_hit(sub_x + 2, sy, 40, sh, UiAction::CycleSubTab(true));
+
+        // [詳細] - the one button every screen carries.
+        //
+        // It is on this bar because this bar is where the screens are named:
+        // the raw bytes of the screen that is showing are one press away from
+        // wherever the user is, and the same pill is the touch target for the
+        // pad's [R 長押し]. The label dims on the screens that have no bytes of
+        // their own (the file lists and the detail screens themselves) instead
+        // of disappearing, so the row never changes shape.
+        let detail_here = detail_available(ed);
+        let (d_bg, d_fg, d_bd) = if detail_here {
+            (t.bg_btn_primary, t.text_primary, t.accent_primary)
+        } else {
+            (t.bg_btn, t.text_muted, t.border_subtle)
+        };
+        c.round_rect(DETAIL_X, sy, DETAIL_W, sh, 5, d_bg);
+        c.round_rect_border(DETAIL_X, sy, DETAIL_W, sh, 5, 1, d_bd);
+        btn_text(c, DETAIL_X, sy, DETAIL_W, sh, "[詳細]", d_fg, FontSize::Small);
+        self.add_hit(DETAIL_X, sy, DETAIL_W, sh, UiAction::OpenDetail);
 
         // Right side of Sub-Tab Bar: Concise Tool Pills (x = 964..1266)
         self.draw_sub_bar_quick_tools(c, ed, sy, sh);
@@ -4082,7 +4376,210 @@ impl GuiState {
             Screen::Gmd => self.draw_gmd(c, ed),
             Screen::EntryView => self.draw_entry_view(c, ed),
             Screen::Check => self.draw_check(c, ed),
+            Screen::SaveMap => self.draw_save_map(c, ed),
         }
+    }
+
+    /// 生データ (Screen::SaveMap): the save map's rows on the left, the selected
+    /// row's bytes on the right.
+    ///
+    /// Read-only, so the inspector has no stepper and no value box: the only
+    /// things a press can do on this screen are move the cursor and go back.
+    /// The list is wider than the usual 796 because the hex dump needs the room
+    /// - a 16 byte row is 57 characters, and 57 characters of the small font do
+    /// not fit in the 428px inspector the other screens use.
+    fn draw_save_map(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        let fields = mhnx_core::savemap::fields();
+        let rows = ed.save_map_rows();
+        let total = rows.len();
+
+        c.text_clipped(
+            MAIN_X + 4,
+            CONTENT_Y,
+            620,
+            "生データ（セーブマップ）",
+            t.text_primary,
+            FontSize::Medium,
+        );
+        c.text_right(
+            1262,
+            CONTENT_Y + 3,
+            &format!("スロット {} / {} 行 / 読み取り専用", ed.slot + 1, total),
+            t.text_secondary,
+            FontSize::Small,
+        );
+
+        let body_y = CONTENT_Y + 30;
+        let body_h = FOOTER_Y - body_y - 10;
+        const ROW_H: i32 = 50;
+        const VIS: usize = 9;
+        let list_w = 600i32;
+        let insp_x = MAIN_X + list_w + 16; // 636
+        let insp_w = 1262 - insp_x; // 626
+        let start = window_start(ed.map_cursor, total, VIS);
+
+        // ---- left: the named stretches of the save
+        c.round_rect(MAIN_X, body_y, list_w, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(MAIN_X, body_y, list_w, body_h, t.corner_r, 1, t.border_subtle);
+        c.hline(MAIN_X + 12, body_y + 30, list_w - 24, t.border_subtle);
+
+        for i in 0..VIS {
+            let pos = start + i;
+            if pos >= total {
+                break;
+            }
+            let idx = rows[pos];
+            let f = &fields[idx];
+            let ry = body_y + 34 + (i as i32) * ROW_H;
+            let selected = pos == ed.map_cursor;
+            let bg = if selected {
+                t.bg_selected
+            } else if i % 2 == 1 {
+                t.bg_row_odd
+            } else {
+                t.bg_row_even
+            };
+            c.round_rect(MAIN_X + 8, ry, list_w - 16, ROW_H - 4, 5, bg);
+            self.add_hit(MAIN_X + 8, ry, list_w - 16, ROW_H - 4, UiAction::SelectRow(pos));
+            if selected {
+                c.rect(MAIN_X + 8, ry + 6, 3, ROW_H - 16, t.accent_primary);
+            }
+            let title_col = if selected { t.text_primary } else { t.text_secondary };
+            // The name leads and the offset follows it: a reader looks for
+            // 装備ボックス before whatever lives at 0x62EE.
+            c.text_clipped(MAIN_X + 20, ry + 12, 300, f.name, title_col, FontSize::Medium);
+            let at = ed
+                .save
+                .as_ref()
+                .and_then(|s| mhnx_core::savemap::offset_in(s, idx));
+            let at_text = match at {
+                Some(o) => format!("+0x{:06X}", o),
+                None => String::from("このセーブに無し"),
+            };
+            c.text_clipped(
+                MAIN_X + 330,
+                ry + 15,
+                150,
+                &at_text,
+                t.text_muted,
+                FontSize::Small,
+            );
+            c.text_right(
+                MAIN_X + list_w - 72,
+                ry + 15,
+                &format!("{}B", f.len),
+                t.text_secondary,
+                FontSize::Small,
+            );
+            c.text_right(
+                MAIN_X + list_w - 16,
+                ry + 15,
+                &format!("#{:03}", pos + 1),
+                t.text_muted,
+                FontSize::Small,
+            );
+        }
+        if total == 0 {
+            c.text_clipped(
+                MAIN_X + 20,
+                body_y + 44,
+                list_w - 40,
+                "このセーブに並べられる領域がありません",
+                t.text_muted,
+                FontSize::Small,
+            );
+        }
+        let ids: Vec<usize> = rows.iter().enumerate().map(|(i, _)| i).collect();
+        self.draw_list_bar(
+            c,
+            ed,
+            MAIN_X,
+            list_w,
+            body_y + 34,
+            (VIS as i32) * ROW_H,
+            ScrollBar::new(total, VIS, start),
+            &ids,
+            false,
+        );
+
+        // ---- right: what that row is, and its bytes
+        c.round_rect(insp_x, body_y, insp_w, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(insp_x, body_y, insp_w, body_h, t.corner_r, 1, t.border_subtle);
+
+        let Some(field) = ed.save_map_field() else {
+            c.text_clipped(
+                insp_x + 20,
+                body_y + 24,
+                insp_w - 40,
+                "行を選んでください",
+                t.text_muted,
+                FontSize::Small,
+            );
+            return;
+        };
+        c.text_clipped(
+            insp_x + 20,
+            body_y + 18,
+            insp_w - 40,
+            field.name,
+            t.text_primary,
+            FontSize::Medium,
+        );
+        c.text_clipped(
+            insp_x + 20,
+            body_y + 50,
+            insp_w - 40,
+            &ed.save_map_meta(),
+            t.accent_secondary,
+            FontSize::Small,
+        );
+        if let Some(value) = ed.save_map_value() {
+            if !value.is_empty() {
+                c.text_clipped(
+                    insp_x + 20,
+                    body_y + 74,
+                    insp_w - 40,
+                    &format!("値: {}", value),
+                    t.text_secondary,
+                    FontSize::Small,
+                );
+            }
+        }
+        c.hline(insp_x + 16, body_y + 100, insp_w - 32, t.border_subtle);
+
+        // The dump: 16 bytes a line, at the one size that fits 57 characters.
+        let dump = ed.save_map_dump();
+        if dump.is_empty() {
+            c.text_clipped(
+                insp_x + 20,
+                body_y + 112,
+                insp_w - 40,
+                "このセーブにこの領域はありません",
+                t.text_muted,
+                FontSize::Small,
+            );
+        } else {
+            let line_h = c.line_height_sized(FontSize::Small).max(18);
+            let room = (body_h - 124) / line_h.max(1);
+            for (i, line) in dump.iter().take(room.max(1) as usize).enumerate() {
+                c.text_clipped(
+                    insp_x + 20,
+                    body_y + 112 + (i as i32) * line_h,
+                    insp_w - 40,
+                    line,
+                    t.text_primary,
+                    FontSize::Small,
+                );
+            }
+        }
+        c.text_right(
+            insp_x + insp_w - 20,
+            body_y + body_h - 26,
+            &format!("{} / {} 行", ed.map_cursor + 1, total),
+            t.text_muted,
+            FontSize::Small,
+        );
     }
 
     // -----------------------------------------------------------------------

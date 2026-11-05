@@ -968,6 +968,9 @@ impl Painter {
                 unsafe { sys::consoleClear() };
                 sys::log_line("XXSE - MHXX save editor (Switch)");
                 sys::log_line("=====================================================");
+                // The same one-line guide the canvas draws under the bar, so
+                // the fallback screen tells a first-time player the same thing.
+                sys::log_line(ed.screen_guide());
                 for l in &lines {
                     sys::log_line(&format!("{}{}", if l.cursor { ">" } else { " " }, l.text));
                 }
@@ -1035,6 +1038,8 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Palico => "配信オトモ",
         Options => "設定",
         Csv => "CSV 入出力",
+        // 詳細: the bytes behind the screen 詳細 was pressed on.
+        SaveMap => "生データ（セーブマップ）",
     }
 }
 
@@ -1261,6 +1266,13 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "適用(2回)"),
             ("Y", "書き出し"),
             ("-", "再読込"),
+            ("B", "戻る"),
+        ],
+        // 生データ is read-only: the four chips are the whole of it.
+        SaveMap => &[
+            ("▲/▼", "行"),
+            ("◀/▶", "10行"),
+            ("A", "元の領域"),
             ("B", "戻る"),
         ],
     }
@@ -1701,6 +1713,14 @@ pub fn run() -> i32 {
     let mut l_fired = false;
     let mut l_clean = true;
     let mut l_hold = mhnx_core::confirm::HoldConfirm::new();
+    // R is the sub-tab key on a tap and 詳細 (生データ) on a long hold. The
+    // shape is L's, which answers a hold with the whole-save undo: both
+    // shoulders now say "hold me for the thing this screen cannot otherwise
+    // reach", and the footer names both.
+    let mut r_pending = false;
+    let mut r_fired = false;
+    let mut r_clean = true;
+    let mut r_hold = mhnx_core::confirm::HoldConfirm::new();
 
     unsafe {
         sys::padConfigureInput(1, HID_NPAD_STYLE_SET_NPAD_STANDARD);
@@ -1738,10 +1758,13 @@ pub fn run() -> i32 {
             ed.set_repeating(repeated);
 
             if painter.gui.osk.is_some() {
-                // L answers the keyboard here, not the list: drop the deferred
-                // press so a release inside the keyboard cannot reach it later.
+                // L / R answer the keyboard here, not the list: drop the
+                // deferred presses so a release inside the keyboard cannot
+                // reach them later.
                 l_pending = false;
                 l_fired = false;
+                r_pending = false;
+                r_fired = false;
                 // ZL walks the character tabs; ZR inserts a line break (Key::Z
                 // is the raw ZR and no longer remapped to [R] here, because a
                 // name field has to be able to hold a second line).
@@ -1756,6 +1779,8 @@ pub fn run() -> i32 {
             } else if painter.gui.mib_picker.is_some() {
                 l_pending = false;
                 l_fired = false;
+                r_pending = false;
+                r_fired = false;
                 if down & BTN_RSTICK_UP != 0 {
                     painter.gui.page_by(&mut ed, -1);
                     need_draw = true;
@@ -1777,6 +1802,8 @@ pub fn run() -> i32 {
             } else if ed.review_open() {
                 l_pending = false;
                 l_fired = false;
+                r_pending = false;
+                r_fired = false;
                 // The save review is modal: A writes, B goes back, and nothing
                 // else is heard. The UI drops taps on anything but its two
                 // buttons for the same reason - a tap must not reach the list
@@ -1914,18 +1941,62 @@ pub fn run() -> i32 {
                     }
                 }
 
+                // R: a tap is the sub-tab key, a long hold is 詳細. It is
+                // answered on release for the same reason L is - the two
+                // meanings must not fire off the same press.
+                if down & BTN_R != 0 {
+                    r_pending = true;
+                    r_fired = false;
+                    r_clean = true;
+                    r_hold.press();
+                }
+                if r_pending {
+                    if cur & BTN_R == 0 {
+                        r_pending = false;
+                        // A press that did something else on the way does not
+                        // also count as a tab press: the sub-tab would move
+                        // under a screen the user just opened.
+                        if !r_fired && r_clean {
+                            // A key press takes the list back from a coasting
+                            // flick, exactly as the immediate dispatch did.
+                            painter.gui.stop_fling();
+                            painter.gui.handle_pad_key(&mut ed, Key::R, cur);
+                            need_draw = true;
+                        }
+                        r_fired = false;
+                        let _ = r_hold.release();
+                    } else if !r_fired {
+                        match r_hold.tick() {
+                            // 詳細 is a view, not a destructive action: the
+                            // first long hold opens it. The offer is taken
+                            // back at once, so holding longer cannot open it
+                            // twice.
+                            mhnx_core::confirm::HoldAction::Arm
+                            | mhnx_core::confirm::HoldAction::Run => {
+                                r_fired = true;
+                                r_hold.clear_arm();
+                                painter.gui.open_detail(&mut ed);
+                                need_draw = true;
+                            }
+                            mhnx_core::confirm::HoldAction::None => {}
+                        }
+                    }
+                }
+
                 if let Some(k) = key {
                     // Don't double-send Key::Z when ZR was already used for tab cycling,
                     // and Key::L is answered above (tap on release, hold for undo).
-                    if k != Key::Z && k != Key::L {
+                    if k != Key::Z && k != Key::L && k != Key::R {
                         // A key press takes the list back from a coasting flick:
                         // the two must never move the cursor at the same time.
                         painter.gui.stop_fling();
                         l_clean = false;
-                        // Some other key means the offer is gone: it has to be
-                        // asked for again rather than waiting for the next
+                        r_clean = false;
+                        // Some other key means the offers are gone: they have to
+                        // be asked for again rather than waiting for the next
                         // hold however long later.
                         l_hold.clear_arm();
+                        r_hold.clear_arm();
                         painter.gui.handle_pad_key(&mut ed, k, cur);
                         need_draw = true;
                     }

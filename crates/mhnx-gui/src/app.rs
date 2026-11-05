@@ -163,6 +163,192 @@ pub enum Tab {
     QuestWork,
 }
 
+/// Which shelf of the two-layer tab bar a screen sits on.
+///
+/// The bar has two layers on purpose. The everyday screens (上段) are where an
+/// ordinary edit session happens; the screens that name bytes, files and tables
+/// live on the 詳細・ツール shelf, one `詳細` button away from the screen that
+/// asked for them; and the records the save keeps about play sit between the
+/// two under 記録. Nothing was removed to do this: every screen still exists
+/// and every one of them is still one click from the bar - see
+/// [TabShelf::tabs], which is the single list the bar and the tests read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabShelf {
+    /// 上段: the screens an ordinary edit session runs in.
+    Everyday,
+    /// 記録: what the save remembers about the play that made it.
+    Record,
+    /// 詳細・ツール: the screens that name bytes, files or tables.
+    Tools,
+}
+
+impl TabShelf {
+    /// The tabs of this shelf, in the order the bar draws them.
+    ///
+    /// One table for the bar and for the test that walks it: a screen added to
+    /// a shelf is drawn and reachable without a second edit, and a screen left
+    /// out of every shelf fails `every_screen_sits_on_exactly_one_shelf`.
+    pub fn tabs(self) -> &'static [Tab] {
+        match self {
+            TabShelf::Everyday => &[
+                Tab::Save,
+                Tab::Items,
+                Tab::Charm,
+                Tab::Equip,
+                Tab::QuestWork,
+                Tab::Palico,
+                Tab::Sets,
+            ],
+            TabShelf::Record => &[Tab::Dlc, Tab::Hunts, Tab::Guild, Tab::Progress],
+            TabShelf::Tools => &[
+                Tab::Quest,
+                Tab::SaveMap,
+                Tab::Review,
+                Tab::Database,
+                Tab::Extras,
+                Tab::About,
+            ],
+        }
+    }
+
+    /// The heading the bar writes in front of the shelf.
+    pub fn heading(self) -> &'static str {
+        match self {
+            TabShelf::Everyday => "上段",
+            TabShelf::Record => "記録",
+            TabShelf::Tools => "詳細・ツール",
+        }
+    }
+}
+
+impl Tab {
+    /// Which shelf this screen sits on.
+    pub fn shelf(self) -> TabShelf {
+        if TabShelf::Everyday.tabs().contains(&self) {
+            TabShelf::Everyday
+        } else if TabShelf::Record.tabs().contains(&self) {
+            TabShelf::Record
+        } else {
+            TabShelf::Tools
+        }
+    }
+
+    /// The label on its button.
+    ///
+    /// アイテム is the one screen whose label comes out of the catalogue; the
+    /// rest still spell theirs inline, one screen at a time.
+    pub fn label(self, lang: Lang) -> &'static str {
+        match self {
+            Tab::Save => "キャラ",
+            Tab::Items => strings::text(lang, "tab.items"),
+            Tab::Quest => "クエスト（ファイル）",
+            Tab::QuestWork => "クエスト改造",
+            Tab::Dlc => "DLC",
+            Tab::Charm => "お守り",
+            Tab::Equip => "装備",
+            Tab::Hunts => "狩猟記録",
+            Tab::Guild => "ギルド",
+            Tab::Progress => "進行状況",
+            Tab::Palico => "オトモ",
+            Tab::Sets => "マイセット",
+            Tab::Extras => "設定/オトモ",
+            Tab::SaveMap => "セーブマップ",
+            Tab::Review => "変更一覧",
+            Tab::Database => "データベース",
+            Tab::About => "情報",
+        }
+    }
+
+    /// The one line above the screen that says what it is for.
+    ///
+    /// Written for someone opening the tool for the first time: what can be
+    /// changed here, and where to go when a value needs its bytes. Every
+    /// everyday and record screen ends by pointing at its [詳細] button, which
+    /// is the path to the binary-level view this layer hides.
+    pub fn guide(self) -> &'static str {
+        match self {
+            Tab::Save => {
+                "キャラ名・所持金・HR をここで直せます。分からないときは右下の [詳細]"
+            }
+            Tab::Items => {
+                "アイテムを選んで数を変えます（CSV は一覧の下）。分からないときは右下の [詳細]"
+            }
+            Tab::Charm => "お守りを選ぶとスキルとスロットを編集できます。分からないときは右下の [詳細]",
+            Tab::Equip => "装備を選ぶと右の欄で編集できます。分からないときは右下の [詳細]",
+            Tab::QuestWork => {
+                "クエストを名前で選んで編集します。分からないときは右上の [詳細]（ファイル単位）"
+            }
+            Tab::Palico => "オトモを選んでレベル・スキルを編集できます。分からないときは右下の [詳細]",
+            Tab::Sets => "アイテムセットと装備セットを呼び出す・保存できます。分からないときは右下の [詳細]",
+            Tab::Dlc => "配信クエストの一覧・差し替え・書き出しです。分からないときは右下の [詳細]",
+            Tab::Hunts => "モンスターごとの討伐・捕獲・サイズです。分からないときは右下の [詳細]",
+            Tab::Guild => "ギルドカードと受信カードを編集できます。分からないときは右下の [詳細]",
+            Tab::Progress => "勲章・依頼・クエストの進行状況です。分からないときは右下の [詳細]",
+            Tab::Quest => "ファイル単位の編集（上級者向け）。左上の「戻る」でクエスト改造へ",
+            Tab::SaveMap => {
+                "読み取り専用です。行を選ぶとその範囲の 16 進ダンプを出します。左上の「戻る」で元の画面へ"
+            }
+            Tab::Review => "保存した内容との違いです。行ごとに 1 項目ずつ戻せます（読み取り専用）",
+            Tab::Database => "ゲームのテーブル（romfs）を読んで表示します。読み取り専用です",
+            Tab::Extras => "本体オプション・配信オトモ・キャラの入出力（上級者向け）",
+            Tab::About => "このツールの説明と、使う前に読む注意書きです",
+        }
+    }
+
+    /// Whether the screen needs an open save.
+    ///
+    /// The four that do not: the character screen and 情報 say what to do with
+    /// no save, クエスト改造 opens an archive from disk, and データベース reads
+    /// a romfs folder rather than a save.
+    pub fn needs_save(self) -> bool {
+        !matches!(
+            self,
+            Tab::Save | Tab::About | Tab::Database | Tab::QuestWork
+        )
+    }
+}
+
+/// Where a screen's `詳細` button sends the reader.
+///
+/// The destination is a screen of the 詳細・ツール shelf, and `field` names the
+/// row of [mhnx_core::savemap::fields] that holds the bytes this screen edits.
+/// The row is named rather than numbered because the map is a table the core
+/// crate owns: a row added above it must not move the button somewhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailJump {
+    /// The screen the button opens.
+    pub tab: Tab,
+    /// Row of the save map holding this screen's bytes, by its name.
+    pub field: Option<&'static str>,
+    /// Record inside that row the screen had selected, when it had one.
+    pub record: Option<usize>,
+}
+
+/// Which row - and which record of it - a `詳細` jump landed on.
+///
+/// Kept on the editor rather than in the save map's own state so the tab can
+/// start its dump at the very record the screen was showing, and so the way
+/// back knows which screen asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailFocus {
+    /// Index into [mhnx_core::savemap::fields].
+    pub field: usize,
+    /// Record of that row to dump, when the screen had one selected.
+    pub record: Option<usize>,
+}
+
+/// One record of a save map row, as a `詳細` jump dumps it.
+struct RecordDump {
+    /// Body offset the record starts at.
+    offset: usize,
+    /// Bytes the record holds.
+    len: usize,
+    /// Records the whole row holds, so the header can say which of how many.
+    count: usize,
+    /// Sixteen bytes a line, the way the whole-row dump draws them.
+    lines: Vec<String>,
+}
+
 /// Which section of the クエスト改造 screen is on screen.
 ///
 /// The four sections are what a quest is edited through: its text and time
@@ -1135,6 +1321,12 @@ pub struct MhnxEditor {
     /// The tab drawn last frame, so opening 変更一覧 knows it was opened and
     /// rebuilds the list the other tabs have invalidated.
     pub shown_tab: Option<Tab>,
+    /// Is the 詳細・ツール row of the tab bar unfolded?
+    ///
+    /// The everyday and record shelves are always drawn; the binary-level ones
+    /// are one toggle away, and stay unfolded while a tool screen is open so
+    /// the user can see where the 詳細 button put them.
+    pub show_tools: bool,
 
     // ---- undo: the whole save, shared by every tab ----
     /// Steps of the all-tab undo, newest last. Each one is a whole parsed save
@@ -1220,6 +1412,15 @@ pub struct MhnxEditor {
     pub savemap_filter: String,
     /// Row of the save map whose bytes the dump under the list shows.
     pub savemap_selected: Option<usize>,
+    /// The row and the record of it a `詳細` button landed on.
+    ///
+    /// Set by [MhnxEditor::open_detail] and read by the save map, which starts
+    /// its dump at that record instead of at the first 512 bytes of a 2000
+    /// record box. Cleared when another row is picked.
+    pub detail_focus: Option<DetailFocus>,
+    /// The screen the `詳細` button was pressed on, so the tool screen can
+    /// offer the way back. Cleared as soon as the bar is used to change screen.
+    pub detail_return: Option<Tab>,
 
     // ---- database (データベース) ----
     /// The tables last read out of the romfs folder, in file name order.
@@ -1419,6 +1620,9 @@ impl Default for MhnxEditor {
             quest_missing_only: false,
             savemap_filter: String::new(),
             savemap_selected: None,
+            detail_focus: None,
+            detail_return: None,
+            show_tools: false,
             db_tables: Vec::new(),
             db_selected: None,
             db_filter: String::new(),
@@ -3573,6 +3777,13 @@ impl eframe::App for MhnxEditor {
         self.settings_window(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // The one-line guide and the `詳細` button, above whatever screen
+            // is open. When the button moves the editor, this frame stops here
+            // and the next one draws the screen it opened.
+            if self.screen_header(ui) {
+                ui.ctx().request_repaint();
+                return;
+            }
             // These tabs stack several sections and could grow past the
             // window with no way to reach the last one. The ones that already
             // scroll their own lists are left alone so they do not nest.
@@ -3959,7 +4170,18 @@ impl MhnxEditor {
         });
     }
 
-    /// The tab bar, across the top of the window.
+    /// The tab bar, in two layers across the top of the window.
+    ///
+    /// 上段 is the everyday layer: the seven screens an ordinary edit session
+    /// runs in. The record screens sit on their own line under it, and the
+    /// binary-level ones (クエストのファイル画面, セーブマップ, 変更一覧,
+    /// データベース, 設定/オトモ, 情報) are folded away behind 詳細・ツール.
+    ///
+    /// Nothing was removed to do this. The shelf lists in [TabShelf::tabs] are
+    /// what the bar draws and what the reachability test walks, so every screen
+    /// is on exactly one shelf and one click from the bar - and the way to the
+    /// bytes stays the `詳細` button on the screen the user is already on,
+    /// rather than a tab they have to know to open.
     fn tab_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             // A permanent line above the bar while an MHGU save is open. Four
@@ -3979,43 +4201,41 @@ impl MhnxEditor {
                         );
                     });
             }
+            let opened = self.tab;
+            // The first layer: an ordinary session never leaves this row.
             ui.horizontal_wrapped(|ui| {
-                for (tab, label) in [
-                    (Tab::Save, "キャラ"),
-                    // The first tab whose title comes from the catalogue: the
-                    // rest of the bar still spells its labels inline, which is
-                    // the next stretch of work, one tab at a time.
-                    (Tab::Items, strings::text(self.lang, "tab.items")),
-                    // The screen the editor opens on: a quest is chosen by
-                    // name, not by the file that happens to hold one field.
-                    (Tab::QuestWork, "クエスト改造"),
-                    (Tab::Quest, "クエスト"),
-                    (Tab::Dlc, "DLC"),
-                    (Tab::Charm, "お守り"),
-                    (Tab::Equip, "装備"),
-                    (Tab::Hunts, "狩猟記録"),
-                    (Tab::Guild, "ギルド"),
-                    (Tab::Progress, "進行状況"),
-                    (Tab::Palico, "オトモ"),
-                    (Tab::Sets, "マイセット"),
-                    (Tab::Extras, "設定/オトモ"),
-                    (Tab::SaveMap, "セーブマップ"),
-                    (Tab::Review, "変更一覧"),
-                    (Tab::Database, "データベース"),
-                    (Tab::About, "情報"),
-                ] {
-                    // A save has to be open before a tab can be anything but a
-                    // dead end: eleven of them were just a line of text.
-                    // データベース is the second tab that does not need a save:
-                    // it lists the tables of a romfs folder, not of a save.
-                    let enabled = self.save.is_some()
-                        || matches!(tab, Tab::Save | Tab::About | Tab::Database | Tab::QuestWork);
-                    ui.add_enabled_ui(enabled, |ui| {
-                        ui.selectable_value(&mut self.tab, tab, label);
-                    });
+                for tab in TabShelf::Everyday.tabs() {
+                    self.shelf_tab(ui, *tab);
+                }
+            });
+            // The second layer: what the save remembers about play, and the
+            // folded 詳細・ツール shelf.
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(TabShelf::Record.heading()).weak().small());
+                for tab in TabShelf::Record.tabs() {
+                    self.shelf_tab(ui, *tab);
+                }
+                ui.separator();
+                let on_tools = self.tab.shelf() == TabShelf::Tools;
+                let tools_open = self.show_tools || on_tools;
+                // The button says where the user is: "セーブマップ" behind a
+                // folded shelf and "詳細・ツール: セーブマップ" with it open.
+                let mut label = String::from(TabShelf::Tools.heading());
+                if on_tools {
+                    label.push_str(": ");
+                    label.push_str(self.tab.label(self.lang));
+                }
+                label.push_str(if tools_open { " ▴" } else { " ▾" });
+                if ui
+                    .selectable_label(on_tools, label)
+                    .on_hover_text(
+                        "セーブマップ・変更一覧・データベースなど、生のバイトを扱う画面を開きます",
+                    )
+                    .clicked()
+                {
+                    self.show_tools = !tools_open;
                 }
                 if self.save.is_none() {
-                    ui.separator();
                     ui.label(
                         egui::RichText::new("セーブを開くと他のタブが使えます")
                             .weak()
@@ -4023,7 +4243,245 @@ impl MhnxEditor {
                     );
                 }
             });
+            if self.show_tools || self.tab.shelf() == TabShelf::Tools {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(TabShelf::Tools.heading()).weak().small());
+                    for tab in TabShelf::Tools.tabs() {
+                        self.shelf_tab(ui, *tab);
+                    }
+                });
+            }
+            // A click on the bar is a different route from the 詳細 button: the
+            // way back and the record that button landed on belong to that
+            // route, so using the bar drops both.
+            if self.tab != opened {
+                self.detail_return = None;
+                self.detail_focus = None;
+            }
         });
+    }
+
+    /// One tab of the bar.
+    ///
+    /// A save has to be open before a screen can be anything but a dead end, so
+    /// the ones that need one are disabled and say nothing until they can be
+    /// used; the four that do not need a save are always live ([Tab::needs_save]).
+    fn shelf_tab(&mut self, ui: &mut egui::Ui, tab: Tab) {
+        let enabled = self.save.is_some() || !tab.needs_save();
+        let label = tab.label(self.lang);
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.selectable_value(&mut self.tab, tab, label);
+        });
+    }
+
+    /// The line above every screen: what the screen is for, and the `詳細`
+    /// button that goes to the bytes behind it.
+    ///
+    /// Returns true when the button moved the editor to another screen, so the
+    /// caller skips this frame's body: the next frame draws the screen that was
+    /// opened, and drawing the old body underneath it would show the wrong
+    /// screen for a moment.
+    fn screen_header(&mut self, ui: &mut egui::Ui) -> bool {
+        let tab = self.tab;
+        let mut jump: Option<DetailJump> = None;
+        let mut back = false;
+        ui.horizontal(|ui| {
+            // Laid out from the right first: the button keeps its place
+            // whatever the length of the sentence beside it.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                match self.detail_jump_for(tab) {
+                    Some(target) => {
+                        let enabled = self.save.is_some();
+                        let what = target.field.unwrap_or(tab.label(self.lang));
+                        let hover = if enabled {
+                            format!("この画面の生データを開きます（セーブマップの「{}」）", what)
+                        } else {
+                            String::from("セーブを開くと詳細へ飛べます")
+                        };
+                        if ui
+                            .add_enabled(
+                                enabled,
+                                egui::Button::new(egui::RichText::new("詳細").small()),
+                            )
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            jump = Some(target);
+                        }
+                    }
+                    // A tool screen opened from a 詳細 button gets the way back
+                    // on the same line. One opened from the bar has nothing to
+                    // go back to, so it shows no button at all.
+                    None => {
+                        if let Some(origin) = self.detail_return {
+                            if tab.shelf() == TabShelf::Tools && tab != Tab::Quest {
+                                let label = format!("← {} へ戻る", origin.label(self.lang));
+                                if ui
+                                    .small_button(label)
+                                    .on_hover_text("詳細を開く前の画面へ戻ります")
+                                    .clicked()
+                                {
+                                    back = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let guide = tab.guide();
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(guide).weak().small()).truncate(),
+                    )
+                    .on_hover_text(guide);
+                });
+            });
+        });
+        if let Some(target) = jump {
+            self.open_detail(target);
+            return true;
+        }
+        if back {
+            if let Some(origin) = self.detail_return.take() {
+                self.tab = origin;
+                self.detail_focus = None;
+                self.message = format!("{} に戻りました", origin.label(self.lang));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Where a screen's `詳細` button goes, or `None` for a screen that is
+    /// itself the binary-level view.
+    ///
+    /// The row is named, not numbered: [MhnxEditor::open_detail] resolves it
+    /// against [mhnx_core::savemap::fields] by name, so the map and this table
+    /// cannot drift apart silently. The record is what the screen had selected,
+    /// which is what makes 装備 land on the record the list was showing rather
+    /// than at the top of a 2,000 record box.
+    pub fn detail_jump_for(&self, tab: Tab) -> Option<DetailJump> {
+        let row = |field: &'static str, record: Option<usize>| DetailJump {
+            tab: Tab::SaveMap,
+            field: Some(field),
+            record,
+        };
+        match tab {
+            Tab::Save => Some(row("名前", None)),
+            Tab::Items => Some(row("アイテムボックス", None)),
+            Tab::Charm => Some(row("護石", Some(self.charm_index))),
+            Tab::Equip => Some(row("装備ボックス", self.equip_selected)),
+            Tab::Palico => Some(row("オトモ", self.palico_selected)),
+            Tab::Sets => Some(row("アイテムマイセット", self.item_set_selected)),
+            Tab::Dlc => Some(row("DLC クエスト（205 枠）", None)),
+            Tab::Hunts => Some(row("狩猟記録（討伐）", None)),
+            Tab::Guild => Some(match self.card_selected {
+                Some(card) => row(
+                    match self.card_list {
+                        mhnx_core::guildcard::CardList::Stored => "受信カード（保存 100 枚）",
+                        mhnx_core::guildcard::CardList::Inbox => "受信カード（受信箱 50 枚）",
+                    },
+                    Some(card),
+                ),
+                None => row("ギルドカード", None),
+            }),
+            Tab::Progress => Some(row(
+                match self.progress_section {
+                    ProgressSection::Awards => "勲章（解禁マップ）",
+                    ProgressSection::Requests => "依頼フラグ",
+                    ProgressSection::Quests => "クエスト（クリア）",
+                },
+                None,
+            )),
+            Tab::Extras => Some(row("画面の明るさ", None)),
+            // クエスト改造 and クエスト carry their own 詳細 / 戻る in their
+            // headers, and the tool screens are the destination.
+            _ => None,
+        }
+    }
+
+    /// The `詳細` button: leave this screen for the tool that shows its bytes.
+    pub fn open_detail(&mut self, jump: DetailJump) {
+        if jump.field.is_some() && self.save.is_none() {
+            self.message = String::from("セーブを開くと詳細を表示できます");
+            return;
+        }
+        let origin = self.tab;
+        let Some(name) = jump.field else {
+            self.detail_return = Some(origin);
+            self.tab = jump.tab;
+            return;
+        };
+        let Some(index) = Self::savemap_index_named(name) else {
+            self.message = format!("セーブマップに「{}」の行がありません", name);
+            return;
+        };
+        self.detail_return = Some(origin);
+        self.detail_focus = Some(DetailFocus {
+            field: index,
+            record: jump.record,
+        });
+        // The filter would hide the row that was just asked for; the list is
+        // showing this row now, so it starts from a clean one.
+        self.savemap_filter.clear();
+        self.savemap_selected = Some(index);
+        self.tab = jump.tab;
+        self.message = match jump.record {
+            Some(record) => format!(
+                "{} の #{} の生のバイトを表示しています（読み取り専用）",
+                name,
+                record + 1
+            ),
+            None => format!("{} の生のバイトを表示しています（読み取り専用）", name),
+        };
+    }
+
+    /// The row of [mhnx_core::savemap::fields] with this name.
+    fn savemap_index_named(name: &str) -> Option<usize> {
+        mhnx_core::savemap::fields()
+            .iter()
+            .position(|field| field.name == name)
+    }
+
+    /// The hex lines of one record of a save map row.
+    ///
+    /// The map draws a whole row, which for 装備ボックス is 2,000 records and
+    /// stops at its first 512 bytes; a `詳細` jump knows which record the
+    /// screen had selected and dumps that one instead. `None` when the row
+    /// holds no records, the index is past its end, or the save does not hold
+    /// the range.
+    fn record_dump(save: &Save, field_index: usize, record: usize) -> Option<RecordDump> {
+        let field = mhnx_core::savemap::fields().get(field_index)?;
+        let (size, count) = match field.kind {
+            mhnx_core::savemap::FieldKind::Record { size, count, .. } if record < count => {
+                (size, count)
+            }
+            _ => return None,
+        };
+        let start = mhnx_core::savemap::offset_in(save, field_index)? + record * size;
+        let bytes = save.body().get(start..start + size)?;
+        let shown = bytes.len().min(mhnx_core::savemap::DUMP_BYTES);
+        let mut lines: Vec<String> =
+            Vec::with_capacity(shown / mhnx_core::savemap::DUMP_COLUMNS + 1);
+        for line_no in (0..shown).step_by(mhnx_core::savemap::DUMP_COLUMNS) {
+            let n = mhnx_core::savemap::DUMP_COLUMNS.min(shown - line_no);
+            let mut line = format!("{:06X}  ", start + line_no);
+            for i in 0..n {
+                if i == 8 && n > 8 {
+                    line.push(' ');
+                }
+                line.push_str(&format!("{:02x} ", bytes[line_no + i]));
+            }
+            while line.ends_with(' ') {
+                line.pop();
+            }
+            lines.push(line);
+        }
+        Some(RecordDump {
+            offset: start,
+            len: bytes.len(),
+            count,
+            lines,
+        })
     }
 
     fn side_panel(&mut self, ctx: &egui::Context) {
@@ -15444,6 +15902,9 @@ impl MhnxEditor {
         });
         if let Some(p) = pick {
             self.savemap_selected = Some(p);
+            // Picking a row is a new question: the record a `詳細` jump landed
+            // on belongs to the row the jump came from.
+            self.detail_focus = None;
         }
         let selected = self.savemap_selected;
         ui.separator();
@@ -15477,27 +15938,65 @@ impl MhnxEditor {
                 ui.label(egui::RichText::new(format!("現在値: {}", value)).small());
             }
         });
-        match mhnx_core::savemap::dump_for(save, index) {
-            Some(lines) => {
-                let mut text = String::with_capacity(lines.len() * 56);
-                for line in &lines {
-                    text.push_str(line);
-                    text.push('\n');
-                }
-                let height = ui.available_height().max(80.0);
-                egui::ScrollArea::both()
-                    .id_salt("savemapdump")
-                    .max_height(height)
-                    .show(ui, |ui| {
-                        ui.add(egui::Label::new(
-                            egui::RichText::new(text).monospace().small(),
-                        ));
-                    });
+        // The record a `詳細` button landed on, while it still names the row
+        // that is selected: the dump starts there instead of at the row's first
+        // 512 bytes, which for 装備ボックス is the first 14 of 2,000 records.
+        let focused = self
+            .detail_focus
+            .filter(|f| f.field == index)
+            .and_then(|f| f.record);
+        let mut clear_focus = false;
+        let dump = match focused.and_then(|record| {
+            Self::record_dump(save, index, record).map(|dump| (record, dump))
+        }) {
+            Some((record, dump)) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "#{} のレコード（全 {} レコード中・0x{:06X}・{} バイト）",
+                            record + 1,
+                            dump.count,
+                            dump.offset,
+                            dump.len
+                        ))
+                        .strong()
+                        .small(),
+                    );
+                    if ui
+                        .small_button("行全体を表示")
+                        .on_hover_text("この行の先頭から 512 バイトを表示します")
+                        .clicked()
+                    {
+                        clear_focus = true;
+                    }
+                });
+                dump.lines
             }
-            None => {
-                ui.label(egui::RichText::new("このセーブにはこの範囲がありません").weak());
+            None => mhnx_core::savemap::dump_for(save, index).unwrap_or_default(),
+        };
+        if clear_focus {
+            if let Some(focus) = self.detail_focus.as_mut() {
+                focus.record = None;
             }
         }
+        if dump.is_empty() {
+            ui.label(egui::RichText::new("このセーブにはこの範囲がありません").weak());
+            return;
+        }
+        let mut text = String::with_capacity(dump.len() * 56);
+        for line in &dump {
+            text.push_str(line);
+            text.push('\n');
+        }
+        let height = ui.available_height().max(80.0);
+        egui::ScrollArea::both()
+            .id_salt("savemapdump")
+            .max_height(height)
+            .show(ui, |ui| {
+                ui.add(egui::Label::new(
+                    egui::RichText::new(text).monospace().small(),
+                ));
+            });
     }
 
     /// Why the セーブマップ tab refuses this save, or `None` when the map applies.
@@ -23991,6 +24490,396 @@ mod tests {
         assert_eq!(equipment_name_of(22, 3), "#3（名前不明）");
         assert_eq!(equipment_name_of(7, 0), "（なし）");
         assert_eq!(equipment_name_of(7, 1), mhnx_core::equip::name(&equipment_for(7, 1)).to_owned() + "（ID 1）");
+    }
+
+    // ------------------------------------------------ the two-layer tab bar
+
+    /// Every screen of the window, so the shelf test cannot miss one.
+    const ALL_TABS: [Tab; 17] = [
+        Tab::Save,
+        Tab::Items,
+        Tab::Quest,
+        Tab::QuestWork,
+        Tab::Dlc,
+        Tab::Charm,
+        Tab::Equip,
+        Tab::Hunts,
+        Tab::Guild,
+        Tab::Progress,
+        Tab::Palico,
+        Tab::Sets,
+        Tab::Extras,
+        Tab::SaveMap,
+        Tab::Review,
+        Tab::Database,
+        Tab::About,
+    ];
+
+    /// The bar is two layers, and every screen is on exactly one shelf: a
+    /// screen left off every shelf would be one the bar draws nowhere, which is
+    /// how a "move the technical screens" change loses a feature.
+    #[test]
+    fn every_screen_sits_on_exactly_one_shelf() {
+        let mut seen: Vec<Tab> = Vec::new();
+        for shelf in [TabShelf::Everyday, TabShelf::Record, TabShelf::Tools] {
+            for tab in shelf.tabs() {
+                assert!(!seen.contains(tab), "{:?} is on two shelves", tab);
+                seen.push(*tab);
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            ALL_TABS.len(),
+            "the shelves cover {} of {} screens",
+            seen.len(),
+            ALL_TABS.len()
+        );
+        for tab in ALL_TABS {
+            assert!(seen.contains(&tab), "{:?} is on no shelf", tab);
+            assert!(tab.shelf().tabs().contains(&tab), "{:?} disagrees with its shelf", tab);
+        }
+
+        // 上段 is the everyday layer, and it is the seven screens an ordinary
+        // session runs in.
+        assert_eq!(
+            TabShelf::Everyday.tabs(),
+            [
+                Tab::Save,
+                Tab::Items,
+                Tab::Charm,
+                Tab::Equip,
+                Tab::QuestWork,
+                Tab::Palico,
+                Tab::Sets,
+            ]
+        );
+        // The binary-level screens are behind 詳細・ツール, not beside them.
+        for tool in [Tab::SaveMap, Tab::Review, Tab::Database, Tab::About] {
+            assert_eq!(tool.shelf(), TabShelf::Tools, "{:?} is not a tool screen", tool);
+        }
+        // The record screens are the intermediate group.
+        for record in [Tab::Dlc, Tab::Hunts, Tab::Guild, Tab::Progress] {
+            assert_eq!(record.shelf(), TabShelf::Record, "{:?} is not a record", record);
+        }
+
+        // One label and one guide line each, and no two screens sharing a
+        // label: the bar has to be readable at a glance.
+        let mut labels: Vec<&str> = Vec::new();
+        for tab in ALL_TABS {
+            let label = tab.label(Lang::Ja);
+            assert!(!label.is_empty(), "{:?} has no label", tab);
+            assert!(!labels.contains(&label), "two screens are called {label}");
+            labels.push(label);
+            assert!(!tab.guide().is_empty(), "{:?} has no guide line", tab);
+        }
+        // Every everyday and record screen points at the 詳細 button: that is
+        // the path into this layer from the one a beginner uses.
+        for tab in TabShelf::Everyday.tabs().iter().chain(TabShelf::Record.tabs()) {
+            assert!(
+                tab.guide().contains("詳細"),
+                "{:?} does not say where the detail view is: {}",
+                tab,
+                tab.guide()
+            );
+        }
+    }
+
+    /// The one-line guide is drawn above every screen, and a tool screen opened
+    /// from 詳細 gets the way back on the same line.
+    #[test]
+    fn the_guide_line_is_drawn_and_the_detail_button_leaves_a_way_back() {
+        let dir = Scratch::new("guides");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let ctx = egui::Context::default();
+        let frame = |app: &mut MhnxEditor, ctx: &egui::Context| {
+            let output = ctx.run(frame_input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.screen_header(ui);
+                });
+            });
+            drawn_text(&output)
+        };
+        for tab in ALL_TABS {
+            app.tab = tab;
+            let text = frame(&mut app, &ctx);
+            assert!(
+                text.contains(tab.guide()),
+                "{:?} did not draw its guide line: {text}",
+                tab
+            );
+        }
+
+        // A screen with a detail target says 詳細, and the tool it opens says
+        // which screen asked so the user can go back.
+        app.tab = Tab::Equip;
+        let text = frame(&mut app, &ctx);
+        assert!(text.contains("詳細"), "装備 lost its detail button: {text}");
+
+        app.open_detail(app.detail_jump_for(Tab::Equip).expect("装備 has a detail"));
+        assert_eq!(app.tab, Tab::SaveMap);
+        let text = frame(&mut app, &ctx);
+        assert!(
+            text.contains("← 装備 へ戻る"),
+            "the save map has no way back to 装備: {text}"
+        );
+    }
+
+    /// The 詳細 button lands on the row that holds the screen's bytes, with the
+    /// record the screen had selected - and refuses when no save is open.
+    #[test]
+    fn the_detail_button_lands_on_the_row_that_holds_the_screen() {
+        let dir = Scratch::new("detailjump");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // Every row the buttons name is in the map: a typo would send the user
+        // to an empty screen, which looks exactly like a save with no data.
+        for tab in ALL_TABS {
+            if let Some(jump) = app.detail_jump_for(tab) {
+                if let Some(name) = jump.field {
+                    assert!(
+                        MhnxEditor::savemap_index_named(name).is_some(),
+                        "{:?} names a row that is not in the map: {name}",
+                        tab
+                    );
+                }
+            }
+        }
+
+        // 装備: the equipment box, the selected record, and a filter that would
+        // have hidden the row is dropped rather than left in the way.
+        app.tab = Tab::Equip;
+        app.equip_selected = Some(6);
+        app.savemap_filter = String::from("名前");
+        let jump = app.detail_jump_for(Tab::Equip).expect("装備 has a detail");
+        app.open_detail(jump);
+        assert_eq!(app.tab, Tab::SaveMap);
+        assert_eq!(app.detail_return, Some(Tab::Equip));
+        assert_eq!(
+            app.savemap_selected,
+            MhnxEditor::savemap_index_named("装備ボックス")
+        );
+        assert!(app.savemap_filter.is_empty(), "the filter still hides the row");
+        let focus = app.detail_focus.expect("the jump left no focus");
+        assert_eq!(focus.record, Some(6));
+        assert!(app.message.contains("装備ボックス"), "{}", app.message);
+
+        // お守り: the same bytes, named as the talisman row (護石).
+        app.tab = Tab::Charm;
+        app.charm_index = 12;
+        let jump = app.detail_jump_for(Tab::Charm).expect("お守り has a detail");
+        app.open_detail(jump);
+        assert_eq!(app.savemap_selected, MhnxEditor::savemap_index_named("護石"));
+        assert_eq!(app.detail_focus.and_then(|f| f.record), Some(12));
+
+        // 進行状況: the bit map of the section that is on screen (ビット列).
+        app.tab = Tab::Progress;
+        app.progress_section = ProgressSection::Quests;
+        let jump = app.detail_jump_for(Tab::Progress).expect("進行状況 has a detail");
+        app.open_detail(jump);
+        assert_eq!(
+            app.savemap_selected,
+            MhnxEditor::savemap_index_named("クエスト（クリア）")
+        );
+        app.tab = Tab::Progress;
+        app.progress_section = ProgressSection::Awards;
+        let jump = app.detail_jump_for(Tab::Progress).expect("進行状況 has a detail");
+        app.open_detail(jump);
+        assert_eq!(
+            app.savemap_selected,
+            MhnxEditor::savemap_index_named("勲章（解禁マップ）")
+        );
+
+        // A tool screen is the destination, so it shows no 詳細 button of its
+        // own - 設定/オトモ excepted, which is on the shelf because it is
+        // advanced, and still has bytes (the body options) to show. クエスト改造
+        // keeps the button in its own header.
+        for tab in TabShelf::Tools.tabs() {
+            if *tab == Tab::Extras {
+                continue;
+            }
+            assert!(app.detail_jump_for(*tab).is_none(), "{:?} has a detail", tab);
+        }
+        assert_eq!(
+            app.detail_jump_for(Tab::Extras).and_then(|j| j.field),
+            Some("画面の明るさ")
+        );
+        assert!(app.detail_jump_for(Tab::QuestWork).is_none());
+
+        // No save: the jump refuses instead of landing on a row read out of
+        // nothing.
+        let mut empty = MhnxEditor::default();
+        empty.tab = Tab::Equip;
+        empty.open_detail(DetailJump {
+            tab: Tab::SaveMap,
+            field: Some("装備ボックス"),
+            record: None,
+        });
+        assert_eq!(empty.tab, Tab::Equip);
+        assert!(empty.message.contains("セーブ"), "{}", empty.message);
+    }
+
+    /// The dump a 詳細 jump lands on is the selected record, not the first 512
+    /// bytes of the whole box: 装備ボックス is 2,000 records of 36 bytes.
+    #[test]
+    fn the_detail_jump_dumps_the_selected_record_not_the_whole_box() {
+        let dir = Scratch::new("recorddump");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let index = MhnxEditor::savemap_index_named("装備ボックス").expect("the box is in the map");
+        // A byte of record 6 that neither the row's first 512 bytes nor a
+        // neighbouring record holds.
+        let start = {
+            let save = app.save.as_mut().expect("a save");
+            let start = mhnx_core::savemap::offset_in(save, index)
+                .expect("the row is in this save")
+                + 6 * mhnx_core::save::EQUIPMENT_RECORD;
+            save.body_mut()[start + 0x0D] = 0xAB;
+            start
+        };
+        let save = app.save.as_ref().expect("a save");
+        let dump = MhnxEditor::record_dump(save, index, 6).expect("record 6 dumps");
+        assert_eq!(dump.offset, start);
+        assert_eq!(dump.len, mhnx_core::save::EQUIPMENT_RECORD);
+        assert_eq!(dump.count, mhnx_core::save::TOTAL_EQUIP_SLOTS);
+        let joined = dump.lines.join("\n");
+        assert!(joined.contains(&format!("{:06X}", start)), "{joined}");
+        assert!(dump.lines.iter().any(|l| l.contains("ab ")), "{joined}");
+        assert!(
+            dump.lines.len() <= 4,
+            "36 bytes is three lines, not {}: {joined}",
+            dump.lines.len()
+        );
+        // The whole row starts six records earlier, so the two cannot be the
+        // same dump.
+        let row = mhnx_core::savemap::dump_for(save, index).expect("the row dumps");
+        assert_ne!(row.join("\n"), joined);
+        // A record past the end of the row is refused rather than read past it.
+        assert!(MhnxEditor::record_dump(save, index, usize::MAX).is_none());
+
+        // The tab draws the record line (and the way back to the row) when it
+        // was opened by a 詳細 jump.
+        app.tab = Tab::Equip;
+        app.equip_selected = Some(6);
+        let jump = app.detail_jump_for(Tab::Equip).expect("装備 has a detail");
+        app.open_detail(jump);
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save_map(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("#7 のレコード"), "the record line is missing: {text}");
+        assert!(text.contains("行全体を表示"), "no way to the whole row: {text}");
+        assert!(text.contains(&format!("{:06X}", start)), "{text}");
+    }
+
+    /// The bar draws the everyday and record shelves at rest, keeps the tools
+    /// folded, and draws every one of them once it is unfolded: the route the
+    /// reachability audit needs must not disappear with the tab.
+    #[test]
+    fn the_bar_folds_the_tools_away_and_still_reaches_every_screen() {
+        let dir = Scratch::new("tabbarfold");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let ctx = egui::Context::default();
+
+        // A panel takes its height from the frame before it, so the first
+        // frame of a taller bar is clipped to one row; the window runs every
+        // frame, and the second one is what the user sees.
+        let bar_text = |app: &mut MhnxEditor, ctx: &egui::Context| {
+            let _ = ctx.run(frame_input(), |ctx| app.tab_bar(ctx));
+            let output = ctx.run(frame_input(), |ctx| app.tab_bar(ctx));
+            drawn_text(&output)
+        };
+
+        app.tab = Tab::Equip;
+        app.show_tools = false;
+        let text = bar_text(&mut app, &ctx);
+        for tab in TabShelf::Everyday.tabs().iter().chain(TabShelf::Record.tabs()) {
+            assert!(
+                text.contains(tab.label(Lang::Ja)),
+                "{:?} is not on the bar: {text}",
+                tab
+            );
+        }
+        // Folded: nothing of the tool shelf is drawn, and the button says so.
+        for tab in TabShelf::Tools.tabs() {
+            assert!(
+                !text.contains(tab.label(Lang::Ja)),
+                "{:?} leaked out of the folded shelf: {text}",
+                tab
+            );
+        }
+        assert!(text.contains(TabShelf::Tools.heading()), "{text}");
+
+        // Unfolded: every screen of the shelf is on the bar.
+        app.show_tools = true;
+        let text = bar_text(&mut app, &ctx);
+        for tab in TabShelf::Tools.tabs() {
+            assert!(
+                text.contains(tab.label(Lang::Ja)),
+                "{:?} is not reachable from the bar: {text}",
+                tab
+            );
+        }
+
+        // Opening a tool keeps the shelf unfolded, so the user can see where
+        // the 詳細 button put them.
+        app.show_tools = false;
+        app.tab = Tab::SaveMap;
+        let text = bar_text(&mut app, &ctx);
+        assert!(
+            text.contains("詳細・ツール: セーブマップ"),
+            "the bar does not say which tool is open: {text}"
+        );
+    }
+
+    /// The upper layer does the work: an edit on an everyday or record screen
+    /// never needs the 詳細 view, and never moves the user off the screen.
+    #[test]
+    fn the_everyday_layer_edits_without_opening_the_detail_view() {
+        let dir = Scratch::new("everyday");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // 装備: create a record from the screen's own editor.
+        app.tab = Tab::Equip;
+        assert!(app.equip_create(7, 40, 1), "{}", app.message);
+        assert!(app.dirty, "the equipment write did not reach the save");
+        assert_eq!(app.tab, Tab::Equip, "an edit moved off the screen");
+        assert!(app.detail_focus.is_none() && app.detail_return.is_none());
+
+        // 進行状況: a quest bit from its own screen.
+        app.tab = Tab::Progress;
+        app.set_quest(821, Progress::Cleared, true);
+        assert_eq!(app.tab, Tab::Progress);
+        let cleared = app
+            .save
+            .as_ref()
+            .and_then(|s| mhnx_core::questprogress::get(s, 0, Progress::Cleared, 821))
+            .unwrap_or(false);
+        assert!(cleared, "the quest bit did not reach the save");
+
+        // マイセット: a set name from its own screen.
+        app.tab = Tab::Sets;
+        assert!(app.set_name_write(0, "検証セット"), "{}", app.message);
+        assert_eq!(app.tab, Tab::Sets);
+        assert!(app.dirty);
+
+        // None of that touched the binary-level view.
+        assert!(app.detail_focus.is_none());
+        assert!(app.detail_return.is_none());
     }
 }
 

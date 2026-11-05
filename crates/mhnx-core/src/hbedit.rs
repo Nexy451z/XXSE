@@ -37,6 +37,7 @@ use crate::questprogress::{self, Progress};
 use crate::requests;
 use crate::romfstables::RequestRecord;
 use crate::save::{Character, NameError, NameFit, NameUnit, NameWarning, Save, SaveKind};
+use crate::savemap;
 
 /// Which screen is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +135,19 @@ pub enum Screen {
     /// [Editor::step_mib_field], the reward rows through the .rem table writer,
     /// and the placements through [Editor::adjust_sem_placement].
     QuestEdit,
+    /// 生データ (セーブマップ) - the bytes behind the screen the user came from.
+    ///
+    /// The 詳細 button on every record screen lands here, on the row
+    /// [crate::savemap] names for the region that screen edits (装備ボックス,
+    /// 護石, the item box, the award / request / quest bit maps …), and the
+    /// right-hand panel is that row's hex dump. It is the binary view the
+    /// reference editor calls セーブマップ.
+    ///
+    /// Every row is **read-only**: [Editor::input_save_map] moves a cursor and
+    /// nothing else, so no key on this screen can change a byte. [B] goes back
+    /// to the screen 詳細 was pressed on, which is why the screen keeps the name
+    /// of that screen rather than a stack.
+    SaveMap,
 }
 
 /// The three views of [Screen::Progress], in the order L / R walks them.
@@ -150,6 +164,11 @@ pub const PROGRESS_TABS: usize = 3;
 /// One page of quests (1508 indices over this step is 31 pages), and a
 /// comfortable stride over 132 awards or 380 request flags.
 pub const PROGRESS_JUMP: usize = 50;
+
+/// Rows the 生データ (セーブマップ) list shows at once.
+pub const SAVE_MAP_VISIBLE: usize = 9;
+/// Rows [◀] / [▶] jump on the 生データ list.
+pub const SAVE_MAP_JUMP: usize = 10;
 
 /// The two request flag bands, as `[start, end)` numbers into the flag map.
 ///
@@ -4093,6 +4112,15 @@ pub struct Editor {
     pub palico_skill: Option<PalicoSkill>,
     /// Cursor inside the options list.
     pub option_cursor: usize,
+    /// Cursor inside the 生データ (save map) list.
+    ///
+    /// A position in [Editor::save_map_rows], not a row of
+    /// [crate::savemap::fields]: the list is narrowed to the current slot, so
+    /// the two numbers differ by every row of the other two slots.
+    pub map_cursor: usize,
+    /// The screen [B] returns to from 生データ, i.e. the screen 詳細 was
+    /// pressed on.
+    pub map_return: Screen,
     /// CSV files offered by the I/O layer, in the folder's own order.
     ///
     /// Paths, not contents: a file is read only when the user applies it, and
@@ -4257,6 +4285,8 @@ impl Editor {
             palico_equip: None,
             palico_skill: None,
             option_cursor: 0,
+            map_cursor: 0,
+            map_return: Screen::SaveList,
             csv_files: Vec::new(),
             csv_cursor: 0,
             csv_armed: None,
@@ -4911,6 +4941,11 @@ impl Editor {
                 }
             }
             Screen::Convert => "[◀/▶] 値変更  [X] 保存  [B] 戻る",
+            // 生データ: no key writes anything here, so the line says so and
+            // names the two that move the cursor and the one that goes back.
+            Screen::SaveMap => {
+                "[▲/▼] 行  [◀/▶] 10行  [A] 元の領域  [B] 戻る（読み取り専用）"
+            }
         };
         base
     }
@@ -7183,6 +7218,7 @@ impl Editor {
             Screen::Options => self.input_options(key),
             Screen::Csv => self.input_csv(key),
             Screen::QuestEdit => self.input_quest_edit(key),
+            Screen::SaveMap => self.input_save_map(key),
         }
     }
 
@@ -9780,6 +9816,269 @@ impl Editor {
             PROGRESS_AWARDS => self.award_cursor = row,
             PROGRESS_REQUESTS => self.request_cursor = row,
             _ => self.quest_cursor = row,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 詳細 (Screen::SaveMap): the raw bytes behind the screen the user is on
+    //
+    // One screen for every record screen, rather than one per screen: what
+    // 詳細 answers is the same question everywhere - "what do the bytes this
+    // screen edits actually look like?" - and [crate::savemap] already knows
+    // every named stretch of the save. The screen only picks the row that
+    // belongs to the screen 詳細 was pressed on.
+    // -----------------------------------------------------------------------
+
+    /// The 生データ row a screen's 詳細 opens on, by the name the save map
+    /// prints for it.
+    ///
+    /// `None` means the screen has no save region of its own: the file lists
+    /// (a card or an archive is not a save record), the screens that already
+    /// *are* the detail view (クエストのファイル単位の画面), and 生データ itself.
+    pub fn detail_field_name(screen: Screen) -> Option<&'static str> {
+        match screen {
+            // A card list, a folder, an archive list: nothing in the save.
+            Screen::SaveList | Screen::Convert | Screen::ArcList => None,
+            // The character's own fields, the first of which is its name.
+            Screen::Slots | Screen::Char => Some("名前"),
+            // The pickers edit the box the screen behind them shows.
+            Screen::Items | Screen::ItemPick | Screen::Csv => Some("アイテムボックス"),
+            Screen::Charms | Screen::CharmEdit | Screen::SkillPick => Some("護石"),
+            Screen::Equip | Screen::EquipEdit | Screen::JewelPick | Screen::EquipPick => {
+                Some("装備ボックス")
+            }
+            // The set screen has two arrays (item sets and equipment sets) and
+            // the console picks between them; this is the equipment one.
+            Screen::Sets => Some("装備マイセット"),
+            Screen::Hunts => Some("狩猟記録（討伐）"),
+            Screen::Guild => Some("ギルドカード"),
+            // The progress screen has three views; this is the first, and the
+            // console opens the view the screen is on (see its open_detail).
+            Screen::Progress => Some("勲章（解禁マップ）"),
+            Screen::Roster => Some("オトモ"),
+            Screen::Palico => Some("DLC オトモ（共通プール）"),
+            Screen::SaveQuests => Some("DLC クエスト（205 枠）"),
+            Screen::QuestEquip => Some("DLC クエスト装備（45 枠）"),
+            Screen::Options => Some("画面の明るさ"),
+            // The file-by-file quest screens are the quest's own detail view,
+            // and 生データ is the detail view of a save record.
+            Screen::QuestEdit
+            | Screen::ArcEntries
+            | Screen::EntryView
+            | Screen::Mib
+            | Screen::Gmd
+            | Screen::Check
+            | Screen::SaveMap => None,
+        }
+    }
+
+    /// The [crate::savemap::fields] index of a row, for one character slot.
+    ///
+    /// The name alone is not enough: every slot row exists three times, once
+    /// per character, and 詳細 must land on the slot the screen is editing. A
+    /// body-wide row (no slot) and a download-section row are found the same
+    /// way, so the caller does not have to know which kind it asked for.
+    pub fn save_map_row_named(name: &str, slot: usize) -> Option<usize> {
+        let rows = savemap::fields();
+        rows.iter()
+            .position(|f| f.name == name && f.slot == Some(slot))
+            .or_else(|| rows.iter().position(|f| f.name == name && f.slot.is_none()))
+            .or_else(|| rows.iter().position(|f| f.name == name))
+    }
+
+    /// The row a screen's 詳細 opens on, resolved for one slot.
+    pub fn detail_row_for(screen: Screen, slot: usize) -> Option<usize> {
+        let name = Self::detail_field_name(screen)?;
+        Self::save_map_row_named(name, slot)
+    }
+
+    /// The save map rows this screen lists: the current slot's, plus the rows
+    /// that belong to the save as a whole (the body and the DLC section).
+    pub fn save_map_rows(&self) -> Vec<usize> {
+        savemap::fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.slot.is_none() || f.slot == Some(self.slot))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The [crate::savemap::fields] index under the cursor, if any.
+    pub fn save_map_selected(&self) -> Option<usize> {
+        let rows = self.save_map_rows();
+        rows.get(self.map_cursor).copied()
+    }
+
+    /// The row under the cursor, as the table holds it.
+    pub fn save_map_field(&self) -> Option<&'static savemap::Field> {
+        let index = self.save_map_selected()?;
+        savemap::fields().get(index)
+    }
+
+    /// Where the row under the cursor sits inside the open save, or `None`
+    /// when the save does not hold it (no such slot, no DLC section).
+    pub fn save_map_offset(&self) -> Option<usize> {
+        let index = self.save_map_selected()?;
+        savemap::offset_in(self.save.as_ref()?, index)
+    }
+
+    /// The decoded one-line value of the row under the cursor.
+    pub fn save_map_value(&self) -> Option<String> {
+        let index = self.save_map_selected()?;
+        savemap::value_text(self.save.as_ref()?, index)
+    }
+
+    /// The hex dump of the row under the cursor.
+    pub fn save_map_dump(&self) -> Vec<String> {
+        let Some(index) = self.save_map_selected() else {
+            return Vec::new();
+        };
+        self.save
+            .as_ref()
+            .and_then(|s| savemap::dump_for(s, index))
+            .unwrap_or_default()
+    }
+
+    /// The line the 生データ screen prints about the row under the cursor:
+    /// where it lives, how long it is and what the table calls it.
+    pub fn save_map_meta(&self) -> String {
+        let Some(field) = self.save_map_field() else {
+            return String::from("行がありません");
+        };
+        let offset = match self.save_map_offset() {
+            Some(o) => alloc::format!("+0x{:06X}", o),
+            None => String::from("このセーブに無し"),
+        };
+        alloc::format!(
+            "{} / {} / {}B / {}",
+            savemap::region(self.save_map_selected().unwrap_or(0)),
+            offset,
+            field.len,
+            field.kind.label()
+        )
+    }
+
+    /// 詳細: open the save map on the region the current screen edits.
+    pub fn open_save_map(&mut self, from: Screen) {
+        let row = Self::detail_row_for(from, self.slot);
+        self.open_save_map_at(from, row);
+    }
+
+    /// The same, with the row chosen by the caller.
+    ///
+    /// The console needs this for the two screens whose region depends on a
+    /// view it owns (マイセット's two arrays and 進行状況's three bit maps), and
+    /// for a row that has no name yet. `None` leaves the cursor at the top of
+    /// the list rather than refusing to open.
+    pub fn open_save_map_at(&mut self, from: Screen, row: Option<usize>) {
+        self.map_return = if from == Screen::SaveMap {
+            Screen::SaveList
+        } else {
+            from
+        };
+        self.screen = Screen::SaveMap;
+        self.map_cursor = 0;
+        let rows = self.save_map_rows();
+        let pos = row
+            .or_else(|| Self::detail_row_for(from, self.slot))
+            .and_then(|r| rows.iter().position(|&x| x == r))
+            .unwrap_or(0);
+        self.map_cursor = pos;
+        self.message = match self.save_map_field() {
+            Some(f) => alloc::format!(
+                "詳細: {} の生データです（[▲/▼] 行 / [B] で戻る・読み取り専用）",
+                f.name
+            ),
+            None => String::from("詳細: 生データを表示できません（セーブを開いてください）"),
+        };
+    }
+
+    /// The cursor moved by `delta` rows, wrapping at both ends.
+    pub fn save_map_move(&mut self, delta: i32) {
+        let len = self.save_map_rows().len();
+        if len == 0 {
+            self.map_cursor = 0;
+            return;
+        }
+        let len_i = len as i32;
+        let cur = self.map_cursor as i32;
+        let next = (cur + delta).rem_euclid(len_i);
+        self.map_cursor = next as usize;
+    }
+
+    /// Every key the 生データ screen answers.
+    ///
+    /// Read-only on purpose: the screen shows bytes, and nothing here may
+    /// write one. [A] is the way back to the region 詳細 was pressed on, which
+    /// is the one "action" the list has.
+    fn input_save_map(&mut self, key: Key) {
+        match key {
+            Key::Up => self.save_map_move(-1),
+            Key::Down => self.save_map_move(1),
+            Key::Left => self.save_map_move(-(SAVE_MAP_JUMP as i32)),
+            Key::Right => self.save_map_move(SAVE_MAP_JUMP as i32),
+            // A is the region the screen 詳細 was pressed on: after scrolling
+            // away it is one press back, and on a row that is already it the
+            // press says where it is.
+            Key::A => {
+                if let Some(row) = Self::detail_row_for(self.map_return, self.slot) {
+                    let rows = self.save_map_rows();
+                    if let Some(pos) = rows.iter().position(|&x| x == row) {
+                        self.map_cursor = pos;
+                    }
+                }
+                if let Some(f) = self.save_map_field() {
+                    self.message = alloc::format!("{}: {}", f.name, self.save_map_meta());
+                }
+            }
+            Key::B => {
+                self.screen = self.map_return;
+                self.message = String::from("詳細から戻りました");
+            }
+            _ => {}
+        }
+    }
+
+    /// The one-line description at the top of the screen.
+    ///
+    /// The console draws this above the content, once per screen, so a player
+    /// who has never seen the screen is told what the first key does without
+    /// opening a manual. It is also the line that says how to reach 詳細, which
+    /// is the whole point of the two-tier navigation: the usual work finishes
+    /// on the first tier and the bytes are one press further away.
+    pub fn screen_guide(&self) -> &'static str {
+        match self.screen {
+            Screen::SaveList => "セーブを選んで [A] で開きます。[Y] でカードを読み直します。",
+            Screen::Slots => "キャラを選んで [A] で編集。[◀/▶] で枠、[Y] で一括MAX。",
+            Screen::Char => "行を選んで [◀/▶] で変更、[A] で最大。[詳細] で生データ。",
+            Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[詳細] で生データ。",
+            Screen::ItemPick => "名前で絞って [A] で決定。[B] で元の画面へ。",
+            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[詳細] で生データ。",
+            Screen::CharmEdit => "行ごとに [A] で操作、[◀/▶] で値。[B] で一覧へ。",
+            Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を絞れます。",
+            Screen::Equip => "装備を選んで [A] で編集、[＋] で新規。[詳細] で装備BOXの生データ。",
+            Screen::EquipEdit => "行を選んで [◀/▶] で値、[Y] で名前から選択。[B] で一覧へ。",
+            Screen::JewelPick => "装飾品を選んで [A] で決定。[Y] で名前を絞れます。",
+            Screen::EquipPick => "装備を名前で選んで [A] で決定。[-] で種別を切り替え。",
+            Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
+            Screen::Hunts => "狩猟記録の行を選んで [◀/▶] で増減。[Y] で項目切替。",
+            Screen::Guild => "ギルドカードの行を [◀/▶] で変更、[-] で進行状況。[詳細] で生データ。",
+            Screen::Progress => "[A] でビットを切替、[L/R] でビット列を切替。[詳細] で生データ。",
+            Screen::Roster => "オトモを選んで [A] で名前、[-] で装備、[＋] でスキル。",
+            Screen::Palico => "配信オトモを選んで [A] で導入/解除、[Y] で全導入。",
+            Screen::Convert => "3DS と Switch の形式を変換して保存します。[A] で実行。",
+            Screen::Options => "設定の行を [◀/▶] で変更、[A] で保存。[詳細] で生データ。",
+            Screen::Csv => "CSV を選んで [A] で適用（2回）、[Y] で書き出し。",
+            Screen::SaveQuests => "クエストを選んで [A] で改造、[-] で書き出し。[L/R] で一覧切替。",
+            Screen::QuestEquip => "固定装備の枠を [A] で開いて編集します。",
+            Screen::QuestEdit => "4つのタブでクエストを作ります。[詳細] でファイル単位の画面へ。",
+            Screen::ArcList => ".arc を選んで [A] で開きます。[Y] でセーブへ導入、[-] で書き出し。",
+            Screen::ArcEntries => "クエストの構成ファイルです。[A] で中身、[L/R] でタブ切替。",
+            Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み幅。",
+            Screen::Mib => "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。",
+            Screen::Gmd => "クエストの文章です。[A] でテキスト編集、[X] で保存。",
+            Screen::Check => "クエストの検査結果です。[A] で直せる項目を修正します。",
+            Screen::SaveMap => "生データ（セーブマップ）です。読み取り専用で、[B] で元の画面へ。",
         }
     }
 
@@ -14369,6 +14668,61 @@ impl Editor {
                     push(&mut out, text, true, i == self.quest_edit_cursor);
                 }
             }
+            // 詳細: the raw bytes of the screen 詳細 was pressed on, named the
+            // way the save is laid out. Read-only, so nothing here has a value
+            // box to edit.
+            Screen::SaveMap => {
+                let rows = self.save_map_rows();
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "SAVE MAP slot {}  {} rows  read only",
+                        self.slot + 1,
+                        rows.len()
+                    ),
+                    false,
+                    false,
+                );
+                let fields = savemap::fields();
+                let start = self.map_cursor.saturating_sub(4).min(rows.len().saturating_sub(1));
+                for (pos, &idx) in rows.iter().enumerate().skip(start).take(SAVE_MAP_VISIBLE) {
+                    let f = &fields[idx];
+                    push(
+                        &mut out,
+                        alloc::format!(
+                            "  {:>3}  {:<26} {:>7}B  {}",
+                            pos + 1,
+                            f.name,
+                            f.len,
+                            savemap::region(idx)
+                        ),
+                        true,
+                        pos == self.map_cursor,
+                    );
+                }
+                if let Some(f) = self.save_map_field() {
+                    push(
+                        &mut out,
+                        alloc::format!("  {}  {}", f.name, self.save_map_meta()),
+                        false,
+                        false,
+                    );
+                    if let Some(v) = self.save_map_value() {
+                        if !v.is_empty() {
+                            push(&mut out, alloc::format!("  = {}", v), false, false);
+                        }
+                    }
+                    for line in self.save_map_dump().into_iter().take(6) {
+                        push(&mut out, alloc::format!("  {}", line), false, false);
+                    }
+                }
+                push(
+                    &mut out,
+                    String::from("  Up/Down row  Left/Right 10 rows  A origin  B back"),
+                    false,
+                    false,
+                );
+            }
             Screen::Charms => {
                 let list = self.charms();
                 push(
@@ -17605,5 +17959,272 @@ mod tests {
         assert!(window
             .iter()
             .any(|line| line.contains("セーブファイル") && line.contains("3 バイト")));
+    }
+
+    // ------------------------------------------- the two-tier UI (詳細 / ガイド)
+
+    /// Every Screen variant, so the two tests below cannot miss a new one.
+    ///
+    /// Kept here as well as in the console audit because these are the rules
+    /// the two-tier navigation rests on: every screen has a guide, and every
+    /// record screen has a 詳細 destination.
+    const TWO_TIER_SCREENS: [Screen; 31] = [
+        Screen::SaveList,
+        Screen::Slots,
+        Screen::Char,
+        Screen::Items,
+        Screen::ItemPick,
+        Screen::Charms,
+        Screen::CharmEdit,
+        Screen::SkillPick,
+        Screen::Equip,
+        Screen::EquipEdit,
+        Screen::JewelPick,
+        Screen::EquipPick,
+        Screen::QuestEquip,
+        Screen::Hunts,
+        Screen::Guild,
+        Screen::Roster,
+        Screen::Sets,
+        Screen::Palico,
+        Screen::Convert,
+        Screen::Options,
+        Screen::SaveQuests,
+        Screen::ArcList,
+        Screen::ArcEntries,
+        Screen::QuestEdit,
+        Screen::EntryView,
+        Screen::Mib,
+        Screen::Gmd,
+        Screen::Check,
+        Screen::Csv,
+        Screen::Progress,
+        Screen::SaveMap,
+    ];
+
+    /// An editor holding a blank Switch save.
+    fn editor_with_a_blank_save() -> Editor {
+        let save = crate::save::empty_switch_save();
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        assert!(ed.save.is_some(), "{}", ed.message);
+        ed
+    }
+
+    /// 詳細 has to name a row of the save map for every screen that edits one,
+    /// and the rows it names have to be the regions the task asks for.
+    #[test]
+    fn the_detail_of_every_record_screen_names_a_save_map_row() {
+        for &screen in TWO_TIER_SCREENS.iter() {
+            match Editor::detail_field_name(screen) {
+                Some(name) => {
+                    let row = Editor::save_map_row_named(name, 0)
+                        .unwrap_or_else(|| panic!("{:?} names {:?}, which the save map does not hold", screen, name));
+                    assert_eq!(
+                        savemap::fields()[row].name,
+                        name,
+                        "{:?} must land on the row it named",
+                        screen
+                    );
+                }
+                None => assert!(
+                    matches!(
+                        screen,
+                        // The file lists are not save records.
+                        Screen::SaveList
+                            | Screen::Convert
+                            | Screen::ArcList
+                            // These screens already are a detail view.
+                            | Screen::ArcEntries
+                            | Screen::EntryView
+                            | Screen::Mib
+                            | Screen::Gmd
+                            | Screen::Check
+                            // クエスト改造's 詳細 is its file screens, not a save
+                            // map row: the console routes that press to
+                            // GuiState::open_quest_detail.
+                            | Screen::QuestEdit
+                            // 詳細 cannot open itself.
+                            | Screen::SaveMap
+                    ),
+                    "{:?} has no 詳細 destination and is not one of the documented exceptions",
+                    screen
+                ),
+            }
+        }
+        // The three the review named, by the words the panel prints.
+        assert_eq!(Editor::detail_field_name(Screen::Equip), Some("装備ボックス"));
+        assert_eq!(Editor::detail_field_name(Screen::Charms), Some("護石"));
+        assert_eq!(Editor::detail_field_name(Screen::Progress), Some("勲章（解禁マップ）"));
+        // The equipment box and the talismans are the same bytes, and the two
+        // rows are told apart by the record type - which is why both exist.
+        let equip = Editor::save_map_row_named("装備ボックス", 0).expect("the box row");
+        let charm = Editor::save_map_row_named("護石", 0).expect("the talisman row");
+        assert_ne!(equip, charm);
+        assert_eq!(savemap::fields()[equip].len, savemap::fields()[charm].len);
+    }
+
+    /// 詳細 opens on the region of the screen it was pressed on, and [B] hands
+    /// that screen back - the first tier never loses its place.
+    #[test]
+    fn the_detail_opens_on_the_region_the_screen_edits() {
+        let mut ed = editor_with_a_blank_save();
+        ed.screen = Screen::Equip;
+        ed.equip_cursor = 5;
+        ed.open_save_map(Screen::Equip);
+        assert_eq!(ed.screen, Screen::SaveMap);
+        assert_eq!(ed.map_return, Screen::Equip);
+        let field = ed.save_map_field().expect("a row");
+        assert_eq!(field.name, "装備ボックス");
+        let selected = ed.save_map_selected().expect("a row index");
+        let at = ed.save_map_offset().expect("the row lands in this save");
+        assert_eq!(
+            at,
+            savemap::offset_in(ed.save.as_ref().expect("save"), selected).expect("offset")
+        );
+        assert!(!ed.save_map_dump().is_empty(), "the box has bytes to dump");
+        assert!(ed.save_map_meta().contains("装備ボックス") || ed.save_map_meta().contains("スロット"));
+
+        // [B] is the way back, and the cursor of the screen underneath is
+        // where it was: 詳細 is a view, not a navigation away.
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::Equip);
+        assert_eq!(ed.equip_cursor, 5);
+
+        // The same for the talisman box and the progress bit maps.
+        ed.open_save_map(Screen::Charms);
+        assert_eq!(ed.save_map_field().map(|f| f.name), Some("護石"));
+        ed.open_save_map(Screen::Progress);
+        assert_eq!(ed.save_map_field().map(|f| f.name), Some("勲章（解禁マップ）"));
+    }
+
+    /// The 詳細 screen shows the row's bytes and writes none of them.
+    #[test]
+    fn the_detail_screen_is_read_only_and_shows_the_rows_bytes() {
+        let mut ed = editor_with_a_blank_save();
+        // A byte nobody else would produce, so a write anywhere shows up.
+        let at = ed
+            .save
+            .as_ref()
+            .expect("save")
+            .slot_base(0)
+            .expect("a slot") as usize
+            + crate::save::OFF_EQUIPMENT_BOX
+            + 7;
+        ed.save.as_mut().expect("save").body_mut()[at] = 0xAB;
+        ed.open_save_map(Screen::Equip);
+        let before = ed.save.as_ref().expect("save").body().to_vec();
+        assert_eq!(before[at], 0xAB);
+
+        // Every key the screen answers, and then some.
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::Left,
+            Key::Right,
+            Key::A,
+            Key::B,
+            Key::X,
+            Key::Y,
+            Key::Minus,
+            Key::Plus,
+            Key::L,
+            Key::R,
+            Key::Z,
+        ] {
+            ed.input(key);
+        }
+        assert_eq!(
+            ed.save.as_ref().expect("save").body(),
+            before.as_slice(),
+            "nothing on 詳細 may write the save"
+        );
+        assert!(!ed.dirty);
+        assert!(ed.take_write().is_none(), "no write may be queued either");
+
+        // The dump is the row's bytes, at the row's offset.
+        ed.open_save_map(Screen::Equip);
+        let selected = ed.save_map_selected().expect("a row");
+        let off = savemap::offset_in(ed.save.as_ref().expect("save"), selected).expect("offset");
+        let dump = ed.save_map_dump();
+        assert!(!dump.is_empty());
+        assert!(
+            dump[0].starts_with(&alloc::format!("{:06X}", off)),
+            "the first dump line names the row's offset: {}",
+            dump[0]
+        );
+        // 0xAB is inside the equipment box, so its line is somewhere in there.
+        let want = alloc::format!("{:02x}", 0xAB);
+        assert!(
+            dump.iter().any(|line| line.split_whitespace().any(|b| b == want)),
+            "the box's own bytes are in the dump: {:?}",
+            dump
+        );
+    }
+
+    /// The 詳細 screen renders: a list with one cursor, and the selected row's
+    /// bytes under it. This is the text renderer the fallback console draws, so
+    /// the new screen has to be readable there too.
+    #[test]
+    fn the_detail_screen_renders_the_selected_row_and_its_dump() {
+        let mut ed = editor_with_a_blank_save();
+        ed.open_save_map(Screen::Equip);
+        let lines = ed.lines();
+        assert!(
+            lines.iter().any(|l| l.text.contains("SAVE MAP")),
+            "the screen has to name itself"
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.cursor).count(),
+            1,
+            "one row carries the cursor"
+        );
+        let cursor = lines.iter().find(|l| l.cursor).expect("a cursor");
+        assert!(cursor.text.contains("装備ボックス"), "{}", cursor.text);
+        let dump = ed.save_map_dump();
+        assert!(!dump.is_empty());
+        assert!(
+            lines.iter().any(|l| l.text.contains(dump[0].as_str())),
+            "the dump is under the list: {:?}",
+            dump[0]
+        );
+        // Moving the cursor moves the mark, and nothing else.
+        ed.input(Key::Down);
+        let moved = ed.lines();
+        assert_eq!(moved.iter().filter(|l| l.cursor).count(), 1);
+        let cursor = moved.iter().find(|l| l.cursor).expect("a cursor");
+        assert_ne!(cursor.text, "", "the moved-to row still says what it is");
+        assert_eq!(
+            ed.save.as_ref().expect("save").body(),
+            crate::save::empty_switch_save().body(),
+            "moving the cursor writes nothing"
+        );
+    }
+
+    /// A first-time player is told what the screen does, on one line, before
+    /// touching anything - and every screen has such a line.
+    #[test]
+    fn every_screen_has_a_one_line_guide() {
+        let mut ed = Editor::new();
+        for &screen in TWO_TIER_SCREENS.iter() {
+            ed.screen = screen;
+            let guide = ed.screen_guide();
+            assert!(!guide.is_empty(), "{:?} has no guide", screen);
+            assert!(!guide.contains('\n'), "{:?} guide is not one line", screen);
+            assert!(
+                guide.chars().count() <= 52,
+                "{:?} guide does not fit the strip: {}",
+                screen,
+                guide
+            );
+        }
+        // The guide of the two screens the task quotes names the two facts a
+        // newcomer needs: the first key, and where 詳細 is.
+        ed.screen = Screen::Equip;
+        let guide = ed.screen_guide();
+        assert!(guide.contains("[A]"), "{}", guide);
+        assert!(guide.contains("詳細"), "{}", guide);
+        ed.screen = Screen::SaveMap;
+        assert!(ed.screen_guide().contains("読み取り専用"));
     }
 }

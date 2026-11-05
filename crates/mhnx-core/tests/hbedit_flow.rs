@@ -3731,7 +3731,7 @@ fn the_console_entry_is_labelled_in_the_list() {
 // ===========================================================================
 
 /// Every Screen variant, so the reachability test cannot miss a new one.
-const AUDIT_SCREENS: [Screen; 30] = [
+const AUDIT_SCREENS: [Screen; 31] = [
     Screen::SaveList,
     Screen::Slots,
     Screen::Char,
@@ -3762,6 +3762,8 @@ const AUDIT_SCREENS: [Screen; 30] = [
     Screen::Check,
     Screen::Csv,
     Screen::Progress,
+    // Added with the two-tier navigation: 詳細 on any record screen.
+    Screen::SaveMap,
 ];
 
 /// Keys that could plausibly start an edit on a record screen.
@@ -3811,6 +3813,8 @@ fn audit_screen_name(s: Screen) -> &'static str {
         Screen::Progress => "Progress",
         // Added with クエスト改造: the aggregate quest screen.
         Screen::QuestEdit => "QuestEdit",
+        // Added with the two-tier navigation: the raw bytes behind a screen.
+        Screen::SaveMap => "SaveMap",
     }
 }
 
@@ -4145,6 +4149,15 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Slots);
     press!(Key::A);
     assert_eq!(ed.screen, Screen::Char);
+    // 詳細: not a key of its own - the console opens it from the [詳細] pill or
+    // a long [R] hold - so the audit calls the entry point the pill calls and
+    // proves that [B] hands the record screen back.
+    ed.open_save_map(Screen::Char);
+    audit_note(&ed, &mut seen);
+    assert_eq!(ed.screen, Screen::SaveMap);
+    press!(Key::Down, Key::Right, Key::A);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::Char, "B must come back to the record screen");
     press!(Key::Minus);
     assert_eq!(ed.screen, Screen::Hunts);
     press!(Key::B);
@@ -4846,7 +4859,7 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
         .collect();
     assert_eq!(
         arms.len(),
-        30,
+        31,
         "arms: {:?}",
         arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     );
