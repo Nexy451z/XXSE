@@ -8,7 +8,7 @@
 
 use mhnx_core::hbedit::{
     list_end, page_move, scroll_track, KeyRepeat, ScrollBar, SCROLL_BAR_W, SCROLL_HIT_W,
-    SCROLL_MIN_THUMB,
+    SCROLL_MIN_THUMB, SCROLL_TEXT_GAP,
 };
 
 /// The track the equipment box uses: nine 56px rows.
@@ -158,22 +158,36 @@ fn a_held_direction_repeats_after_eight_frames_then_every_three_or_four() {
 
 #[test]
 fn the_bar_never_sits_on_a_rows_value() {
-    // The list panel is 796px wide at x = 20. A row puts its value flush to
-    // 22px of the panel's right edge, so the bar has that whole margin to live
-    // in - and the touch area has to stay inside the panel as well, or a drag
-    // would start on the panel's border.
+    // The list panel is 796px wide at x = 20. The row's value is right aligned
+    // at `text_right`, which sits one gap left of the bar's touch area, so the
+    // two can never overlap whatever the value holds - and the row's own tap
+    // area stops at the same line, so a tap can never mean both.
     const PANEL_X: i32 = 20;
     const PANEL_W: i32 = 796;
-    const VALUE_INSET: i32 = 22;
+    const ROW_X: i32 = PANEL_X + 8;
 
     let track = scroll_track(PANEL_X, PANEL_W);
-    let value_right = PANEL_X + PANEL_W - VALUE_INSET;
-    assert!(track.bar_x >= value_right + 8, "bar at {} on value ending {}", track.bar_x, value_right);
-    assert!(track.hit_x >= value_right + 2, "hit area at {}", track.hit_x);
+    assert_eq!(track.text_right, track.hit_x - SCROLL_TEXT_GAP);
+    assert!(SCROLL_TEXT_GAP >= 8, "no glyph may touch the thumb");
+    assert!(
+        track.bar_x >= track.text_right + 8,
+        "bar at {} on value ending {}",
+        track.bar_x,
+        track.text_right
+    );
     assert_eq!(track.bar_x + track.bar_w, PANEL_X + PANEL_W - 8);
     assert_eq!(track.hit_x + track.hit_w, PANEL_X + PANEL_W);
     assert_eq!(track.hit_w, SCROLL_HIT_W);
+    // 40px of thumb is what a finger can hold; the old 20 is not.
+    assert_eq!(SCROLL_HIT_W, 40);
     assert_eq!(track.bar_w, SCROLL_BAR_W);
+    assert_eq!(track.bar_w, 6, "the bar itself stays a line");
+
+    // The row - its tap area and its value - stops before the bar's zone.
+    let row_w = track.row_right - ROW_X;
+    assert!(track.row_ends_before_the_bar(ROW_X, row_w));
+    assert!(!track.hits(ROW_X + row_w - 1), "the row ends outside the zone");
+    assert!(track.hits(track.hit_x));
 
     // The hit area is the bar plus a margin on both sides, and the bar is
     // inside it.

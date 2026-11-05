@@ -189,14 +189,17 @@ fn the_new_form_creates_a_record_and_selects_its_row() {
     assert_eq!(form.field, 0, "the first row is the type");
     assert_eq!(form.kind, 1);
 
-    // 種別 1 -> 2, ID 1 -> 2, レベル 1 -> 2.
+    // 種別 1 -> 2, ID 1 -> 11, レベル 1 -> 2. The id row takes the pick lists'
+    // ten-row step (`hbedit::EQUIP_ID_STEP`), the other two rows one at a
+    // time, which is the rule the row's own hint prints.
     ed.input(Key::Right);
     ed.input(Key::Down);
     ed.input(Key::Right);
     ed.input(Key::Down);
     ed.input(Key::Right);
     let form = ed.equip_edit.expect("still open");
-    assert_eq!((form.kind, form.id, form.level), (2, 2, 2));
+    let id = 1 + mhnx_core::hbedit::EQUIP_ID_STEP as u16;
+    assert_eq!((form.kind, form.id, form.level), (2, id, 2));
 
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Equip, "[A] writes and returns to the list");
@@ -208,7 +211,7 @@ fn the_new_form_creates_a_record_and_selects_its_row() {
         .unwrap()
         .equipment_at(slot, blank_index)
         .expect("the first blank record is the one create() used");
-    assert_eq!((created.kind, created.id, created.level), (2, 2, 2));
+    assert_eq!((created.kind, created.id, created.level), (2, id, 2));
     assert!(
         ed.message.contains("新規作成"),
         "message was {}",
@@ -263,6 +266,12 @@ fn changing_the_type_in_the_form_replaces_the_record() {
     let new_kind = ed.equip_edit.unwrap().kind;
     assert_ne!(new_kind, old_kind, "[▶] changes the type");
 
+    // [A] on 種別 opens the name picker (that is the whole point of the row's
+    // "▸ 選ぶ"), so the write comes from the row the form marks "▸ 書き込み":
+    // 装備枠, row 0.
+    while ed.equip_edit.map(|e| e.field) != Some(0) {
+        ed.input(Key::Up);
+    }
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Equip);
     assert!(

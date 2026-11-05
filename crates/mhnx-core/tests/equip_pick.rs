@@ -198,15 +198,23 @@ fn the_id_row_takes_a_typed_number_instead_of_stepping_to_it() {
     let form = ed.equip_edit.expect("the form is still open");
     assert_eq!(form.id, 40);
     assert!(ed.message.contains("爆砕の大剣"), "{}", ed.message);
+    // The typed id leaves the cursor on the row that writes (the status line
+    // says "[A] で書き込み", so that press has to be the one the form is on),
+    // which means the id row has to be selected again to type another one.
+    assert_eq!(form.field, form.write_row());
+    // This form is making a record, so its id row is row 1 (種別 is row 0).
+    ed.equip_edit.as_mut().unwrap().field = 1;
     // A bare number is decimal, which is the one place this interface accepts
     // one; the row re-spells it in hex and names it, so a wrong reading shows.
     assert!(ed.apply_equip_id_text("40"));
     assert_eq!(ed.equip_edit.expect("form").id, 40);
     // An id the name table does not carry is accepted and said out loud.
+    ed.equip_edit.as_mut().unwrap().field = 1;
     assert!(ed.apply_equip_id_text("0x7FFF"));
     assert_eq!(ed.equip_edit.expect("form").id, 0x7FFF);
     assert!(ed.message.contains("名前表に無い"), "{}", ed.message);
     // Text that is not a number changes nothing and says what the row wants.
+    ed.equip_edit.as_mut().unwrap().field = 1;
     let before = ed.equip_edit.expect("form").id;
     assert!(!ed.apply_equip_id_text("大剣"));
     assert_eq!(ed.equip_edit.expect("form").id, before);

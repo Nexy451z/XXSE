@@ -7,7 +7,11 @@
 //!     rather than the play (`セーブマップ` / `CSV入出力` / `環境設定`).
 //!     Nothing was removed: every screen that used to sit beside the everyday
 //!     ones still exists, one press further to the right.
-//!   - `L / R`: Cycle the Sub-Tabs of the current Section (NEVER switches character slot unexpectedly!).
+//!   - `L / R`: Cycle the Sub-Tabs of the current Section (NEVER switches
+//!     character slot unexpectedly!), answered on the press rather than on the
+//!     release so two quick presses do not feel one behind. Holding L offers
+//!     the whole-save undo (two holds run it); holding R opens 詳細. On the four
+//!     pick lists the shoulders are the ten row step and repeat while held.
 //!   - The strip under the sub-tabs is the one-line guide for the screen
 //!     (`Editor::screen_guide`), so a first-time player is told what `[A]` does.
 //!   - `R 長押し` (or the `[詳細]` pill on the sub-tab bar): the `詳細` view of
@@ -23,9 +27,13 @@
 //!     with the flick coasting on after the finger lifts).
 //!   - The right hand scrollbar of every list can be dragged as well: the thumb
 //!     moves the window and the cursor keeps its place inside it, and a tap on
-//!     the bar - above or below the thumb - turns one page. The bar is 6px wide
-//!     and answers a finger within 20px (`hbedit::SCROLL_HIT_W`), and the row's
-//!     value stops 8px short of it, so no text and no tap can land on the other.
+//!     the bar - above or below the thumb - turns one page. The bar is drawn
+//!     6px wide (14px while a finger holds it) and answers a finger within 40px
+//!     (`hbedit::SCROLL_HIT_W`), and the row's tap area and its value both stop
+//!     8px short of that zone (`hbedit::SCROLL_TEXT_GAP`), so no text and no tap
+//!     can land on the other.
+//!   - 装備フォームの `[A]` は行ごとの操作（装備名/装飾品を選ぶ・値・書き込み）で、
+//!     行そのものに「▸ 選ぶ / ▸ 書き込み」と出る（`hbedit::EquipFormAction`）。
 //!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `お守り反映`).
 //!   - `Y`: Secondary tool action (`刻み幅切替` / `検索` / `スキル選択` / `2段階確認削除`).
 //!   - 護石の `[A]` は行ごとの操作（種類/スロット/スキル選択/数値/BOXへ反映）で、
@@ -446,6 +454,13 @@ pub struct OskState {
     pub col: usize,
     /// The last character the field refused, so the modal can name it.
     pub refused: Option<char>,
+    /// Why this keyboard was used when the system one was the first choice.
+    ///
+    /// Empty on the normal path. It is set when swkbd cannot be launched (the
+    /// process is a library applet) and a one-line field falls back to this
+    /// built-in keyboard: the modal then says so instead of leaving the user to
+    /// wonder why the system keyboard never appeared.
+    pub note: String,
 }
 
 #[derive(Clone, Copy)]
@@ -506,6 +521,20 @@ struct BarDrag {
     /// The finger went down above the thumb (the rest of the bar is below it).
     above: bool,
     picker: bool,
+}
+
+/// Do L / R mean "move by ten" on this screen instead of "change the sub-tab"?
+///
+/// The four pick lists spend the shoulders on their ten row step: the console
+/// turns L / R into [◀] / [▶] there (see `GuiState::handle_pad_key`). They are
+/// therefore the screens where a held shoulder has to auto-repeat, and the only
+/// ones: everywhere else the shoulder is the sub-tab key, and repeating that
+/// would walk the tab strip while the finger rests.
+pub fn shoulder_moves(ed: &Editor) -> bool {
+    matches!(
+        ed.screen,
+        Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
+    )
 }
 
 pub struct GuiState {
@@ -597,6 +626,23 @@ impl GuiState {
         initial: &str,
         spec: mhnx_core::hbedit::NameSpec,
     ) {
+        self.open_osk_with_note(req_idx, header, initial, spec, "");
+    }
+
+    /// The same keyboard, with the reason it was used instead of swkbd.
+    ///
+    /// hbedit::KeyboardRoute::BuiltinFallback is the one route that passes a
+    /// note: a one-line field would have used the system keyboard, but the
+    /// applet cannot be launched (started from the album), so the built-in one
+    /// opens and says why.
+    pub fn open_osk_with_note(
+        &mut self,
+        req_idx: usize,
+        header: &str,
+        initial: &str,
+        spec: mhnx_core::hbedit::NameSpec,
+        note: &str,
+    ) {
         // Whatever an old keyboard or an old save left in the text goes
         // through the field filter before it can be edited: a tab has no glyph
         // in a name and the writers refuse it, so it never reaches the box.
@@ -610,6 +656,7 @@ impl GuiState {
             row: 0,
             col: 0,
             refused,
+            note: String::from(note),
         });
     }
 
@@ -1389,9 +1436,10 @@ impl GuiState {
     /// Draw one list's scrollbar and remember it for the touch handler.
     ///
     /// A list that fits draws nothing: a thumb that cannot move would claim the
-    /// table is longer than it is. The bar is 6px, the area that answers a
-    /// finger is 20px (hbedit::SCROLL_HIT_W), and the row value stops 8px short
-    /// of the bar, so the two never meet on screen.
+    /// table is longer than it is. The bar is drawn 6px (14px while a finger
+    /// holds it), the area that answers a finger is 40px
+    /// (hbedit::SCROLL_HIT_W), and the row - its tap area and its value - stops
+    /// 8px short of that area, so the two never meet on screen.
     #[allow(clippy::too_many_arguments)]
     fn draw_list_bar(
         &mut self,
@@ -1422,16 +1470,19 @@ impl GuiState {
             return;
         }
         // The groove, then the thumb. The thumb turns amber while it is being
-        // dragged, so a finger knows it is holding the bar and not a row.
-        c.round_rect(
-            track.bar_x,
-            track_y,
-            track.bar_w,
-            track_h,
-            track.bar_w / 2,
-            t.bg_btn,
-        );
+        // dragged, so a finger knows it is holding the bar and not a row; the
+        // bar itself also grows for as long as the finger holds it, because a
+        // 6px line is something the eye reads but a thumb cannot hold. The
+        // growth is even, so the bar widens around its own centre line and the
+        // strip it covers never moves.
         let dragging = matches!(&self.bar_drag, Some(d) if d.picker == picker);
+        let bar_w = if dragging {
+            mhnx_core::hbedit::SCROLL_BAR_ACTIVE_W
+        } else {
+            track.bar_w
+        };
+        let bar_x = track.bar_x - (bar_w - track.bar_w) / 2;
+        c.round_rect(bar_x, track_y, bar_w, track_h, bar_w / 2, t.bg_btn);
         let thumb_col = if dragging {
             t.accent_secondary
         } else {
@@ -1440,11 +1491,11 @@ impl GuiState {
         let thumb = scroll.thumb_len(track_h);
         let off = scroll.thumb_offset(track_h);
         c.round_rect(
-            track.bar_x,
+            bar_x,
             track_y + off,
-            track.bar_w,
+            bar_w,
             thumb,
-            track.bar_w / 2,
+            bar_w / 2,
             thumb_col,
         );
     }
@@ -1791,6 +1842,30 @@ impl GuiState {
         ed.open_save_map_at(from, row);
     }
 
+    /// Feed one pad key. The console calls this on the frame the key goes down
+    /// (a held direction repeats through the same entry point), so every answer
+    /// here is a key-down answer.
+    ///
+    /// The key map, by route, and why nothing collides:
+    ///
+    /// | key            | pick lists (Item/Skill/Jewel/EquipPick) | item box / roster / palico panels | every other screen |
+    /// |----------------|--------------------------------------|-----------------------------------|--------------------|
+    /// | [◀] / [▶]      | 10 rows (hbedit::pick_move)           | value / page by the row's meaning | value ±step; 10 on an id row |
+    /// | [▲] / [▼]      | 1 row                                 | 1 row                             | 1 row              |
+    /// | held [◀]/[▶]   | repeats at 8 / 4 / 3 frames           | repeats at 8 / 4 / 3 frames       | repeats at 8 / 4 / 3 frames |
+    /// | [L] / [R] tap  | ten rows, same as [◀] / [▶], repeated while held | the mode's own key (swallowed by the set / palico form) | previous / next sub-tab |
+    /// | held [L]       | (repeats the ten-row step)            | —                                 | first hold offers 元に戻す, second hold runs it |
+    /// | held [R]       | (repeats the ten-row step)            | —                                 | opens 詳細 |
+    /// | [A]            | 決定                                  | the row's own action              | the row's own action (equipment / talisman forms: 選ぶ・書き込み・作成) |
+    /// | [Y]            | 名前で絞る (the keyboard)              | the mode's own key                | the row's second action / 検索 / 刻み |
+    /// | [X]            | クリア／保存 (per screen)              | 保存                              | 保存 (global QuickSave) |
+    /// | [－] / [＋]     | 種別 filter / 終了                     | 2-press delete / quit             | the screen's own tool |
+    ///
+    /// The two rules that make it collision-free: (1) a shoulder is answered on
+    /// the press, and its hold is a *second* answer that never undoes the first,
+    /// so a hold cannot lose its tab move and two taps cannot be swallowed by a
+    /// hold; (2) a pick list owns L / R as movement before the sub-tab rule is
+    /// reached (see `shoulder_moves`), exactly as it owns [◀] / [▶].
     pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
         // Picker screens use L/R for fast ±10 page jump; EVERY other screen uses L/R for Sub-Tab switching!
         if matches!(key, Key::L | Key::R) {
@@ -1819,10 +1894,7 @@ impl GuiState {
             // turned into that pair here rather than scrolling on their own,
             // so the two layers cannot disagree about the same key - which is
             // how one route used to page and the next one not.
-            if matches!(
-                ed.screen,
-                Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
-            ) {
+            if shoulder_moves(ed) {
                 ed.input(if key == Key::R { Key::Right } else { Key::Left });
                 return;
             }
@@ -2001,19 +2073,13 @@ impl GuiState {
                 other => ed.input(other),
             },
             Screen::CharmEdit => match key {
-                // [A] is the row's own action: 種類 and スロット数 cycle, the
-                // two skill rows open the name picker, the two point rows step
-                // the value, and the box-slot row writes the form into the box.
-                // Which one it is comes from hbedit::CharmAction - the same
-                // value the footer line and the inspector's [A] button print -
-                // so the hint and the key can no longer disagree. [Y] is left
-                // to the state machine: on a skill row it opens the picker too,
-                // on any other row it says which row to move to. It used to be
-                // the 合法最大値 preset key, which read nothing like the footer.
-                Key::A => {
-                    let a = ed.charm_edit.map(|c| c.a_key()).unwrap_or(Key::A);
-                    ed.input(a);
-                }
+                // [A] is the row's own action, and the state machine dispatches
+                // it from the same value the footer and the inspector button
+                // print (hbedit::CharmAction): 種類 / スロット数 cycle, the two
+                // skill rows open the name picker, the two point rows step, and
+                // the box-slot row writes. [Y] on a skill row is the search
+                // route into the same picker, and says where it works on the
+                // rows that have no list.
                 other => ed.input(other),
             },
             // The palico equipment panel is a mode of these two screens: while
@@ -2591,7 +2657,10 @@ impl GuiState {
                 if let Some(mut ce) = ed.charm_edit {
                     ce.field = field_idx;
                     ed.charm_edit = Some(ce);
-                    ed.input(Key::Y);
+                    // The browse route, which is what the pad's [A] does on a
+                    // skill row; [Y] would open the same list with the search
+                    // box up, and a tap on "スキル" should not pop a keyboard.
+                    ed.input(Key::A);
                 }
             }
             UiAction::PageScroll(delta) => self.page_scroll(ed, delta),
@@ -4141,7 +4210,10 @@ impl GuiState {
 
         // Line 1, left: the whole-save undo. The key is L held down; a plain L
         // is the sub-tab key everywhere.
-        let undo = format!("[L長押し] {}", ed.undo_line());
+        // Two holds run the undo (the first one only offers it), so the pill
+        // says how many: a single "long press" would be a promise the second
+        // hold does not keep.
+        let undo = format!("[L 長押し2回] {}", ed.undo_line());
         let undo_w = (c.text_width_sized(&undo, FontSize::Small) + 22).min(470);
         let has_undo = ed.undo_depth() > 0;
         let (undo_bg, undo_fg) = if has_undo {
@@ -4418,6 +4490,9 @@ impl GuiState {
         let insp_x = MAIN_X + list_w + 16; // 636
         let insp_w = 1262 - insp_x; // 626
         let start = window_start(ed.map_cursor, total, VIS);
+        // The same 40px rule as the wide list: the row's tap area and its
+        // right-hand text stop before the bar's touch area.
+        let track = scroll_track(MAIN_X, list_w);
 
         // ---- left: the named stretches of the save
         c.round_rect(MAIN_X, body_y, list_w, body_h, t.corner_r, t.bg_panel);
@@ -4441,7 +4516,13 @@ impl GuiState {
                 t.bg_row_even
             };
             c.round_rect(MAIN_X + 8, ry, list_w - 16, ROW_H - 4, 5, bg);
-            self.add_hit(MAIN_X + 8, ry, list_w - 16, ROW_H - 4, UiAction::SelectRow(pos));
+            self.add_hit(
+                MAIN_X + 8,
+                ry,
+                track.row_right - (MAIN_X + 8),
+                ROW_H - 4,
+                UiAction::SelectRow(pos),
+            );
             if selected {
                 c.rect(MAIN_X + 8, ry + 6, 3, ROW_H - 16, t.accent_primary);
             }
@@ -4466,14 +4547,14 @@ impl GuiState {
                 FontSize::Small,
             );
             c.text_right(
-                MAIN_X + list_w - 72,
+                track.text_right - 56,
                 ry + 15,
                 &format!("{}B", f.len),
                 t.text_secondary,
                 FontSize::Small,
             );
             c.text_right(
-                MAIN_X + list_w - 16,
+                track.text_right,
                 ry + 15,
                 &format!("#{:03}", pos + 1),
                 t.text_muted,
@@ -4647,6 +4728,14 @@ impl GuiState {
             warnings.len().min(2) as i32 * warn_lh + 16
         };
         let row_h = LIST_ROW_H;
+        // The scrollbar's own geometry decides where a row's text and its tap
+        // area may end: the bar answers a finger 40px from the panel edge now,
+        // and nothing the row draws may reach into those 40px - a tap that
+        // landed on the value must not move the window, and a value drawn under
+        // the thumb reads as part of it. Computed from the same call the bar is
+        // drawn from (scroll_track), so the two cannot drift apart.
+        let track = scroll_track(MAIN_X, V1_LIST_W);
+        let row_hit_w = track.row_right - (MAIN_X + 8);
         let rows_that_fit = ((body_h - 10 - warn_reserve).max(row_h)) / row_h;
         let vis = (rows_that_fit.max(1) as usize).min(9);
         let vis = if warnings.is_empty() { vis } else { vis.min(8) };
@@ -4771,7 +4860,8 @@ impl GuiState {
                 c.hline(MAIN_X + 16, ry + row_h - 1, V1_LIST_W - 32, t.border_subtle);
             }
 
-            self.add_row_hit(MAIN_X + 8, ry + 2, V1_LIST_W - 16, row_h - 4, row_idx);
+            // The row's tap area stops where the bar's starts.
+            self.add_row_hit(MAIN_X + 8, ry + 2, row_hit_w, row_h - 4, row_idx);
 
             // 1. Left Badge
             let mut tx = MAIN_X + 20;
@@ -4789,7 +4879,10 @@ impl GuiState {
             }
 
             // 2. Right Value (clipped to max 230px so it never crowds the left title)
-            let right_edge = MAIN_X + V1_LIST_W - 22;
+            // Its right edge is 8px left of the bar's touch area
+            // (hbedit::SCROLL_TEXT_GAP), so no glyph is ever drawn under the
+            // thumb and no tap on a value can be read as a tap on the bar.
+            let right_edge = track.text_right;
             // A name value may hold a line break, and the game draws the second
             // line: the row draws them both, small, instead of clipping after
             // the first one.
@@ -6676,51 +6769,22 @@ impl GuiState {
             .as_ref()
             .map(|q| mhnx_core::equip::name(q).to_string())
             .unwrap_or_default();
-        let deco = |sock: usize| -> alloc::string::String {
-            let id = ee.decorations[sock];
-            if id == 0 {
-                String::from("なし")
-            } else {
-                decoration_name_of(id)
-            }
-        };
-        let deco_id = |sock: usize| -> alloc::string::String {
-            format!("◀ ▶ で切替 / ID {}", ee.decorations[sock])
-        };
+        // The rows and the words for [A] live in the state machine
+        // (hbedit::equip_form_rows / EquipFormAction), so the host tests read
+        // exactly what this list draws - the same arrangement the talisman form
+        // uses. Each title already carries its own "▸ 選ぶ" / "▸ 書き込み", so a
+        // row says what [A] does without the footer being read first.
+        let rows: alloc::vec::Vec<(usize, String, String, String, String)> =
+            mhnx_core::hbedit::equip_form_rows(&ee, &ename)
+                .into_iter()
+                .map(|r| (r.field, r.title, r.meta, r.value, r.badge))
+                .collect();
 
         if ee.new {
-            // A record that does not exist yet has no level word, layer or
-            // sockets to preserve: ask for the three values create() writes.
-            let rows = alloc::vec![
-                (
-                    0,
-                    String::from("種別"),
-                    String::from("◀ ▶ で選択（1 〜 21）"),
-                    format!("{} {}", ee.kind, mhnx_core::equip::type_name(ee.kind)),
-                    String::from("#01"),
-                ),
-                (
-                    1,
-                    String::from("アイテムID"),
-                    String::from("[Y] 名前で選ぶ / [R] ID を入力 / ◀ ▶ で増減"),
-                    format!(
-                        "{}  {}",
-                        mhnx_core::hbedit::equip_choice_name(ee.kind, ee.id),
-                        mhnx_core::hbedit::EquipChoice { kind: ee.kind, id: ee.id }.hex()
-                    ),
-                    String::from("#02"),
-                ),
-                (
-                    2,
-                    String::from("レベル"),
-                    String::from("1 〜 32"),
-                    format!("{}", ee.level),
-                    String::from("#03"),
-                ),
+            let notice = alloc::vec![
+                String::from("種別・ID は [A] で一覧から、レベルは [◀/▶] で決めます"),
+                String::from("最後の [A] で空き枠に作成します（[B] で中止）"),
             ];
-            let notice = alloc::vec![String::from(
-                "決めた種別・ID・レベルで空き枠に作成します（[B] で中止）",
-            )];
             self.draw_adaptive_rows_warn(
                 c,
                 ed,
@@ -6729,88 +6793,11 @@ impl GuiState {
                 &rows,
                 ee.field.min(rows.len().saturating_sub(1)),
                 true,
-                "作成",
+                ee.a_label(),
                 &notice,
             );
             return;
         }
-
-        // Nine rows, the same shape as the talisman form. 種別 and ID sit at
-        // the bottom because moving either of them turns [A] into
-        // equipops::replace, which empties the three sockets.
-        let rows = alloc::vec![
-            (
-                0,
-                String::from("装備枠"),
-                format!(
-                    "◀ ▶ で移動 / {} {}",
-                    mhnx_core::equip::type_name(ee.kind),
-                    ename
-                ),
-                format!("#{:04}", ee.index),
-                String::from("#01"),
-            ),
-            (
-                1,
-                String::from("レベル"),
-                String::from("1 〜 32"),
-                format!("{}", ee.level),
-                String::from("#02"),
-            ),
-            (
-                2,
-                String::from("着せ替えID"),
-                String::from("0 = 着せ替えなし"),
-                format!("{}", ee.transmog_id),
-                String::from("#03"),
-            ),
-            (
-                3,
-                String::from("着せ替え元レベル"),
-                String::from("1 〜 32"),
-                format!("{}", ee.transmog_level),
-                String::from("#04"),
-            ),
-            (
-                4,
-                String::from("装飾品1"),
-                deco_id(0),
-                deco(0),
-                String::from("#05"),
-            ),
-            (
-                5,
-                String::from("装飾品2"),
-                deco_id(1),
-                deco(1),
-                String::from("#06"),
-            ),
-            (
-                6,
-                String::from("装飾品3"),
-                deco_id(2),
-                deco(2),
-                String::from("#07"),
-            ),
-            (
-                7,
-                String::from("種別"),
-                String::from("◀ ▶ で選択（1 〜 21）"),
-                format!("{} {}", ee.kind, mhnx_core::equip::type_name(ee.kind)),
-                String::from("#08"),
-            ),
-            (
-                8,
-                String::from("アイテムID"),
-                String::from("[Y] 名前で選ぶ / [R] ID 入力 / 変えると差し替え"),
-                format!(
-                    "{}  {}",
-                    mhnx_core::hbedit::equip_choice_name(ee.kind, ee.id),
-                    mhnx_core::hbedit::EquipChoice { kind: ee.kind, id: ee.id }.hex()
-                ),
-                String::from("#09"),
-            ),
-        ];
 
         // Whether [A] patches the record or replaces it is decided by these
         // two fields, so the strip says which one is about to happen.
@@ -6819,17 +6806,17 @@ impl GuiState {
             .map(|q| q.kind != ee.kind || q.id != ee.id)
             .unwrap_or(false);
         let notice = if identity_changed {
-            alloc::vec![String::from(
-                "種別/ID を変えて [A]: 差し替えます（装飾品3枠は外れます）",
-            )]
+            alloc::vec![
+                String::from("種別/ID を変えて書き込むと差し替えます（装飾品3枠は外れます）"),
+                String::from("名前行は [A] で一覧、書き込みは「装備枠」の行の [A] です"),
+            ]
         } else {
-            alloc::vec![String::from(
-                "[A] でレベル・着せ替え・装飾品を書き込みます（種別/ID 変更で差し替え）",
-            )]
+            alloc::vec![
+                String::from("[A] は行ごとの操作です（選ぶ / 値を増やす / 書き込み）"),
+                String::from("書き込みは「装備枠」の行の [A]。X でファイルに保存します"),
+            ]
         };
 
-        // [A] writes the form into the box; the save file is written with X,
-        // the same split the talisman form uses.
         self.draw_adaptive_rows_warn(
             c,
             ed,
@@ -6838,16 +6825,13 @@ impl GuiState {
             &rows,
             ee.field.min(rows.len().saturating_sub(1)),
             true,
-            if identity_changed {
-                "差し替え"
-            } else {
-                "BOXへ反映"
-            },
+            ee.a_label(),
             &notice,
         );
     }
 
-    /// Decoration name picker, opened from the equipment form with [Y].
+    /// Decoration name picker, opened from the equipment form with [A] on a
+    /// socket row ([Y] opens the same list with the search box already up).
     fn draw_jewel_pick(&mut self, c: &mut Canvas, ed: &Editor) {
         let matches = ed.jewel_pick_matches();
         let mut rows = Vec::with_capacity(matches.len());
@@ -6881,7 +6865,8 @@ impl GuiState {
         );
     }
 
-    /// Equipment name picker, opened from the form's 種別 / ID row with [Y].
+    /// Equipment name picker, opened from the form's 種別 / ID row with [A]
+    /// (the primary route; [Y] opens the same list with the search box up).
     ///
     /// The row is the name with the id beside it - 「爆砕の大剣  0x28」 - and the
     /// id is hex because that is what the box, the form and this list print;
@@ -8701,6 +8686,10 @@ impl GuiState {
         let list_x = mx + 24;
         let list_w = mw - 48;
         let list_y0 = my + 64;
+        // The bar's 40px touch area, the same rule the lists use: the row's tap
+        // area and the 決定 button stop before it, so a tap that aimed at the
+        // button cannot grab the thumb instead.
+        let track = scroll_track(list_x, list_w);
 
         for row in 0..visible {
             let idx = start + row;
@@ -8723,33 +8712,41 @@ impl GuiState {
                 c.round_rect(list_x + 3, ry + 5, 4, row_h - 10, 2, t.accent_primary);
             }
 
+            // The button stops 6px short of the bar's touch area: those 40px
+            // belong to the scrollbar, and a tap that aimed at 決定 must not
+            // grab the thumb instead. The label beside it is clipped to what is
+            // left, so it cannot run under the button either.
+            let bw = 94;
+            let bx = track.hit_x - 6 - bw;
+            let label_w = (bx - 12 - (list_x + 18)).max(80);
             c.text_clipped(
                 list_x + 18,
                 ry + 11,
-                list_w - 140,
+                label_w,
                 label,
                 if selected { t.accent_primary } else { t.text_primary },
                 FontSize::Medium,
             );
-
             if selected {
-                // The button stops 14px short of the bar's touch area: the
-                // right hand 20px of the row belongs to the scrollbar now, and
-                // a tap that aimed at 決定 must not grab the thumb instead.
-                let bx = list_x + list_w - 128;
-                c.round_rect(bx, ry + 6, 94, 34, 5, t.accent_primary);
+                c.round_rect(bx, ry + 6, bw, 34, 5, t.accent_primary);
                 btn_text(
                     c,
                     bx,
                     ry + 6,
-                    94,
+                    bw,
                     34,
                     "[A] 決定",
                     white_or_dark(t.accent_primary),
                     FontSize::Small,
                 );
             }
-            self.add_hit(list_x, ry, list_w, row_h, UiAction::MibPickerSelect(idx));
+            self.add_hit(
+                list_x,
+                ry,
+                track.row_right - list_x,
+                row_h,
+                UiAction::MibPickerSelect(idx),
+            );
         }
 
         // The picker's own bar. The monster table runs to sixty entries, and a
@@ -8803,6 +8800,19 @@ impl GuiState {
             title.push_str(&format!(" / その文字は使えません（U+{:04X}）", c as u32));
         }
         c.text_clipped(mx + 24, my + 16, 640, &title, t.text_primary, FontSize::Medium);
+        // The fallback note sits under the title: it only exists when the
+        // system keyboard could not be launched, and it is the answer to "why
+        // am I looking at this instead of the console's own keyboard?".
+        if !osk.note.is_empty() {
+            c.text_clipped(
+                mx + 24,
+                my + 38,
+                760,
+                &osk.note,
+                t.accent_warn,
+                FontSize::Small,
+            );
+        }
         // The key legend names the line-break key, because a player who is not
         // told about it will never find it. A one-line field says so instead.
         let legend = if osk.spec.multiline {

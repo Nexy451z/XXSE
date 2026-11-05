@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 
 use crate::arc::{extension_for, Arc};
 use crate::awards;
+use crate::confirm::{HoldAction, HoldConfirm};
 use crate::check::{self, Finding, Severity};
 use crate::diffvalues::{diff_values, ValueChange};
 use crate::charm::{self, Charm, CHARM_COUNT};
@@ -657,17 +658,28 @@ impl CharmAction {
         }
     }
 
-    /// The key the console sends to the state machine for this action.
+    /// The key the console hands the state machine for this action.
+    ///
+    /// `[A]` is the answer for every row: `input_charm_edit` dispatches on
+    /// this value itself, so the picker rows open their list from the same key
+    /// the write uses. The key no longer changes with the row, which is what
+    /// "[A] is always choose / edit" means on this build - and it is what makes
+    /// the skill list reachable without reading the footer.
     pub fn key(self) -> Key {
-        match self {
-            CharmAction::WriteToBox => Key::A,
-            CharmAction::PickSkill => Key::Y,
-            // The three that step a field use the arrow key the footer names,
-            // so `[A]` and `[◀/▶]` cannot drift apart either.
-            CharmAction::CycleKind | CharmAction::CycleSlots | CharmAction::RaisePoints => Key::Right,
-        }
+        Key::A
     }
 
+    /// The hint the row draws after its name, so the row itself says what
+    /// `[A]` does. `▸` marks the row's own key, the same mark the equipment
+    /// form uses.
+    pub fn row_hint(self) -> &'static str {
+        match self {
+            CharmAction::WriteToBox => "▸ 書き込み",
+            CharmAction::PickSkill => "▸ 選ぶ",
+            // The three that step a field use the arrow key the footer names.
+            CharmAction::CycleKind | CharmAction::CycleSlots | CharmAction::RaisePoints => "▸ +1",
+        }
+    }
 }
 
 impl CharmEdit {
@@ -686,6 +698,11 @@ impl CharmEdit {
         self.a_action().label()
     }
 
+    /// The hint the row draws after its name, for the row the cursor is on.
+    pub fn a_row_hint(&self) -> &'static str {
+        self.a_action().row_hint()
+    }
+
     /// The key the console sends when `[A]` is pressed on this row.
     pub fn a_key(&self) -> Key {
         self.a_action().key()
@@ -698,8 +715,11 @@ impl CharmEdit {
         // X -> QuickSave), which on this form writes the record into the box and
         // then saves the file. It used to be advertised as 刻み here, which the
         // pad never sent the state machine.
+        // [A] opens the row's own list on a skill row (the same key every
+        // other screen uses for "choose"), so [Y] is the search shortcut rather
+        // than the only way in.
         format!(
-            "[A] {}  [▲/▼] 行  [◀/▶] 値  [Y] スキル行で選択  [X] 保存  [B] 戻る",
+            "[A] {}  [▲/▼] 行  [◀/▶] 値  [Y] スキルを検索  [X] 保存  [B] 戻る",
             self.a_label()
         )
     }
@@ -781,17 +801,23 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
             },
         }
     };
+    // Every row says what `[A]` does to it, so the key does not have to be
+    // found in the footer first: "▸ 選ぶ" on the two skill rows is the same
+    // mark the equipment form uses for its pickers.
+    let hint = |field: usize, name: &str| -> String {
+        format!("{}  {}", name, CharmAction::of_row(field).row_hint())
+    };
     [
         CharmFormRow {
             field: 0,
-            title: String::from("装備BOX枠"),
+            title: hint(0, "装備BOX枠"),
             meta: String::from("対象スロット"),
             value: format!("#{:04}", e.index),
             badge: String::from("#01"),
         },
         CharmFormRow {
             field: 1,
-            title: String::from("種類"),
+            title: hint(1, "種類"),
             // The game's own name of the talisman is the value; the rarity and
             // the measured ceiling of this kind are the inspector's line.
             meta: match limits {
@@ -807,7 +833,7 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
         },
         CharmFormRow {
             field: 2,
-            title: String::from("スロット数"),
+            title: hint(2, "スロット数"),
             meta: format!(
                 "0 〜 {}",
                 limits
@@ -819,14 +845,14 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
         },
         CharmFormRow {
             field: 3,
-            title: String::from("第1スキル"),
+            title: hint(3, "第1スキル"),
             meta: format!("Skill ID: {}", e.skill1),
             value: s1.to_string(),
             badge: String::from("#04"),
         },
         CharmFormRow {
             field: 4,
-            title: String::from("第1スキル値"),
+            title: hint(4, "第1スキル値"),
             meta: range_of(e.skill1, false),
             value: format!("{:+}", e.points1),
             badge: String::from("#05"),
@@ -837,7 +863,7 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
         // the name it holds: the warning line is what explains it.
         CharmFormRow {
             field: 5,
-            title: String::from("第2スキル"),
+            title: hint(5, "第2スキル"),
             meta: if e.second_skill_available() {
                 format!("Skill ID: {}", e.skill2)
             } else {
@@ -852,7 +878,7 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
         },
         CharmFormRow {
             field: 6,
-            title: String::from("第2スキル値"),
+            title: hint(6, "第2スキル値"),
             meta: range_of(e.skill2, true),
             value: if !e.second_skill_available() && e.skill2 == 0 {
                 String::from("—")
@@ -894,6 +920,15 @@ pub const EQUIP_EDIT_ROWS: usize = 9;
 /// A new record has no level word, layer or sockets to preserve yet, so the
 /// form asks for the three things `equipops::create` writes: type, id, level.
 pub const EQUIP_NEW_ROWS: usize = 3;
+
+/// How far [◀] / [▶] move the equipment id rows: ten entries.
+///
+/// The same big step the pick lists use (`PICK_STEP`), spelled for the form so
+/// the two can be read together: the id space runs to 6,435 named entries, and
+/// one per press is not a way to reach any of them. The pad's auto-repeat
+/// (`KeyRepeat`) turns a held key into ten at a time, which is what makes a
+/// long table usable.
+pub const EQUIP_ID_STEP: i64 = 10;
 
 /// The equipment record currently being edited on the EquipEdit screen.
 ///
@@ -958,6 +993,242 @@ impl EquipEdit {
             None
         }
     }
+
+    /// Is this row one of the two that name the record (種別 / アイテムID)?
+    ///
+    /// Editing: 7 種別 / 8 ID. Creating: 0 種別 / 1 ID. Those are the only
+    /// rows with a name table behind them, so they are the only rows the
+    /// equipment name picker can write into.
+    pub fn is_identity_row(&self, field: usize) -> bool {
+        if self.new {
+            field == 0 || field == 1
+        } else {
+            field == 7 || field == 8
+        }
+    }
+
+    /// The row whose `[A]` writes: 装備枠 on the editing form, レベル on the
+    /// new one.
+    ///
+    /// The two identity rows open a picker rather than writing, so after a pick
+    /// the cursor is put on this row: the status line can then say "[A] で
+    /// 書き込み" and be telling the truth about the row the key would press.
+    pub fn write_row(&self) -> usize {
+        if self.new {
+            EQUIP_NEW_ROWS - 1
+        } else {
+            0
+        }
+    }
+
+    /// What `[A]` does on the row the cursor is on.
+    ///
+    /// The form's `[A]` used to be one thing on every row - write the record -
+    /// while the two rows that name it needed a separate `[Y]` nobody found.
+    /// The row's own action lives here now: the button, the row's hint, the
+    /// footer and the key the console feeds back all read this one value, so
+    /// `[A]` on アイテムID cannot mean "write" while the row says "pick".
+    pub fn a_action(&self) -> EquipFormAction {
+        let field = self.field.min(self.rows().saturating_sub(1));
+        if self.is_identity_row(field) {
+            return EquipFormAction::PickEquip;
+        }
+        if self.decoration_socket(field).is_some() {
+            return EquipFormAction::PickDecoration;
+        }
+        if self.new {
+            // The new form's remaining row is レベル, and it is the copy.
+            return EquipFormAction::CreateRecord;
+        }
+        match field {
+            0 => EquipFormAction::WriteForm,
+            _ => EquipFormAction::StepValue,
+        }
+    }
+
+    /// The word the footer and the inspector `[A]` button print.
+    pub fn a_label(&self) -> &'static str {
+        self.a_action().label()
+    }
+}
+
+/// What `[A]` does on one row of the equipment form.
+///
+/// The pick lists are the point: a 6,435 row name table is not something the
+/// arrow keys can be asked to walk, and `[Y]` used to be the only way in. `[A]`
+/// is the key every other screen uses for "choose", so it opens the picker on
+/// the rows that name the record, and the write stays on the one row that
+/// names the box slot - the same shape the talisman form has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EquipFormAction {
+    /// 装備枠 (editing form, row 0): write the working copy into the box.
+    WriteForm,
+    /// レベル (new form, row 2): create the record the three values name.
+    CreateRecord,
+    /// レベル / 着せ替えID / 着せ替え元レベル: step the value by a row step.
+    StepValue,
+    /// 装飾品1..3: open the decoration picker.
+    PickDecoration,
+    /// 種別 / アイテムID: open the equipment name picker.
+    PickEquip,
+}
+
+impl EquipFormAction {
+    /// The word the footer and the `[A]` button print.
+    pub fn label(self) -> &'static str {
+        match self {
+            EquipFormAction::WriteForm => "書き込み",
+            EquipFormAction::CreateRecord => "作成",
+            EquipFormAction::StepValue => "値を増やす",
+            EquipFormAction::PickDecoration => "装飾品を選ぶ",
+            EquipFormAction::PickEquip => "装備名を選ぶ",
+        }
+    }
+
+    /// The hint the row draws after its name, so the row says what `[A]` does
+    /// without the footer being read. `▸` marks it as the row's own key.
+    pub fn row_hint(self) -> &'static str {
+        match self {
+            EquipFormAction::WriteForm => "▸ 書き込み",
+            EquipFormAction::CreateRecord => "▸ 作成",
+            EquipFormAction::StepValue => "▸ +1",
+            EquipFormAction::PickDecoration => "▸ 選ぶ",
+            EquipFormAction::PickEquip => "▸ 選ぶ",
+        }
+    }
+
+    /// Is this action one of the two that open a list?
+    pub fn opens_picker(self) -> bool {
+        matches!(self, EquipFormAction::PickDecoration | EquipFormAction::PickEquip)
+    }
+}
+
+/// One row of the drawn equipment form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EquipFormRow {
+    /// The row number Up / Down counts.
+    pub field: usize,
+    /// Left column: the field's name and what `[A]` does to it.
+    pub title: String,
+    /// The inspector's second line (the list never draws this).
+    pub meta: String,
+    /// Right column: the value the row holds.
+    pub value: String,
+    /// The row badge ("#04").
+    pub badge: String,
+    /// What `[A]` does here.
+    pub action: EquipFormAction,
+}
+
+/// The rows of the drawn equipment form, in row order.
+///
+/// The console builds its list from this instead of assembling the strings
+/// itself, so what the host tests read is what the screen draws - the same
+/// arrangement `charm_form_rows` has. Each title ends with the row's own
+/// `EquipFormAction::row_hint`, which is how "▸ 選ぶ" reaches the list without
+/// the footer being the only place that says it.
+///
+/// `ename` is the name of the record the box holds at `e.index` ("",
+/// when it cannot be read): it is what the 装備枠 row shows beside its number.
+pub fn equip_form_rows(e: &EquipEdit, ename: &str) -> Vec<EquipFormRow> {
+    let action = |field: usize| -> EquipFormAction {
+        let mut probe = *e;
+        probe.field = field;
+        probe.a_action()
+    };
+    let row = |field: usize, name: &str, meta: String, value: String| -> EquipFormRow {
+        let a = action(field);
+        EquipFormRow {
+            field,
+            title: format!("{}  {}", name, a.row_hint()),
+            meta,
+            value,
+            badge: format!("#{:02}", field + 1),
+            action: a,
+        }
+    };
+    let hex = EquipChoice { kind: e.kind, id: e.id }.hex();
+    let named = format!("{}  {}", equip_choice_name(e.kind, e.id), hex);
+    let deco = |sock: usize| -> EquipFormRow {
+        let id = e.decorations[sock];
+        row(
+            4 + sock,
+            &format!("装飾品{}", sock + 1),
+            format!("◀ ▶ で切替 / [A] で一覧 / ID {}", id),
+            if id == 0 {
+                String::from("なし")
+            } else {
+                decoration_name_of(id)
+            },
+        )
+    };
+    if e.new {
+        return alloc::vec![
+            row(
+                0,
+                "種別",
+                String::from("◀ ▶ で1つずつ / [A] で一覧"),
+                format!("{} {}", e.kind, crate::equip::type_name(e.kind)),
+            ),
+            row(
+                1,
+                "アイテムID",
+                String::from("[A] 名前から選ぶ / ◀ ▶ で10件 / [R] ID入力 / [Y] 検索"),
+                named,
+            ),
+            row(
+                2,
+                "レベル",
+                String::from("◀ ▶ で増減（1 〜 32）/ [A] でこの内容を作成"),
+                format!("{}", e.level),
+            ),
+        ];
+    }
+    alloc::vec![
+        row(
+            0,
+            "装備枠",
+            format!(
+                "◀ ▶ で移動 / {} {}",
+                crate::equip::type_name(e.kind),
+                ename
+            ),
+            format!("#{:04}", e.index),
+        ),
+        row(
+            1,
+            "レベル",
+            String::from("◀ ▶ で増減（1 〜 32）"),
+            format!("{}", e.level),
+        ),
+        row(
+            2,
+            "着せ替えID",
+            String::from("◀ ▶ で増減 / 0 = 着せ替えなし"),
+            format!("{}", e.transmog_id),
+        ),
+        row(
+            3,
+            "着せ替え元レベル",
+            String::from("◀ ▶ で増減（1 〜 32）"),
+            format!("{}", e.transmog_level),
+        ),
+        deco(0),
+        deco(1),
+        deco(2),
+        row(
+            7,
+            "種別",
+            String::from("◀ ▶ で1つずつ / [A] で一覧から選ぶ"),
+            format!("{} {}", e.kind, crate::equip::type_name(e.kind)),
+        ),
+        row(
+            8,
+            "アイテムID",
+            String::from("[A] 名前から選ぶ / ◀ ▶ で10件 / [R] ID入力 / 変えると差し替え"),
+            named,
+        ),
+    ]
 }
 
 /// Rows of the palico equipment panel: the weapon, the head and the body.
@@ -4839,8 +5110,13 @@ impl Editor {
             Screen::Equip => {
                 "[A] 編集  [▲/▼] 行  [Y] 絞る/解除  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
             }
+            // [A] is the row's own action (hbedit::EquipFormAction): the two
+            // rows that name the record open the picker, the sockets open the
+            // decoration list, the numeric rows step, 装備枠 writes and the new
+            // form's レベル creates. [Y] is the search shortcut into the same
+            // two lists.
             Screen::EquipEdit => {
-                "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装備名/装飾品  [R] ID入力  [X] 保存  [B] 戻る"
+                "[A] 行の操作  [▲/▼] 行  [◀/▶] 10件/値  [Y] 名前で検索  [R] ID入力  [X] 保存"
             }
             Screen::JewelPick => {
                 "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [X] クリア  [B] 戻る"
@@ -7467,38 +7743,41 @@ impl Editor {
                     _ => {}
                 }
             }
-            // Y on a skill row opens the name picker: typing a number is
-            // hopeless when there are 306 skills.
+            // [Y] on a skill row is the search shortcut: the picker opens with
+            // its search box already up. [A] below is the browsing route, which
+            // is the one a first-time player presses.
             Key::Y => {
                 if e.field == 3 || e.field == 5 {
-                    let second = e.field == 5;
-                    if second && !e.second_skill_available() {
-                        // Nothing to choose: rarity 97 has no slot-2 rows, so
-                        // the row is 選択不可 rather than an empty picker.
-                        self.message = format!(
-                            "{} は第2スキルを選べません（この種類は第2スキルを持てません）",
-                            charm::kind_name(e.kind).unwrap_or("?")
-                        );
-                    } else {
-                        self.skill_pick_field = if second { 2 } else { 1 };
-                        self.skill_pick_filter.clear();
-                        self.skill_pick_cursor = 0;
-                        self.charm_edit = Some(e);
-                        self.screen = Screen::SkillPick;
-                        let n = charm::allowed_skill_ids(e.kind, second).len();
-                        self.message = format!(
-                            "スキルを名前から選んでください（{} / スキル{}: {}種）",
-                            charm::kind_name(e.kind).unwrap_or("?"),
-                            self.skill_pick_field,
-                            n
-                        );
-                    }
-                } else {
-                    self.message = String::from("先にスキルの行へ移動してください");
+                    self.charm_edit = Some(e);
+                    self.charm_open_skill_pick(true);
+                    return;
                 }
+                self.message =
+                    String::from("スキルの行で [A] 一覧から選択 / [Y] 名前で検索");
             }
             Key::X => self.step = (self.step + 1) % STEPS.len(),
+            // [A] is the row's own action (hbedit::CharmAction). The skill rows
+            // open the picker, the three field rows step, and the box-slot row
+            // writes - so the same key that opens a 306 entry list here cannot
+            // also mean "write the record", and the footer's word always names
+            // what the press will do.
             Key::A => {
+                match e.a_action() {
+                    CharmAction::PickSkill => {
+                        self.charm_edit = Some(e);
+                        self.charm_open_skill_pick(false);
+                        return;
+                    }
+                    CharmAction::CycleKind
+                    | CharmAction::CycleSlots
+                    | CharmAction::RaisePoints => {
+                        self.charm_edit = Some(e);
+                        self.input(Key::Right);
+                        return;
+                    }
+                    // The box-slot row is the one row that writes.
+                    CharmAction::WriteToBox => {}
+                }
                 let c = Charm {
                     index: e.index,
                     slots: e.slots,
@@ -7536,6 +7815,52 @@ impl Editor {
             _ => {}
         }
         self.charm_edit = Some(e);
+    }
+
+    /// Open the skill name picker on the row the form is on.
+    ///
+    /// Typing a number is hopeless when the table holds 306 skills, so both
+    /// routes end here: `[A]` opens the list with the cursor on the skill the
+    /// row already holds (browse), `[Y]` opens the same list with the search
+    /// box already up (search). The two are separate presses rather than one
+    /// key with two meanings, which is what makes the list reachable without
+    /// reading the footer.
+    fn charm_open_skill_pick(&mut self, search: bool) {
+        let Some(e) = self.charm_edit else {
+            return;
+        };
+        if e.field != 3 && e.field != 5 {
+            self.message = String::from("スキルの行で [A] を押してください");
+            return;
+        }
+        let second = e.field == 5;
+        if second && !e.second_skill_available() {
+            // Nothing to choose: this kind has no slot-2 rows, so the row is
+            // 選択不可 rather than an empty picker.
+            self.message = format!(
+                "{} は第2スキルを選べません（この種類は第2スキルを持てません）",
+                charm::kind_name(e.kind).unwrap_or("?")
+            );
+            return;
+        }
+        let held = if second { e.skill2 } else { e.skill1 };
+        let pool = self.skill_pick_allowed();
+        self.skill_pick_field = if second { 2 } else { 1 };
+        self.skill_pick_filter.clear();
+        // The cursor starts on the skill the row holds, so opening the list a
+        // second time does not lose the entry the user came back for.
+        self.skill_pick_cursor = pool.iter().position(|id| *id == held).unwrap_or(0);
+        let n = pool.len();
+        self.screen = Screen::SkillPick;
+        self.message = format!(
+            "スキルを名前から選んでください（{} / スキル{}: {}種）",
+            charm::kind_name(e.kind).unwrap_or("?"),
+            self.skill_pick_field,
+            n
+        );
+        if search {
+            self.pending_text = Some((TEXT_SKILL_FILTER, self.skill_pick_filter.clone()));
+        }
     }
 
     fn input_palico(&mut self, key: Key) {
@@ -10054,10 +10379,10 @@ impl Editor {
             Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[詳細] で生データ。",
             Screen::ItemPick => "名前で絞って [A] で決定。[B] で元の画面へ。",
             Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[詳細] で生データ。",
-            Screen::CharmEdit => "行ごとに [A] で操作、[◀/▶] で値。[B] で一覧へ。",
+            Screen::CharmEdit => "行ごとに [A] で操作（スキルは一覧）、[◀/▶] で値。[B] で一覧へ。",
             Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を絞れます。",
             Screen::Equip => "装備を選んで [A] で編集、[＋] で新規。[詳細] で装備BOXの生データ。",
-            Screen::EquipEdit => "行を選んで [◀/▶] で値、[Y] で名前から選択。[B] で一覧へ。",
+            Screen::EquipEdit => "行ごとに [A] で選択、[◀/▶] で10件/値。[B] で一覧へ。",
             Screen::JewelPick => "装飾品を選んで [A] で決定。[Y] で名前を絞れます。",
             Screen::EquipPick => "装備を名前で選んで [A] で決定。[-] で種別を切り替え。",
             Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
@@ -12527,12 +12852,24 @@ impl Editor {
             Key::Up => e.field = (e.field + rows - 1) % rows,
             Key::Down => e.field = (e.field + 1) % rows,
             Key::Left | Key::Right => {
-                let d: i64 = if key == Key::Right { 1 } else { -1 } * STEPS[self.step].min(10).max(1);
+                let dir: i64 = if key == Key::Right { 1 } else { -1 };
+                // The step the rest of the editor uses (X is the save key on
+                // this screen, so it is effectively one), except on the two
+                // rows whose values are equipment ids: those take the pick
+                // lists' big step so the arrow keys can cross a 6,435 row
+                // table, and holding the key flows ten at a time through the
+                // pad's auto-repeat.
+                let d: i64 = dir * STEPS[self.step].min(10).max(1);
+                let big: i64 = dir * EQUIP_ID_STEP;
                 if e.new {
                     // 種別 / ID / レベル: the three values create() writes.
                     match e.field {
-                        0 => e.kind = cycle_equip_kind(e.kind, d),
-                        1 => e.id = clamp_u16(e.id, d),
+                        // Twenty-one kinds: a ten-jump would step over the one
+                        // the user is looking for, so the type goes one at a
+                        // time (the picker's [-] and the list are the big
+                        // moves).
+                        0 => e.kind = cycle_equip_kind(e.kind, dir),
+                        1 => e.id = clamp_u16(e.id, big),
                         _ => e.level = cycle_equip_level(e.level, d),
                     }
                 } else {
@@ -12574,34 +12911,32 @@ impl Editor {
                         }
                         // 種別 / ID. Changing either is what makes A replace
                         // the record instead of patching its fields.
-                        7 => e.kind = cycle_equip_kind(e.kind, d),
-                        _ => e.id = clamp_u16(e.id, d),
+                        7 => e.kind = cycle_equip_kind(e.kind, dir),
+                        _ => e.id = clamp_u16(e.id, big),
                     }
                 }
             }
-            // [Y] is "pick the row by name" on this form, and it means the same
-            // thing on all four rows that have a name behind them: the three
-            // sockets open the decoration picker, 種別 / ID open the equipment
-            // picker. It used to answer "先に装飾品の行へ移動してください" on
-            // the two rows that name the record itself, which is the row the
-            // hardware report was about.
+            // [Y] is the search route on the four rows that have a list behind
+            // them: the three sockets open the decoration picker, 種別 / ID
+            // open the equipment picker, and both open with the search box
+            // already up. [A] is the browsing route (see the arm below), which
+            // is the one a first-time player reaches for.
             Key::Y => {
                 if e.decoration_socket(e.field).is_some() {
                     self.equip_edit = Some(e);
-                    self.jewel_pick_filter.clear();
-                    self.jewel_pick_cursor = 0;
-                    self.screen = Screen::JewelPick;
-                    self.message = self.pick_key_hint();
-                } else if self.equip_id_field(e.field) {
+                    self.equip_form_open_jewel(true);
+                } else if e.is_identity_row(e.field) {
                     self.equip_edit = Some(e);
-                    self.open_equip_picker();
+                    if self.open_equip_picker() {
+                        self.equip_form_search_equip();
+                    }
                     return;
                 } else if e.new {
                     self.message =
                         String::from("装飾品は作成後に選べます（[A] で作成してから編集）");
                 } else {
                     self.message = String::from(
-                        "装備名は 種別・ID の行で [Y] / 装飾品は装飾品の行で [Y] を押してください",
+                        "装備名は 種別・ID の行で [A] / 装飾品は装飾品の行で [A] を押してください",
                     );
                 }
             }
@@ -12610,22 +12945,53 @@ impl Editor {
             // On 種別 / ID it is the fallback for an id the name tables do not
             // carry (and for a build that has no tables at all).
             Key::R => {
-                if self.equip_id_field(e.field) {
+                if e.is_identity_row(e.field) {
                     self.equip_edit = Some(e);
                     self.request_equip_id_text();
                     return;
                 }
                 self.message =
-                    String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [Y]）");
+                    String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [A]）");
             }
+            // The editor's step is not reachable from the console on this
+            // screen (X is the save key everywhere), so the arrow keys above do
+            // not depend on it; the arm stays because the GUI reads this state
+            // machine and a key that does nothing is worse than one that steps.
             Key::X => self.step = (self.step + 1) % STEPS.len(),
+            // [A] is the row's own action (hbedit::EquipFormAction): the
+            // identity rows open the equipment picker, the sockets open the
+            // decoration picker, the numeric rows step, the 装備枠 row writes
+            // and the new form's レベル row creates. The row prints the same
+            // word ("▸ 選ぶ" / "▸ 書き込み" / "▸ 作成"), so the key does not
+            // have to be read out of the footer first.
             Key::A => {
-                if e.new {
-                    self.write_new_equip(&e);
-                } else {
-                    self.write_equip_edit(&e);
+                match e.a_action() {
+                    EquipFormAction::PickEquip => {
+                        self.equip_edit = Some(e);
+                        self.open_equip_picker();
+                        return;
+                    }
+                    EquipFormAction::PickDecoration => {
+                        self.equip_edit = Some(e);
+                        self.equip_form_open_jewel(false);
+                        return;
+                    }
+                    EquipFormAction::StepValue => {
+                        self.equip_edit = Some(e);
+                        self.input(Key::Right);
+                        return;
+                    }
+                    EquipFormAction::CreateRecord => {
+                        self.equip_edit = Some(e);
+                        self.write_new_equip(&e);
+                        return;
+                    }
+                    EquipFormAction::WriteForm => {
+                        self.equip_edit = Some(e);
+                        self.write_equip_edit(&e);
+                        return;
+                    }
                 }
-                return;
             }
             Key::B => {
                 // The working copy is dropped: only A writes.
@@ -12650,10 +13016,38 @@ impl Editor {
     /// Creating: 0 種別 / 1 ID. Editing: 7 種別 / 8 ID. Both pairs are the only
     /// rows with a name table behind them.
     fn equip_id_field(&self, field: usize) -> bool {
-        if self.equip_edit.map(|e| e.new).unwrap_or(false) {
-            field == 0 || field == 1
+        self.equip_edit
+            .map(|e| e.is_identity_row(field))
+            .unwrap_or(false)
+    }
+
+    /// [A] / [Y] on 装飾品1..3: open the decoration list on that socket.
+    ///
+    /// `search` is the difference between the two routes: [A] opens the list
+    /// (browse, [▲/▼] / [◀/▶]), [Y] opens the same list with the search box
+    /// already up, because that is what the key is for everywhere else.
+    fn equip_form_open_jewel(&mut self, search: bool) {
+        self.jewel_pick_filter.clear();
+        self.jewel_pick_cursor = 0;
+        self.screen = Screen::JewelPick;
+        if search {
+            self.message = String::from(
+                "装飾品名で絞り込みます（空にすると一覧が戻ります）",
+            );
+            self.pending_text = Some((TEXT_JEWEL_FILTER, self.jewel_pick_filter.clone()));
         } else {
-            field == 7 || field == 8
+            self.message = self.pick_key_hint();
+        }
+    }
+
+    /// [Y] on 種別 / ID: the equipment picker with its search box already up.
+    fn equip_form_search_equip(&mut self) {
+        if self.screen != Screen::EquipPick {
+            return;
+        }
+        self.pending_text = Some((TEXT_EQUIP_PICK_FILTER, self.equip_pick_filter.clone()));
+        if !self.equip_pick_names_available() {
+            self.message = String::from("名前が読めないので ID（16進）で検索します（例: 28）");
         }
     }
 
@@ -12732,7 +13126,7 @@ impl Editor {
             return false;
         };
         if !self.equip_id_field(e.field) {
-            self.message = String::from("種別・ID の行で [Y] を押してください");
+            self.message = String::from("種別・ID の行で [A] を押してください");
             return false;
         }
         let scope = EquipScope::of_kind(e.kind);
@@ -12812,8 +13206,22 @@ impl Editor {
                     if let Some(e) = &mut self.equip_edit {
                         e.kind = c.kind;
                         e.id = c.id;
+                        // The two identity rows open a picker rather than
+                        // writing, so the cursor goes to the row whose [A]
+                        // does write: the status line can then promise
+                        // "[A] で書き込み" and mean the press the user has to
+                        // make next, not one they have to go looking for.
+                        e.field = e.write_row();
                     }
-                    self.message = format!("{} を選びました（[A] で書き込み）", c.label());
+                    self.message = format!(
+                        "{} を選びました（[A] で{}）",
+                        c.label(),
+                        if self.equip_edit.map(|e| e.new).unwrap_or(false) {
+                            "作成"
+                        } else {
+                            "書き込み"
+                        }
+                    );
                     self.screen = Screen::EquipEdit;
                 } else {
                     // Nothing to pick: stay on the list so the word can be
@@ -12838,7 +13246,7 @@ impl Editor {
             return false;
         };
         if !self.equip_id_field(e.field) {
-            self.message = String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [Y]）");
+            self.message = String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [A]）");
             return false;
         }
         self.pending_text = Some((TEXT_EQUIP_ID, EquipChoice { kind: e.kind, id: e.id }.hex()));
@@ -12867,19 +13275,26 @@ impl Editor {
             return false;
         };
         e.id = id;
+        // The cursor goes to the row whose [A] writes, for the same reason a
+        // pick from the list does: the message below names the press, and that
+        // press has to be one the form is actually sitting on.
+        e.field = e.write_row();
         self.equip_edit = Some(e);
         let name = equip_choice_name(e.kind, id);
+        let next = if e.new { "作成" } else { "書き込み" };
         self.message = if name == "-" || name == "(未使用)" {
             format!(
-                "{} {} にしました（名前表に無い ID です / [A] で書き込み）",
+                "{} {} にしました（名前表に無い ID です / [A] で{}）",
                 crate::equip::type_name(e.kind),
-                EquipChoice { kind: e.kind, id }.hex()
+                EquipChoice { kind: e.kind, id }.hex(),
+                next
             )
         } else {
             format!(
-                "{} {} にしました（[A] で書き込み）",
+                "{} {} にしました（[A] で{}）",
                 name,
-                EquipChoice { kind: e.kind, id }.hex()
+                EquipChoice { kind: e.kind, id }.hex(),
+                next
             )
         };
         true
@@ -15424,7 +15839,7 @@ impl Editor {
                     push(
                         &mut out,
                         String::from(
-                            "  Up/Down row  Left/Right value  Y 名前で選ぶ  R ID入力  A 作成  B 戻る",
+                            "  Up/Down row  Left/Right 10件  A 種別/IDは一覧・レベル行で作成  Y 検索  R ID入力  B 戻る",
                         ),
                         false,
                         false,
@@ -15489,7 +15904,7 @@ impl Editor {
                     push(
                         &mut out,
                         String::from(
-                            "  Up/Down row  Left/Right value  Y 装備名/装飾品  R ID入力  X 刻み  A 反映/差し替え  B 戻る",
+                            "  Up/Down row  Left/Right 10件(ID)/値  A 行の操作（一覧/値/書き込み）  Y 検索  R ID入力  B 戻る",
                         ),
                         false,
                         false,
@@ -16147,11 +16562,28 @@ pub const SCROLL_MIN_THUMB: i32 = 16;
 /// under it has already spent the right hand 22px of the panel on its value.
 pub const SCROLL_BAR_W: i32 = 6;
 
+/// The width the bar is drawn at while a finger is dragging it.
+///
+/// The bar itself stays 6px - a fat line next to a list is loud - but a 6px
+/// target is not something a finger can hold, and a drag that keeps slipping
+/// off the thumb is worse than a bar that grows for the second it is used.
+pub const SCROLL_BAR_ACTIVE_W: i32 = 14;
+
 /// The width of the area that answers a finger: wider than the bar on purpose.
 ///
 /// A finger is not 6px wide and does not land where it aimed. The bar is what
-/// the eye reads; this is what the hand hits.
-pub const SCROLL_HIT_W: i32 = 20;
+/// the eye reads; this is what the hand hits. It was 20px, which on a 6.2 inch
+/// panel is about 1.5mm - a target a thumb cannot find, let alone hold. Forty
+/// pixels is about 3mm of glass: still inside the panel, and wide enough that
+/// aiming is not part of using the list.
+pub const SCROLL_HIT_W: i32 = 40;
+
+/// Clear space between the row's value text and the bar's touch area.
+///
+/// The value is right aligned, so this is the gap between the last glyph of a
+/// row and the first pixel that belongs to the bar. Eight pixels is enough that
+/// no glyph can be read as part of the bar, and no tap can be read as text.
+pub const SCROLL_TEXT_GAP: i32 = 8;
 
 /// Where a list panel's right hand scrollbar and its touch area sit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16164,6 +16596,10 @@ pub struct ScrollTrack {
     pub hit_x: i32,
     /// Width of that area.
     pub hit_w: i32,
+    /// Right edge of a row's value text: `SCROLL_TEXT_GAP` left of `hit_x`.
+    pub text_right: i32,
+    /// Right edge of a row's own tap area: the bar's touch area wins.
+    pub row_right: i32,
 }
 
 impl ScrollTrack {
@@ -16172,15 +16608,27 @@ impl ScrollTrack {
     pub fn hits(&self, px: i32) -> bool {
         px >= self.hit_x && px < self.hit_x + self.hit_w
     }
+
+    /// Does a row drawn from `row_x` for `row_w` pixels stay clear of the bar?
+    ///
+    /// The rows stop at `row_right` so they never reach the bar's touch area,
+    /// which is what keeps a tap that aimed at a row from grabbing the thumb
+    /// instead. The host test `no_row_and_no_value_reach_the_bars_touch_area`
+    /// pins the relation between the two numbers.
+    #[inline]
+    pub fn row_ends_before_the_bar(&self, row_x: i32, row_w: i32) -> bool {
+        row_x + row_w <= self.hit_x
+    }
 }
 
 /// Lay the scrollbar out against the right edge of a list panel.
 ///
 /// The bar keeps 8px clear of the panel edge so it reads as part of the panel
-/// rather than as its border, and the touch area straddles it: 14px of the 20
+/// rather than as its border, and the touch area straddles it: 34px of the 40
 /// sit to the left of the bar and 6px to the right, which keeps the whole area
-/// inside the panel while still catching a finger that aimed at the bar and
-/// landed on the row's padding.
+/// inside the panel while catching a finger that aimed at the bar and landed on
+/// the row's padding. Everything a row draws - its tap area and its value -
+/// stops before `hit_x`, so those 40px belong to the bar and to nothing else.
 pub fn scroll_track(panel_x: i32, panel_w: i32) -> ScrollTrack {
     let bar_x = panel_x + panel_w - 8 - SCROLL_BAR_W;
     let hit_x = panel_x + panel_w - SCROLL_HIT_W;
@@ -16189,6 +16637,8 @@ pub fn scroll_track(panel_x: i32, panel_w: i32) -> ScrollTrack {
         bar_w: SCROLL_BAR_W,
         hit_x,
         hit_w: SCROLL_HIT_W,
+        text_right: hit_x - SCROLL_TEXT_GAP,
+        row_right: hit_x,
     }
 }
 
@@ -16389,6 +16839,116 @@ impl KeyRepeat {
         } else {
             false
         }
+    }
+}
+
+/// A shoulder button's press, resolved on the frame the key goes down.
+///
+/// `L` / `R` used to be answered on the release, because a tap had to be told
+/// from a hold before either meaning could run: the sub-tab therefore arrived
+/// after the finger came up, and two quick presses felt one press behind. The
+/// tab is answered on the press now - `press()` says so - and the hold keeps
+/// its second job (`tick()`: L offers the whole-save undo, R offers 詳細).
+///
+/// A hold never takes the tab move back: the tab has already been drawn, and
+/// undoing it on the way to the undo would be a second, invisible answer to the
+/// same press. The two meanings are ordered, not cancelled:
+///
+///   * frame 1: `press()` -> true -> the sub-tab moves
+///   * frame 60: `tick()` -> Arm -> the screen says what a second hold runs
+///   * second hold: `tick()` -> Run -> the undo (or 詳細) runs
+///
+/// The state machine lives here so the ordering can be tested without a
+/// console (see `the_shoulder_moves_its_tab_on_the_press_not_the_release`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShoulderPress {
+    down: bool,
+    hold: HoldConfirm,
+}
+
+impl ShoulderPress {
+    pub const fn new() -> Self {
+        ShoulderPress {
+            down: false,
+            hold: HoldConfirm::new(),
+        }
+    }
+
+    /// The key went down. True means "run the tap's job on this frame".
+    ///
+    /// A second report while the key is already down is not a press: the pad
+    /// reports an edge once, and a caller that feeds the held state back must
+    /// not move the tab a second time.
+    pub fn press(&mut self) -> bool {
+        if self.down {
+            return false;
+        }
+        self.down = true;
+        self.hold.press();
+        true
+    }
+
+    /// One frame with the key still down: the hold's own answer.
+    pub fn tick(&mut self) -> HoldAction {
+        if !self.down {
+            return HoldAction::None;
+        }
+        self.hold.tick()
+    }
+
+    /// The key came up. The hold's frame counter restarts; the arm it may have
+    /// left behind does not (`clear_arm` is the caller's "something else
+    /// happened" key).
+    pub fn release(&mut self) {
+        self.down = false;
+        let _ = self.hold.release();
+    }
+
+    /// Take the hold's offer back, because the press did something else.
+    pub fn clear_arm(&mut self) {
+        self.hold.clear_arm();
+    }
+
+    /// Is the hold's action offered, waiting for the second hold?
+    pub fn is_armed(&self) -> bool {
+        self.hold.is_armed()
+    }
+
+    /// Is the key still down?
+    pub fn is_down(&self) -> bool {
+        self.down
+    }
+}
+
+/// Which keyboard a one-line or multi-line text request should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardRoute {
+    /// The system keyboard (swkbd): a one-line value, so the missing line
+    /// break costs nothing and the console's own IME is better than ours.
+    System,
+    /// The built-in on-screen keyboard: the field holds a line break, which
+    /// the system keyboard cannot type.
+    Builtin,
+    /// The system keyboard cannot be launched (the process is a library
+    /// applet, i.e. started from the album): the built-in keyboard is used for
+    /// a one-line field too, and the screen says why.
+    BuiltinFallback,
+}
+
+/// Pick the keyboard for a text request.
+///
+/// The rule is one line: a field that can hold U+000A needs the built-in
+/// keyboard, because the system one is single line; every other field prefers
+/// the system keyboard and falls back to the built-in one when the applet
+/// cannot be launched. Keeping the decision here means the console screen, the
+/// message it prints and the host tests cannot each have their own answer.
+pub const fn keyboard_route(spec: NameSpec, system_available: bool) -> KeyboardRoute {
+    if spec.multiline {
+        KeyboardRoute::Builtin
+    } else if system_available {
+        KeyboardRoute::System
+    } else {
+        KeyboardRoute::BuiltinFallback
     }
 }
 
@@ -17635,9 +18195,12 @@ mod tests {
         ed.input(Key::Right);
         assert_eq!(ed.undo_label(), Some("設定"));
 
-        // 装備
+        // 装備: the two rows that name the record open the picker, so the
+        // create is the row the form says creates (レベル, the new form's last
+        // row) - the same split the talisman form has.
         ed.screen = Screen::Equip;
         ed.input(Key::Plus);
+        ed.equip_edit.as_mut().expect("the new form").field = EQUIP_NEW_ROWS - 1;
         ed.input(Key::A);
         assert_eq!(ed.undo_label(), Some("装備の新規作成"), "{}", ed.message);
 
@@ -17663,9 +18226,13 @@ mod tests {
         ed.input(Key::A);
         assert_eq!(ed.undo_label(), Some("進行状況"), "{}", ed.message);
 
-        // 護石: the form writes through set_charm_with_kind.
+        // 護石: the form writes through set_charm_with_kind, from the one row
+        // whose [A] is the write. A new form lands on the first skill row, and
+        // [A] there opens the skill list now, so the cursor moves to 装備BOX枠 -
+        // the row the form itself marks "▸ 書き込み".
         ed.open_charms();
         ed.input(Key::L);
+        ed.charm_edit.as_mut().expect("the talisman form").field = 0;
         ed.input(Key::A);
         assert_eq!(ed.undo_label(), Some("お守りの書き込み"), "{}", ed.message);
 
@@ -18226,5 +18793,362 @@ mod tests {
         assert!(guide.contains("詳細"), "{}", guide);
         ed.screen = Screen::SaveMap;
         assert!(ed.screen_guide().contains("読み取り専用"));
+    }
+
+    // ---------------------------------------------------------------- the five
+    // review items: A opens the list, the id rows step ten, the bar answers a
+    // thumb, the shoulders answer the press, and a one-line field prefers the
+    // system keyboard.
+
+    /// An editor holding a blank save with one weapon record in the box and the
+    /// equipment form open on it.
+    fn editor_on_an_equipment_record() -> Editor {
+        let mut save = crate::save::empty_switch_save();
+        let index = crate::equipops::create(&mut save, 0, 1, 40, 1).expect("a blank weapon record");
+        let mut ed = Editor::new();
+        ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
+        assert!(ed.save.is_some(), "{}", ed.message);
+        ed.screen = Screen::Equip;
+        ed.equip_cursor = 0;
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
+        assert_eq!(ed.equip_edit.map(|e| e.index), Some(index));
+        ed
+    }
+
+    #[test]
+    fn the_equipment_form_rows_say_what_a_does() {
+        let ed = editor_on_an_equipment_record();
+        let e = ed.equip_edit.expect("the form is open");
+        let name = crate::equip::name(&ed.equipment()[0]).to_string();
+        let rows = equip_form_rows(&e, &name);
+        assert_eq!(rows.len(), EQUIP_EDIT_ROWS);
+        // 装備枠 is the row that writes, and the row itself says so - a reader
+        // who never looks at the footer can still find the write.
+        assert_eq!(rows[0].action, EquipFormAction::WriteForm);
+        assert!(rows[0].title.contains("▸ 書き込み"), "{}", rows[0].title);
+        // The two rows that name the record open the picker, and say so.
+        for i in [7usize, 8] {
+            assert_eq!(rows[i].action, EquipFormAction::PickEquip);
+            assert!(rows[i].title.contains("▸ 選ぶ"), "{}", rows[i].title);
+            assert!(rows[i].meta.contains("[A]"), "{}", rows[i].meta);
+        }
+        // The three sockets open the decoration list.
+        for i in 4..=6 {
+            assert_eq!(rows[i].action, EquipFormAction::PickDecoration);
+            assert!(rows[i].title.contains("▸ 選ぶ"), "{}", rows[i].title);
+        }
+        // The numeric rows step.
+        for i in 1..=3 {
+            assert_eq!(rows[i].action, EquipFormAction::StepValue);
+        }
+        // A new record: the two identity rows pick, the level row creates.
+        let mut fresh = e;
+        fresh.new = true;
+        let rows = equip_form_rows(&fresh, "");
+        assert_eq!(rows.len(), EQUIP_NEW_ROWS);
+        assert_eq!(rows[0].action, EquipFormAction::PickEquip);
+        assert_eq!(rows[1].action, EquipFormAction::PickEquip);
+        assert_eq!(rows[2].action, EquipFormAction::CreateRecord);
+        assert!(rows[2].title.contains("▸ 作成"), "{}", rows[2].title);
+        assert_eq!(rows[2].badge, "#03");
+    }
+
+    #[test]
+    fn the_equipment_id_row_steps_ten_and_the_kind_steps_one() {
+        let mut ed = editor_on_an_equipment_record();
+        {
+            let e = ed.equip_edit.as_mut().expect("the form is open");
+            e.field = 8;
+            e.id = 40;
+        }
+        ed.input(Key::Right);
+        assert_eq!(
+            ed.equip_edit.expect("form").id,
+            40 + EQUIP_ID_STEP as u16,
+            "the id row takes the pick lists' big step"
+        );
+        ed.input(Key::Left);
+        assert_eq!(ed.equip_edit.expect("form").id, 40, "and back");
+        // The type axis holds twenty-one values: a ten-jump would step over the
+        // one being looked for, so it moves one at a time.
+        {
+            let e = ed.equip_edit.as_mut().expect("the form is open");
+            e.field = 7;
+            e.kind = 1;
+        }
+        ed.input(Key::Right);
+        assert_eq!(ed.equip_edit.expect("form").kind, 2);
+        // The numeric rows keep the editor's step, which is one here.
+        {
+            let e = ed.equip_edit.as_mut().expect("the form is open");
+            e.field = 1;
+            e.level = 5;
+        }
+        ed.input(Key::Right);
+        assert_eq!(ed.equip_edit.expect("form").level, 6);
+    }
+
+    #[test]
+    fn a_on_the_identity_row_opens_the_picker_and_the_pick_lands_on_the_write_row() {
+        let mut ed = editor_on_an_equipment_record();
+        let kind = ed.equip_edit.expect("form").kind;
+        {
+            let e = ed.equip_edit.as_mut().expect("form");
+            e.field = 8;
+        }
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::EquipPick, "{}", ed.message);
+        assert!(!ed.equip_pick_choices().is_empty());
+        // The picker starts on the record the form holds.
+        let sel = ed.equip_pick_choices()[ed.equip_pick_cursor];
+        assert_eq!(sel.kind, kind);
+        assert_eq!(sel.id, ed.equip_edit.expect("form").id);
+        // [B] leaves the form as it was.
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::EquipEdit);
+        // [A] picks, and the cursor is put on the row that writes: the status
+        // line promises "[A] で書き込み", so that press has to be a real one.
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::EquipPick);
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
+        let e = ed.equip_edit.expect("form");
+        assert_eq!(e.field, e.write_row());
+        assert_eq!(e.a_action(), EquipFormAction::WriteForm);
+        assert!(ed.message.contains("[A] で書き込み"), "{}", ed.message);
+    }
+
+    #[test]
+    fn a_on_the_level_row_steps_it_and_a_on_the_slot_row_writes() {
+        let mut ed = editor_on_an_equipment_record();
+        {
+            let e = ed.equip_edit.as_mut().expect("form");
+            e.field = 1;
+            e.level = 7;
+        }
+        // A on a numeric row is the row's own "more", not the copy: the label
+        // and the key come from the same value.
+        assert_eq!(
+            ed.equip_edit.expect("form").a_label(),
+            EquipFormAction::StepValue.label()
+        );
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::EquipEdit);
+        assert_eq!(ed.equip_edit.expect("form").level, 8);
+        // A on 装備枠 writes the form into the box and returns to the list.
+        {
+            let e = ed.equip_edit.as_mut().expect("form");
+            e.field = 0;
+            e.level = 12;
+        }
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::Equip);
+        let written = ed.equipment()[0];
+        assert_eq!(written.level, 12);
+        assert!(ed.message.contains("書き込みました"), "{}", ed.message);
+    }
+
+    #[test]
+    fn a_on_a_charm_skill_row_opens_the_skill_picker_and_y_is_the_search() {
+        let mut ed = editor_with_a_blank_save();
+        ed.open_charm_editor(true);
+        assert_eq!(ed.screen, Screen::CharmEdit);
+        {
+            let e = ed.charm_edit.as_mut().expect("the talisman form");
+            e.field = 3;
+        }
+        // A skill the kind on the form actually allows, so the cursor has a
+        // real row to start on.
+        let want = ed.skill_pick_allowed()[1];
+        ed.charm_edit.as_mut().expect("form").skill1 = want;
+        // The row says what A does, and A opens the list (browse, no keyboard).
+        assert_eq!(
+            ed.charm_edit.expect("form").a_label(),
+            CharmAction::PickSkill.label()
+        );
+        let rows = charm_form_rows(&ed.charm_edit.expect("form"));
+        assert!(rows[3].title.contains("▸ 選ぶ"), "{}", rows[3].title);
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::SkillPick, "{}", ed.message);
+        assert_eq!(
+            ed.take_text_request(),
+            None,
+            "[A] browses: it must not open the search box as well"
+        );
+        // The cursor starts on the skill the row holds.
+        let allowed = ed.skill_pick_allowed();
+        assert_eq!(allowed[ed.skill_pick_cursor], want);
+        // [Y] is the search route: the same list, with the search box up.
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::CharmEdit);
+        ed.input(Key::Y);
+        assert_eq!(ed.screen, Screen::SkillPick, "{}", ed.message);
+        let req = ed.take_text_request().expect("[Y] opens the search box");
+        assert_eq!(req.0, TEXT_SKILL_FILTER);
+    }
+
+    #[test]
+    fn the_shoulder_moves_its_tab_on_the_press_not_the_release() {
+        let mut l = ShoulderPress::new();
+        // Frame 1: the press already answers the tap, which is the whole point
+        // - the sub-tab no longer waits for the finger to come up.
+        assert!(l.press(), "the first frame of the hold is the tap");
+        assert!(!l.press(), "a frame of the same hold is not a second press");
+        assert!(l.is_down());
+        // The hold's second job still needs the whole hold.
+        for _ in 0..(crate::confirm::HOLD_CONFIRM_FRAMES - 1) {
+            assert_eq!(l.tick(), HoldAction::None);
+        }
+        assert_eq!(l.tick(), HoldAction::Arm);
+        assert!(l.is_armed(), "the offer is shown, nothing has run");
+        l.release();
+        assert!(!l.is_down());
+        // The offer survives the release: the second hold runs it, and the tab
+        // has already moved - a hold never takes the tab move back.
+        assert!(l.press());
+        let mut last = HoldAction::None;
+        for _ in 0..crate::confirm::HOLD_CONFIRM_FRAMES {
+            last = l.tick();
+        }
+        assert_eq!(last, HoldAction::Run);
+        assert!(!l.is_armed());
+        l.release();
+        // Something else happening takes the offer away.
+        assert!(l.press());
+        for _ in 0..crate::confirm::HOLD_CONFIRM_FRAMES {
+            let _ = l.tick();
+        }
+        l.clear_arm();
+        l.release();
+        assert!(!l.is_armed());
+    }
+
+    #[test]
+    fn a_held_direction_repeats_on_eight_four_then_three_frames() {
+        // 8 / 4 / 3 frames: the first repeat after 8 frames of the hold, then
+        // every 4, and every 3 once the hold has produced RAMP repeats. The
+        // cadence is measured, not assumed: the frames the repeats land on are
+        // the only thing a held key promises.
+        let mut r = KeyRepeat::new();
+        r.press();
+        let mut frames = Vec::new();
+        for frame in 0..120 {
+            if r.tick(true) {
+                frames.push(frame);
+            }
+        }
+        assert!(frames.len() > KeyRepeat::RAMP as usize + 2);
+        assert_eq!(frames[0], KeyRepeat::FIRST as i32 - 1);
+        let deltas: Vec<i32> = frames.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(deltas[0], KeyRepeat::NEXT as i32);
+        assert_eq!(
+            deltas.last().copied(),
+            Some(KeyRepeat::FAST as i32),
+            "a long hold speeds up to three frames"
+        );
+        assert!(
+            deltas
+                .iter()
+                .all(|d| *d == KeyRepeat::NEXT as i32 || *d == KeyRepeat::FAST as i32),
+            "the cadence only ever takes the two documented gaps: {:?}",
+            deltas
+        );
+        // Letting go restarts the hold, so the next press is slow again.
+        assert!(!r.tick(false));
+        r.press();
+        assert!(!r.tick(true));
+        for _ in 0..(KeyRepeat::FIRST - 2) {
+            assert!(!r.tick(true));
+        }
+        assert!(r.tick(true), "the next press waits the same eight frames");
+    }
+
+    #[test]
+    fn the_scrollbar_answers_a_finger_forty_pixels_from_the_edge() {
+        // The list panel of the console: x = 20, w = 796.
+        let track = scroll_track(20, 796);
+        assert_eq!(track.hit_w, SCROLL_HIT_W);
+        assert_eq!(SCROLL_HIT_W, 40, "a thumb cannot hold 20px of glass");
+        assert_eq!(track.hit_x, 776);
+        assert!(track.hits(776), "the first pixel of the zone answers");
+        assert!(track.hits(815), "the last pixel of the panel answers");
+        assert!(!track.hits(775), "one pixel left of the zone is a row");
+        assert!(!track.hits(816), "nothing outside the panel answers");
+        // The eye still sees a thin bar.
+        assert_eq!(track.bar_w, SCROLL_BAR_W);
+        assert_eq!(SCROLL_BAR_W, 6);
+        assert_eq!(track.bar_x, 802);
+        assert!(track.bar_x >= track.hit_x);
+        assert!(track.bar_x + track.bar_w <= track.hit_x + track.hit_w);
+        // And the drawn bar grows only while a finger holds it.
+        assert!(SCROLL_BAR_ACTIVE_W > SCROLL_BAR_W);
+        assert_eq!(
+            SCROLL_BAR_ACTIVE_W - SCROLL_BAR_W,
+            (SCROLL_BAR_ACTIVE_W - SCROLL_BAR_W) / 2 * 2,
+            "the growth is even, so the bar grows around its own centre"
+        );
+    }
+
+    #[test]
+    fn no_row_and_no_value_reach_the_bars_touch_area() {
+        // The three panels that draw a bar: the 796px list, the 600px save map
+        // and the 912px picker. Each row draws its value right aligned at
+        // text_right and its tap area from row_right, so the arithmetic is the
+        // same check on all three - and the check is the one the console's
+        // geometry uses.
+        for (panel_x, panel_w, row_x) in [(20, 796, 28), (20, 600, 28), (184, 912, 192)] {
+            let track = scroll_track(panel_x, panel_w);
+            // The row's tap area stops exactly at the bar's zone.
+            let row_w = track.row_right - row_x;
+            assert!(
+                track.row_ends_before_the_bar(row_x, row_w),
+                "{panel_w}px panel: the row reaches into the bar"
+            );
+            assert!(!track.hits(row_x + row_w - 1), "the row's last pixel is not the bar");
+            assert!(track.hits(track.hit_x));
+            // The value is right aligned at text_right, so its right edge is
+            // SCROLL_TEXT_GAP left of the zone whatever the string holds; a
+            // value is at most 230px wide, so it can never cross either.
+            assert_eq!(track.text_right, track.hit_x - SCROLL_TEXT_GAP);
+            assert!(SCROLL_TEXT_GAP > 0);
+            let value_left = track.text_right - 230;
+            assert!(
+                track.text_right <= track.hit_x && value_left >= row_x,
+                "{panel_w}px panel: the value and the bar overlap"
+            );
+            // The bar itself sits inside the zone, never outside the panel.
+            assert!(track.bar_x + track.bar_w <= panel_x + panel_w);
+            assert!(track.hit_x >= panel_x);
+        }
+    }
+
+    #[test]
+    fn a_one_line_field_prefers_the_system_keyboard_and_a_name_never_does() {
+        // A search box, a file name, an id: one line, so swkbd is better.
+        assert_eq!(
+            keyboard_route(NameSpec::singleline(60), true),
+            KeyboardRoute::System
+        );
+        // The same field where the applet cannot be launched (album launch):
+        // the built-in keyboard, and the screen has to say why.
+        assert_eq!(
+            keyboard_route(NameSpec::singleline(60), false),
+            KeyboardRoute::BuiltinFallback
+        );
+        // A name holds U+000A, which swkbd cannot type: always the built-in
+        // one, whether the applet is available or not.
+        for available in [true, false] {
+            assert_eq!(
+                keyboard_route(NameTarget::Hunter.spec(), available),
+                KeyboardRoute::Builtin
+            );
+            assert_eq!(
+                keyboard_route(NameTarget::CardComment.spec(), available),
+                KeyboardRoute::Builtin
+            );
+        }
+        assert!(NameTarget::Hunter.spec().multiline);
+        assert!(!NameSpec::singleline(60).multiline);
     }
 }

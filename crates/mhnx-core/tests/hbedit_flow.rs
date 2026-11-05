@@ -583,6 +583,11 @@ fn charm_screen_creates_and_deletes() {
     ed.input(Key::Right);
     ed.input(Key::Down);
     ed.input(Key::Right);
+    // [A] on a skill or point row is that row's own action, so the write comes
+    // from the row the form marks "▸ 書き込み" (装備BOX枠, row 0).
+    while ed.charm_edit.map(|e| e.field) != Some(0) {
+        ed.input(Key::Up);
+    }
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Charms);
     let list = ed.save.as_ref().unwrap().charms(0).unwrap();
@@ -1094,7 +1099,10 @@ fn y_on_a_skill_row_opens_the_name_picker() {
     assert!(lines[0].text.contains("PICK SKILL 1"), "{}", lines[0].text);
     // The first rows carry real Japanese names - of the pool, not of the whole
     // name table, so 毒 (a skill no 天 can carry in slot 1) is not one of them.
-    let first_name = mhnx_core::skills::skill_name(pool[0]).expect("a name");
+    // The window is centred on the row the form already holds (so opening the
+    // list twice does not lose it), which is the name that has to be on screen.
+    let first_name =
+        mhnx_core::skills::skill_name(pool[ed.skill_pick_cursor]).expect("a name");
     assert!(
         lines.iter().any(|l| l.text.contains(first_name)),
         "skill names must be rendered: {:?}",
@@ -1306,6 +1314,10 @@ fn the_console_charm_editor_can_change_the_grade() {
         after.grade.max_slots(),
         after.grade.name()
     );
+    // The write is the 装備BOX枠 row; [A] on the grade row steps the grade.
+    while ed.charm_edit.map(|e| e.field) != Some(0) {
+        ed.input(Key::Up);
+    }
     ed.input(Key::A);
     assert!(ed.dirty, "writing marks the save dirty");
     let rec = {
@@ -4362,6 +4374,9 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
         Some(r) => (edit.skill1, edit.points1.clamp(r.min, r.max)),
         None => (0, 0),
     };
+    while ed.charm_edit.map(|e| e.field) != Some(0) {
+        ed.input(Key::Up);
+    }
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Charms);
     assert!(ed.dirty);
@@ -4417,6 +4432,10 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
         e.points1 = 0;
     }
     let target = ed.charm_edit.expect("open");
+    // Write from the 装備BOX枠 row: [A] on the skill row opens the skill list.
+    while ed.charm_edit.map(|e| e.field) != Some(0) {
+        ed.input(Key::Up);
+    }
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Charms);
     let rec2 = {

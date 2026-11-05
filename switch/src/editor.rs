@@ -1110,9 +1110,9 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         // so this line cannot name a single one; the drawn build prints the
         // row's own word in its footer and on its [A] button.
         CharmEdit => &[
-            ("A", "選択中の行の操作"),
+            ("A", "行の操作"),
             ("</>", "値"),
-            ("Y", "スキル選択"),
+            ("Y", "スキル検索"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1134,13 +1134,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("R", "オトモ"),
             ("B", "戻る"),
         ],
-        // [Y] is the name picker on every row of this form that has a name
-        // behind it: the three sockets open the decoration list, 種別 / ID the
-        // equipment list. [R] types the id of the 種別 / ID row.
+        // [A] is the row's own action (hbedit::EquipFormAction): the three
+        // sockets open the decoration list, 種別 / ID the equipment list, the
+        // numeric rows step, the 装備枠 row writes and the new form's レベル
+        // row creates. [Y] opens the same two lists with the search box up.
         EquipEdit => &[
-            ("A", "反映/作成"),
-            ("</>", "値"),
-            ("Y", "装備名/装飾品"),
+            ("A", "選ぶ/書き込み"),
+            ("</>", "10件/値"),
+            ("Y", "名前で検索"),
             ("R", "ID入力"),
             ("X", "保存"),
             ("B", "戻る"),
@@ -1651,14 +1652,47 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             (label, 512)
         };
         let spec = mhnx_core::hbedit::NameSpec::singleline(max_bytes);
-        if !crate::swkbd::is_available() {
-            // In Applet mode (launched from Album), Horizon OS forbids launching
-            // the swkbd LibraryApplet. Use our built-in touch & controller OSK!
-            gui.open_osk(idx, header, &initial, spec);
-        } else {
-            match crate::swkbd::input_text(header, &initial, max_bytes) {
-                Some(s) => apply_text_result(ed, idx, s),
-                None => ed.message = String::from("文字入力をキャンセルしました"),
+        // Which keyboard to use, decided by one function so the screen, this
+        // dispatch and the host tests cannot each have their own answer
+        // (hbedit::keyboard_route):
+        //
+        //   * a name holds U+000A, which the system keyboard cannot type, so a
+        //     name always uses the built-in one - the one real reason the
+        //     built-in keyboard exists;
+        //   * every other request is one line, so the system keyboard is
+        //     preferred: it has the console's IME, flick input and the layout
+        //     the player already knows;
+        //   * where the applet cannot be launched at all (the process is a
+        //     library applet, i.e. started from the album), the built-in
+        //     keyboard is used and the modal says why.
+        match mhnx_core::hbedit::keyboard_route(spec, crate::swkbd::is_available()) {
+            mhnx_core::hbedit::KeyboardRoute::System => {
+                match crate::swkbd::input_text(header, &initial, max_bytes) {
+                    Some(s) => apply_text_result(ed, idx, s),
+                    None => {
+                        ed.message = String::from(
+                            "文字入力をキャンセルしました（もう一度押すとやり直せます）",
+                        )
+                    }
+                }
+            }
+            mhnx_core::hbedit::KeyboardRoute::BuiltinFallback => {
+                // The system keyboard cannot be launched from this process, so
+                // the built-in one opens for a one-line field too - and says so
+                // on the modal, in the status row and nowhere silently.
+                gui.open_osk_with_note(
+                    idx,
+                    header,
+                    &initial,
+                    spec,
+                    "システムキーボードが使えないため、内蔵キーボードで入力します",
+                );
+                ed.message = String::from(
+                    "システムキーボードが使えないため内蔵キーボードで入力します（[+] で確定）",
+                );
+            }
+            mhnx_core::hbedit::KeyboardRoute::Builtin => {
+                gui.open_osk(idx, header, &initial, spec);
             }
         }
     }
@@ -1701,26 +1735,26 @@ pub fn run() -> i32 {
     // is the core's, so the frames it fires on are pinned by a host test.
     let mut held: u64 = 0;
     let mut key_repeat = mhnx_core::hbedit::KeyRepeat::new();
-    // L: held for the undo, tapped for the sub-tab.
+    // The shoulders: the press is answered on the frame the key goes down.
     //
-    // L is the sub-tab key on every screen, so the undo cannot be a plain L
-    // press. It used to be half a second and it fired on the frame the
-    // threshold was crossed, which turned a press that lingered into a
-    // whole-save undo with no way back: undo_last pops the step, so nothing
-    // puts it on again. It is one second now, and the first hold only offers
-    // the undo - the second one runs it (confirm::HoldConfirm).
-    let mut l_pending = false;
-    let mut l_fired = false;
-    let mut l_clean = true;
-    let mut l_hold = mhnx_core::confirm::HoldConfirm::new();
-    // R is the sub-tab key on a tap and 詳細 (生データ) on a long hold. The
-    // shape is L's, which answers a hold with the whole-save undo: both
-    // shoulders now say "hold me for the thing this screen cannot otherwise
-    // reach", and the footer names both.
-    let mut r_pending = false;
-    let mut r_fired = false;
-    let mut r_clean = true;
-    let mut r_hold = mhnx_core::confirm::HoldConfirm::new();
+    // L / R used to be answered on the release, because a tap had to be told
+    // from a hold first: the sub-tab therefore arrived after the finger came
+    // up, and two quick presses felt one press behind (the review called it
+    // もたつく). The tab now moves on the press. The holds keep their second
+    // job - L offers the whole-save undo, R opens 詳細 - and a hold never takes
+    // the tab move back: the tab has already been drawn, and undoing it on the
+    // way to the undo would be a second, invisible answer to one press.
+    // hbedit::ShoulderPress owns that ordering and its host test pins it; the
+    // undo still costs two holds, so a press that lingers cannot throw a save
+    // away (confirm::HoldConfirm).
+    let mut l_press = mhnx_core::hbedit::ShoulderPress::new();
+    let mut r_press = mhnx_core::hbedit::ShoulderPress::new();
+    // A held shoulder repeats on the four pick lists, where L / R are the ten
+    // row step rather than the sub-tab: the same 8 / 4 / 3 cadence the
+    // direction keys use, so holding L crosses a 6,435 row list instead of
+    // moving ten rows once.
+    let mut l_repeat = mhnx_core::hbedit::KeyRepeat::new();
+    let mut r_repeat = mhnx_core::hbedit::KeyRepeat::new();
 
     unsafe {
         sys::padConfigureInput(1, HID_NPAD_STYLE_SET_NPAD_STANDARD);
@@ -1758,13 +1792,13 @@ pub fn run() -> i32 {
             ed.set_repeating(repeated);
 
             if painter.gui.osk.is_some() {
-                // L / R answer the keyboard here, not the list: drop the
-                // deferred presses so a release inside the keyboard cannot
-                // reach them later.
-                l_pending = false;
-                l_fired = false;
-                r_pending = false;
-                r_fired = false;
+                // L / R answer the keyboard here, not the list: forget the
+                // holds so a press that came up inside the keyboard cannot
+                // reach the screen behind it later.
+                l_press = mhnx_core::hbedit::ShoulderPress::new();
+                r_press = mhnx_core::hbedit::ShoulderPress::new();
+                l_repeat.tick(false);
+                r_repeat.tick(false);
                 // ZL walks the character tabs; ZR inserts a line break (Key::Z
                 // is the raw ZR and no longer remapped to [R] here, because a
                 // name field has to be able to hold a second line).
@@ -1777,10 +1811,10 @@ pub fn run() -> i32 {
                     }
                 }
             } else if painter.gui.mib_picker.is_some() {
-                l_pending = false;
-                l_fired = false;
-                r_pending = false;
-                r_fired = false;
+                l_press = mhnx_core::hbedit::ShoulderPress::new();
+                r_press = mhnx_core::hbedit::ShoulderPress::new();
+                l_repeat.tick(false);
+                r_repeat.tick(false);
                 if down & BTN_RSTICK_UP != 0 {
                     painter.gui.page_by(&mut ed, -1);
                     need_draw = true;
@@ -1800,10 +1834,10 @@ pub fn run() -> i32 {
                     }
                 }
             } else if ed.review_open() {
-                l_pending = false;
-                l_fired = false;
-                r_pending = false;
-                r_fired = false;
+                l_press = mhnx_core::hbedit::ShoulderPress::new();
+                r_press = mhnx_core::hbedit::ShoulderPress::new();
+                l_repeat.tick(false);
+                r_repeat.tick(false);
                 // The save review is modal: A writes, B goes back, and nothing
                 // else is heard. The UI drops taps on anything but its two
                 // buttons for the same reason - a tap must not reach the list
@@ -1897,106 +1931,94 @@ pub fn run() -> i32 {
                     need_draw = true;
                 }
 
-                // L is the sub-tab key on every screen, so a plain L cannot also
-                // be the undo key. Holding it is the undo; a tap still does what
-                // L always did. The tap is answered on release, which is what
-                // keeps the two answers from firing off the same press.
-                if down & BTN_L != 0 {
-                    l_pending = true;
-                    l_fired = false;
-                    l_clean = true;
-                    l_hold.press();
+                // L / R, answered on the press. A tap is the sub-tab (or the ten
+                // row step on a pick list); a hold offers the second job without
+                // touching what the tap did.
+                if down & BTN_L != 0 && l_press.press() {
+                    // A key press takes the list back from a coasting flick.
+                    painter.gui.stop_fling();
+                    painter.gui.handle_pad_key(&mut ed, Key::L, cur);
+                    l_repeat.press();
+                    need_draw = true;
                 }
-                if l_pending {
-                    if cur & BTN_L == 0 {
-                        l_pending = false;
-                        // A press that did something else on the way does not
-                        // also count as a tab press: the sub-tab would move
-                        // under a screen the user just opened.
-                        if !l_fired && l_clean {
+                if down & BTN_R != 0 && r_press.press() {
+                    painter.gui.stop_fling();
+                    painter.gui.handle_pad_key(&mut ed, Key::R, cur);
+                    r_repeat.press();
+                    need_draw = true;
+                }
+                // A held shoulder repeats where L / R mean movement. On every
+                // other screen the shoulder is the sub-tab key, and repeating
+                // that would walk the tab strip while the finger rests.
+                if crate::ui::shoulder_moves(&ed) {
+                    if cur & BTN_L != 0 {
+                        if l_repeat.tick(true) {
                             painter.gui.handle_pad_key(&mut ed, Key::L, cur);
                             need_draw = true;
                         }
-                        l_fired = false;
-                        let _ = l_hold.release();
-                    } else if !l_fired {
-                        match l_hold.tick() {
-                            mhnx_core::confirm::HoldAction::Arm => {
-                                l_fired = true;
-                                ed.message = alloc::format!(
-                                    "もう一度 [L] を {} 秒長押しすると元に戻します（取り消す操作: {}）",
-                                    mhnx_core::confirm::HOLD_CONFIRM_FRAMES / 60,
-                                    ed.undo_label().unwrap_or("-")
-                                );
-                                need_draw = true;
-                            }
-                            mhnx_core::confirm::HoldAction::Run => {
-                                l_fired = true;
-                                if ed.undo_last() {
-                                    need_draw = true;
-                                }
-                            }
-                            mhnx_core::confirm::HoldAction::None => {}
-                        }
+                    } else {
+                        l_repeat.tick(false);
                     }
-                }
-
-                // R: a tap is the sub-tab key, a long hold is 詳細. It is
-                // answered on release for the same reason L is - the two
-                // meanings must not fire off the same press.
-                if down & BTN_R != 0 {
-                    r_pending = true;
-                    r_fired = false;
-                    r_clean = true;
-                    r_hold.press();
-                }
-                if r_pending {
-                    if cur & BTN_R == 0 {
-                        r_pending = false;
-                        // A press that did something else on the way does not
-                        // also count as a tab press: the sub-tab would move
-                        // under a screen the user just opened.
-                        if !r_fired && r_clean {
-                            // A key press takes the list back from a coasting
-                            // flick, exactly as the immediate dispatch did.
-                            painter.gui.stop_fling();
+                    if cur & BTN_R != 0 {
+                        if r_repeat.tick(true) {
                             painter.gui.handle_pad_key(&mut ed, Key::R, cur);
                             need_draw = true;
                         }
-                        r_fired = false;
-                        let _ = r_hold.release();
-                    } else if !r_fired {
-                        match r_hold.tick() {
-                            // 詳細 is a view, not a destructive action: the
-                            // first long hold opens it. The offer is taken
-                            // back at once, so holding longer cannot open it
-                            // twice.
-                            mhnx_core::confirm::HoldAction::Arm
-                            | mhnx_core::confirm::HoldAction::Run => {
-                                r_fired = true;
-                                r_hold.clear_arm();
-                                painter.gui.open_detail(&mut ed);
+                    } else {
+                        r_repeat.tick(false);
+                    }
+                } else {
+                    // L: the whole-save undo, two holds. R: 詳細, which is a
+                    // view rather than a destructive action, so the first hold
+                    // opens it and the offer is taken back at once so holding
+                    // longer cannot open it twice.
+                    match l_press.tick() {
+                        mhnx_core::confirm::HoldAction::Arm => {
+                            ed.message = alloc::format!(
+                                "もう一度 [L] を {} 秒長押しすると元に戻します（取り消す操作: {}）",
+                                mhnx_core::confirm::HOLD_CONFIRM_FRAMES / 60,
+                                ed.undo_label().unwrap_or("-")
+                            );
+                            need_draw = true;
+                        }
+                        mhnx_core::confirm::HoldAction::Run => {
+                            if ed.undo_last() {
                                 need_draw = true;
                             }
-                            mhnx_core::confirm::HoldAction::None => {}
                         }
+                        mhnx_core::confirm::HoldAction::None => {}
                     }
+                    match r_press.tick() {
+                        mhnx_core::confirm::HoldAction::Arm
+                        | mhnx_core::confirm::HoldAction::Run => {
+                            r_press.clear_arm();
+                            painter.gui.open_detail(&mut ed);
+                            need_draw = true;
+                        }
+                        mhnx_core::confirm::HoldAction::None => {}
+                    }
+                }
+                // The keys came up: the holds restart from zero next time.
+                if cur & BTN_L == 0 {
+                    l_press.release();
+                }
+                if cur & BTN_R == 0 {
+                    r_press.release();
                 }
 
                 if let Some(k) = key {
-                    // Don't double-send Key::Z when ZR was already used for tab cycling,
-                    // and Key::L is answered above (tap on release, hold for undo).
+                    // Don't double-send Key::Z when ZR was already used for tab
+                    // cycling, and L / R are answered above (press = tap, hold =
+                    // the second job).
                     if k != Key::Z && k != Key::L && k != Key::R {
                         // A key press takes the list back from a coasting flick:
                         // the two must never move the cursor at the same time.
                         painter.gui.stop_fling();
-                        l_clean = false;
-                        r_clean = false;
-                        // Some other key means the offers are gone: they have to
-                        // be asked for again rather than waiting for the next
-                        // hold however long later.
-                        l_hold.clear_arm();
-                        r_hold.clear_arm();
+                        // Some other key means the holds' offers are gone: they
+                        // have to be asked for again rather than waiting for the
+                        // next hold however long later.
+                        l_press.clear_arm();
+                        r_press.clear_arm();
                         painter.gui.handle_pad_key(&mut ed, k, cur);
                         need_draw = true;
                     }
