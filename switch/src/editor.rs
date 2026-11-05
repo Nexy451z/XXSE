@@ -1075,9 +1075,13 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "保存"),
             ("B", "戻る"),
         ],
+        // The same three chips on every pick list: the direction keys are one
+        // rule on all routes (hbedit::pick_move), so the footer names the same
+        // two steps rather than a route-specific wording.
         ItemPick => &[
             ("A", "決定/追加"),
-            ("</>", "行移動 / 個数"),
+            ("◀/▶", "10件"),
+            ("▲/▼", "1件"),
             ("Y", "名前で絞る"),
             ("X", "クリア"),
             ("B", "戻る"),
@@ -1101,7 +1105,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("X", "保存"),
             ("B", "戻る"),
         ],
-        SkillPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
+        SkillPick => &[
+            ("A", "決定"),
+            ("◀/▶", "10件"),
+            ("▲/▼", "1件"),
+            ("Y", "絞る"),
+            ("X", "クリア"),
+            ("B", "戻る"),
+        ],
         Equip => &[
             ("A", "編集"),
             ("Y", "絞る"),
@@ -1119,7 +1130,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("X", "保存"),
             ("B", "戻る"),
         ],
-        JewelPick => &[("A", "決定"), ("Y", "絞る"), ("X", "クリア"), ("B", "戻る")],
+        JewelPick => &[
+            ("A", "決定"),
+            ("◀/▶", "10件"),
+            ("▲/▼", "1件"),
+            ("Y", "絞る"),
+            ("X", "クリア"),
+            ("B", "戻る"),
+        ],
         QuestEquip => &[("A", "中身を開く/変更"), ("B", "戻る")],
         SaveQuests => &[
             ("A", "編集"),
@@ -1512,7 +1530,18 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             return force_redraw;
         }
         let (header, max_bytes) = if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
-            ("アイテム名で絞り込み", 60usize)
+            // Which of the two searches the picker will run: the names when
+            // this build has them, the ids when it does not. The state machine
+            // answers the same question (item_pick_names_available), so the
+            // keyboard title and the list cannot promise different things.
+            if ed.item_pick_names_available() {
+                (
+                    "アイテム名で絞り込み（部分一致・英数の大小は無視）",
+                    60usize,
+                )
+            } else {
+                ("アイテムIDで絞り込み（名前が読めません 例: 975）", 60)
+            }
         } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
             ("スキル名で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {

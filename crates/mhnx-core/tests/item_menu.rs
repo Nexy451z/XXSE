@@ -318,14 +318,22 @@ fn the_add_row_picks_the_item_then_the_count() {
     assert_eq!(box_of(&ed), before, "choosing the item writes nothing");
     assert!(ed.message.contains("◀/▶"), "{}", ed.message);
 
-    // Five of it: Right four times.
+    // The number keeps the pick lists' rule: [◀] / [▶] take the big step
+    // (ten) and [▲] / [▼] the small one. It used to be the other way round,
+    // which is what made the same key pair change meaning inside one screen.
+    ed.input(Key::Right);
+    assert_eq!(ed.item_pick_add_count, 11, "Right is the ten step");
+    ed.input(Key::Up);
+    assert_eq!(ed.item_pick_add_count, 12, "Up is the one step");
+    ed.input(Key::Down);
+    assert_eq!(ed.item_pick_add_count, 11);
+    ed.input(Key::Left);
+    assert_eq!(ed.item_pick_add_count, 1, "Left comes back down by ten");
+    // Five of it: the one step, four times.
     for _ in 0..4 {
-        ed.input(Key::Right);
+        ed.input(Key::Up);
     }
     assert_eq!(ed.item_pick_add_count, 5);
-    ed.input(Key::Left);
-    assert_eq!(ed.item_pick_add_count, 4, "Left comes back down");
-    ed.input(Key::Right);
     // The cap is the game's own 99, so holding Right cannot pass it.
     for _ in 0..200 {
         ed.input(Key::Right);
@@ -336,7 +344,7 @@ fn the_add_row_picks_the_item_then_the_count() {
     }
     assert_eq!(ed.item_pick_add_count, 1, "and it never reaches zero");
     for _ in 0..4 {
-        ed.input(Key::Right);
+        ed.input(Key::Up);
     }
 
     ed.input(Key::A);

@@ -1161,21 +1161,17 @@ impl GuiState {
                 ed.input(key);
                 return;
             }
-            // The second stage of the bulk add is one number: L/R step it
-            // instead of paging the list underneath.
-            if ed.screen == Screen::ItemPick
-                && ed.item_pick_mode == 3
-                && ed.item_pick_stage == 1
-            {
-                ed.input(if key == Key::R { Key::Right } else { Key::Left });
-                return;
-            }
+            // The three pick lists move through one rule (hbedit::pick_move):
+            // [◀] / [▶] take ten rows and [▲] / [▼] one, and the second stage
+            // of the bulk add steps its count the same way. The shoulders are
+            // turned into that pair here rather than scrolling on their own,
+            // so the two layers cannot disagree about the same key - which is
+            // how one route used to page and the next one not.
             if matches!(
                 ed.screen,
                 Screen::ItemPick | Screen::SkillPick | Screen::JewelPick
             ) {
-                let d = if key == Key::Right || key == Key::R { 10 } else { -10 };
-                scroll_active_cursor(ed, d);
+                ed.input(if key == Key::R { Key::Right } else { Key::Left });
                 return;
             }
             // A reward / supply row holds numbers, and [R] is the key that
@@ -5366,16 +5362,19 @@ impl GuiState {
             )
         } else if adding {
             String::from("アイテム追加 1/2  アイテムを選択")
-        } else if ed.item_pick_filter.is_empty() {
-            String::from("アイテム選択")
         } else {
-            format!("アイテム選択 (検索: {})", ed.item_pick_filter)
+            String::from("アイテム選択")
         };
+        // What the filter is and what it left, beside the title: "検索: ほげ（12件）",
+        // the whole table, or the notice that this build can only search ids.
+        // The state machine writes the line, so the drawn header and the text
+        // console cannot word it differently.
+        let sub = ed.item_pick_search_line(matches.len());
         self.draw_adaptive_rows(
             c,
             ed,
             &hdr,
-            "",
+            &sub,
             &rows,
             ed.item_pick_cursor.min(rows.len().saturating_sub(1)),
             count_stage,

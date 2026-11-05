@@ -1035,6 +1035,145 @@ pub fn item_name_of(id: u16) -> alloc::string::String {
     alloc::format!("#{}", id)
 }
 
+// ---------------------------------------------------------------------------
+// The one rule the pick lists move by
+// ---------------------------------------------------------------------------
+
+/// How far [◀] / [▶] move a pick list: ten rows. [▲] / [▼] move one.
+///
+/// The item picker, the decoration picker and the skill picker all move
+/// through pick_move, and the two-stage bulk add steps its number through
+/// pick_step_count with the same shape, so no route can end up with a
+/// different answer to the same key. The console layer turns its shoulders
+/// into the same pair instead of scrolling on its own, which is what used to
+/// make one key do one thing on one route and another thing on the next.
+pub const PICK_STEP: usize = 10;
+
+/// Highest item id any picker offers.
+///
+/// The id range is a save-format fact, so it stays even in a build without the
+/// compiled name table (the table is a feature; the ids are the format).
+#[cfg(feature = "gamedata")]
+pub const PICK_LAST_ITEM_ID: usize = crate::gamedata::LAST_ITEM_ID;
+#[cfg(not(feature = "gamedata"))]
+pub const PICK_LAST_ITEM_ID: usize = 2990;
+
+/// One direction key against a list of n rows.
+///
+/// Returns true when the key was one of the four, so a caller can answer them
+/// in one place and keep its own match for the rest.
+fn pick_move(cursor: &mut usize, n: usize, key: Key) -> bool {
+    if n == 0 {
+        // An empty list still swallows the keys: a cursor that points at
+        // nothing must not be moved, and the screen must stay usable.
+        *cursor = 0;
+        return matches!(key, Key::Up | Key::Down | Key::Left | Key::Right);
+    }
+    match key {
+        Key::Up => *cursor = (*cursor + n - 1) % n,
+        Key::Down => *cursor = (*cursor + 1) % n,
+        Key::Left => *cursor = (*cursor).saturating_sub(PICK_STEP),
+        Key::Right => *cursor = (*cursor + PICK_STEP).min(n - 1),
+        _ => return false,
+    }
+    true
+}
+
+/// One direction key against a number: [▲] / [▼] step one, [◀] / [▶] step
+/// PICK_STEP.
+///
+/// This is the pick lists' rule applied to the one number a picker owns (the
+/// count of the bulk add), so the big step is on the same key pair everywhere.
+fn pick_step_count(value: &mut u16, lo: u16, hi: u16, key: Key) -> bool {
+    let step: i32 = match key {
+        Key::Up => 1,
+        Key::Down => -1,
+        Key::Right => PICK_STEP as i32,
+        Key::Left => -(PICK_STEP as i32),
+        _ => return false,
+    };
+    *value = (*value as i32 + step).clamp(lo as i32, hi as i32) as u16;
+    true
+}
+
+/// The needle a filter compares with: trimmed, and without the leading '#'.
+fn filter_needle(text: &str) -> alloc::string::String {
+    let t = text.trim();
+    let t = t.strip_prefix('#').unwrap_or(t);
+    t.to_lowercase()
+}
+
+/// Does a name answer a needle (already lowercased)?
+///
+/// A prefix match would need the user to remember the start of the name; the
+/// game's own names put the useful word in the middle (回復薬グレート), so this
+/// is a substring test. The cheap direct test answers the Japanese case
+/// without allocating; the lowercased one only runs when it has to, which is
+/// what makes "attack" find "Attack Up".
+pub fn name_matches(name: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    name.contains(needle) || name.to_lowercase().contains(needle)
+}
+
+/// Does the decimal spelling of an id contain the needle?
+///
+/// Used when this build cannot name an item: the picker then searches the id,
+/// so a user who knows the number is not locked out. Written without an
+/// allocation because the list is rebuilt on every frame the picker is open.
+fn id_digits_contain(id: usize, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let needle = needle.as_bytes();
+    if !needle.iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let mut digits = [0u8; 20];
+    let mut n = id;
+    let mut len = 0;
+    loop {
+        digits[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+        if n == 0 || len == digits.len() {
+            break;
+        }
+    }
+    if needle.len() > len {
+        return false;
+    }
+    // The digits were written least significant first, so the decimal
+    // spelling is digits[len - 1 - k].
+    (0..=len - needle.len()).any(|start| {
+        (0..needle.len()).all(|k| digits[len - 1 - (start + k)] == needle[k])
+    })
+}
+
+/// Item ids a filter keeps, in id order.
+///
+/// names is the compiled name table, or None for a build that has none: then
+/// the needle is matched against the decimal id instead of the name, so the
+/// picker still narrows (and the screen says which of the two it is doing).
+pub fn filter_item_ids_in(needle: &str, names: Option<&[&str]>) -> Vec<u16> {
+    let needle = filter_needle(needle);
+    let mut out = Vec::new();
+    for id in 1..=PICK_LAST_ITEM_ID {
+        let hit = match names {
+            Some(list) => list
+                .get(id)
+                .map(|name| name_matches(name, &needle))
+                .unwrap_or(false),
+            None => id_digits_contain(id, &needle),
+        };
+        if hit {
+            out.push(id as u16);
+        }
+    }
+    out
+}
+
 /// Every decoration id the name table knows, empty socket (0) excluded.
 pub fn decoration_ids() -> Vec<u16> {
     #[cfg(feature = "gamedata")]
@@ -3962,11 +4101,14 @@ impl Editor {
             Screen::Items => {
                 "[A] 変更  [-] 一括操作  [◀/▶] 個数  [L/R] BOX切替  [Y] 刻み  [R] 数値入力  [X] 保存"
             }
+            // The three pick lists print the same line: the direction keys are
+            // one rule everywhere, and the footer says which is which instead
+            // of leaving the user to find out per route.
             Screen::ItemPick if self.item_pick_mode == 3 && self.item_pick_stage == 1 => {
-                "[◀/▶] 個数  [▲/▼] ±10  [A] この個数を追加  [B] 選び直す"
+                "[◀/▶] 個数±10  [▲/▼] 個数±1  [A] この個数を追加  [B] 選び直す"
             }
             Screen::ItemPick | Screen::SkillPick => {
-                "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [X] クリア  [B] 戻る"
             }
             // One delete key on every screen: [-] twice.
             Screen::Charms => "[A] 編集  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存",
@@ -3979,7 +4121,7 @@ impl Editor {
                 "[A] 反映/作成  [▲/▼] 行  [◀/▶] 値  [Y] 装飾品  [X] 保存  [B] 戻る"
             }
             Screen::JewelPick => {
-                "[A] 決定  [Y] 検索  [X] クリア  [L/R] ±10行  [▲/▼] 行  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で絞る  [X] クリア  [B] 戻る"
             }
             Screen::Sets if self.set_edit.is_some() => {
                 "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 外す（2回）  [Y] 警告  [X] 保存  [B] 一覧"
@@ -5301,8 +5443,9 @@ impl Editor {
                         self.item_pick_filter.clear();
                         self.screen = Screen::ItemPick;
                         self.message = alloc::format!(
-                            "{} 行目のアイテムを選んでください",
-                            self.entry_row_cursor
+                            "{} 行目のアイテムを選んでください — {}",
+                            self.entry_row_cursor,
+                            self.pick_key_hint()
                         );
                     } else {
                         self.message = String::from("このエントリに編集できる項目はありません");
@@ -6560,7 +6703,11 @@ impl Editor {
                     self.item_pick_cursor = 0;
                     self.item_pick_filter.clear();
                     self.screen = Screen::ItemPick;
-                    self.message = format!("枠 #{} のアイテムを選んでください", idx + 1);
+                    self.message = alloc::format!(
+                        "枠 #{} のアイテムを選んでください — {}",
+                        idx + 1,
+                        self.pick_key_hint()
+                    );
                 }
             }
             // The bulk menu hangs off Minus: X is the step key on this screen
@@ -6907,13 +7054,26 @@ impl Editor {
         self.item_pick_add_id = 0;
         self.item_pick_add_count = 1;
         self.screen = Screen::ItemPick;
-        self.message = String::from("追加するアイテムを選んでください（選んだあと [◀/▶] で個数）");
+        self.message = String::from(self.pick_key_hint());
+    }
+
+    /// The one line that says what the pick lists' direction keys do.
+    ///
+    /// It is used as the message when a picker opens, so the rule is on screen
+    /// the moment a route reaches one of them, and it names the same rule the
+    /// footer prints.
+    pub fn pick_key_hint(&self) -> String {
+        String::from("[◀/▶] 10件送り  [▲/▼] 1件  [Y] 名前で絞る  [X] クリア  [A] 決定")
     }
 
     /// The footer line of the add stage: which item and how many.
+    ///
+    /// The step rule is the picker's own: the big step stays on [◀] / [▶] and
+    /// the small one on [▲] / [▼], so the second stage of the same screen does
+    /// not swap what the keys mean.
     pub fn item_add_message(&self) -> String {
         format!(
-            "{} を {} 個追加 — [◀/▶] ±1、[▲/▼] ±10、[A] 決定、[B] 選び直す",
+            "{} を {} 個追加 — [◀/▶] ±10、[▲/▼] ±1、[A] 決定、[B] 選び直す",
             item_name_of(self.item_pick_add_id),
             self.item_pick_add_count
         )
@@ -6961,33 +7121,57 @@ impl Editor {
         self.item_armed = None;
     }
 
-    /// Item ids whose name matches the current filter, in id order.
+    /// Item ids the current filter keeps, in id order.
     pub fn item_pick_matches(&self) -> Vec<u16> {
-        let needle = self.item_pick_filter.trim().to_lowercase();
+        #[cfg(feature = "gamedata")]
+        let names: Option<&[&str]> = Some(crate::gamedata::ITEM_NAME_LIST);
+        #[cfg(not(feature = "gamedata"))]
+        let names: Option<&[&str]> = None;
+        filter_item_ids_in(&self.item_pick_filter, names)
+    }
+
+    /// Can this build put a name to an item?
+    ///
+    /// Without the compiled table (or with an empty one) the picker cannot
+    /// search by name; it says so and searches the id instead rather than
+    /// offering an empty list.
+    pub fn item_pick_names_available(&self) -> bool {
         #[cfg(feature = "gamedata")]
         {
-            let mut out = Vec::new();
-            for (id, name) in crate::gamedata::ITEM_NAME_LIST.iter().enumerate() {
-                if id == 0 || id as usize > crate::gamedata::LAST_ITEM_ID {
-                    continue;
-                }
-                if needle.is_empty() || name.to_lowercase().contains(&needle) {
-                    out.push(id as u16);
-                }
-            }
-            out
+            !crate::gamedata::ITEM_NAME_LIST.is_empty()
         }
         #[cfg(not(feature = "gamedata"))]
         {
-            let _ = needle;
-            Vec::new()
+            false
+        }
+    }
+
+    /// The line under a picker's title: what the filter is and what it left.
+    ///
+    /// "検索: ほげ（12件）" while a filter is on, the whole table when it is
+    /// empty, and the id-search notice when this build has no item names.
+    pub fn item_pick_search_line(&self, matches: usize) -> String {
+        if !self.item_pick_names_available() {
+            return alloc::format!("名前が読めないので ID で検索します（{}件）", matches);
+        }
+        let needle = self.item_pick_filter.trim();
+        if needle.is_empty() {
+            alloc::format!("全 {}件", matches)
+        } else {
+            alloc::format!("検索: {}（{}件）", needle, matches)
         }
     }
 
     /// The io layer answers a filter request with this.
+    ///
+    /// The status row repeats the header's line, so the answer to the keyboard
+    /// says how many rows the text left even on a console that draws no header
+    /// for the picker.
     pub fn apply_item_filter(&mut self, text: String) {
         self.item_pick_filter = text;
         self.item_pick_cursor = 0;
+        let n = self.item_pick_matches().len();
+        self.message = self.item_pick_search_line(n);
     }
 
     /// The extension of the open .arc entry, if one is open.
@@ -9168,6 +9352,7 @@ impl Editor {
                         self.item_pick_cursor = 0;
                         self.item_pick_filter.clear();
                         self.screen = Screen::ItemPick;
+                        self.message = self.pick_key_hint();
                     }
                 } else if n > 0 {
                     self.qe_open = true;
@@ -10386,7 +10571,7 @@ impl Editor {
                     self.jewel_pick_filter.clear();
                     self.jewel_pick_cursor = 0;
                     self.screen = Screen::JewelPick;
-                    self.message = String::from("装飾品を名前から選んでください");
+                    self.message = self.pick_key_hint();
                 } else if e.new {
                     self.message =
                         String::from("装飾品は作成後に選べます（[A] で作成してから編集）");
@@ -10581,19 +10766,13 @@ impl Editor {
     }
 
     fn input_jewel_pick(&mut self, key: Key) {
+        // The same rule the item and skill pickers use: [▲] / [▼] one row,
+        // [◀] / [▶] ten (hbedit::pick_move).
         let n = self.jewel_pick_matches().len();
+        if pick_move(&mut self.jewel_pick_cursor, n, key) {
+            return;
+        }
         match key {
-            Key::Up => {
-                self.jewel_pick_cursor =
-                    (self.jewel_pick_cursor + n.saturating_sub(1)) % n.max(1)
-            }
-            Key::Down => self.jewel_pick_cursor = (self.jewel_pick_cursor + 1) % n.max(1),
-            Key::Left => self.jewel_pick_cursor = self.jewel_pick_cursor.saturating_sub(10),
-            Key::Right => {
-                if n > 0 {
-                    self.jewel_pick_cursor = (self.jewel_pick_cursor + 10).min(n - 1);
-                }
-            }
             Key::Y => {
                 self.pending_text = Some((TEXT_JEWEL_FILTER, self.jewel_pick_filter.clone()));
             }
@@ -10643,18 +10822,12 @@ impl Editor {
     }
 
     fn input_skill_pick(&mut self, key: Key) {
+        // Same rule as the other two pick lists (hbedit::pick_move).
         let n = self.skill_pick_matches().len();
+        if pick_move(&mut self.skill_pick_cursor, n, key) {
+            return;
+        }
         match key {
-            Key::Up => {
-                self.skill_pick_cursor = (self.skill_pick_cursor + n.saturating_sub(1)) % n.max(1)
-            }
-            Key::Down => self.skill_pick_cursor = (self.skill_pick_cursor + 1) % n.max(1),
-            Key::Left => self.skill_pick_cursor = self.skill_pick_cursor.saturating_sub(10),
-            Key::Right => {
-                if n > 0 {
-                    self.skill_pick_cursor = (self.skill_pick_cursor + 10).min(n - 1);
-                }
-            }
             Key::Y => {
                 self.pending_text = Some((TEXT_SKILL_FILTER, self.skill_pick_filter.clone()));
             }
@@ -10690,48 +10863,40 @@ impl Editor {
         // Stage two of "アイテムを追加": the item is chosen, so Left / Right
         // now pick the count and A adds it. The list underneath is kept on
         // screen (it still names the item) but no longer moves.
+        //
+        // The number keeps the pick lists' own rule - the big step on
+        // [◀] / [▶], the small one on [▲] / [▼] - so the second stage of this
+        // screen does not swap what the same key pair means.
         if self.item_pick_mode == 3 && self.item_pick_stage == 1 {
+            if pick_step_count(&mut self.item_pick_add_count, 1, MAX_COUNT, key) {
+                self.message = self.item_add_message();
+                return;
+            }
             match key {
-                Key::Left => {
-                    self.item_pick_add_count = self.item_pick_add_count.saturating_sub(1).max(1);
-                    self.message = self.item_add_message();
-                }
-                Key::Right => {
-                    self.item_pick_add_count = (self.item_pick_add_count + 1).min(MAX_COUNT);
-                    self.message = self.item_add_message();
-                }
-                Key::Up => {
-                    self.item_pick_add_count = (self.item_pick_add_count + 10).min(MAX_COUNT);
-                    self.message = self.item_add_message();
-                }
-                Key::Down => {
-                    self.item_pick_add_count = self.item_pick_add_count.saturating_sub(10).max(1);
-                    self.message = self.item_add_message();
-                }
                 Key::A => self.apply_item_add(),
                 Key::B => {
                     self.item_pick_stage = 0;
                     self.message = String::from("追加するアイテムを選び直してください");
                 }
                 Key::Plus => {
-                self.press_quit();
-            }
+                    self.press_quit();
+                }
                 _ => {}
             }
             return;
         }
+        // Every pick list moves through the same function: [▲] / [▼] one row,
+        // [◀] / [▶] ten (hbedit::pick_move).
         let n = self.item_pick_matches().len();
+        if pick_move(&mut self.item_pick_cursor, n, key) {
+            return;
+        }
         match key {
-            Key::Up => self.item_pick_cursor = (self.item_pick_cursor + n.saturating_sub(1)) % n.max(1),
-            Key::Down => self.item_pick_cursor = (self.item_pick_cursor + 1) % n.max(1),
-            Key::Left => self.item_pick_cursor = self.item_pick_cursor.saturating_sub(10),
-            Key::Right => {
-                if n > 0 {
-                    self.item_pick_cursor = (self.item_pick_cursor + 10).min(n - 1);
-                }
-            }
             Key::Y => {
                 self.pending_text = Some((TEXT_ITEM_FILTER, self.item_pick_filter.clone()));
+                if !self.item_pick_names_available() {
+                    self.message = String::from("名前が読めないので ID で検索します（例: 975）");
+                }
             }
             Key::X => {
                 self.item_pick_filter.clear();
@@ -11988,20 +12153,8 @@ impl Editor {
                         )
                     };
                     push(&mut out, head, false, false);
-                    push(
-                        &mut out,
-                        format!(
-                            "filter: {}   ({} match)",
-                            if self.item_pick_filter.is_empty() {
-                                "(all)"
-                            } else {
-                                &self.item_pick_filter
-                            },
-                            matches.len()
-                        ),
-                        false,
-                        false,
-                    );
+                    let search = self.item_pick_search_line(matches.len());
+                    push(&mut out, search, false, false);
                     let mut start = self.item_pick_cursor.saturating_sub(8);
                     if start + 14 > matches.len() {
                         start = matches.len().saturating_sub(14);
@@ -12017,9 +12170,9 @@ impl Editor {
                     push(
                         &mut out,
                         if self.item_pick_stage == 0 {
-                            String::from("  A choose  Y filter  X clear  Up/Down  Left/Right +-10  B back")
+                            String::from("  A choose  Y filter  X clear  Up/Down 1  Left/Right 10  B back")
                         } else {
-                            String::from("  Left/Right +-1  Up/Down +-10  A add  B choose again")
+                            String::from("  Left/Right +-10  Up/Down +-1  A add  B choose again")
                         },
                         false,
                         false,
@@ -12042,20 +12195,8 @@ impl Editor {
                     false,
                     false,
                 );
-                push(
-                    &mut out,
-                    format!(
-                        "filter: {}   ({} match)",
-                        if self.item_pick_filter.is_empty() {
-                            "(all)"
-                        } else {
-                            &self.item_pick_filter
-                        },
-                        matches.len()
-                    ),
-                    false,
-                    false,
-                );
+                let search = self.item_pick_search_line(matches.len());
+                push(&mut out, search, false, false);
                 let mut start = self.item_pick_cursor.saturating_sub(8);
                 if start + 16 > matches.len() {
                     start = matches.len().saturating_sub(16);
@@ -12070,7 +12211,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A choose  Y type filter  X clear  Up/Down  Left/Right +-10  B back"),
+                    String::from("  A choose  Y type filter  X clear  Up/Down 1  Left/Right 10  B back"),
                     false,
                     false,
                 );
@@ -13039,7 +13180,7 @@ impl Editor {
                 push(
                     &mut out,
                     String::from(
-                        "  A choose  Y type filter  X clear  Up/Down  Left/Right +-10  B back",
+                        "  A choose  Y type filter  X clear  Up/Down 1  Left/Right 10  B back",
                     ),
                     false,
                     false,
@@ -13137,7 +13278,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A choose  Y type  X clear  Up/Down  Left/Right +-10  B back"),
+                    String::from("  A choose  Y type  X clear  Up/Down 1  Left/Right 10  B back"),
                     false,
                     false,
                 );
