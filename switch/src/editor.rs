@@ -1021,6 +1021,7 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         QuestEquip => "クエスト装備",
         SaveQuests => "クエスト (セーブ内)",
         ArcList => "クエスト (.arc)",
+        QuestEdit => "クエスト改造",
         ArcEntries => "クエストの中身",
         EntryView => "エントリ",
         Mib => "クエスト条件",
@@ -1169,6 +1170,17 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("B", "戻る"),
         ],
         ArcList => &[("A", "開く"), ("Z", "クエスト追加"), ("X", "セーブ内"), ("Y", "セーブ編集"), ("+", "終了")],
+        // クエスト改造: one row pair moves, the other steps, [A] opens the
+        // row's chooser, [Y] the ▸詳細 rows, [ZR] the file-by-file screens.
+        QuestEdit => &[
+            ("</>", "値"),
+            ("A", "選択"),
+            ("Y", "詳細行"),
+            ("-", "項目"),
+            ("Z", "ファイル単位"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
         ArcEntries => &[
             ("A", "編集"),
             ("Y", "表示"),
@@ -1449,7 +1461,16 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                 let path = ed.arc_files.get(i).cloned();
                 if let Some(p) = path {
                     match read_file(&p) {
-                        Some(b) => ed.open_arc_bytes(&p, &b),
+                        Some(b) => {
+                            ed.open_arc_bytes(&p, &b);
+                            // A quest that was picked is a quest to edit, not
+                            // fifteen files to choose from: the console lands
+                            // on クエスト改造, and [詳細] goes back to the file
+                            // list this used to open directly.
+                            if ed.arc.is_some() {
+                                ed.enter_quest_edit();
+                            }
+                        }
                         None => ed.message = format!("cannot read {}", p),
                     }
                 }

@@ -154,6 +154,79 @@ pub enum Tab {
     /// needs a save to be open.
     Database,
     About,
+    /// クエスト改造: クエストを名前で選ぶ画面. The files behind a quest
+    /// (parameters, text, rewards, supplies, monster placements) are read and
+    /// matched inside; the user never picks one of them by extension.
+    ///
+    /// [Tab::Quest] stays as the 詳細 view, one file at a time, which this
+    /// screen's 詳細 button opens.
+    QuestWork,
+}
+
+/// Which section of the クエスト改造 screen is on screen.
+///
+/// The four sections are what a quest is edited through: its text and time
+/// limit, its five large monsters, its reward table and its supply box. They
+/// live on one screen because the user picks a quest, not a file: which payload
+/// holds which field is this editor's problem, not theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuestWorkTab {
+    #[default]
+    Basic,
+    Monsters,
+    Rewards,
+    Supplies,
+}
+
+impl QuestWorkTab {
+    /// The label drawn on the section button.
+    fn label(self) -> &'static str {
+        match self {
+            QuestWorkTab::Basic => "基本",
+            QuestWorkTab::Monsters => "モンスター",
+            QuestWorkTab::Rewards => "報酬",
+            QuestWorkTab::Supplies => "支給品",
+        }
+    }
+}
+
+/// One quest the クエスト改造 screen can load, named the way the picker names it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuestWorkRow {
+    /// Quest id, the number the save files the quest under.
+    pub quest_id: i32,
+    /// Slot it occupies in the save; diagnostics only.
+    pub slot: usize,
+    /// Title read out of the quest's own text payload.
+    pub title: String,
+}
+
+impl QuestWorkRow {
+    /// "タイトル 0x…": the name first, the id in hex, never decimal.
+    pub fn label(&self) -> String {
+        let title = self.title.trim();
+        let title = if title.is_empty() { "（無題）" } else { title };
+        format!("{} 0x{:X}", title, self.quest_id as u32)
+    }
+}
+
+/// Which entry of the open archive holds each part the クエスト改造 screen edits.
+///
+/// Resolved from the archive itself by type, so a quest whose entries are in a
+/// different order still lands on the right ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct QuestWorkParts {
+    mib: Option<usize>,
+    gmd: Option<usize>,
+    rem: Option<usize>,
+    sup: Option<usize>,
+}
+
+impl QuestWorkParts {
+    /// Does this archive hold nothing this screen can edit?
+    fn is_empty(self) -> bool {
+        self.mib.is_none() && self.gmd.is_none() && self.rem.is_none() && self.sup.is_none()
+    }
 }
 
 /// One row of the セーブマップ list, with the text the table draws already
@@ -904,6 +977,26 @@ pub struct MhnxEditor {
     /// slot: each of them narrows the name list on its own.
     pub mib_mob_search: [String; 5],
     pub gmd: Option<Gmd>,
+    /// クエスト改造: which of its four sections is on screen.
+    pub qw_tab: QuestWorkTab,
+    /// The save's quests, as the picker lists them.
+    ///
+    /// Built when the screen is opened or 再読込 is pressed, not every frame:
+    /// building it parses the payload of every quest the save holds, and this
+    /// is the default screen.
+    pub qw_rows: Vec<QuestWorkRow>,
+    /// Set when qw_rows no longer matches the save.
+    pub qw_rows_stale: bool,
+    /// Search text of the quest picker.
+    pub qw_filter: String,
+    /// Which of the five monster rows has its 詳細 open.
+    pub qw_mob_open: [bool; 5],
+    /// Search text of the five monster pickers, one per slot.
+    pub qw_mob_search: [String; 5],
+    /// Selected reward row and supply row, and the item search they share.
+    pub qw_reward_sel: Option<usize>,
+    pub qw_supply_sel: Option<usize>,
+    pub qw_item_filter: String,
     /// Problems found by the quest checker.
     pub findings: Vec<Finding>,
     /// Download Palico installer: 0 = Japanese, 1 = English.
@@ -1177,7 +1270,9 @@ pub struct MhnxEditor {
 impl Default for MhnxEditor {
     fn default() -> Self {
         MhnxEditor {
-            tab: Tab::Save,
+            // クエスト改造 is the way in: a quest is chosen by name, and the
+            // file-by-file screen is one 詳細 button away.
+            tab: Tab::QuestWork,
             status: String::new(),
             message: String::new(),
             save_path: None,
@@ -1217,6 +1312,21 @@ impl Default for MhnxEditor {
                 String::new(),
             ],
             gmd: None,
+            qw_tab: QuestWorkTab::Basic,
+            qw_rows: Vec::new(),
+            qw_rows_stale: true,
+            qw_filter: String::new(),
+            qw_mob_open: [false; 5],
+            qw_mob_search: [
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ],
+            qw_reward_sel: None,
+            qw_supply_sel: None,
+            qw_item_filter: String::new(),
             findings: Vec::new(),
             cat_lang: 0,
             cat_id: 0,
@@ -1355,6 +1465,8 @@ impl MhnxEditor {
                 self.save = Some(s);
                 self.save_path = Some(path.clone());
                 self.dirty = false;
+                // The quest picker of クエスト改造 lists this save's quests.
+                self.qw_rows_stale = true;
                 // What the file looked like at the moment it was read. Without
                 // this a save that the game (or an emulator) wrote between the
                 // read and the write was overwritten without a word.
@@ -3128,8 +3240,14 @@ impl MhnxEditor {
                 self.arc = Some(a);
                 self.arc_path = Some(path.clone());
                 self.arc_from_save = None;
+                // A quest just chosen belongs on the クエスト改造 screen; the
+                // file-level editors stay one 詳細 button away.
+                self.qw_reward_sel = None;
+                self.qw_supply_sel = None;
+                self.qw_mob_open = [false; 5];
                 self.load_arc_entry(idx);
                 self.run_quest_check();
+                self.tab = Tab::QuestWork;
                 self.message = format!("クエストを読み込みました: {}", path.display());
             }
             Err(e) => self.message = format!("読み込み失敗: {}", e),
@@ -3142,6 +3260,20 @@ impl MhnxEditor {
     /// copy and nothing is written until the user asks for it. Returns true
     /// when the archive opened.
     pub fn open_arc_from_save(&mut self, quest_id: i32) -> bool {
+        self.open_arc_from_save_in(quest_id, Tab::Quest)
+    }
+
+    /// Load one of the save's quests into the クエスト改造 screen.
+    ///
+    /// The same load path as [MhnxEditor::open_arc_from_save], which is the
+    /// 詳細 view's: only the tab it lands on differs.
+    pub fn open_quest_for_work(&mut self, quest_id: i32) -> bool {
+        self.open_arc_from_save_in(quest_id, Tab::QuestWork)
+    }
+
+    /// The shared body of both: copy the payload out, parse it, point the
+    /// editors at its parameter record, and land on `tab`.
+    fn open_arc_from_save_in(&mut self, quest_id: i32, tab: Tab) -> bool {
         let Some(save) = &self.save else {
             self.message = "先にセーブを開いてください".to_owned();
             return false;
@@ -3169,12 +3301,15 @@ impl MhnxEditor {
                 // No path: this arc lives in the save, not on disk.
                 self.arc_path = None;
                 self.arc_from_save = Some(quest_id);
+                self.qw_reward_sel = None;
+                self.qw_supply_sel = None;
+                self.qw_mob_open = [false; 5];
                 self.load_arc_entry(idx);
                 self.run_quest_check();
-                self.tab = Tab::Quest;
+                self.tab = tab;
                 self.message = format!(
-                    "セーブのクエスト {} を開きました（{} バイト）",
-                    quest_id,
+                    "セーブのクエスト 0x{:X} を開きました（{} バイト）",
+                    quest_id as u32,
                     q.data.len()
                 );
                 true
@@ -3407,6 +3542,11 @@ impl eframe::App for MhnxEditor {
             if self.tab == Tab::Review {
                 self.review_list = None;
             }
+            // Entering クエスト改造 rebuilds the quest list: the DLC tab may
+            // have installed or removed a quest since the list was built.
+            if self.tab == Tab::QuestWork {
+                self.qw_rows_stale = true;
+            }
             self.shown_tab = Some(self.tab);
         }
         // The keyboard shortcuts, in one place: Ctrl+S / Ctrl+O / Ctrl+Z /
@@ -3470,6 +3610,7 @@ impl MhnxEditor {
             Tab::Save => self.tab_save(ui),
             Tab::Items => self.tab_items(ui),
             Tab::Quest => self.tab_quest(ui),
+            Tab::QuestWork => self.tab_quest_work(ui),
             Tab::Dlc => self.tab_dlc(ui),
             Tab::Charm => self.tab_charm(ui),
             Tab::Equip => self.tab_equip(ui),
@@ -3552,6 +3693,7 @@ impl MhnxEditor {
             self.tab,
             Tab::Items
                 | Tab::Quest
+                | Tab::QuestWork
                 | Tab::Dlc
                 | Tab::Charm
                 | Tab::Equip
@@ -3844,6 +3986,9 @@ impl MhnxEditor {
                     // rest of the bar still spells its labels inline, which is
                     // the next stretch of work, one tab at a time.
                     (Tab::Items, strings::text(self.lang, "tab.items")),
+                    // The screen the editor opens on: a quest is chosen by
+                    // name, not by the file that happens to hold one field.
+                    (Tab::QuestWork, "クエスト改造"),
                     (Tab::Quest, "クエスト"),
                     (Tab::Dlc, "DLC"),
                     (Tab::Charm, "お守り"),
@@ -3864,7 +4009,7 @@ impl MhnxEditor {
                     // データベース is the second tab that does not need a save:
                     // it lists the tables of a romfs folder, not of a save.
                     let enabled = self.save.is_some()
-                        || matches!(tab, Tab::Save | Tab::About | Tab::Database);
+                        || matches!(tab, Tab::Save | Tab::About | Tab::Database | Tab::QuestWork);
                     ui.add_enabled_ui(enabled, |ui| {
                         ui.selectable_value(&mut self.tab, tab, label);
                     });
@@ -6109,6 +6254,24 @@ impl MhnxEditor {
     }
 
     fn quest_tab_body(&mut self, ui: &mut egui::Ui) {
+        // クエスト改造 is the way in; this screen is its 詳細 view. The way
+        // back sits at the top, where the user left it.
+        ui.horizontal(|ui| {
+            if ui
+                .small_button("← クエスト改造へ戻る")
+                .on_hover_text("名前でクエストを選ぶ画面へ戻ります")
+                .clicked()
+            {
+                self.back_to_quest_work();
+                return;
+            }
+            ui.label(
+                egui::RichText::new("詳細（ファイル単位の編集）")
+                    .weak()
+                    .small(),
+            );
+        });
+        ui.separator();
         if self.arc.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.label("「.arc を開く」か、DLC タブのクエスト一覧で「編集」を押してください")
@@ -6485,6 +6648,1160 @@ impl MhnxEditor {
         } else {
             self.entry_panel(ui);
         }
+    }
+
+    // ------------------------------------------------------------ quest work
+    //
+    // The screen the editor opens on: a quest is chosen by name and the four
+    // sections below edit it. Which payload (the parameters, the text, the
+    // reward table, the supply box, one placement per monster) holds a value
+    // is resolved here and never shown: the user edits a quest, not a bag of
+    // files.
+
+    /// The クエスト改造 tab, with its own scroll: the monster table and the
+    /// reward table both grow past the window.
+    fn tab_quest_work(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("questwork")
+            .show(ui, |ui| self.quest_work_body(ui));
+    }
+
+    /// The body of the クエスト改造 tab, drawn without the outer scroll so a
+    /// test can read one frame of it.
+    fn quest_work_body(&mut self, ui: &mut egui::Ui) {
+        self.quest_work_ensure_rows();
+        self.quest_work_header(ui);
+        ui.separator();
+        if self.arc.is_none() {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("クエストを選ぶと、関連するファイルをまとめて読み込みます")
+                    .strong(),
+            );
+            ui.label(
+                egui::RichText::new(
+                    "この画面では拡張子を選びません。セーブのクエスト一覧から名前で選んでください。",
+                )
+                .weak()
+                .small(),
+            );
+            return;
+        }
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        if parts.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(235, 190, 90),
+                "このクエストには、この画面で編集できるデータがありません",
+            );
+            return;
+        }
+        ui.horizontal(|ui| {
+            for t in [
+                QuestWorkTab::Basic,
+                QuestWorkTab::Monsters,
+                QuestWorkTab::Rewards,
+                QuestWorkTab::Supplies,
+            ] {
+                ui.selectable_value(&mut self.qw_tab, t, t.label());
+            }
+        });
+        ui.add_space(4.0);
+        match self.qw_tab {
+            QuestWorkTab::Basic => self.quest_work_basic(ui),
+            QuestWorkTab::Monsters => self.quest_work_monsters(ui),
+            QuestWorkTab::Rewards => self.quest_work_items(ui, true),
+            QuestWorkTab::Supplies => self.quest_work_items(ui, false),
+        }
+    }
+
+    /// Which entry of the open archive holds each part this screen edits.
+    fn quest_work_parts(arc: &Arc) -> QuestWorkParts {
+        let mut parts = QuestWorkParts::default();
+        for (i, e) in arc.entries.iter().enumerate() {
+            match extension_for(e.type_hash) {
+                Some("mib") if parts.mib.is_none() => parts.mib = Some(i),
+                Some("gmd") if parts.gmd.is_none() => parts.gmd = Some(i),
+                Some("rem") if parts.rem.is_none() => parts.rem = Some(i),
+                Some("sup") if parts.sup.is_none() => parts.sup = Some(i),
+                _ => {}
+            }
+        }
+        parts
+    }
+
+    /// Build the quest picker's rows when the save changed.
+    fn quest_work_ensure_rows(&mut self) {
+        if !self.qw_rows_stale {
+            return;
+        }
+        self.qw_rows_stale = false;
+        self.qw_rows = match &self.save {
+            Some(save) => quest_work_rows(&dlc::list_quests(save)),
+            None => Vec::new(),
+        };
+    }
+
+    /// The picker, the 再読込 button and the small 詳細 button.
+    fn quest_work_header(&mut self, ui: &mut egui::Ui) {
+        let mut open_id: Option<i32> = None;
+        let mut open_path: Option<PathBuf> = None;
+        let mut detail = false;
+        let mut write = false;
+        let mut reopen = false;
+        let current_id = self
+            .arc
+            .as_ref()
+            .and_then(|a| a.by_ext("mib"))
+            .and_then(|e| Mib::from_bytes(&e.data).ok())
+            .map(|m| m.quest_id());
+        let current_title = self
+            .arc
+            .as_ref()
+            .and_then(|a| a.by_ext("gmd"))
+            .and_then(|e| Gmd::from_bytes(&e.data).ok())
+            .and_then(|g| g.title().map(|s| s.to_owned()))
+            .unwrap_or_default();
+        let current_label = match current_id {
+            Some(id) => {
+                let title = current_title.trim();
+                let title = if title.is_empty() { "（無題）" } else { title };
+                format!("{} 0x{:X}", title, id)
+            }
+            None => {
+                if self.arc.is_some() {
+                    String::from("（クエスト ID なし）")
+                } else {
+                    String::from("（未選択）")
+                }
+            }
+        };
+        let rows = self.qw_rows.clone();
+        // Two rows, because the picker and the two buttons do not fit one at
+        // the window's minimum width: the 詳細 button is what the screen is
+        // for, so it must not be the part that gets clipped.
+        ui.horizontal(|ui| {
+            ui.heading("クエスト改造");
+            ui.add_space(8.0);
+            ui.label("クエスト");
+            egui::ComboBox::from_id_salt("qw_quest")
+                .selected_text(current_label)
+                .width(300.0)
+                .show_ui(ui, |ui| {
+                    // The filter itself is the box beside the picker: it is
+                    // visible at rest, which is what Ctrl+F needs to reach.
+                    let needle = self.qw_filter.trim().to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .id_salt("qw_quest_list")
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            if rows.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "セーブにクエストがありません。セーブを開くか、クエストを開いてください",
+                                    )
+                                    .weak(),
+                                );
+                            }
+                            let mut any = false;
+                            for row in &rows {
+                                let label = row.label();
+                                if !needle.is_empty() && !label.to_lowercase().contains(&needle)
+                                {
+                                    continue;
+                                }
+                                any = true;
+                                if ui
+                                    .selectable_label(
+                                        current_id == Some(row.quest_id as u32),
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    open_id = Some(row.quest_id);
+                                }
+                            }
+                            if !any && !needle.is_empty() {
+                                ui.label(
+                                    egui::RichText::new("一致するクエストはありません").weak(),
+                                );
+                            }
+                        });
+                });
+            if ui
+                .small_button("再読込")
+                .on_hover_text("セーブのクエスト一覧を読み直します")
+                .clicked()
+            {
+                reopen = true;
+            }
+            if (self.save.is_none() || self.qw_rows.is_empty())
+                && ui
+                    .small_button("クエストを開く…")
+                    .on_hover_text("クエストのアーカイブを選びます")
+                    .clicked()
+            {
+                if let Some(p) = rfd::FileDialog::new()
+                    .set_title("クエストを選ぶ")
+                    .add_filter("quest archive", &["arc"])
+                    .pick_file()
+                {
+                    open_path = Some(p);
+                }
+            }
+            // The way to the file-by-file screens, small and at the top right:
+            // it is the advanced view, not the way in.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let resp = ui
+                    .add_enabled(
+                        self.arc.is_some(),
+                        egui::Button::new(egui::RichText::new("詳細").small()),
+                    )
+                    .on_hover_text("ファイル単位の編集画面へ（上級者向け）");
+                if resp.clicked() {
+                    detail = true;
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label("絞り込み");
+            Self::filter_edit(
+                ui,
+                &mut self.qw_filter,
+                220.0,
+                "名前・ID（16 進）",
+                &mut self.focus_filter,
+            );
+            if ui.small_button("クリア").clicked() {
+                self.qw_filter.clear();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.arc_from_save.is_some()
+                    && ui
+                        .small_button("セーブに書き戻す")
+                        .on_hover_text("編集内容をこのセーブへ書き戻します")
+                        .clicked()
+                {
+                    write = true;
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            if let Some(id) = self.arc_from_save {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "セーブ内のクエスト 0x{:X} を編集中",
+                        id as u32
+                    ))
+                    .strong()
+                    .color(egui::Color32::from_rgb(0x6F, 0xC0, 0x6F)),
+                );
+            } else if self.arc.is_some() {
+                ui.label(
+                    egui::RichText::new("読み込んだクエストを編集中（セーブには未接続）")
+                        .weak()
+                        .small(),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(
+                        "上の一覧からクエストを選ぶか、セーブを開いてください",
+                    )
+                    .weak(),
+                );
+            }
+        });
+        if reopen {
+            self.qw_rows_stale = true;
+        }
+        if detail {
+            self.open_quest_detail();
+        }
+        if write {
+            self.write_quest_work_to_save();
+        }
+        if let Some(id) = open_id {
+            self.open_quest_for_work(id);
+        }
+        if let Some(path) = open_path {
+            self.open_arc(path);
+        }
+    }
+
+    /// 基本: the three text lines and the time limit.
+    fn quest_work_basic(&mut self, ui: &mut egui::Ui) {
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        let mut gmd = {
+            let Some(arc) = &self.arc else { return };
+            parts
+                .gmd
+                .and_then(|i| arc.entries.get(i))
+                .and_then(|e| Gmd::from_bytes(&e.data).ok())
+        };
+        let mut mib_bytes = {
+            let Some(arc) = &self.arc else { return };
+            parts.mib.and_then(|i| arc.entries.get(i)).map(|e| e.data.clone())
+        };
+        ui.label(egui::RichText::new("基本").strong());
+        ui.label(
+            egui::RichText::new("クエスト名・依頼主・目的は文字そのものです。名前が主役です。")
+                .weak()
+                .small(),
+        );
+        let mut gmd_changed = false;
+        match &mut gmd {
+            Some(g) => {
+                egui::Grid::new("qw_basic_text")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        for (row, label) in
+                            [(0usize, "クエスト名"), (1, "依頼主"), (2, "目的")]
+                        {
+                            ui.label(egui::RichText::new(label).strong());
+                            let mut s = g.strings.get(row).cloned().unwrap_or_default();
+                            let resp = ui.add(
+                                egui::TextEdit::multiline(&mut s)
+                                    .desired_rows(1)
+                                    .desired_width(620.0),
+                            );
+                            if resp.changed() {
+                                while g.strings.len() <= row {
+                                    g.strings.push(String::new());
+                                }
+                                g.strings[row] = s;
+                                gmd_changed = true;
+                            }
+                            ui.end_row();
+                        }
+                    });
+            }
+            None => {
+                ui.label(
+                    egui::RichText::new(
+                        "このクエストにはクエスト名・依頼主・目的のデータがありません",
+                    )
+                    .weak(),
+                );
+            }
+        }
+        ui.add_space(6.0);
+        let mut mib_changed = false;
+        egui::Grid::new("qw_basic_time")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("制限時間").strong());
+                match &mut mib_bytes {
+                    Some(bytes) => {
+                        let field = mib_field("time_limit");
+                        let mut v = field
+                            .and_then(|f| mhnx_core::questfields::read_u32(bytes, f.offset, f.kind))
+                            .unwrap_or(0) as i64;
+                        let resp = ui
+                            .add(
+                                egui::DragValue::new(&mut v)
+                                    .range(0..=255)
+                                    .speed(1.0)
+                                    .suffix(" 分"),
+                            )
+                            .on_hover_text("実測 35..50 分（多くは 50）");
+                        if resp.changed() {
+                            if let Some(f) = field {
+                                if mhnx_core::questfields::write_u32(
+                                    bytes,
+                                    f.offset,
+                                    f.kind,
+                                    v as u32,
+                                ) {
+                                    mib_changed = true;
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new(
+                                "このクエストには制限時間のデータがありません",
+                            )
+                            .weak(),
+                        );
+                    }
+                }
+                ui.end_row();
+            });
+        if gmd_changed {
+            if let Some(i) = parts.gmd {
+                let bytes = gmd.as_ref().map(|g| g.to_bytes()).unwrap_or_default();
+                self.quest_work_put(i, bytes);
+                self.message = String::from("クエストの文面を変更しました（「セーブに書き戻す」で保存）");
+            }
+        }
+        if mib_changed {
+            if let (Some(i), Some(bytes)) = (parts.mib, mib_bytes) {
+                self.quest_work_put(i, bytes);
+                self.message = String::from("制限時間を変更しました（「セーブに書き戻す」で保存）");
+            }
+        }
+    }
+
+    /// モンスター: the five large-monster slots, with the area as the main
+    /// choice and the placement numbers behind 詳細.
+    fn quest_work_monsters(&mut self, ui: &mut egui::Ui) {
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        let Some(mib_idx) = parts.mib else {
+            ui.label(
+                egui::RichText::new("このクエストにはモンスター情報がありません").weak(),
+            );
+            return;
+        };
+        let mut mib_bytes = match self.arc.as_ref().and_then(|a| a.entries.get(mib_idx)) {
+            Some(e) => e.data.clone(),
+            None => return,
+        };
+        if mib_bytes.len() < mhnx_core::quest::MIB_SIZE {
+            ui.colored_label(
+                egui::Color32::from_rgb(235, 190, 90),
+                "モンスター情報の大きさが想定と違うため、表示できません",
+            );
+            return;
+        }
+        let offsets = mib_mob_slot_offsets();
+        if offsets.is_empty() {
+            return;
+        }
+        let fields: Vec<&MibMobField> = ["hp", "attack", "defense", "size", "count"]
+            .iter()
+            .filter_map(|k| MIB_MOB_FIELDS.iter().find(|f| f.key == *k))
+            .collect();
+
+        struct Row {
+            off: usize,
+            id: u16,
+            sem: Option<usize>,
+            extra: usize,
+            sem_raw: [u8; 32],
+            area: u32,
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        {
+            let Some(arc) = &self.arc else { return };
+            for off in offsets.iter() {
+                let id = mib_mob_id(&mib_bytes, *off);
+                let (sem, extra) = quest_work_sem_index(arc, id);
+                let mut sem_raw = [0u8; 32];
+                let mut area = 0u32;
+                if let Some(i) = sem {
+                    if let Some(e) = arc.entries.get(i) {
+                        if e.data.len() >= 32 {
+                            sem_raw.copy_from_slice(&e.data[..32]);
+                            area = sem_u32_at(&sem_raw, 0x0C).unwrap_or(0);
+                        }
+                    }
+                }
+                rows.push(Row {
+                    off: *off,
+                    id,
+                    sem,
+                    extra,
+                    sem_raw,
+                    area,
+                });
+            }
+        }
+        let mut search = std::mem::take(&mut self.qw_mob_search);
+        let mut open = self.qw_mob_open;
+        let mut mib_changed = false;
+        let mut sem_changes: Vec<(usize, [u8; 32])> = Vec::new();
+        ui.label(egui::RichText::new("大型モンスター（5 枠）").strong());
+        ui.label(
+            egui::RichText::new(
+                "エリアは選ぶだけです。X / Y / Z / 向き / ウェーブは「詳細」で開きます。",
+            )
+            .weak()
+            .small(),
+        );
+        ui.horizontal(|ui| {
+            ui.add_sized([24.0, 20.0], egui::Label::new(egui::RichText::new("枠").strong()));
+            ui.add_sized(
+                [256.0, 20.0],
+                egui::Label::new(egui::RichText::new("モンスター").strong()),
+            );
+            ui.add_sized(
+                [96.0, 20.0],
+                egui::Label::new(egui::RichText::new("エリア").strong()),
+            );
+            for h in ["体力", "攻撃", "防御", "サイズ%", "出現数"] {
+                ui.add_sized(
+                    [60.0, 20.0],
+                    egui::Label::new(egui::RichText::new(h).strong()),
+                );
+            }
+            ui.add_sized(
+                [64.0, 20.0],
+                egui::Label::new(egui::RichText::new("詳細").strong()),
+            );
+        });
+        // Rows drawn one by one rather than in a Grid: a Grid widens its
+        // columns to fit the open 詳細 line, which pushed 出現数 and the 詳細
+        // button off the right edge of the window.
+        for (slot, row) in rows.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [24.0, 20.0],
+                    egui::Label::new(format!("{}", slot + 1)),
+                );
+                // The monster is chosen by name; the id rides along in hex,
+                // small, and the picker searches both.
+                let mut picked: Option<u16> = None;
+                ui.scope(|ui| {
+                    ui.set_min_width(256.0);
+                    egui::ComboBox::from_id_salt(("qw_mob_pick", slot))
+                        .selected_text(monster_name_hex(row.id))
+                        .width(230.0)
+                        .show_ui(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut search[slot])
+                                    .hint_text("モンスター名・ID（16 進）で検索")
+                                    .desired_width(230.0),
+                            );
+                            if ui.small_button("クリア").clicked() {
+                                search[slot].clear();
+                            }
+                            if row.id != 0 && ui.small_button("空きにする").clicked() {
+                                picked = Some(0);
+                            }
+                            let needle = search[slot].trim().to_lowercase();
+                            egui::ScrollArea::vertical()
+                                .id_salt(("qw_mob_list", slot))
+                                .max_height(260.0)
+                                .show(ui, |ui| {
+                                    for (mid, name) in monster_choices() {
+                                        let hex = format!("0x{:X}", mid);
+                                        if !needle.is_empty()
+                                            && !name.to_lowercase().contains(&needle)
+                                            && !hex.to_lowercase().contains(&needle)
+                                        {
+                                            continue;
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                row.id == mid,
+                                                format!("{} {}", name, hex),
+                                            )
+                                            .clicked()
+                                        {
+                                            picked = Some(mid);
+                                        }
+                                    }
+                                });
+                        });
+                });
+                if let Some(mid) = picked {
+                    row.id = mid;
+                    if mib_mob_set_id(&mut mib_bytes, row.off, mid) {
+                        mib_changed = true;
+                    }
+                }
+                // エリア is the row's main field: one choice, no number to type.
+                let mut picked_area: Option<u32> = None;
+                let area_label = if row.sem.is_some() {
+                    format!("{}", row.area)
+                } else {
+                    String::from("—")
+                };
+                ui.scope(|ui| {
+                    ui.set_min_width(96.0);
+                    ui.add_enabled_ui(row.sem.is_some(), |ui| {
+                        egui::ComboBox::from_id_salt(("qw_area", slot))
+                            .selected_text(egui::RichText::new(area_label).strong())
+                            .width(80.0)
+                            .show_ui(ui, |ui| {
+                                if row.extra > 1 {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "同じモンスターの配置 {} 件のうち先頭を編集します",
+                                            row.extra
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                }
+                                for a in quest_work_area_choices(row.area) {
+                                    if ui
+                                        .selectable_label(row.area == a, a.to_string())
+                                        .clicked()
+                                    {
+                                        picked_area = Some(a);
+                                    }
+                                }
+                            });
+                    });
+                });
+                if let Some(a) = picked_area {
+                    row.area = a;
+                    if sem_set_area_main(&mut row.sem_raw, a) {
+                        if let Some(i) = row.sem {
+                            sem_changes.push((i, row.sem_raw));
+                        }
+                    }
+                }
+                for f in &fields {
+                    let mut v = mib_mob_read(&mib_bytes, row.off, f).unwrap_or(0) as i64;
+                    let hi = if f.size == 2 { 0xFFFFi64 } else { 0xFFi64 };
+                    let resp = ui
+                        .push_id((row.off, f.key), |ui| {
+                            ui.add_sized(
+                                [60.0, 20.0],
+                                egui::DragValue::new(&mut v).range(0..=hi).speed(1.0),
+                            )
+                        })
+                        .inner
+                        .on_hover_text(format!(
+                            "{}（実測 {}..{}）",
+                            f.ja, f.observed.0, f.observed.1
+                        ));
+                    if resp.changed() && mib_mob_write(&mut mib_bytes, row.off, f, v as u32) {
+                        mib_changed = true;
+                    }
+                }
+                let toggle = if open[slot] { "▼詳細" } else { "▶詳細" };
+                if ui
+                    .add_sized([64.0, 20.0], egui::Button::new(toggle).small())
+                    .clicked()
+                {
+                    open[slot] = !open[slot];
+                }
+            });
+            if open[slot] {
+                // The placement numbers, in the order the console build walks
+                // them. They sit under the row so the columns above stay put.
+                let mut sem_dirty = false;
+                ui.horizontal(|ui| {
+                    ui.add_space(32.0);
+                    ui.add_sized(
+                        [80.0, 20.0],
+                        egui::Label::new(egui::RichText::new("配置の詳細").weak().small()),
+                    );
+                    if row.sem.is_some() {
+                        for (label, off) in
+                            [("X", 0x10usize), ("Y", 0x14), ("Z", 0x18), ("向き", 0x1C)]
+                        {
+                            ui.label(egui::RichText::new(label).weak().small());
+                            let mut v = sem_f32(&row.sem_raw, off).unwrap_or(0.0);
+                            let resp = ui.add_sized(
+                                [64.0, 20.0],
+                                egui::DragValue::new(&mut v).speed(1.0).max_decimals(2),
+                            );
+                            if resp.changed() && sem_set_f32(&mut row.sem_raw, off, v) {
+                                sem_dirty = true;
+                            }
+                        }
+                        ui.label(egui::RichText::new("ウェーブ").weak().small());
+                        let mut wave = sem_u32_at(&row.sem_raw, 0x08).unwrap_or(0) as i64;
+                        let resp = ui.add_sized(
+                            [56.0, 20.0],
+                            egui::DragValue::new(&mut wave).range(0..=255),
+                        );
+                        if resp.changed() && sem_set_u32(&mut row.sem_raw, 0x08, wave as u32) {
+                            sem_dirty = true;
+                        }
+                    } else {
+                        ui.label(
+                            egui::RichText::new("このモンスターの配置データが見つかりません")
+                                .weak(),
+                        );
+                    }
+                });
+                if sem_dirty {
+                    if let Some(i) = row.sem {
+                        sem_changes.push((i, row.sem_raw));
+                    }
+                }
+            }
+        }
+        self.qw_mob_search = search;
+        self.qw_mob_open = open;
+        if mib_changed {
+            self.quest_work_put(mib_idx, mib_bytes);
+            self.message =
+                String::from("モンスターを変更しました（「セーブに書き戻す」で保存）");
+        }
+        for (i, raw) in sem_changes {
+            self.quest_work_put(i, raw.to_vec());
+        }
+    }
+
+    /// 報酬 and 支給品: one item table, with names first and ids in hex.
+    fn quest_work_items(&mut self, ui: &mut egui::Ui, reward: bool) {
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        let Some(idx) = (if reward { parts.rem } else { parts.sup }) else {
+            ui.label(
+                egui::RichText::new(if reward {
+                    "このクエストには報酬データがありません"
+                } else {
+                    "このクエストには支給品データがありません"
+                })
+                .weak(),
+            );
+            return;
+        };
+        let data = match self.arc.as_ref().and_then(|a| a.entries.get(idx)) {
+            Some(e) => e.data.clone(),
+            None => return,
+        };
+        let mut table = match mhnx_core::entries::ItemTable::parse(&data) {
+            Ok(t) => t,
+            Err(err) => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("読み取れません: {}", err),
+                );
+                return;
+            }
+        };
+        if reward {
+            ui.label(egui::RichText::new("報酬").strong());
+            ui.label(
+                egui::RichText::new(
+                    "アイテム名が主役です。確率はグループごとに合計 100% が目安です。",
+                )
+                .weak()
+                .small(),
+            );
+            let groups = table.groups();
+            for (line, warn) in reward_group_lines(&groups) {
+                if warn {
+                    ui.colored_label(egui::Color32::from_rgb(240, 170, 80), line);
+                } else {
+                    ui.label(line);
+                }
+            }
+        } else {
+            ui.label(egui::RichText::new("支給品").strong());
+            ui.label(
+                egui::RichText::new("アイテム名と個数を変えられます。")
+                    .weak()
+                    .small(),
+            );
+        }
+        let mut sel = if reward {
+            self.qw_reward_sel
+        } else {
+            self.qw_supply_sel
+        };
+        sel = sel.filter(|i| *i < table.records.len());
+        let cols = if reward { 4 } else { 3 };
+        let mut changed = false;
+        let groups = table.groups();
+        let mut group_of = vec![0usize; table.records.len()];
+        for (gi, g) in groups.iter().enumerate() {
+            for k in g.start..(g.start + g.len).min(group_of.len()) {
+                group_of[k] = gi;
+            }
+        }
+        let grid_salt = if reward { "qw_reward_grid" } else { "qw_supply_grid" };
+        egui::ScrollArea::vertical()
+            .id_salt(if reward { "qw_rewards" } else { "qw_supplies" })
+            .max_height(360.0)
+            .show(ui, |ui| {
+                egui::Grid::new(grid_salt)
+                    .striped(true)
+                    .num_columns(cols)
+                    .spacing([8.0, 3.0])
+                    .show(ui, |ui| {
+                        let headers: &[&str] = if reward {
+                            &["#", "アイテム", "個数", "確率%"]
+                        } else {
+                            &["#", "アイテム", "個数"]
+                        };
+                        for h in headers {
+                            ui.label(egui::RichText::new(*h).strong());
+                        }
+                        ui.end_row();
+                        for i in 0..table.records.len() {
+                            if reward
+                                && groups.len() > 1
+                                && i > 0
+                                && group_of.get(i) != group_of.get(i - 1)
+                            {
+                                let gi = group_of[i];
+                                let (total, len) = groups
+                                    .get(gi)
+                                    .map(|g| (g.total, g.len))
+                                    .unwrap_or((0, 0));
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "— グループ{} 合計 {}% / {}枠 —",
+                                        gi + 1,
+                                        total,
+                                        len
+                                    ))
+                                    .weak()
+                                    .small(),
+                                );
+                                for _ in 1..cols {
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                            if ui
+                                .selectable_label(sel == Some(i), format!("{}", i))
+                                .clicked()
+                            {
+                                sel = Some(i);
+                            }
+                            let item = table.records[i].item;
+                            if ui
+                                .selectable_label(sel == Some(i), item_name_hex(item))
+                                .clicked()
+                            {
+                                sel = Some(i);
+                            }
+                            let mut c = table.records[i].count as i32;
+                            if ui
+                                .add(egui::DragValue::new(&mut c).range(0..=99))
+                                .changed()
+                            {
+                                table.records[i].count = c as u8;
+                                changed = true;
+                            }
+                            if reward {
+                                let mut p = table.records[i].slot as i32;
+                                if ui
+                                    .add(egui::DragValue::new(&mut p).range(0..=100))
+                                    .changed()
+                                {
+                                    table.set_probability(i, p as u8);
+                                    changed = true;
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(i) = sel {
+            if i < table.records.len() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("アイテムを変更");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.qw_item_filter)
+                            .hint_text("アイテム名・ID（16 進）で検索")
+                            .desired_width(220.0),
+                    );
+                    if ui.small_button("クリア").clicked() {
+                        self.qw_item_filter.clear();
+                    }
+                });
+                let needle = self.qw_item_filter.trim().to_lowercase();
+                if needle.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "アイテム名を入力すると、差し替え候補が出ます",
+                        )
+                        .weak()
+                        .small(),
+                    );
+                } else {
+                    let hits = quest_work_item_matches(&needle, 40);
+                    if hits.is_empty() {
+                        ui.label(egui::RichText::new("その名前のアイテムはありません").weak());
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("qw_item_pick")
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for (id, name) in &hits {
+                                if ui
+                                    .selectable_label(
+                                        table.records[i].item == *id,
+                                        format!("{} 0x{:X}", name, id),
+                                    )
+                                    .clicked()
+                                {
+                                    table.records[i].item = *id;
+                                    if table.records[i].count == 0 {
+                                        table.records[i].count = 1;
+                                    }
+                                    changed = true;
+                                    self.qw_item_filter.clear();
+                                }
+                            }
+                        });
+                }
+            }
+        }
+        if reward {
+            self.qw_reward_sel = sel;
+        } else {
+            self.qw_supply_sel = sel;
+        }
+        if changed {
+            self.quest_work_put(idx, table.to_bytes());
+            self.message = String::from("アイテムを変更しました（「セーブに書き戻す」で保存）");
+        }
+    }
+
+    /// Write the buffer into one entry, and keep the 詳細 editors in step.
+    ///
+    /// The file-by-file screen edits the same bytes through its own buffers;
+    /// re-pointing them at the entry that just changed is what keeps the two
+    /// screens from writing stale bytes over each other.
+    fn quest_work_put(&mut self, index: usize, data: Vec<u8>) {
+        let written = match self.arc.as_mut().and_then(|a| a.entries.get_mut(index)) {
+            Some(e) => {
+                e.data = data;
+                true
+            }
+            None => false,
+        };
+        if written && self.arc_selected == index {
+            self.load_arc_entry(index);
+        }
+    }
+
+    /// The 詳細 button: the file-by-file screen, with this archive still open.
+    ///
+    /// It lands on the parameter record again, like opening an archive does,
+    /// so 詳細 always starts at the top of the quest rather than wherever the
+    /// entry list was left. select_arc_entry flushes the editors first, so an
+    /// edit made in the detail screen and not yet applied is not lost.
+    pub fn open_quest_detail(&mut self) {
+        let Some(arc) = &self.arc else { return };
+        let idx = arc
+            .entries
+            .iter()
+            .position(|e| extension_for(e.type_hash) == Some("mib"))
+            .or_else(|| {
+                arc.entries
+                    .iter()
+                    .position(|e| extension_for(e.type_hash) == Some("gmd"))
+            })
+            .unwrap_or(self.arc_selected.min(arc.entries.len().saturating_sub(1)));
+        if idx < arc.entries.len() {
+            self.select_arc_entry(idx);
+        }
+        self.tab = Tab::Quest;
+    }
+
+    /// The 詳細 screen's way back.
+    ///
+    /// The editors are flushed first: a value typed on the detail screen and
+    /// left without 反映 is still in its buffer, and the quest screen reads the
+    /// archive rather than the buffers. Writing it here is what keeps the
+    /// round trip from quietly dropping an edit.
+    pub fn back_to_quest_work(&mut self) {
+        if self.arc.is_some() {
+            self.store_arc_entry(self.arc_selected);
+            self.load_arc_entry(self.arc_selected);
+            self.qw_rows_stale = true;
+        }
+        self.tab = Tab::QuestWork;
+    }
+
+    /// Write the edited quest back into the save it came from.
+    ///
+    /// Unlike [MhnxEditor::write_arc_to_save] this does not call
+    /// [MhnxEditor::store_arc_entry] first: every edit on this screen already
+    /// lives in the archive entry, so flushing a buffer there could overwrite
+    /// a part the user did not touch.
+    pub fn write_quest_work_to_save(&mut self) -> bool {
+        let Some(id) = self.arc_from_save else {
+            self.message = String::from(
+                "セーブから開いたクエストではありません（書き戻し先がありません）",
+            );
+            return false;
+        };
+        let built = match self.arc.as_ref() {
+            Some(a) => a.to_bytes(),
+            None => return false,
+        };
+        let bytes = match built {
+            Ok(b) => b,
+            Err(e) => {
+                self.message = format!("再構築失敗: {}", e);
+                return false;
+            }
+        };
+        self.push_undo(String::from("クエストの書き戻し"));
+        let Some(save) = &mut self.save else {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        };
+        match dlc::install_quest(save, id, &bytes) {
+            Ok(slot) => {
+                self.dirty = true;
+                self.qw_rows_stale = true;
+                self.message = format!(
+                    "クエスト 0x{:X} を枠 {} に書き戻しました（{} バイト）",
+                    id as u32,
+                    slot,
+                    bytes.len()
+                );
+                true
+            }
+            Err(e) => {
+                self.message = format!("書き戻し失敗: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Set the time limit of the open quest, the way the 基本 section does.
+    ///
+    /// Public so the headless harness can drive the same path a click takes.
+    #[allow(dead_code)] // the headless harness and the tests call the same path
+    pub fn quest_work_set_time_limit(&mut self, minutes: u8) -> bool {
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        let Some(index) = parts.mib else { return false };
+        let Some(f) = mib_field("time_limit") else { return false };
+        let mut data = match self.arc.as_ref().and_then(|a| a.entries.get(index)) {
+            Some(e) => e.data.clone(),
+            None => return false,
+        };
+        if !mhnx_core::questfields::write_u32(&mut data, f.offset, f.kind, minutes as u32) {
+            return false;
+        }
+        self.quest_work_put(index, data);
+        true
+    }
+
+    /// Rename the open quest, the way the 基本 section does.
+    #[allow(dead_code)] // the headless harness and the tests call the same path
+    pub fn quest_work_set_title(&mut self, title: &str) -> bool {
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        let Some(index) = parts.gmd else { return false };
+        let Some(mut gmd) = self
+            .arc
+            .as_ref()
+            .and_then(|a| a.entries.get(index))
+            .and_then(|e| Gmd::from_bytes(&e.data).ok())
+        else {
+            return false;
+        };
+        while gmd.strings.is_empty() {
+            gmd.strings.push(String::new());
+        }
+        gmd.strings[0] = title.to_owned();
+        self.quest_work_put(index, gmd.to_bytes());
+        true
+    }
+
+    /// Set the area of the main placement of one monster.
+    ///
+    /// Returns false when the quest has no placement for that monster. The
+    /// weight fix is the same one the file-by-file screen applies: an area with
+    /// a zero weight is a row the game skips.
+    #[allow(dead_code)] // the headless harness and the tests call the same path
+    pub fn quest_work_set_area(&mut self, monster: u16, area: u32) -> bool {
+        let Some(index) = self
+            .arc
+            .as_ref()
+            .and_then(|a| quest_work_sem_index(a, monster).0)
+        else {
+            return false;
+        };
+        let Some(mut raw) = self
+            .arc
+            .as_ref()
+            .and_then(|a| a.entries.get(index))
+            .filter(|e| e.data.len() >= 32)
+            .map(|e| {
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&e.data[..32]);
+                b
+            })
+        else {
+            return false;
+        };
+        if !sem_set_area_main(&mut raw, area) {
+            return false;
+        }
+        self.quest_work_put(index, raw.to_vec());
+        true
+    }
+
+    /// Replace one reward row, the way the 報酬 section does.
+    #[allow(dead_code)] // the headless harness and the tests call the same path
+    pub fn quest_work_set_reward(
+        &mut self,
+        index: usize,
+        item: u16,
+        count: u8,
+        probability: u8,
+    ) -> bool {
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        let Some(entry) = parts.rem else { return false };
+        let Some(mut table) = self
+            .arc
+            .as_ref()
+            .and_then(|a| a.entries.get(entry))
+            .and_then(|e| mhnx_core::entries::ItemTable::parse(&e.data).ok())
+        else {
+            return false;
+        };
+        if index >= table.records.len() {
+            return false;
+        }
+        table.records[index].item = item;
+        table.records[index].count = count;
+        table.set_probability(index, probability);
+        self.quest_work_put(entry, table.to_bytes());
+        true
+    }
+
+    /// Replace one supply row, the way the 支給品 section does.
+    #[allow(dead_code)] // the headless harness and the tests call the same path
+    pub fn quest_work_set_supply(&mut self, index: usize, item: u16, count: u8) -> bool {
+        let parts = self
+            .arc
+            .as_ref()
+            .map(Self::quest_work_parts)
+            .unwrap_or_default();
+        let Some(entry) = parts.sup else { return false };
+        let Some(mut table) = self
+            .arc
+            .as_ref()
+            .and_then(|a| a.entries.get(entry))
+            .and_then(|e| mhnx_core::entries::ItemTable::parse(&e.data).ok())
+        else {
+            return false;
+        };
+        if index >= table.records.len() {
+            return false;
+        }
+        table.records[index].item = item;
+        table.records[index].count = count;
+        self.quest_work_put(entry, table.to_bytes());
+        true
     }
 
     /// The five large-monster slots of the open .mib, by name and by number.
@@ -14479,6 +15796,35 @@ impl MhnxEditor {
             if t.trim().eq_ignore_ascii_case("database") {
                 self.tab = Tab::Database;
             }
+            if t.trim().eq_ignore_ascii_case("questwork") {
+                self.tab = Tab::QuestWork;
+            }
+        }
+        // The クエスト改造 screen's selection, for the screenshot harness: the
+        // picker needs a click and the harness has none. Runs after the save
+        // hooks in main.rs, so the save is already loaded.
+        if let Ok(s) = std::env::var("MHNXEDITOR_QUEST_WORK") {
+            if let Ok(id) = s.trim().parse::<i32>() {
+                self.open_quest_for_work(id);
+            }
+        }
+        // One monster row's 詳細, for the same harness: 1..5, or 0 for none.
+        if let Ok(s) = std::env::var("MHNXEDITOR_QUEST_WORK_DETAIL") {
+            if let Ok(slot) = s.trim().parse::<usize>() {
+                if (1..=5).contains(&slot) {
+                    self.qw_mob_open[slot - 1] = true;
+                }
+            }
+        }
+        // Which of the four sections, for the same harness: the buttons need
+        // a click and it has none.
+        if let Ok(s) = std::env::var("MHNXEDITOR_QUEST_WORK_TAB") {
+            self.qw_tab = match s.trim().to_ascii_lowercase().as_str() {
+                "monsters" | "monster" | "モンスター" => QuestWorkTab::Monsters,
+                "rewards" | "reward" | "報酬" => QuestWorkTab::Rewards,
+                "supplies" | "supply" | "支給品" => QuestWorkTab::Supplies,
+                _ => QuestWorkTab::Basic,
+            };
         }
         // The save map's row selection, for the screenshot harness: the table
         // needs a click and the harness has none.
@@ -22274,6 +23620,351 @@ mod tests {
         assert!(text.contains("（ダミー）"), "the dummy placement is not marked");
     }
 
+    // -----------------------------------------------------------------------
+    // クエスト改造: the screen that opens on a quest, not on a file
+    // -----------------------------------------------------------------------
+
+    /// A quest archive with one of every part the クエスト改造 screen edits.
+    ///
+    /// Built here rather than read from a game file so the test says exactly
+    /// which monster is in which slot and which item is in which reward row.
+    fn synth_quest_arc() -> Arc {
+        let mut mib = vec![0u8; mhnx_core::quest::MIB_SIZE];
+        mib[0..4].copy_from_slice(&[0x00, 0x00, b'K', b'C']);
+        mib[4..8].copy_from_slice(&1u32.to_le_bytes());
+        mib[12..16].copy_from_slice(&1010001u32.to_le_bytes());
+        // 制限時間: 50, the value 140 of the 141 shipped quests carry.
+        mib[22] = 50;
+        let offs = mib_mob_slot_offsets();
+        assert!(mib_mob_set_id(&mut mib, offs[0], 80));
+        assert!(mib_mob_set_id(&mut mib, offs[1], 85));
+        assert!(mib_mob_write(&mut mib, offs[0], work_field("hp"), 120));
+        assert!(mib_mob_write(&mut mib, offs[0], work_field("attack"), 13));
+        assert!(mib_mob_write(&mut mib, offs[1], work_field("count"), 2));
+
+        let gmd = synth_gmd(
+            "questData_1010001",
+            &[
+                "テストクエスト",
+                "村長",
+                "モンスターを狩れ",
+                "ディノバルド",
+                "討伐",
+                "失敗",
+                "サブ",
+            ],
+        );
+        let rem = synth_work_rem(&[(9, 2, 60), (10, 1, 40)]);
+        let sup = synth_work_sup(&[(9, 3, 0), (10, 1, 1)]);
+        let mut sem = [0u8; 32];
+        assert!(sem_set_f32(&mut sem, 0x00, 1.0));
+        assert!(sem_set_u32(&mut sem, 0x04, 1));
+        assert!(sem_set_u32(&mut sem, 0x08, 1));
+        assert!(sem_set_u32(&mut sem, 0x0C, 2));
+        assert!(sem_set_f32(&mut sem, 0x10, -147.0));
+        assert!(sem_set_f32(&mut sem, 0x14, 1172.0));
+        assert!(sem_set_f32(&mut sem, 0x18, 171.0));
+        assert!(sem_set_f32(&mut sem, 0x1C, 90.0));
+
+        let mut arc = Arc::default();
+        for (name, hash, data) in [
+            ("quest\\questData\\questData_1010001", 0x1BBF_D18E, mib),
+            ("quest\\questData\\questData_1010001", 0x242B_B29A, gmd),
+            ("quest\\reward\\rem_000001", 0x5B3C_302D, rem),
+            ("quest\\supply\\sup_000001", 0x5453_9AEE, sup),
+            (
+                "quest\\boss\\setEmMain\\b_m01em080_00",
+                0x2553_701D,
+                sem.to_vec(),
+            ),
+        ] {
+            let mut entry = mhnx_core::arc::ArcEntry::default();
+            entry.name = name.to_owned();
+            entry.type_hash = hash;
+            entry.data = data;
+            arc.entries.push(entry);
+        }
+        arc
+    }
+
+    /// One .rem payload: a single roll group of the rows given.
+    fn synth_work_rem(rows: &[(u16, u8, u8)]) -> Vec<u8> {
+        let mut raw = vec![0u8; mhnx_core::quest::REM_SIZE];
+        raw[0x08] = 1;
+        raw[0x09] = rows.len() as u8;
+        for (i, (item, count, probability)) in rows.iter().enumerate() {
+            let o = mhnx_core::quest::REWARD_DATA_OFFSET + i * 4;
+            raw[o..o + 2].copy_from_slice(&item.to_le_bytes());
+            raw[o + 2] = *count;
+            raw[o + 3] = *probability;
+        }
+        raw
+    }
+
+    /// One .sup payload: a fixed array of records, the way a supply box is.
+    fn synth_work_sup(rows: &[(u16, u8, u8)]) -> Vec<u8> {
+        let mut raw = vec![0u8; mhnx_core::quest::SUP_SIZE];
+        for (i, (item, count, slot)) in rows.iter().enumerate() {
+            let o = mhnx_core::quest::SUP_DATA_OFFSET + i * 4;
+            raw[o..o + 2].copy_from_slice(&item.to_le_bytes());
+            raw[o + 2] = *count;
+            raw[o + 3] = *slot;
+        }
+        raw
+    }
+
+    /// One editable number of a monster slot, by the name the screen uses.
+    fn work_field(key: &str) -> &'static MibMobField {
+        MIB_MOB_FIELDS
+            .iter()
+            .find(|f| f.key == key)
+            .expect("the field exists")
+    }
+
+    /// The new screen names things: the name is the label, the id is small
+    /// hex, and a number the table cannot name says so instead of posing as one.
+    #[test]
+    fn the_quest_work_labels_put_the_name_first_and_the_id_in_hex() {
+        assert_eq!(monster_name_hex(80), "ディノバルド 0x50");
+        assert_eq!(monster_name_hex(85), "ドスマッカォ 0x55");
+        // 269 has no row in the game's table, and the label says so.
+        assert_eq!(monster_name_hex(269), "ID 0x10D（名前不明）");
+        assert_eq!(monster_name_hex(0), "（空き）");
+        assert_eq!(item_name_hex(9), "回復薬 0x9");
+        assert_eq!(item_name_hex(0), "（なし）");
+        assert_eq!(item_name_hex(0xFFFF), "ID 0xFFFF（名前不明）");
+        // Neither label uses the decimal spelling the older helpers print.
+        assert!(!monster_name_hex(80).contains("（ID 80）"));
+        assert!(!item_name_hex(9).contains("（ID 9）"));
+        // The area list is the measured range, and an out-of-range value is
+        // kept rather than hidden.
+        assert_eq!(quest_work_area_choices(2), (0..=11).collect::<Vec<u32>>());
+        assert!(quest_work_area_choices(200).contains(&200));
+    }
+
+    /// The 基本 section draws the quest by its own words and its time limit,
+    /// and none of the four sections names a file.
+    #[test]
+    fn the_quest_work_screen_draws_a_quest_not_its_files() {
+        let mut app = MhnxEditor::default();
+        app.arc = Some(synth_quest_arc());
+        app.load_arc_entry(0);
+        app.tab = Tab::QuestWork;
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_work_body(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("クエスト改造"), "{text}");
+        assert!(text.contains("テストクエスト"), "the title is missing: {text}");
+        assert!(text.contains("村長"), "the client is missing: {text}");
+        assert!(text.contains("モンスターを狩れ"), "the objective is missing: {text}");
+        assert!(text.contains("制限時間"), "{text}");
+        for section in ["基本", "モンスター", "報酬", "支給品"] {
+            assert!(text.contains(section), "the {section} section is missing: {text}");
+        }
+        for ext in [".mib", ".gmd", ".rem", ".sup", ".sem", ".arc"] {
+            assert!(!text.contains(ext), "the screen leaked {ext}: {text}");
+        }
+
+        // モンスター: the five slots, their names, and the area choice.
+        app.qw_tab = QuestWorkTab::Monsters;
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_work_body(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("ディノバルド"), "{text}");
+        assert!(text.contains("ドスマッカォ"), "{text}");
+        assert!(text.contains("エリア"), "{text}");
+        assert!(text.contains("体力") && text.contains("攻撃") && text.contains("防御"));
+        assert!(text.contains("サイズ%") && text.contains("出現数"), "{text}");
+        assert!(text.contains("詳細"), "the per-row detail toggle is missing: {text}");
+
+        // 報酬: names first, count and chance, and the group total.
+        app.qw_tab = QuestWorkTab::Rewards;
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_work_body(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("回復薬 0x9"), "{text}");
+        assert!(text.contains("確率%") && text.contains("個数"), "{text}");
+        assert!(text.contains("合計 100%"), "the group total is missing: {text}");
+
+        // 支給品: the same names, no chance column.
+        app.qw_tab = QuestWorkTab::Supplies;
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_work_body(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("支給品") && text.contains("回復薬 0x9"), "{text}");
+        assert!(!text.contains("確率%"), "a supply box has no chance: {text}");
+    }
+
+    /// A quest is chosen from the save by its name, and the 詳細 view is a
+    /// round trip rather than a replacement: the file screen is still there.
+    #[test]
+    fn a_quest_is_chosen_by_its_name_and_the_detail_view_is_a_round_trip() {
+        let dir = Scratch::new("questworkpick");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        let bytes = synth_quest_arc().to_bytes().expect("serialise the fixture");
+        let added = dlc::add_quest(app.save.as_mut().expect("save"), 1010001, &bytes);
+        assert!(added.is_ok(), "the fixture quest was refused: {:?}", added.err());
+
+        assert!(app.open_quest_for_work(1010001));
+        assert_eq!(app.tab, Tab::QuestWork);
+        assert_eq!(app.arc_from_save, Some(1010001));
+        app.quest_work_ensure_rows();
+        assert_eq!(app.qw_rows.len(), 1);
+        assert_eq!(app.qw_rows[0].title, "テストクエスト");
+        let label = app.qw_rows[0].label();
+        assert!(label.contains("テストクエスト"), "{label}");
+        assert!(label.contains(&format!("0x{:X}", 1010001)), "{label}");
+        assert!(!label.contains(".arc"), "the picker names a file: {label}");
+
+        // 詳細 opens the file-by-file screen, with the archive still open.
+        app.open_quest_detail();
+        assert_eq!(app.tab, Tab::Quest);
+        assert!(app.arc.is_some(), "the detail screen lost the archive");
+        app.back_to_quest_work();
+        assert_eq!(app.tab, Tab::QuestWork);
+        assert!(app.arc.is_some(), "the way back lost the archive");
+
+        // セーブに書き戻す: the edit reaches the save, and the slot is the
+        // same one the quest was listed from.
+        assert!(app.quest_work_set_time_limit(40));
+        assert!(app.write_quest_work_to_save());
+        let listed = dlc::list_quests(app.save.as_ref().expect("save"));
+        let saved = listed
+            .iter()
+            .find(|q| q.quest_id == 1010001)
+            .expect("the quest is still listed");
+        let saved_arc = Arc::parse(&saved.data).expect("the saved payload parses");
+        let saved_mib = saved_arc.by_ext("mib").expect("the saved .mib");
+        assert_eq!(saved_mib.data[22], 40, "the time limit did not reach the save");
+    }
+
+    /// Every edit on the new screen lands in the part it names, and nothing
+    /// else: the same offsets the file screen writes.
+    #[test]
+    fn the_quest_work_edits_reach_the_parts_they_name() {
+        let mut app = MhnxEditor::default();
+        app.arc = Some(synth_quest_arc());
+        app.load_arc_entry(0);
+
+        // 制限時間 through the field the table documents.
+        assert!(app.quest_work_set_time_limit(40));
+        let mib_data = app.arc.as_ref().unwrap().by_ext("mib").unwrap().data.clone();
+        assert_eq!(mib_data[22], 40);
+        let field = mib_field("time_limit").expect("the field");
+        assert_eq!(
+            mhnx_core::questfields::read_u32(&mib_data, field.offset, field.kind),
+            Some(40)
+        );
+
+        // クエスト名 through the text payload, and the other lines survive.
+        assert!(app.quest_work_set_title("新しい名前"));
+        let gmd_data = app.arc.as_ref().unwrap().by_ext("gmd").unwrap().data.clone();
+        let gmd = Gmd::from_bytes(&gmd_data).expect("the text payload");
+        assert_eq!(gmd.title(), Some("新しい名前"));
+        assert_eq!(gmd.client(), Some("村長"));
+        assert_eq!(gmd.request(), Some("モンスターを狩れ"));
+
+        // エリア: the main placement of the monster, with the weight the game
+        // needs, and a monster with no placement is refused.
+        {
+            let sem = app
+                .arc
+                .as_mut()
+                .unwrap()
+                .entries
+                .iter_mut()
+                .find(|e| extension_for(e.type_hash) == Some("sem"))
+                .expect("one placement");
+            sem.data[0..4].copy_from_slice(&0f32.to_le_bytes());
+        }
+        assert!(app.quest_work_set_area(80, 7));
+        let sem = app
+            .arc
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .find(|e| extension_for(e.type_hash) == Some("sem"))
+            .expect("one placement");
+        assert_eq!(sem_u32_at(&sem.data[..32], 0x0C), Some(7));
+        assert_eq!(sem_u32_at(&sem.data[..32], 0x00), Some(1.0f32.to_bits()));
+        assert_eq!(sem_u32_at(&sem.data[..32], 0x04), Some(1));
+        assert!(!app.quest_work_set_area(269, 3));
+
+        // 報酬 row: item, count and chance.
+        assert!(app.quest_work_set_reward(0, 11, 5, 100));
+        let rem_data = app.arc.as_ref().unwrap().by_ext("rem").unwrap().data.clone();
+        let table = mhnx_core::entries::ItemTable::parse(&rem_data).expect("the reward table");
+        assert_eq!(table.records[0].item, 11);
+        assert_eq!(table.records[0].count, 5);
+        assert_eq!(table.records[0].slot, 100);
+        assert!(!app.quest_work_set_reward(99, 1, 1, 1));
+
+        // 支給品 row: item and count.
+        assert!(app.quest_work_set_supply(0, 12, 7));
+        let sup_data = app.arc.as_ref().unwrap().by_ext("sup").unwrap().data.clone();
+        let table = mhnx_core::entries::ItemTable::parse(&sup_data).expect("the supply box");
+        assert_eq!(table.records[0].item, 12);
+        assert_eq!(table.records[0].count, 7);
+    }
+
+    /// The new screen is the way in, adds no chord, and keeps Ctrl+F working
+    /// on its own filter box.
+    #[test]
+    fn the_quest_work_screen_is_the_default_and_adds_no_keyboard_shortcut() {
+        assert_eq!(
+            MhnxEditor::default().tab,
+            Tab::QuestWork,
+            "the editor does not open on the quest screen"
+        );
+        let mut app = MhnxEditor::default();
+        app.tab = Tab::QuestWork;
+        assert!(app.tab_has_filter(), "Ctrl+F cannot reach the new screen");
+        app.focus_current_filter();
+        assert!(app.focus_filter, "Ctrl+F did not ask for the filter");
+        assert!(app.message.contains("Ctrl+F"), "{}", app.message);
+
+        // One table drives both the line on screen and the handler, so a key
+        // listed twice is a key two actions would answer.
+        let keys: Vec<&str> = MhnxEditor::SHORTCUTS.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, ["Ctrl+S", "Ctrl+O", "Ctrl+Z", "Ctrl+Shift+Z", "Ctrl+F"]);
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), keys.len(), "two shortcuts share a chord: {:?}", keys);
+
+        // The four sections are buttons, not keys: none of them is in the
+        // table, and no chord was taken away from a screen that had one.
+        for t in [
+            QuestWorkTab::Basic,
+            QuestWorkTab::Monsters,
+            QuestWorkTab::Rewards,
+            QuestWorkTab::Supplies,
+        ] {
+            assert!(["基本", "モンスター", "報酬", "支給品"].contains(&t.label()));
+            assert!(!keys.iter().any(|k| *k == t.label()));
+        }
+
+        // The focus request is consumed by the new screen's own filter box,
+        // not left set for whatever tab is opened next.
+        app.arc = Some(synth_quest_arc());
+        app.focus_filter = true;
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_work_body(ui));
+        });
+        assert!(!output.shapes.is_empty(), "the screen drew nothing");
+        assert!(!app.focus_filter, "the new screen never took the Ctrl+F focus");
+    }
+
     #[test]
     fn every_equipment_type_lists_its_names() {
         // 大剣 (7): the picker and the label read the same table.
@@ -22651,6 +24342,151 @@ pub fn sem_set_u32(data: &mut [u8], off: usize, value: u32) -> bool {
     }
     data[off..off + 4].copy_from_slice(&value.to_le_bytes());
     true
+}
+
+/// Give a placement an area and make sure the game will not skip it.
+///
+/// The weight at +0x00 has to be non-zero for the game to use the row at all;
+/// the file-by-file screen learned this first and this is the same rule, one
+/// place instead of two.
+pub fn sem_set_area_main(data: &mut [u8], area: u32) -> bool {
+    if !sem_set_u32(data, 0x0C, area) {
+        return false;
+    }
+    if area > 0 && sem_f32(data, 0x00).unwrap_or(0.0) == 0.0 {
+        let _ = sem_set_f32(data, 0x00, 1.0);
+        let _ = sem_set_u32(data, 0x04, 1);
+    }
+    true
+}
+
+/// The main placement of one monster, and how many placements it has.
+///
+/// A quest carries one placement per large monster; which monster a placement
+/// is for is only in its name (see [monster_id_from_sem_name]). The main one is
+/// the setEmMain placement when there is one, because that is the row the
+/// quest's own area choice is read from; otherwise the first is used. Returns
+/// the entry index and the number of placements that named this monster.
+pub fn quest_work_sem_index(arc: &Arc, monster: u16) -> (Option<usize>, usize) {
+    if monster == 0 {
+        return (None, 0);
+    }
+    let mut main: Option<usize> = None;
+    let mut fallback: Option<usize> = None;
+    let mut count = 0usize;
+    for (i, e) in arc.entries.iter().enumerate() {
+        if extension_for(e.type_hash) != Some("sem") || e.data.len() != 32 {
+            continue;
+        }
+        if monster_id_from_sem_name(&e.name).unwrap_or(0) != monster {
+            continue;
+        }
+        count += 1;
+        if e.name.to_ascii_lowercase().contains("setemmain") {
+            if main.is_none() {
+                main = Some(i);
+            }
+        } else if fallback.is_none() {
+            fallback = Some(i);
+        }
+    }
+    (main.or(fallback), count)
+}
+
+/// The areas the クエスト改造 screen offers, with the current value kept.
+///
+/// Measured on 4416 shipped placements: 0..=11. A value outside that range is
+/// kept in the list rather than hidden, so a file with one is shown as it is.
+pub fn quest_work_area_choices(current: u32) -> Vec<u32> {
+    let mut out: Vec<u32> = (0..=11).collect();
+    if current > 11 {
+        out.push(current);
+    }
+    out
+}
+
+/// A monster id the way the クエスト改造 screen says it: name first, id in hex.
+///
+/// The id is only ever printed in hex, and when the game's table has no name
+/// the row says so instead of pretending the number is a name.
+pub fn monster_name_hex(id: u16) -> String {
+    if id == 0 {
+        return String::from("（空き）");
+    }
+    match monster_id_name(id) {
+        Some(name) if !name.is_empty() => format!("{} 0x{:X}", name, id),
+        _ => format!("ID 0x{:X}（名前不明）", id),
+    }
+}
+
+/// An item id the same way: name first, id in hex.
+pub fn item_name_hex(id: u16) -> String {
+    if id == 0 {
+        return String::from("（なし）");
+    }
+    #[cfg(feature = "gamedata")]
+    {
+        if id <= LAST_ITEM_ID as u16 {
+            if let Some(name) = mhnx_core::gamedata::ITEM_NAME_LIST.get(id as usize) {
+                if !name.is_empty() && *name != "なし" {
+                    return format!("{} 0x{:X}", name, id);
+                }
+            }
+        }
+    }
+    format!("ID 0x{:X}（名前不明）", id)
+}
+
+/// The .mib field with this key, from the table the file-by-file screen reads.
+fn mib_field(key: &str) -> Option<&'static mhnx_core::questfields::FieldDef> {
+    mhnx_core::questfields::MIB_FIELDS.iter().find(|f| f.key == key)
+}
+
+/// Item ids and names that match a needle, in id order.
+///
+/// The name and the hex id are both searchable; decimal ids are not, because
+/// this screen never prints one.
+fn quest_work_item_matches(needle: &str, limit: usize) -> Vec<(u16, String)> {
+    #[cfg(feature = "gamedata")]
+    {
+        let mut out: Vec<(u16, String)> = Vec::new();
+        for id in 1..=LAST_ITEM_ID as u16 {
+            let name = item_name(id);
+            let hex = format!("0x{:X}", id);
+            if !needle.is_empty()
+                && !name.to_lowercase().contains(needle)
+                && !hex.to_lowercase().contains(needle)
+            {
+                continue;
+            }
+            out.push((id, name));
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+    #[cfg(not(feature = "gamedata"))]
+    {
+        let _ = (needle, limit);
+        Vec::new()
+    }
+}
+
+/// The save's quests, named for the クエスト改造 picker.
+///
+/// A slot whose payload is empty is a broken record, not a quest: it is left
+/// out rather than listed with no name.
+pub fn quest_work_rows(quests: &[dlc::InstalledQuest]) -> Vec<QuestWorkRow> {
+    quests
+        .iter()
+        .filter(|q| !q.data.is_empty())
+        .map(|q| QuestWorkRow {
+            quest_id: q.quest_id,
+            slot: q.slot,
+            title: MhnxEditor::title_of(&q.data),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

@@ -119,6 +119,21 @@ pub enum Screen {
     /// an award or a quest bit is a single flag the game itself re-merges, so
     /// pressing the same key again is the undo.
     Progress,
+    /// クエスト改造 - the quest as one picture, not as fifteen files.
+    ///
+    /// A quest archive is fifteen entries: `.mib` parameters, `.gmd` text,
+    /// up to five `.rem` reward tables, a `.sup` supply box and four `.sem`
+    /// placements. Asking the user to pick one of them flipped a coin every
+    /// time: the number that needed changing lived in a different file from the
+    /// row that named it. This screen is the coin landing once - the game's own
+    /// four questions (基本 / モンスター / 報酬 / 支給品) over the same bytes -
+    /// and [Screen::ArcEntries] stays one press away behind 詳細.
+    ///
+    /// Nothing here is a new offset. Every row is read and written through the
+    /// writer the file screen already uses: the .mib fields through
+    /// [Editor::step_mib_field], the reward rows through the .rem table writer,
+    /// and the placements through [Editor::adjust_sem_placement].
+    QuestEdit,
 }
 
 /// The three views of [Screen::Progress], in the order L / R walks them.
@@ -151,6 +166,278 @@ pub const REQUEST_BANDS: [(usize, usize); 2] = [(300, 555), (1270, 1395)];
 /// cannot leave the row count disagreeing with the list.
 pub const REQUEST_ROWS: usize =
     (REQUEST_BANDS[0].1 - REQUEST_BANDS[0].0) + (REQUEST_BANDS[1].1 - REQUEST_BANDS[1].0);
+
+// ---------------------------------------------------------------------------
+// クエスト改造 (Screen::QuestEdit) - the aggregate quest screen
+// ---------------------------------------------------------------------------
+
+/// How many tabs [Screen::QuestEdit] carries, in the order L / R walks them.
+pub const QUEST_TABS: usize = 4;
+/// 基本: クエスト名 / 依頼主 / 目的 / 制限時間.
+pub const QUEST_TAB_BASIC: usize = 0;
+/// モンスター: the five slots of the .mib, plus their .sem placement.
+pub const QUEST_TAB_MONSTERS: usize = 1;
+/// 報酬: every .rem record of the quest.
+pub const QUEST_TAB_REWARDS: usize = 2;
+/// 支給品: the .sup records.
+pub const QUEST_TAB_SUPPLIES: usize = 3;
+/// The four tab labels, in tab order.
+pub const QUEST_TAB_LABELS: [&str; QUEST_TABS] = ["基本", "モンスター", "報酬", "支給品"];
+
+/// Monster slots a .mib carries (13 bytes each, from offset 100).
+pub const QUEST_MON_SLOTS: usize = 5;
+/// How many values [◀/▶] steps on a monster row, in the order [-] walks them.
+pub const QUEST_MON_FIELDS: usize = 6;
+/// 体力.
+pub const QUEST_MON_HP: usize = 0;
+/// 攻撃力.
+pub const QUEST_MON_ATK: usize = 1;
+/// 防御力.
+pub const QUEST_MON_DEF: usize = 2;
+/// サイズ %.
+pub const QUEST_MON_SIZE: usize = 3;
+/// 出現数.
+pub const QUEST_MON_COUNT: usize = 4;
+/// エリア番号: the .sem placement of the same slot.
+pub const QUEST_MON_AREA: usize = 5;
+/// The labels of the six values, in the order [-] walks them.
+///
+/// The area is last here and first on the row, because it is the number the
+/// console's quest menu shows and the one a custom quest most often gets wrong.
+pub const QUEST_MON_LABELS: [&str; QUEST_MON_FIELDS] = [
+    "体力",
+    "攻撃力",
+    "防御力",
+    "サイズ%",
+    "出現数",
+    "エリア番号",
+];
+/// The eight values the .mib screen steps on a monster slot, in its order.
+///
+/// The aggregate screen only steps the first five (the area is the .sem
+/// byte); the .mib screen has all eight, and both go through
+/// [Editor::adjust_mib_mob], so the labels and the offsets are one table.
+pub const MIB_MOB_VALUE_LABELS: [&str; 8] = [
+    "体力",
+    "攻撃力",
+    "防御力",
+    "サイズ%",
+    "出現数",
+    "スタミナ",
+    "変動幅",
+    "獰猛/特殊",
+];
+
+/// How many rows ▸詳細 adds under one monster slot (X/Y/Z/向き/ウェーブ).
+pub const QUEST_MON_DETAIL_ROWS: usize = 5;
+
+/// The labels of the five detail rows, in file order.
+pub const QUEST_MON_DETAIL_LABELS: [&str; QUEST_MON_DETAIL_ROWS] = [
+    "X座標",
+    "Y座標(高さ)",
+    "Z座標",
+    "向き角度(W)",
+    "出現ウェーブ",
+];
+
+/// One row of the 基本 tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestBasicRow {
+    /// What the row is.
+    pub label: &'static str,
+    /// What it holds, already worded for the screen.
+    pub value: String,
+    /// The .gmd string index [A] edits, if this row is a piece of quest text.
+    pub text_index: Option<usize>,
+    /// The id the row carries, when it has one worth printing in hex.
+    pub hex: Option<u32>,
+}
+
+/// One monster slot of the モンスター tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestMonster {
+    /// Slot 0..QUEST_MON_SLOTS.
+    pub slot: usize,
+    /// Monster id as the .mib stores it (the mint_ space).
+    pub id: u16,
+    /// The game's name for it, or "" when the id has none.
+    pub name: String,
+    /// 名前 + hex id, or the id alone when the name cannot be looked up.
+    pub label: String,
+    /// 体力.
+    pub hp: u8,
+    /// 攻撃力.
+    pub atk: u8,
+    /// 防御力.
+    pub def: u8,
+    /// サイズ %.
+    pub size: u16,
+    /// 出現数.
+    pub count: u8,
+    /// エリア番号 from the .sem of the same slot, or None when there is none.
+    pub area: Option<u32>,
+    /// 出現ウェーブ from the same .sem.
+    pub wave: Option<u32>,
+}
+
+/// Which row the モンスター tab lists.
+///
+/// The five slots, and - under an opened one - its five ▸詳細 rows. A flat
+/// list of row ids rather than two parallel arrays, because the cursor, the
+/// touch targets and the renderer all count the same rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestMonRow {
+    /// The slot itself.
+    Slot(usize),
+    /// One detail row (1..=QUEST_MON_DETAIL_ROWS) of a slot.
+    Detail(usize, usize),
+}
+
+/// One reward record of the 報酬 tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestRewardRow {
+    /// Archive entry index of the .rem the record lives in.
+    pub entry: usize,
+    /// The table's own name, without path or extension.
+    pub file: String,
+    /// Record index inside that table.
+    pub row: usize,
+    /// Item id.
+    pub item: u16,
+    /// 名前 + hex id.
+    pub label: String,
+    /// 個数.
+    pub count: u8,
+    /// 確率 %.
+    pub chance: u8,
+    /// Which roll group of the table the row belongs to (0 based).
+    pub group: usize,
+    /// How many rows that group has.
+    pub group_len: usize,
+    /// What that group's chance column adds up to.
+    pub group_total: u16,
+    /// Is this the rem_000000 dummy the game never loads?
+    pub dummy: bool,
+}
+
+/// One supply record of the 支給品 tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestSupplyRow {
+    /// Archive entry index of the .sup.
+    pub entry: usize,
+    /// The table's own name, without path or extension.
+    pub file: String,
+    /// Record index inside that table.
+    pub row: usize,
+    /// Item id.
+    pub item: u16,
+    /// 名前 + hex id.
+    pub label: String,
+    /// 個数.
+    pub count: u8,
+}
+
+/// What [A] on the クエスト改造 screen asked the console to open.
+///
+/// Everything the console owns (the monster chooser) is one value here rather
+/// than a screen the state machine pretends to reach: that chooser is a modal
+/// of the console layer, while the item chooser is already a screen the reward
+/// editor opens for itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestPick {
+    /// Nothing for the console to do.
+    None,
+    /// Open the monster chooser for this .mib field index.
+    Monster(usize),
+    /// Open the area chooser for this monster slot (the .sem area number).
+    Area(usize),
+    /// The 詳細 row: the file-by-file screens behind this one.
+    Detail,
+}
+
+/// One .sem placement, decoded.
+///
+/// The six numbers are the six rows the .sem screen draws: エリア番号 (+0x0C),
+/// X / Y / Z / 向き (+0x10..+0x20) and 出現ウェーブ (+0x08).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct SemPlacement {
+    /// エリア番号 stored at +0x0C.
+    pub area: u32,
+    /// X coordinate (+0x10).
+    pub x: f32,
+    /// Y coordinate (+0x14).
+    pub y: f32,
+    /// Z coordinate (+0x18).
+    pub z: f32,
+    /// Facing angle (+0x1C).
+    pub w: f32,
+    /// 出現ウェーブ (+0x08).
+    pub wave: u32,
+}
+
+/// The .mib field index of one monster slot (the mob_slot[n] record).
+pub fn mob_slot_field_index(slot: usize) -> Option<usize> {
+    questfields::MIB_FIELDS
+        .iter()
+        .position(|f| f.key == format!("mob_slot[{}]", slot).as_str())
+}
+
+/// The base name of an archive entry: what the user calls the file.
+///
+/// Archive names are backslash separated and carry no extension, so a row that
+/// shows one says which table it came from without the folder.
+pub fn file_name_of_entry(name: &str) -> String {
+    name.rsplit(['\\', '/']).next().unwrap_or(name).to_string()
+}
+
+/// The game's item name for an id, or None when it cannot be named.
+///
+/// None is what makes the rows print the hex id with the 「名前不明」 note
+/// instead of a name that is really a placeholder.
+pub fn item_name_or_none(id: u16) -> Option<String> {
+    #[cfg(feature = "gamedata")]
+    {
+        crate::gamedata::ITEM_NAME_LIST
+            .get(id as usize)
+            .map(|s| s.to_string())
+    }
+    #[cfg(not(feature = "gamedata"))]
+    {
+        let _ = id;
+        None
+    }
+}
+/// 「名前 0xID」- the name first, the hex id beside it.
+///
+/// The rule on the クエスト改造 screen: a name is what a player recognises and
+/// the hex id is what a table is keyed by, so the id is printed as well but
+/// never instead. When the name cannot be looked up the row says so rather
+/// than quietly printing the number alone: a bare 「0x56」 reads like a name.
+pub fn named_hex(name: Option<&str>, id: u32) -> String {
+    match name {
+        Some(n) if !n.is_empty() => format!("{} 0x{:X}", n, id),
+        _ => format!("0x{:X}（名前不明）", id),
+    }
+}
+
+/// The game's name for a .mib monster id, or None.
+///
+/// The .mib stores the id in the mint_ space, and mons_ is the table of names
+/// in the same order - the same pairing the .mib screen's chooser uses (see the
+/// console layer's monster_name_for_mint).
+pub fn monster_name_of(id: u16) -> Option<&'static str> {
+    for (i, s) in questfields::ENUM_MINT_.iter().enumerate() {
+        if s.parse::<u16>().ok() == Some(id) {
+            return questfields::ENUM_MONS_.get(i).copied();
+        }
+    }
+    None
+}
+
+/// The index of one .mib field by its key.
+pub fn mib_field_index(key: &str) -> Option<usize> {
+    questfields::MIB_FIELDS.iter().position(|f| f.key == key)
+}
 
 /// A button press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3607,6 +3894,25 @@ pub struct Editor {
     /// A row, not an index: row 0 is quest progress index 1, because index 0
     /// lines up with the dummy quest and is never used.
     pub quest_cursor: usize,
+    // ---------------------------------------------- クエスト改造 (QuestEdit)
+
+    /// Which tab of [Screen::QuestEdit] is showing.
+    ///
+    /// Its own cursor family, apart from the .mib / .gmd screens: the two
+    /// are different questions about the same bytes, and one screen's row
+    /// must not move because the other was looked at.
+    pub quest_edit_tab: usize,
+    /// The row the cursor is on inside that tab.
+    pub quest_edit_cursor: usize,
+    /// Which of the six monster values [◀/▶] steps (QUEST_MON_*).
+    pub quest_edit_field: usize,
+    /// Which monster slots have their ▸詳細 rows open.
+    pub quest_edit_open: [bool; QUEST_MON_SLOTS],
+    /// Does [◀/▶] move the chance column on the 報酬 tab?
+    ///
+    /// The same two numbers a reward row carries, the same [-] switch the
+    /// .rem screen has: 個数 and 確率.
+    pub quest_edit_chance: bool,
     /// Award names from the user's own romfs, 132 entries, or empty.
     ///
     /// Game text, so this crate never ships it: a caller that has the dump
@@ -3888,6 +4194,11 @@ impl Editor {
             award_cursor: 0,
             request_cursor: 0,
             quest_cursor: 0,
+            quest_edit_tab: 0,
+            quest_edit_cursor: 0,
+            quest_edit_field: 0,
+            quest_edit_open: [false; QUEST_MON_SLOTS],
+            quest_edit_chance: false,
             romfs_awards: Vec::new(),
             romfs_requests: Vec::new(),
             romfs_records: Vec::new(),
@@ -4585,6 +4896,20 @@ impl Editor {
                 "[A] 開く  [◀/▶] 個数  [▲/▼] 行  [L/R] サブタブ  [X] 保存  [B] 戻る"
             }
             // Convert and the remaining leaf screens have no tools of their own.
+            // The aggregate quest screen: one row pair moves the cursor, the
+            // other steps whatever value the tab is on, [-] picks which value
+            // that is, [Y] opens the ▸詳細 rows, [A] opens the row's own
+            // chooser or keyboard, and 詳細 is a bar button on the console.
+            Screen::QuestEdit => {
+                // The last row of every tab is 詳細, so no key is spent on it:
+                // ZR belongs to the sidebar, and the chip on the bar does the
+                // same thing for a finger.
+                if self.quest_edit_tab == QUEST_TAB_BASIC {
+                    "[▲/▼] 行  [A] 文字編集  [◀/▶] 制限時間  [L/R] タブ  [最下行] 詳細"
+                } else {
+                    "[▲/▼] 行  [◀/▶] 値  [-] 項目切替  [A] 選択  [Y] 詳細行  [L/R] タブ  [最下行] 詳細"
+                }
+            }
             Screen::Convert => "[◀/▶] 値変更  [X] 保存  [B] 戻る",
         };
         base
@@ -4745,6 +5070,1001 @@ impl Editor {
         active
     }
 
+    // ---------------------------------------------- クエスト改造 (QuestEdit)
+
+    /// Open the aggregate quest screen over the archive that is already loaded.
+    ///
+    /// The .mib and .gmd working copies are read here, in one pass, exactly the
+    /// way the file screens read them: the same Mib / Gmd parsers into the same
+    /// two buffers. Nothing else is copied - the reward, supply and placement
+    /// rows are read straight out of the archive on every frame, so an edit made
+    /// on one tab is visible on the next without a second source of truth.
+    pub fn enter_quest_edit(&mut self) {
+        if self.arc.is_none() {
+            self.message = String::from("先にクエスト (.arc) を開いてください");
+            return;
+        }
+        // Anything the file screens left in the working copies goes back into
+        // the archive first: the read below starts from the archive, so a
+        // pending edit would otherwise be replaced by the bytes it replaced.
+        self.flush_quest_edit();
+        self.load_quest_files();
+        self.screen = Screen::QuestEdit;
+        self.quest_edit_tab = self.quest_edit_tab.min(QUEST_TABS - 1);
+        self.quest_edit_cursor = 0;
+        self.quest_edit_field = 0;
+        self.quest_edit_open = [false; QUEST_MON_SLOTS];
+        self.quest_edit_chance = false;
+        let heading = self.quest_heading();
+        self.message = format!("クエスト改造 — {}（[詳細] でファイル単位の画面へ）", heading);
+    }
+
+    /// Read the .mib and the .gmd of the open archive into the working copies.
+    ///
+    /// Returns false when the archive carries neither, which is the one case
+    /// the screen cannot say anything useful about.
+    fn load_quest_files(&mut self) -> bool {
+        self.mib_bytes.clear();
+        self.gmd = None;
+        let Some(a) = &self.arc else { return false };
+        let mut any = false;
+        if let Some(e) = a.by_ext("mib") {
+            if let Ok(m) = Mib::from_bytes(&e.data) {
+                self.mib_bytes = m.raw.clone();
+                any = true;
+            }
+        }
+        if let Some(e) = a.by_ext("gmd") {
+            if let Ok(g) = Gmd::from_bytes(&e.data) {
+                self.gmd = Some(g);
+                any = true;
+            }
+        }
+        // The .mib is the entry the file screens open first, so the archive
+        // cursor is put on it: 詳細 and the .mib editor then agree about which
+        // entry is open, and the row the cursor draws is the one it edits.
+        if let Some(i) = a
+            .entries
+            .iter()
+            .position(|e| extension_for(e.type_hash) == Some("mib"))
+        {
+            self.entry = i;
+            self.cursor = i;
+        }
+        any
+    }
+
+    /// Write the .mib and .gmd working copies back into the open archive.
+    ///
+    /// The file screens flush the entry the cursor is on (store_entry); this
+    /// screen edits two files at once, so the write-back is by extension
+    /// instead. Same bytes, same parsers - only the target is found by type
+    /// rather than by which row happens to be selected.
+    pub fn flush_quest_edit(&mut self) {
+        let Some(a) = &mut self.arc else { return };
+        if !self.mib_bytes.is_empty() {
+            if let Some(e) = a
+                .entries
+                .iter_mut()
+                .find(|e| extension_for(e.type_hash) == Some("mib"))
+            {
+                if e.data != self.mib_bytes {
+                    e.data = self.mib_bytes.clone();
+                }
+            }
+        }
+        if let Some(g) = &self.gmd {
+            if let Some(e) = a
+                .entries
+                .iter_mut()
+                .find(|e| extension_for(e.type_hash) == Some("gmd"))
+            {
+                let bytes = g.to_bytes();
+                if e.data != bytes {
+                    e.data = bytes;
+                }
+            }
+        }
+    }
+
+    /// Is a quest open at all?
+    pub fn quest_is_open(&self) -> bool {
+        self.arc.is_some() && !self.mib_bytes.is_empty()
+    }
+
+    /// The quest name: the first .gmd string, or a placeholder.
+    ///
+    /// Named quest_name rather than quest_title because the save-quest list
+    /// already has a quest_title(id) that answers for an installed quest.
+    pub fn quest_name(&self) -> String {
+        let title = self
+            .gmd
+            .as_ref()
+            .and_then(|g| g.strings.first())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if title.is_empty() {
+            String::from("(名称未設定)")
+        } else {
+            title
+        }
+    }
+
+    /// The quest id as the .mib stores it, in hex, or an em dash.
+    pub fn quest_id_hex(&self) -> String {
+        match Mib::from_bytes(&self.mib_bytes) {
+            Ok(m) => format!("0x{:X}", m.quest_id()),
+            Err(_) => String::from("—"),
+        }
+    }
+
+    /// 「クエスト名 0xID」 - the header of the aggregate screen.
+    pub fn quest_heading(&self) -> String {
+        format!("{} {}", self.quest_name(), self.quest_id_hex())
+    }
+
+    /// The four rows of the 基本 tab.
+    ///
+    /// Three of them are .gmd text (クエスト名 / 依頼主 / 目的) and one is the
+    /// .mib time limit, which is why the tab is the only place in the editor
+    /// where those two files are one list.
+    pub fn quest_basic_rows(&self) -> Vec<QuestBasicRow> {
+        let mut out = Vec::with_capacity(4);
+        let text = |i: usize| -> String {
+            self.gmd
+                .as_ref()
+                .and_then(|g| g.strings.get(i))
+                .map(|s| s.replace('\n', " / "))
+                .unwrap_or_default()
+        };
+        let name = text(0);
+        let client = text(1);
+        let objective = text(4);
+        let limit = self.quest_time_limit();
+        out.push(QuestBasicRow {
+            label: "クエスト名",
+            value: if name.is_empty() { String::from("(未設定)") } else { name },
+            text_index: Some(0),
+            hex: None,
+        });
+        out.push(QuestBasicRow {
+            label: "依頼主",
+            value: if client.is_empty() { String::from("(未設定)") } else { client },
+            text_index: Some(1),
+            hex: None,
+        });
+        out.push(QuestBasicRow {
+            label: "目的（成功条件）",
+            value: if objective.is_empty() { String::from("(未設定)") } else { objective },
+            text_index: Some(4),
+            hex: None,
+        });
+        out.push(QuestBasicRow {
+            label: "制限時間",
+            value: format!("{} 分", limit),
+            text_index: None,
+            hex: None,
+        });
+        out
+    }
+
+    /// The .mib time limit, in minutes (0 when the .mib is not readable).
+    pub fn quest_time_limit(&self) -> u32 {
+        mib_field_index("time_limit")
+            .and_then(|i| questfields::MIB_FIELDS.get(i))
+            .and_then(|f| questfields::read_u32(&self.mib_bytes, f.offset, f.kind))
+            .unwrap_or(0)
+    }
+
+    /// The five .mib monster slots, with the .sem placement of the same slot.
+    ///
+    /// The slot number is the pairing: .mib slot k is the k-th .sem the archive
+    /// carries, which is the order Editor::sem_entry_indices already walks (it
+    /// is the order the .sem preset copies). No new mapping is invented here.
+    pub fn quest_monsters(&self) -> Vec<QuestMonster> {
+        let mut out = Vec::with_capacity(QUEST_MON_SLOTS);
+        for slot in 0..QUEST_MON_SLOTS {
+            let Some(fi) = mob_slot_field_index(slot) else { continue };
+            let field = questfields::MIB_FIELDS[fi];
+            let mib = &self.mib_bytes;
+            let fits = field.offset + 13 <= mib.len();
+            let (id, count, hp, atk, def, size) = if fits {
+                let o = field.offset;
+                (
+                    u16::from_le_bytes([mib[o], mib[o + 1]]),
+                    mib[o + 4],
+                    mib[o + 5],
+                    mib[o + 6],
+                    mib[o + 7],
+                    u16::from_le_bytes([mib[o + 9], mib[o + 10]]),
+                )
+            } else {
+                (0u16, 0u8, 0u8, 0u8, 0u8, 0u16)
+            };
+            let name = if id == 0 {
+                String::new()
+            } else {
+                monster_name_of(id).unwrap_or("").to_string()
+            };
+            // An empty slot is not a monster with an unknown name: it holds no
+            // id at all, so the row says なし rather than printing 0x0.
+            let label = if id == 0 {
+                String::from("なし")
+            } else {
+                named_hex(
+                    if name.is_empty() { None } else { Some(name.as_str()) },
+                    id as u32,
+                )
+            };
+            let (area, wave) = match self.sem_of_slot(slot) {
+                Some(idx) => match self.sem_placement(idx) {
+                    Some(sem) => (Some(sem.area), Some(sem.wave)),
+                    None => (None, None),
+                },
+                None => (None, None),
+            };
+            out.push(QuestMonster {
+                slot,
+                id,
+                name,
+                label,
+                hp,
+                atk,
+                def,
+                size,
+                count,
+                area,
+                wave,
+            });
+        }
+        out
+    }
+
+    /// The archive entry index of the .sem that places monster slot k.
+    ///
+    /// Editor::sem_entry_indices already puts the real placements first and the
+    /// b_m00em000 dummy last, so slot k is simply its k-th answer. A quest with
+    /// fewer placements than slots has no .sem for the extra slots.
+    pub fn sem_of_slot(&self, slot: usize) -> Option<usize> {
+        self.sem_entry_indices().get(slot).copied()
+    }
+
+    /// The five numbers one .sem placement holds: area, X, Y, Z, 向き, ウェーブ.
+    fn sem_placement(&self, entry_idx: usize) -> Option<SemPlacement> {
+        let e = self.arc.as_ref()?.entries.get(entry_idx)?;
+        if e.data.len() < 0x20 {
+            return None;
+        }
+        let f = |o: usize| {
+            f32::from_le_bytes([e.data[o], e.data[o + 1], e.data[o + 2], e.data[o + 3]])
+        };
+        Some(SemPlacement {
+            area: u32::from_le_bytes([
+                e.data[0x0C],
+                e.data[0x0D],
+                e.data[0x0E],
+                e.data[0x0F],
+            ]),
+            x: f(0x10),
+            y: f(0x14),
+            z: f(0x18),
+            w: f(0x1C),
+            wave: u32::from_le_bytes([
+                e.data[0x08],
+                e.data[0x09],
+                e.data[0x0A],
+                e.data[0x0B],
+            ]),
+        })
+    }
+
+    /// The rows of the モンスター tab: five slots, plus the ▸詳細 of an open one.
+    pub fn quest_mon_rows(&self) -> Vec<QuestMonRow> {
+        let mut out = Vec::with_capacity(QUEST_MON_SLOTS + QUEST_MON_DETAIL_ROWS);
+        for slot in 0..QUEST_MON_SLOTS {
+            out.push(QuestMonRow::Slot(slot));
+            if self.quest_edit_open.get(slot).copied().unwrap_or(false) {
+                for k in 1..=QUEST_MON_DETAIL_ROWS {
+                    out.push(QuestMonRow::Detail(slot, k));
+                }
+            }
+        }
+        out
+    }
+
+    /// One ▸詳細 row of a monster slot: (label, value).
+    pub fn quest_monster_detail(&self, slot: usize, k: usize) -> (&'static str, String) {
+        let label = QUEST_MON_DETAIL_LABELS
+            .get(k.saturating_sub(1))
+            .copied()
+            .unwrap_or("値");
+        let Some(sem) = self.sem_of_slot(slot).and_then(|i| self.sem_placement(i)) else {
+            return (label, String::from("—"));
+        };
+        let value = match k {
+            1 => format!("{:.1}", sem.x),
+            2 => format!("{:.1}", sem.y),
+            3 => format!("{:.1}", sem.z),
+            4 => format!("{:.1}°", sem.w),
+            _ => format!("Wave {}", sem.wave),
+        };
+        (label, value)
+    }
+
+    /// Every reward record of the quest, table by table and group by group.
+    pub fn quest_rewards(&self) -> Vec<QuestRewardRow> {
+        let Some(a) = &self.arc else { return Vec::new() };
+        let mut out = Vec::new();
+        for (idx, e) in a.entries.iter().enumerate() {
+            if extension_for(e.type_hash) != Some("rem") {
+                continue;
+            }
+            let Ok(table) = crate::entries::ItemTable::parse(&e.data) else {
+                continue;
+            };
+            let groups = table.groups();
+            let mut group_of = alloc::vec![0usize; table.records.len()];
+            for (gi, g) in groups.iter().enumerate() {
+                for k in g.start..(g.start + g.len).min(group_of.len()) {
+                    group_of[k] = gi;
+                }
+            }
+            let file = file_name_of_entry(&e.name);
+            // rem_000000 is the dummy the game never reads: its rows are shown
+            // (they are editable, and the checker names them) but the tab says
+            // what they are so nobody wonders why a reward does not appear.
+            let dummy = file == "rem_000000";
+            for (i, rec) in table.records.iter().enumerate() {
+                let gi = group_of.get(i).copied().unwrap_or(0);
+                let g = groups.get(gi);
+                out.push(QuestRewardRow {
+                    entry: idx,
+                    file: file.clone(),
+                    row: i,
+                    item: rec.item,
+                    label: named_hex(item_name_or_none(rec.item).as_deref(), rec.item as u32),
+                    count: rec.count,
+                    chance: rec.slot,
+                    group: gi,
+                    group_len: g.map(|g| g.len).unwrap_or(0),
+                    group_total: g.map(|g| g.total).unwrap_or(0),
+                    dummy,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every supply record of the quest.
+    pub fn quest_supplies(&self) -> Vec<QuestSupplyRow> {
+        let Some(a) = &self.arc else { return Vec::new() };
+        let mut out = Vec::new();
+        for (idx, e) in a.entries.iter().enumerate() {
+            if extension_for(e.type_hash) != Some("sup") {
+                continue;
+            }
+            let Ok(table) = crate::entries::ItemTable::parse(&e.data) else {
+                continue;
+            };
+            let file = file_name_of_entry(&e.name);
+            for (i, rec) in table.records.iter().enumerate() {
+                out.push(QuestSupplyRow {
+                    entry: idx,
+                    file: file.clone(),
+                    row: i,
+                    item: rec.item,
+                    label: named_hex(item_name_or_none(rec.item).as_deref(), rec.item as u32),
+                    count: rec.count,
+                });
+            }
+        }
+        out
+    }
+
+    /// How many rows of the tab hold a value (everything but 詳細).
+    pub fn quest_value_rows(&self) -> usize {
+        match self.quest_edit_tab {
+            QUEST_TAB_BASIC => self.quest_basic_rows().len(),
+            QUEST_TAB_MONSTERS => self.quest_mon_rows().len(),
+            QUEST_TAB_REWARDS => self.quest_rewards().len(),
+            _ => self.quest_supplies().len(),
+        }
+    }
+
+    /// Is the cursor on the 詳細 row (the last row of every tab)?
+    pub fn quest_on_detail_row(&self) -> bool {
+        self.quest_edit_cursor >= self.quest_value_rows()
+    }
+
+    /// How many rows the current tab lists.
+    ///
+    /// One more than the values: the last row of every tab is 詳細, so the pad
+    /// can reach the file-by-file screens without a key that belongs to
+    /// something else (ZR is the sidebar's). The button on the bar runs the
+    /// same action.
+    pub fn quest_row_count(&self) -> usize {
+        self.quest_value_rows() + 1
+    }
+
+    /// Move the cursor inside the current tab.
+    pub fn quest_move(&mut self, delta: i32) {
+        let n = self.quest_row_count();
+        if n == 0 {
+            self.quest_edit_cursor = 0;
+            return;
+        }
+        let cur = self.quest_edit_cursor.min(n - 1) as i32;
+        let next = (cur + delta).rem_euclid(n as i32);
+        self.quest_edit_cursor = next as usize;
+        self.cursor = self.quest_edit_cursor;
+    }
+
+    /// Show one of the four tabs, clamping the cursor to that tab.
+    pub fn quest_set_tab(&mut self, tab: usize) {
+        self.quest_edit_tab = tab.min(QUEST_TABS - 1);
+        self.quest_edit_cursor = 0;
+        self.cursor = 0;
+        self.message = format!("タブ: {}", QUEST_TAB_LABELS[self.quest_edit_tab]);
+    }
+
+    /// Which of the six monster values [◀/▶] is on.
+    pub fn quest_field_label(&self) -> &'static str {
+        QUEST_MON_LABELS
+            .get(self.quest_edit_field.min(QUEST_MON_FIELDS - 1))
+            .copied()
+            .unwrap_or("値")
+    }
+
+    /// Step [-] on the current tab: the monster value, or 個数 / 確率.
+    pub fn quest_cycle_field(&mut self) {
+        match self.quest_edit_tab {
+            QUEST_TAB_MONSTERS => {
+                self.quest_edit_field = (self.quest_edit_field + 1) % QUEST_MON_FIELDS;
+                let label = self.quest_field_label();
+                self.message = format!("[◀/▶] で変更する項目: {}", label);
+            }
+            QUEST_TAB_REWARDS => {
+                self.quest_edit_chance = !self.quest_edit_chance;
+                self.message = if self.quest_edit_chance {
+                    String::from("[◀/▶] で変更する項目: 確率%")
+                } else {
+                    String::from("[◀/▶] で変更する項目: 個数")
+                };
+            }
+            QUEST_TAB_SUPPLIES => {
+                self.message = String::from("支給品は個数だけです（確率はありません）");
+            }
+            _ => {
+                self.message = String::from("このタブは [◀/▶] では変わりません（[A] で編集）");
+            }
+        }
+    }
+
+    /// Open / close the ▸詳細 rows of the monster under the cursor.
+    pub fn quest_toggle_detail(&mut self) {
+        if self.quest_edit_tab != QUEST_TAB_MONSTERS {
+            self.message = String::from("このタブに詳細行はありません（[A] で編集）");
+            return;
+        }
+        if self.quest_on_detail_row() {
+            self.message = String::from("詳細行です（[A] でファイル単位の画面へ）");
+            return;
+        }
+        let rows = self.quest_mon_rows();
+        let Some(row) = rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1))) else {
+            return;
+        };
+        let QuestMonRow::Slot(slot) = *row else {
+            self.message = String::from("詳細行です（[◀/▶] で座標・向き・ウェーブを変更）");
+            return;
+        };
+        if let Some(open) = self.quest_edit_open.get_mut(slot) {
+            *open = !*open;
+            let now = *open;
+            self.message = if now {
+                format!("スロット{} の詳細を開きました（X/Y/Z/向き/ウェーブ）", slot + 1)
+            } else {
+                format!("スロット{} の詳細を閉じました", slot + 1)
+            };
+        }
+    }
+
+    /// Step the value the cursor is on: the one thing [◀/▶] does on every tab.
+    ///
+    /// Every branch ends in the writer the file screen already uses, so the
+    /// aggregate screen cannot drift from it: the .mib monster values through
+    /// [Editor::adjust_mib_mob], the area and the placement numbers through
+    /// [Editor::adjust_sem_placement], the reward and supply rows through the
+    /// same .rem / .sup table writer (store_entry_number).
+    pub fn quest_adjust(&mut self, delta: i64) -> bool {
+        if delta == 0 {
+            return false;
+        }
+        if self.quest_on_detail_row() {
+            self.message = String::from("詳細行です（[A] でファイル単位の画面へ）");
+            return false;
+        }
+        let step = delta as i32;
+        match self.quest_edit_tab {
+            QUEST_TAB_BASIC => {
+                if self.quest_edit_cursor != 3 {
+                    self.message = String::from("この行は [A] で文字を編集します");
+                    return false;
+                }
+                let Some(idx) = mib_field_index("time_limit") else {
+                    return false;
+                };
+                let before = self.quest_time_limit();
+                if !self.step_mib_field(idx, step) {
+                    return false;
+                }
+                let after = self.quest_time_limit();
+                self.message = format!("制限時間: {} 分 → {} 分", before, after);
+                true
+            }
+            QUEST_TAB_MONSTERS => {
+                let rows = self.quest_mon_rows();
+                if rows.is_empty() {
+                    return false;
+                }
+                let cur = self.quest_edit_cursor.min(rows.len() - 1);
+                match rows[cur] {
+                    QuestMonRow::Slot(slot) => match self.quest_edit_field {
+                        QUEST_MON_AREA => self.adjust_sem_placement(slot, 0, step),
+                        field => {
+                            let Some(idx) = mob_slot_field_index(slot) else {
+                                return false;
+                            };
+                            self.adjust_mib_mob(idx, field, step);
+                            true
+                        }
+                    },
+                    QuestMonRow::Detail(slot, k) => self.adjust_sem_placement(slot, k, step),
+                }
+            }
+            QUEST_TAB_REWARDS => {
+                let rows = self.quest_rewards();
+                if rows.is_empty() {
+                    self.message = String::from("このクエストに報酬テーブルがありません");
+                    return false;
+                }
+                let cur = self.quest_edit_cursor.min(rows.len() - 1);
+                let row = &rows[cur];
+                let entry = row.entry;
+                let index = row.row;
+                let chance = self.quest_edit_chance;
+                let cur_val = if chance { row.chance as i64 } else { row.count as i64 };
+                self.entry = entry;
+                self.entry_row_cursor = index;
+                self.entry_field = u8::from(chance);
+                self.store_entry_number(cur_val + delta, chance).is_some()
+            }
+            _ => {
+                let rows = self.quest_supplies();
+                if rows.is_empty() {
+                    self.message = String::from("このクエストに支給品テーブルがありません");
+                    return false;
+                }
+                let cur = self.quest_edit_cursor.min(rows.len() - 1);
+                let (entry, index, count) = (rows[cur].entry, rows[cur].row, rows[cur].count);
+                self.entry = entry;
+                self.entry_row_cursor = index;
+                self.entry_field = 0;
+                self.store_entry_number(count as i64 + delta, false).is_some()
+            }
+        }
+    }
+
+    /// [A] on the row under the cursor.
+    ///
+    /// The text rows ask the I/O layer for the keyboard through the same
+    /// request the .gmd screen uses, and a reward / supply row opens the item
+    /// chooser the .rem screen opens (mode 1 writes back into the archive).
+    /// The two choices the console owns - the monster list and the area list -
+    /// come back as a [QuestPick].
+    pub fn quest_activate(&mut self) -> QuestPick {
+        if self.quest_on_detail_row() {
+            return QuestPick::Detail;
+        }
+        match self.quest_edit_tab {
+            QUEST_TAB_BASIC => {
+                let rows = self.quest_basic_rows();
+                let Some(row) = rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1)))
+                else {
+                    return QuestPick::None;
+                };
+                let Some(idx) = row.text_index else {
+                    self.message = String::from("制限時間は [◀/▶] で変更します");
+                    return QuestPick::None;
+                };
+                let current = self
+                    .gmd
+                    .as_ref()
+                    .and_then(|g| g.strings.get(idx))
+                    .cloned()
+                    .unwrap_or_default();
+                self.pending_text = Some((idx, current));
+                QuestPick::None
+            }
+            QUEST_TAB_MONSTERS => {
+                let rows = self.quest_mon_rows();
+                if rows.is_empty() {
+                    return QuestPick::None;
+                }
+                let cur = self.quest_edit_cursor.min(rows.len() - 1);
+                match rows[cur] {
+                    QuestMonRow::Slot(slot) => {
+                        if self.quest_edit_field == QUEST_MON_AREA {
+                            QuestPick::Area(slot)
+                        } else if let Some(idx) = mob_slot_field_index(slot) {
+                            QuestPick::Monster(idx)
+                        } else {
+                            self.message = String::from("このクエストにモンスタースロットがありません");
+                            QuestPick::None
+                        }
+                    }
+                    QuestMonRow::Detail(_, _) => {
+                        self.message = String::from("この行は [◀/▶] で変更します");
+                        QuestPick::None
+                    }
+                }
+            }
+            QUEST_TAB_REWARDS => {
+                let rows = self.quest_rewards();
+                if rows.is_empty() {
+                    self.message = String::from("このクエストに報酬テーブルがありません");
+                    return QuestPick::None;
+                }
+                let cur = self.quest_edit_cursor.min(rows.len() - 1);
+                let (entry, index) = (rows[cur].entry, rows[cur].row);
+                self.entry = entry;
+                self.entry_item_row = index;
+                self.entry_row_cursor = index;
+                self.item_pick_mode = 1;
+                self.item_pick_cursor = 0;
+                self.item_pick_filter.clear();
+                self.screen = Screen::ItemPick;
+                let hint = self.pick_key_hint();
+                self.message = format!("報酬 {} 行目のアイテムを選んでください — {}", index, hint);
+                QuestPick::None
+            }
+            _ => {
+                let rows = self.quest_supplies();
+                if rows.is_empty() {
+                    self.message = String::from("このクエストに支給品テーブルがありません");
+                    return QuestPick::None;
+                }
+                let cur = self.quest_edit_cursor.min(rows.len() - 1);
+                let (entry, index) = (rows[cur].entry, rows[cur].row);
+                self.entry = entry;
+                self.entry_item_row = index;
+                self.entry_row_cursor = index;
+                self.item_pick_mode = 1;
+                self.item_pick_cursor = 0;
+                self.item_pick_filter.clear();
+                self.screen = Screen::ItemPick;
+                let hint = self.pick_key_hint();
+                self.message = format!("支給品 {} 行目のアイテムを選んでください — {}", index, hint);
+                QuestPick::None
+            }
+        }
+    }
+
+    fn input_quest_edit(&mut self, key: Key) {
+        match key {
+            Key::Up => self.quest_move(-1),
+            Key::Down => self.quest_move(1),
+            Key::Left => {
+                let d = STEPS[self.step];
+                self.quest_adjust(-d);
+            }
+            Key::Right => {
+                let d = STEPS[self.step];
+                self.quest_adjust(d);
+            }
+            Key::A => {
+                let _ = self.quest_activate();
+            }
+            Key::Y => self.quest_toggle_detail(),
+            Key::Minus => self.quest_cycle_field(),
+            Key::X => {
+                self.flush_quest_edit();
+                self.request_write_arc();
+            }
+            Key::B => {
+                self.flush_quest_edit();
+                self.gmd = None;
+                self.screen = Screen::ArcList;
+                self.cursor = 0;
+                self.message = String::from("クエスト一覧へ戻りました（[X] を押すまでファイルは変わりません）");
+            }
+            Key::Plus => {
+                self.press_quit();
+            }
+            _ => {}
+        }
+    }
+
+    /// Step one .mib field: the .mib screen's [◀] / [▶], in one place.
+    ///
+    /// `delta` is the signed size of the step (the console passes the step
+    /// size it shows in the footer). A field with an enum table rotates inside
+    /// that table; a numeric field adds and clamps to its own width, signed or
+    /// not. This is the body the .mib screen has always run - it moved here so
+    /// the 制限時間 row of the aggregate screen and the .mib screen cannot
+    /// disagree about what [▶] means.
+    pub fn step_mib_field(&mut self, field_idx: usize, delta: i32) -> bool {
+        let Some(f) = questfields::MIB_FIELDS.get(field_idx).copied() else {
+            return false;
+        };
+        if f.kind == FieldKind::Bytes {
+            self.message = String::from("生バイトの項目です（ここでは編集できません）");
+            return false;
+        }
+        let cur = questfields::read_u32(&self.mib_bytes, f.offset, f.kind).unwrap_or(0);
+        let next = if let Some(table) = f.enum_name.and_then(questfields::enum_table) {
+            let len = table.len() as i64;
+            if len == 0 {
+                cur
+            } else {
+                let d = if delta >= 0 { 1 } else { -1 };
+                (((cur as i64 + d) % len + len) % len) as u32
+            }
+        } else {
+            let d = delta as i64;
+            let width = match f.kind {
+                FieldKind::U8 | FieldKind::I8 => 8u32,
+                FieldKind::U16 | FieldKind::I16 => 16,
+                _ => 32,
+            };
+            let signed = matches!(f.kind, FieldKind::I8 | FieldKind::I16 | FieldKind::I32);
+            let v = if signed {
+                let shift = 32 - width;
+                ((cur << shift) as i32 >> shift) as i64 + d
+            } else {
+                cur as i64 + d
+            };
+            (v.max(0) as u64 & ((1u64 << width) - 1)) as u32
+        };
+        if !questfields::write_u32(&mut self.mib_bytes, f.offset, f.kind, next) {
+            return false;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Step one value of a .mib monster slot.
+    ///
+    /// The six values and their offsets are the ones the .mib screen has always
+    /// stepped (see the console's MIB_MOB_SUB_LABELS): 体力 +5, 攻撃力 +6,
+    /// 防御力 +7, サイズ% +9 (u16), 出現数 +4, and the special byte +3.
+    pub fn adjust_mib_mob(&mut self, field_idx: usize, sub: usize, delta: i32) {
+        let Some(f) = questfields::MIB_FIELDS.get(field_idx).copied() else {
+            return;
+        };
+        if !f.key.starts_with("mob_slot[") || f.offset + 13 > self.mib_bytes.len() {
+            return;
+        }
+        let off = f.offset;
+        let label = MIB_MOB_VALUE_LABELS.get(sub).copied().unwrap_or("値");
+        let next: i64 = match sub {
+            QUEST_MON_HP => {
+                let v = (self.mib_bytes[off + 5] as i32 + delta).clamp(1, 255) as u8;
+                self.mib_bytes[off + 5] = v;
+                v as i64
+            }
+            QUEST_MON_ATK => {
+                let v = (self.mib_bytes[off + 6] as i32 + delta).clamp(1, 255) as u8;
+                self.mib_bytes[off + 6] = v;
+                v as i64
+            }
+            QUEST_MON_DEF => {
+                let v = (self.mib_bytes[off + 7] as i32 + delta).clamp(1, 255) as u8;
+                self.mib_bytes[off + 7] = v;
+                v as i64
+            }
+            QUEST_MON_SIZE => {
+                let cur = u16::from_le_bytes([self.mib_bytes[off + 9], self.mib_bytes[off + 10]]) as i32;
+                let v = (cur + delta).clamp(10, 500) as u16;
+                self.mib_bytes[off + 9..off + 11].copy_from_slice(&v.to_le_bytes());
+                v as i64
+            }
+            QUEST_MON_COUNT => {
+                let v = (self.mib_bytes[off + 4] as i32 + delta).clamp(0, 99) as u8;
+                self.mib_bytes[off + 4] = v;
+                v as i64
+            }
+            // スタミナ and 変動幅 are the two bytes the .mib screen steps after
+            // 出現数; 獰猛/特殊 is the one before the size word.
+            5 => {
+                let v = (self.mib_bytes[off + 8] as i32 + delta).clamp(0, 255) as u8;
+                self.mib_bytes[off + 8] = v;
+                v as i64
+            }
+            6 => {
+                let v = (self.mib_bytes[off + 11] as i32 + delta).clamp(0, 255) as u8;
+                self.mib_bytes[off + 11] = v;
+                v as i64
+            }
+            _ => {
+                let v = (self.mib_bytes[off + 3] as i32 + delta).clamp(0, 255) as u8;
+                self.mib_bytes[off + 3] = v;
+                v as i64
+            }
+        };
+        self.dirty = true;
+        self.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+    }
+
+    /// Step one number of the .sem placement that places monster slot sem_k.
+    ///
+    /// field 0 is エリア番号, 1..4 are X / Y / Z / 向き, 5 is 出現ウェーブ -
+    /// the six rows the .sem screen draws. The code moved here from the console
+    /// layer unchanged, so the aggregate screen and the .sem screen write the
+    /// same bytes with the same clamps.
+    pub fn adjust_sem_placement(&mut self, sem_k: usize, field: usize, delta: i32) -> bool {
+        let sems = self.sem_entry_indices();
+        let Some(&entry_idx) = sems.get(sem_k) else {
+            self.message = format!("配置{} の .sem がありません", sem_k + 1);
+            return false;
+        };
+        let Some(arc) = &mut self.arc else { return false };
+        let Some(e) = arc.entries.get_mut(entry_idx) else {
+            return false;
+        };
+        if e.data.len() < 0x20 {
+            return false;
+        }
+        let name = file_name_of_entry(&e.name);
+        match field {
+            0 => {
+                let cur = u32::from_le_bytes([e.data[0x0C], e.data[0x0D], e.data[0x0E], e.data[0x0F]])
+                    as i32;
+                let step = if delta >= 0 { 1 } else { -1 };
+                let next = (cur + step).clamp(0, 20) as u32;
+                e.data[0x0C..0x10].copy_from_slice(&next.to_le_bytes());
+                if next > 0 {
+                    let w0 = f32::from_le_bytes([e.data[0], e.data[1], e.data[2], e.data[3]]);
+                    if w0 == 0.0 {
+                        e.data[0x00..0x04].copy_from_slice(&1.0f32.to_le_bytes());
+                        e.data[0x04..0x08].copy_from_slice(&1u32.to_le_bytes());
+                    }
+                }
+                self.dirty = true;
+                self.message = format!("配置{} ({}) の初期エリア番号を {} に変更しました", sem_k + 1, name, next);
+            }
+            1..=4 => {
+                let off = 0x10 + (field - 1) * 4;
+                let cur = f32::from_le_bytes([e.data[off], e.data[off + 1], e.data[off + 2], e.data[off + 3]]);
+                let next = cur + delta as f32;
+                let clamped = if field == 4 {
+                    next.clamp(-360.0, 360.0)
+                } else {
+                    next.clamp(-99999.0, 99999.0)
+                };
+                e.data[off..off + 4].copy_from_slice(&clamped.to_le_bytes());
+                let axis = match field {
+                    1 => "X座標",
+                    2 => "Y座標(高さ)",
+                    3 => "Z座標",
+                    _ => "向き角度(W)",
+                };
+                self.dirty = true;
+                self.message = format!("配置{} ({}) の {} を {:.1} に変更しました", sem_k + 1, name, axis, clamped);
+            }
+            _ => {
+                let cur = u32::from_le_bytes([e.data[0x08], e.data[0x09], e.data[0x0A], e.data[0x0B]]) as i32;
+                let step = if delta >= 0 { 1 } else { -1 };
+                let next = (cur + step).clamp(0, 10) as u32;
+                e.data[0x08..0x0C].copy_from_slice(&next.to_le_bytes());
+                self.dirty = true;
+                self.message = format!("配置{} ({}) の出現ウェーブを {} に変更しました", sem_k + 1, name, next);
+            }
+        }
+        true
+    }
+
+    /// Set the area number of one placement outright (the chooser uses this).
+    pub fn set_sem_area(&mut self, sem_k: usize, area: u32) -> bool {
+        let sems = self.sem_entry_indices();
+        let Some(&entry_idx) = sems.get(sem_k) else {
+            self.message = format!("配置{} の .sem がありません", sem_k + 1);
+            return false;
+        };
+        let Some(arc) = &mut self.arc else { return false };
+        let Some(e) = arc.entries.get_mut(entry_idx) else {
+            return false;
+        };
+        if e.data.len() < 0x20 {
+            return false;
+        }
+        let next = area.min(20);
+        e.data[0x0C..0x10].copy_from_slice(&next.to_le_bytes());
+        if next > 0 {
+            let w0 = f32::from_le_bytes([e.data[0], e.data[1], e.data[2], e.data[3]]);
+            if w0 == 0.0 {
+                e.data[0x00..0x04].copy_from_slice(&1.0f32.to_le_bytes());
+                e.data[0x04..0x08].copy_from_slice(&1u32.to_le_bytes());
+            }
+        }
+        let name = file_name_of_entry(&e.name);
+        self.dirty = true;
+        self.message = format!("配置{} ({}) の初期エリア番号を {} にしました", sem_k + 1, name, next);
+        true
+    }
+
+    /// The current tab as plain lines, for the ASCII console fallback.
+    ///
+    /// The console draws [Editor::lines] when the canvas is unavailable; the
+    /// rows here are the same rows the canvas screen draws, in the same order,
+    /// so the two fallbacks cannot show different quests.
+    pub fn quest_console_rows(&self) -> Vec<String> {
+        let mut out = self.quest_console_value_rows();
+        out.push(String::from("  > 詳細（ファイル単位の画面へ）"));
+        out
+    }
+
+    /// The value rows of the current tab, without the 詳細 row.
+    fn quest_console_value_rows(&self) -> Vec<String> {
+        match self.quest_edit_tab {
+            QUEST_TAB_BASIC => self
+                .quest_basic_rows()
+                .into_iter()
+                .map(|r| format!("{}: {}", r.label, r.value))
+                .collect(),
+            QUEST_TAB_MONSTERS => {
+                let monsters = self.quest_monsters();
+                let mut out = Vec::new();
+                for row in self.quest_mon_rows() {
+                    match row {
+                        QuestMonRow::Slot(slot) => {
+                            let Some(m) = monsters.get(slot) else { continue };
+                            let area = match m.area {
+                                Some(a) => format!("エリア {}", a),
+                                None => String::from("エリア -"),
+                            };
+                            out.push(format!(
+                                "{} {}  HP:{} 攻:{} 防:{} 寸:{}% 数:{}  {}",
+                                slot + 1,
+                                m.label,
+                                m.hp,
+                                m.atk,
+                                m.def,
+                                m.size,
+                                m.count,
+                                area
+                            ));
+                        }
+                        QuestMonRow::Detail(slot, k) => {
+                            let (label, value) = self.quest_monster_detail(slot, k);
+                            out.push(format!("    ・{}: {}", label, value));
+                        }
+                    }
+                }
+                out
+            }
+            QUEST_TAB_REWARDS => self
+                .quest_rewards()
+                .into_iter()
+                .map(|r| {
+                    format!(
+                        "{}  G{} 合計{}%  {} ×{}  {}%",
+                        r.file,
+                        r.group + 1,
+                        r.group_total,
+                        r.label,
+                        r.count,
+                        r.chance
+                    )
+                })
+                .collect(),
+            _ => self
+                .quest_supplies()
+                .into_iter()
+                .map(|r| format!("{}  {} ×{}", r.file, r.label, r.count))
+                .collect(),
+        }
+    }
     /// How many monster slots the open .mib really has (id != 0).
     pub fn mib_mob_count(&self) -> usize {
         let mib = &self.mib_bytes;
@@ -5080,14 +6400,17 @@ impl Editor {
     }
 
     /// Push the working copies back into the archive.
+    ///
+    /// By extension, not by the entry the cursor happens to be on. The two
+    /// working copies belong to the .mib and the .gmd of the open archive, and
+    /// the aggregate (クエスト改造) screen edits both of them while its cursor
+    /// sits on a reward table - so an edit made there used to reach the file
+    /// only when the cursor was on the .mib entry. Writing each buffer into the
+    /// entry of its own type is the same write the old body made whenever the
+    /// cursor was in the right place, and it cannot land the .gmd bytes in a
+    /// .rem the way the old `else` branch would have.
     pub fn store_entry(&mut self) {
-        let Some(a) = &mut self.arc else { return };
-        let Some(e) = a.entries.get_mut(self.entry) else { return };
-        if !self.mib_bytes.is_empty() && extension_for(e.type_hash) == Some("mib") {
-            e.data = self.mib_bytes.clone();
-        } else if let Some(g) = &self.gmd {
-            e.data = g.to_bytes();
-        }
+        self.flush_quest_edit();
     }
 
     /// The .mib working bytes (for tests).
@@ -5859,6 +7182,7 @@ impl Editor {
             Screen::Palico => self.input_palico(key),
             Screen::Options => self.input_options(key),
             Screen::Csv => self.input_csv(key),
+            Screen::QuestEdit => self.input_quest_edit(key),
         }
     }
 
@@ -12216,33 +13540,11 @@ impl Editor {
                     self.message = String::from("生バイトの項目です（ここでは編集できません）");
                     return;
                 }
-                let cur = questfields::read_u32(&self.mib_bytes, f.offset, f.kind).unwrap_or(0);
-                let next = if let Some(table) = f.enum_name.and_then(questfields::enum_table) {
-                    let len = table.len() as i64;
-                    if len == 0 {
-                        cur
-                    } else {
-                        let d = if key == Key::Right { 1 } else { -1 };
-                        (((cur as i64 + d) % len + len) % len) as u32
-                    }
-                } else {
-                    let d = if key == Key::Right { 1 } else { -1 } * STEPS[self.step];
-                    let width = match f.kind {
-                        FieldKind::U8 | FieldKind::I8 => 8u32,
-                        FieldKind::U16 | FieldKind::I16 => 16,
-                        _ => 32,
-                    };
-                    let signed = matches!(f.kind, FieldKind::I8 | FieldKind::I16 | FieldKind::I32);
-                    let v = if signed {
-                        let shift = 32 - width;
-                        ((cur << shift) as i32 >> shift) as i64 + d
-                    } else {
-                        cur as i64 + d
-                    };
-                    (v.max(0) as u64 & ((1u64 << width) - 1)) as u32
-                };
-                questfields::write_u32(&mut self.mib_bytes, f.offset, f.kind, next);
-                self.dirty = true;
+                // One implementation of a .mib step (Editor::step_mib_field):
+                // the クエスト改造 screen's 制限時間 row runs the same
+                // arithmetic, so the two can never drift apart.
+                let d = if key == Key::Right { 1 } else { -1 } * STEPS[self.step] as i32;
+                self.step_mib_field(self.mib_cursor, d);
             }
             Key::A => self.request_write_arc(),
             Key::B => {
@@ -13053,6 +14355,19 @@ impl Editor {
                     false,
                     false,
                 );
+            }
+            Screen::QuestEdit => {
+                let heading = self.quest_heading();
+                let tab = self.quest_edit_tab.min(QUEST_TABS - 1);
+                push(
+                    &mut out,
+                    format!("QUEST EDIT  {}  [{}]", heading, QUEST_TAB_LABELS[tab]),
+                    false,
+                    false,
+                );
+                for (i, text) in self.quest_console_rows().into_iter().enumerate() {
+                    push(&mut out, text, true, i == self.quest_edit_cursor);
+                }
             }
             Screen::Charms => {
                 let list = self.charms();

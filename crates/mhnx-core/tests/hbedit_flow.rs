@@ -3731,7 +3731,7 @@ fn the_console_entry_is_labelled_in_the_list() {
 // ===========================================================================
 
 /// Every Screen variant, so the reachability test cannot miss a new one.
-const AUDIT_SCREENS: [Screen; 29] = [
+const AUDIT_SCREENS: [Screen; 30] = [
     Screen::SaveList,
     Screen::Slots,
     Screen::Char,
@@ -3755,6 +3755,7 @@ const AUDIT_SCREENS: [Screen; 29] = [
     Screen::SaveQuests,
     Screen::ArcList,
     Screen::ArcEntries,
+    Screen::QuestEdit,
     Screen::EntryView,
     Screen::Mib,
     Screen::Gmd,
@@ -3808,6 +3809,8 @@ fn audit_screen_name(s: Screen) -> &'static str {
         Screen::Csv => "Csv",
         // Added with the progress screen: awards / requests / quest bits.
         Screen::Progress => "Progress",
+        // Added with クエスト改造: the aggregate quest screen.
+        Screen::QuestEdit => "QuestEdit",
     }
 }
 
@@ -4101,6 +4104,15 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Check);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::ArcEntries);
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::ArcList);
+
+    // クエスト改造 is where the console lands when a quest is picked (the
+    // I/O layer calls this after open_arc_bytes), and its [B] goes back to
+    // the file list, so the screen is reachable and leaves the same way.
+    ed.enter_quest_edit();
+    audit_note(&ed, &mut seen);
+    assert_eq!(ed.screen, Screen::QuestEdit);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::ArcList);
 
@@ -4834,7 +4846,7 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
         .collect();
     assert_eq!(
         arms.len(),
-        29,
+        30,
         "arms: {:?}",
         arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     );
