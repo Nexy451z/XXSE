@@ -1296,7 +1296,7 @@ fn the_console_charm_editor_can_change_the_grade() {
     open_save(&mut ed);
     ed.screen = Screen::Charms;
     ed.cursor = 0;
-    ed.input(Key::Y);
+    ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit);
     let before = ed.charm_edit.expect("editor state");
     assert_eq!(before.field, 3, "the cursor lands on the first skill");
@@ -1348,7 +1348,7 @@ fn the_console_charm_editor_shows_the_allowed_range() {
         .iter()
         .position(|c| c.index == 224)
         .unwrap_or(0);
-    ed.input(Key::Y); // edit
+    ed.input(Key::A); // edit
     assert_eq!(ed.screen, Screen::CharmEdit);
     let text: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
     let joined = text.join("\n");
@@ -1381,7 +1381,7 @@ fn the_console_charm_form_shows_the_kind_ceiling() {
     open_save(&mut ed);
     ed.screen = Screen::Charms;
     ed.cursor = 0;
-    ed.input(Key::Y);
+    ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit);
     let kind = ed.charm_edit.expect("the form is open").kind;
     let limits = mhnx_core::charm::kind_limits(kind).expect("a shipped kind");
@@ -1436,7 +1436,7 @@ fn an_illegal_skill_is_flagged_on_the_console() {
         .iter()
         .position(|c| c.index == 224)
         .unwrap_or(0);
-    ed.input(Key::Y);
+    ed.input(Key::A);
     // Force skill 1 to something the Enduring table forbids: id 1 (Poison)
     // is 0~0 for every talisman type in the sample data.
     if let Some(e) = &mut ed.charm_edit {
@@ -3380,7 +3380,7 @@ fn the_console_shows_the_hunt_records() {
     let joined = lines.join("\n");
     assert!(joined.contains("HUNT RECORDS"), "{}", joined);
     assert!(
-        joined.contains("Rathian") || joined.contains("Rathalos"),
+        joined.contains("リオレイア") || joined.contains("リオレウス"),
         "{}",
         joined
     );
@@ -4272,11 +4272,11 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
     assert_eq!(ed.screen, Screen::Charms);
     assert!(!ed.charms().is_empty(), "the sample has talismans");
 
-    ed.input(Key::Y);
+    ed.input(Key::A);
     assert_eq!(
         ed.screen,
         Screen::CharmEdit,
-        "Y must edit the charm under the cursor"
+        "A must edit the charm under the cursor"
     );
     let seed = ed.charm_edit.expect("the form is open");
     let points0 = seed.points1;
@@ -4415,7 +4415,7 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
         "the sample box holds more than one talisman"
     );
     ed.cursor = 1;
-    ed.input(Key::Y);
+    ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit);
     let second = ed.charm_edit.expect("open");
     assert_ne!(second.index, idx, "the second edit must touch another charm");

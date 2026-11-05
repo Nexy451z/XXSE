@@ -302,7 +302,8 @@ fn the_talisman_list_deletes_on_minus_and_never_on_a_or_y() {
     ed.screen = Screen::Charms;
     ed.cursor = 0;
 
-    // [A] and [Y] open the form; neither of them deletes.
+    // [A] opens the form and deletes nothing. [Y] is the list's search, not a
+    // second route to the form and never a delete: neither of them deletes.
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit, "[A] edits");
     assert_eq!(ed.charms().len(), 1, "nothing was deleted");
@@ -310,9 +311,17 @@ fn the_talisman_list_deletes_on_minus_and_never_on_a_or_y() {
     assert_eq!(ed.screen, Screen::Charms);
     let before = ed.charms().len();
     ed.input(Key::Y);
-    assert_eq!(ed.screen, Screen::CharmEdit, "[Y] edits");
+    assert_eq!(
+        ed.screen,
+        Screen::Charms,
+        "[Y] is the filter key, so the list stays"
+    );
+    assert_eq!(
+        ed.take_text_request().map(|(idx, _)| idx),
+        Some(mhnx_core::hbedit::TEXT_CHARM_FILTER),
+        "[Y] asks for the filter text"
+    );
     assert_eq!(ed.charms().len(), before);
-    ed.input(Key::B);
 
     // [-] is the delete, twice, as one undo step.
     ed.input(Key::Minus);

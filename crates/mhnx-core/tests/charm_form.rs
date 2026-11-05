@@ -69,7 +69,7 @@ fn editor_with_kind(kind: u8) -> Editor {
     ed.save = Some(save);
     ed.screen = Screen::Charms;
     ed.cursor = 0;
-    ed.input(Key::Y); // opens the form on the talisman under the cursor
+    ed.input(Key::A); // opens the form on the talisman under the cursor
     assert_eq!(ed.screen, Screen::CharmEdit, "the form is open");
     ed
 }

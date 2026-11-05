@@ -5299,8 +5299,12 @@ impl Editor {
             // L / R walk the BOX pages of the item box rather than a page of
             // rows: the chip used to say ページ, which reads like a scroll and
             // is not what the key does.
+            // [Y] is the list's own state here: 所持品のみ <-> 空き枠も表示.
+            // The step the [◀/▶] pair uses has no key on this screen any more
+            // (every one of them is taken), so it is the deck's button and the
+            // footer does not promise a key for it.
             Screen::Items => {
-                "[A] 変更  [-] 一括操作  [◀/▶] 個数  [L/R] BOX切替  [Y] 刻み  [R] 数値入力  [X] 保存"
+                "[A] 変更  [-] 一括操作  [◀/▶] 個数  [L/R] BOX切替  [Y] 空き表示  [R] 数値入力  [X] 保存"
             }
             // The three pick lists print the same line: the direction keys are
             // one rule everywhere, and the footer says which is which instead
@@ -5312,7 +5316,9 @@ impl Editor {
                 "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [X] クリア  [B] 戻る"
             }
             // One delete key on every screen: [-] twice.
-            Screen::Charms => "[A] 編集  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存",
+            Screen::Charms => {
+                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存"
+            }
             // Built by the form, not here: see footer_hint.
             Screen::CharmEdit => "",
             Screen::Equip => {
@@ -5372,8 +5378,12 @@ impl Editor {
             Screen::Progress => {
                 "[A] ビット切替  [Y] タブ  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
             }
+            // No [R] in this line: the console answers [R] with the sub-tab,
+            // so the SD write every quest needs is the deck's button
+            // (Editor::request_extract_all_quests) rather than a promise this
+            // key cannot keep.
             Screen::SaveQuests => {
-                "[A] 編集/導入  [Y] 検索  [-] 削除（2回）  [R] SDへ全展開  [L/R] サブタブ  [X] 保存"
+                "[A] 編集/導入  [Y] 検索  [-] 削除（2回）  [L/R] サブタブ  [X] 保存"
             }
             // Screen-specific because every key here does something the other
             // screens do not have: Y installs the file into the open save and
@@ -6852,6 +6862,16 @@ impl Editor {
         }
     }
 
+    /// Ask the I/O layer to write every quest of the save out as a file.
+    ///
+    /// The same request [R] makes on the save's quest list. It is a method of
+    /// its own because the console spends [R] on the sub-tab, so a finger's
+    /// button (and a build without that key) needs one door to the same write.
+    pub fn request_extract_all_quests(&mut self) {
+        self.save_quest_armed = None;
+        self.pending_request = Some(Request::ExtractQuests { ids: Vec::new() });
+    }
+
     /// One press of [-] on the save's quest list: the two-press delete.
     pub fn save_quest_delete_press(&mut self) {
         let list = self.filtered_quests();
@@ -7625,6 +7645,50 @@ impl Editor {
         }
     }
 
+    /// Flip the item box between 所持品のみ and 全枠（空きも表示）.
+    ///
+    /// This is the item box's [Y] and its deck button: both come through here,
+    /// so the count, the cursor and the status line cannot disagree with the
+    /// list. The cursor is clamped into the list the toggle now shows - 2,300
+    /// rows appear when the empty slots do - instead of being thrown back to
+    /// the top, which lost the row the user was looking at on both routes.
+    pub fn toggle_item_show_empty(&mut self) {
+        self.show_empty = !self.show_empty;
+        let n = self.visible_items().len();
+        self.cursor = if n == 0 {
+            0
+        } else {
+            self.cursor.min(n - 1)
+        };
+        self.message = if self.show_empty {
+            alloc::format!(
+                "空き枠も表示します（{} 枠）— 空き枠にも [A] で追加できます",
+                n
+            )
+        } else {
+            alloc::format!("所持品のみ表示（{} 枠）— [Y] で空き枠も表示", n)
+        };
+    }
+
+    /// The item box's heading, with the state that changes what it lists.
+    ///
+    /// Three states, one heading: a search result names the search, the
+    /// 全枠 view has to say that it is showing empty slots - the console drew
+    /// "全枠" there but the toggle behind it was unreachable, so the word was
+    /// the only trace of a state the user could not leave - and the default
+    /// says 所持品. The console prints this line as its list heading; the PC
+    /// build's tab carries the same toggle as a checkbox, so the word has to
+    /// exist in one place rather than in each drawing code.
+    pub fn item_box_heading(&self) -> alloc::string::String {
+        if !self.item_box_filter.trim().is_empty() {
+            alloc::string::String::from("アイテムBOX（検索結果）")
+        } else if self.show_empty {
+            alloc::string::String::from("アイテムBOX（空きも表示）")
+        } else {
+            alloc::string::String::from("アイテムBOX（所持品）")
+        }
+    }
+
     /// Ask the I/O layer for the item box's search text.
     ///
     /// The pill does not filter by itself: the keyboard is the one place text
@@ -7988,19 +8052,23 @@ impl Editor {
                 self.charm_delete_armed = None;
                 self.move_cursor(n, 1);
             }
-            // [A] and [Y] both open the selected talisman's form: [A] is the
-            // button the list advertises and [Y] is the key this screen always
-            // had. Neither of them deletes any more - [A] used to be the
-            // delete key in the console model while [Y] deleted on the console,
-            // which is how the two paths ended up disagreeing.
-            //
-            // The name search is the console's [検索] pill rather than a key:
-            // every key this screen has is spoken for ([-] deletes, [＋]
-            // creates, L/R are the sub-tabs), and the equipment box's [Y] is
-            // the filter only because its [Y] was free.
-            Key::A | Key::Y => {
+            // [A] opens the selected talisman's form. [Y] is the filter, the
+            // same key that filters the equipment box, the three pickers and
+            // the quest list: this screen's filter had no key at all, so its
+            // heading and its status lines already said "[Y] で変更" while [Y]
+            // opened the form. Neither key deletes - [-] does, twice - and the
+            // form has its own [A] in the deck.
+            Key::A => {
                 self.charm_delete_armed = None;
                 self.open_charm_editor(false);
+            }
+            Key::Y => {
+                self.charm_delete_armed = None;
+                self.request_charm_filter();
+                self.message = alloc::format!(
+                    "護石を検索します（{} 件表示中・空にすると解除）",
+                    self.charms().len()
+                );
             }
             // [-] is the one destructive key on every screen, twice. The
             // first press only names the talisman; the second one removes it.
@@ -9139,11 +9207,15 @@ impl Editor {
                     }
                 }
             }
+            // The state machine's own step key. The console never sends it
+            // ([X] is the global save there) and no footer names it any more,
+            // so the deck's 刻み button is the route both builds share.
             Key::X => self.step = (self.step + 1) % STEPS.len(),
-            Key::Y => {
-                self.show_empty = !self.show_empty;
-                self.cursor = 0;
-            }
+            // The item box's one list-shape key: 所持品のみ <-> 全枠. It is a
+            // method of its own because the console's deck has a button that
+            // runs the same thing, and a tap and a press must not be able to
+            // end up in different states.
+            Key::Y => self.toggle_item_show_empty(),
             // R opens the item picker for the slot under the cursor, so the
             // type can be changed by name instead of only the count.
             // Replacing an item is the destructive step here, so it can be
@@ -11264,9 +11336,9 @@ impl Editor {
             // the character rather than a bare 編集.
             Screen::Slots => "キャラを選んで [A] でこのキャラを編集。[◀/▶] で枠、[Y] で一括MAX。",
             Screen::Char => "行を選んで [◀/▶] で変更、[A] で最大。[生データ] でこの画面のバイト。",
-            Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[生データ] でこの画面のバイト。",
+            Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[Y] で空き枠も表示。",
             Screen::ItemPick => "名前で検索して [A] で決定。[B] で元の画面へ。",
-            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[検索] で種類やスキル名を検索できます。",
+            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[Y] で種類やスキル名を検索できます。",
             Screen::CharmEdit => "行ごとに [A] で操作（スキルは一覧）、[◀/▶] で値。[B] で一覧へ。",
             Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を検索できます。",
             Screen::Equip => "装備を選んで [A] で編集、[Y] で名前を検索、[＋] で新規。[生データ] で装備BOXのバイト。",
@@ -14981,11 +15053,10 @@ impl Editor {
             // extract that used to sit here moved to its own button
             // (Editor::request_extract_selected_quest).
             Key::Minus => self.save_quest_delete_press(),
-            // [R] writes every quest of the save out to the card.
-            Key::R => {
-                self.save_quest_armed = None;
-                self.pending_request = Some(Request::ExtractQuests { ids: Vec::new() });
-            }
+            // [R] writes every quest of the save out to the card. The console
+            // cannot send it - [R] is the sub-tab there - so the deck has a
+            // button that calls the same method.
+            Key::R => self.request_extract_all_quests(),
             // 175 quests at 16 rows a page needs a filter.
             Key::Y => {
                 self.pending_text = Some((TEXT_QUEST_FILTER, self.quest_filter.clone()));
@@ -16087,7 +16158,7 @@ impl Editor {
                 push(
                     &mut out,
                     String::from(
-                        "  - delete(2)  A/Y edit  L/+ new  X write save  B back",
+                        "  - delete(2)  A edit  Y search  L/+ new  X write save  B back",
                     ),
                     false,
                     false,

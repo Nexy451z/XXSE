@@ -10,7 +10,7 @@
 //!     +0x60CA   size       (min %, max %) u16     137 x 4 = 548 B
 //! ```
 //!
-//! Index 0 is the first monster (Rathian; names in
+//! Index 0 is the first monster (リオレイア; names in
 //! [`crate::gamedata::MONSTER_HUNT_NAMES`], behind the `gamedata` feature). The
 //! Switch save editor this layout was cross-checked against numbers the same
 //! entries 1..=137 and puts its array bases one entry *before* the first entry,

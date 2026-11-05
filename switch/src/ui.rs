@@ -37,7 +37,13 @@
 //!   - 装備フォームの `[A]` は行ごとの操作（装備名/装飾品を選ぶ・値・書き込み）で、
 //!     行そのものに「▸ 選ぶ / ▸ 書き込み」と出る（`hbedit::EquipFormAction`）。
 //!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `お守り反映`).
-//!   - `Y`: Secondary tool action (`刻み` / `検索` / `装備` / `2段階確認削除`).
+//!   - `Y`: The list key. On every screen whose list can be narrowed it is
+//!     that screen's 検索 (equipment box, talisman list, talisman form, the
+//!     quest list and the three pickers) or `空きも表示` on the item box; on a
+//!     screen with no list it is that screen's own second action and the footer
+//!     names it (刻み on the byte screens, 列切替 on 狩猟記録, 項目切替 on オトモ,
+//!     タブ on マイセット). No screen deletes on `Y`: the two-press delete is
+//!     `[-]` everywhere.
 //!
 //! The words are one vocabulary, not one screen's habit: 検索 opens a name
 //! search everywhere, 刻み is the step size, 削除 removes a record and 解除
@@ -449,10 +455,24 @@ pub enum UiAction {
     /// card. [-] on that screen is the two-press delete now, so the single
     /// extract it used to be moved to a button of its own.
     ExtractSelectedQuest,
+    /// Write every quest of the save out to the card.
+    ///
+    /// This was [R], which the console spends on the sub-tab: the footer
+    /// promised "SDへ全展開" and the press changed tab. The button calls the
+    /// same method the key does in the state machine.
+    ExtractAllQuests,
     /// Switch the hunt list between 記録ありのみ and every monster.
     ToggleHuntShowAll,
     /// Drop the equipment box's name filter and show every record again.
     ClearEquipFilter,
+    /// The item box's 所持品のみ <-> 空きも表示 toggle.
+    ///
+    /// [Y] used to be the step on this screen, which is why the state machine's
+    /// own toggle could not be reached from either the pad or a finger. The key
+    /// and this button now run the same method (hbedit::Editor::
+    /// toggle_item_show_empty), so the list, the count and the heading cannot
+    /// disagree about which state they are in.
+    ToggleItemEmpty,
     InstallArcRow(usize),
     // Built-in OSK
     OskTab(usize),
@@ -1908,7 +1928,7 @@ impl GuiState {
     /// | held [L]       | (repeats the ten-row step)            | —                                 | first hold offers 元に戻す, second hold runs it |
     /// | held [R]       | (repeats the ten-row step)            | —                                 | opens 詳細 |
     /// | [A]            | 決定                                  | the row's own action              | the row's own action (equipment / talisman forms: 選ぶ・書き込み・作成) |
-    /// | [Y]            | 検索 (the keyboard)                    | the mode's own key                | the row's second action / 検索 / 刻み |
+    /// | [Y]            | 検索 (the keyboard)                    | 一覧の表示切替 (item box: 空きも表示) / the mode's own key | 一覧の 検索・表示切替, otherwise the screen's own second action |
     /// | [X]            | クリア／保存 (per screen)              | 保存                              | 保存 (global QuickSave) |
     /// | [－] / [＋]     | 種別 filter / 終了                     | 2-press delete / quit             | the screen's own tool |
     ///
@@ -1954,6 +1974,18 @@ impl GuiState {
             // item box. [L] still moves the sub-tab, and [R] does too on the
             // entries that are not a reward table.
             if key == Key::R && ed.screen == Screen::EntryView && ed.entry_has_numbers() {
+                ed.input(Key::R);
+                return;
+            }
+            // The same job, and the same bug: the guild card and the equipment
+            // form advertise [R] 数値入力 / ID入力 in their own footer, and the
+            // sub-tab rule above swallowed the press - the footer promised a
+            // keyboard and the screen changed instead. The two screens hand [R]
+            // to their state machine, like the reward row above.
+            if key == Key::R
+                && (ed.screen == Screen::EquipEdit
+                    || (ed.screen == Screen::Guild && ed.guild_view() != GUILD_TAB_ARENA))
+            {
                 ed.input(Key::R);
                 return;
             }
@@ -2054,11 +2086,16 @@ impl GuiState {
                     // A opens the Item Picker for the selected slot!
                     ed.input(Key::R);
                 }
+                // [Y] is the list's own state, as the footer promised all
+                // along: 所持品のみ <-> 空きも表示. It used to be the step here,
+                // which left the state machine's toggle unreachable - the one
+                // thing this screen's heading can say that nothing else does.
+                // The step is the deck's button now (every key on this screen
+                // is spoken for: A picks, R types the count, X saves, L undoes,
+                // [-] is the bulk menu, +/- are tools and quit, L/R are the
+                // BOX tabs, ZL/ZR the sidebar).
                 Key::Y if ed.item_menu_open => {}
-                Key::Y => {
-                    ed.step = (ed.step + 1) % STEPS.len();
-                    ed.message = format!("個数の刻みを ±{} に切り替えました", STEPS[ed.step]);
-                }
+                Key::Y => self.apply_action(ed, UiAction::ToggleItemEmpty),
                 // [R] types the count of the selected slot. It used to open the
                 // same picker [A] opens, so nothing was lost by giving it to the
                 // one number on this screen a user would rather type than step.
@@ -2098,9 +2135,10 @@ impl GuiState {
                 Key::Up | Key::Down => ed.input(key),
                 // [A] opens the selected talisman's form (or creates the first
                 // one when the box is empty) and never deletes. [Y] is the
-                // state machine's own and opens the same form, so it falls
-                // through to ed.input below with every other key this layer
-                // does not use.
+                // list's search - the same key as the equipment box, the
+                // quest list and the three pickers - and the state machine
+                // turns it into a keyboard request, so it falls through to
+                // ed.input below like every other key this layer does not use.
                 Key::A => {
                     if ed.charms().is_empty() {
                         ed.input(Key::L);
@@ -2880,8 +2918,10 @@ impl GuiState {
             }
             UiAction::ExtractOfficialArcs => self.wants_extract_official_arcs = true,
             UiAction::ExtractSelectedQuest => ed.request_extract_selected_quest(),
+            UiAction::ExtractAllQuests => ed.request_extract_all_quests(),
             UiAction::ToggleHuntShowAll => ed.toggle_hunt_show_all(),
             UiAction::ClearEquipFilter => ed.apply_equip_filter(String::new()),
+            UiAction::ToggleItemEmpty => ed.toggle_item_show_empty(),
             UiAction::InstallArcRow(idx) => {
                 ed.cursor = idx;
                 self.wants_install_arc_idx = Some(idx);
@@ -4155,11 +4195,19 @@ impl GuiState {
                 self.add_hit(1108, sy, 158, sh, UiAction::CharMaxAll);
             }
             Screen::Items => {
-                let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
+                // The state the heading names, on the key that changes it:
+                // 所持品のみ <-> 空きも表示. The step chip moved into the deck,
+                // because a key for it would have to be taken from one of the
+                // six this screen already uses.
+                let empty_lbl = if ed.show_empty {
+                    String::from("[Y] 空きを隠す")
+                } else {
+                    String::from("[Y] 空きも表示")
+                };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_primary, FontSize::Small);
-                self.add_hit(964, sy, 136, sh, UiAction::SetStep(next_step));
+                btn_text(c, 964, sy, 136, sh, &empty_lbl, t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::ToggleItemEmpty);
 
                 // The bulk edits live in one menu now, so the pill opens it
                 // instead of promising a single *99 that is only one row.
@@ -5827,12 +5875,12 @@ impl GuiState {
                         UiAction::ItemOp(ITEM_OP_CLAMP),
                     );
                     cur_y += 42;
-                    // The last row is two buttons: the add, and the name search.
-                    // The search has no key of its own on this build - [Y] is
-                    // the step, [R] the picker, [X] the save, [-] the menu and
-                    // [L] the undo - so this pill is its route, the same way
-                    // the talisman list opens its search from a pill. One word
-                    // for it: 検索.
+                    // The add, and the name search. The search has no key of
+                    // its own on this build - [Y] is the 空きも表示 toggle,
+                    // [A] the picker, [R] the count, [X] the save, [-] the
+                    // menu and [L] the undo - so this pill is its route, the
+                    // same way it was before the toggle found its key. One
+                    // word for it: 検索.
                     self.draw_tool_button(
                         c,
                         ix + 20,
@@ -5855,6 +5903,36 @@ impl GuiState {
                         36,
                         search_lbl,
                         UiAction::FilterItems,
+                    );
+                    cur_y += 42;
+                    // The two things this screen shows that the pad cannot
+                    // reach: 空きも表示 (the button the review asked for, on the
+                    // same action the [Y] press runs) and the step, which lost
+                    // its key to that toggle.
+                    let empty_lbl = if ed.show_empty {
+                        "[Y] 空きを隠す"
+                    } else {
+                        "[Y] 空きも表示"
+                    };
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        half_w,
+                        36,
+                        empty_lbl,
+                        UiAction::ToggleItemEmpty,
+                    );
+                    let next_step = (ed.step + 1) % STEPS.len();
+                    let step_lbl = format!("刻み ±{}（切替）", STEPS[ed.step]);
+                    self.draw_tool_button(
+                        c,
+                        ix + 28 + half_w,
+                        cur_y,
+                        half_w,
+                        36,
+                        &step_lbl,
+                        UiAction::SetStep(next_step),
                     );
                 }
             }
@@ -6138,6 +6216,18 @@ impl GuiState {
                         38,
                         "選択中のクエストをSDへ展開",
                         UiAction::ExtractSelectedQuest,
+                    );
+                    cur_y += 44;
+                    // The save's whole quest list, one press: the [R] the
+                    // console spends on the sub-tab.
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "セーブ内クエストを全部SDへ展開",
+                        UiAction::ExtractAllQuests,
                     );
                     cur_y += 44;
                     // The pad's two-press delete, reachable by finger too.
@@ -6787,21 +6877,17 @@ impl GuiState {
             ));
         }
 
-        // Three states, one heading: the search result is its own thing, and
-        // the subtitle says what was searched and what it left - the same line
-        // the item picker prints, from the same state machine.
-        let hdr = if !ed.item_box_filter.trim().is_empty() {
-            "アイテムBOX (検索結果)"
-        } else if ed.show_empty {
-            "アイテムBOX (全枠)"
-        } else {
-            "アイテムBOX (所持品)"
-        };
+        // Three states, one heading, and the heading is the state machine's
+        // (hbedit::Editor::item_box_heading) so the PC build prints the same
+        // words: a search result names the search, 空きも表示 says that empty
+        // slots are being shown - the word was on screen even while the state
+        // could not be reached - and the default says 所持品.
+        let hdr = ed.item_box_heading();
         let sub = ed.item_box_search_line(rows.len());
         self.draw_adaptive_rows(
             c,
             ed,
-            hdr,
+            &hdr,
             &sub,
             &rows,
             ed.cursor.min(rows.len().saturating_sub(1)),

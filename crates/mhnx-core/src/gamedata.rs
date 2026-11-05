@@ -515,17 +515,35 @@ pub static PALICO_FORTE: &[&str] = &["Charisma", "Fighting", "Protection", "Assi
 /// C# PalicoTarget (6 entries)
 pub static PALICO_TARGET: &[&str] = &["-----", "Small Only", "Small First", "Balanced", "Big First", "Big Only"];
 
-/// C# PalicoSupportMoves (58 entries)
-pub static PALICO_SUPPORT_MOVES: &[&str] = &["-----", "Herb Horn", "Health Horn", "True Health Horn", "Detox Horn", "Cheer Horn", "Demon Horn", "Armor Horn", "Ultrasonic Horn", "Mini Barrel Bombay", "Barrel Bombay", "Big Barrel Bombay", "Mega Barrel Bombay", "Giga Barrel Bombay", "Bounce Bombay", "Flash Bombay", "Anti-Monster Mine", "Anti-Monster Mine+", "Pitfall Purr-ison", "Shock Purr-ison", "Poison Purr-ision", "Trampoliner", "Vase of Vitality", "Parting Gift", "Emergency Retreat", "Big Boomerangs", "Piercing Boomerangs", "Camoflage", "Weapon Upgrade", "Furr-ious", "Taunt", "Palico Rally", "Dung Bombay", "Go, Fight, Win", "Soothing Roll", "Explosive Roll", "Pilfer", "Plundering", "Felyne Comet", "Claw Dance", "Sumo Stomp", "Chestnut Cannon", "Shock Tripper", "Excavator", "Mega Boomerang", "Rath-of-Meow", "Beast Mode", "Power Roar", "Vase of Recovery", "Purr-Caster", "Diving Attack", "Felyne Cannon", "Wrecking Ball", "Bombing Ride", "Enhanced Horn", "SP Horn", "Acorn Sacrifice", "NULL [57]"];
+/// Names of the 58 support-action slots, in the game's own id order.
+///
+/// Taken from the original Windows editor's `__サポート行動` table, whose keys
+/// are the ids this array is indexed by - the same ids
+/// [`crate::palico::move_name`] is handed. The table tags each row with a
+/// support-tendency letter and a cost (`A回復笛[2]`), so the name is the row
+/// with that mark and the `[cost]` taken off. Slot 57 is the table's blank
+/// row and keeps the `NULL [57]` placeholder this table always had.
+pub static PALICO_SUPPORT_MOVES: &[&str] = &[
+    "-----", "薬草笛", "回復笛", "真・回復笛", "解毒・消臭笛", "応援笛",
+    "鬼人笛", "硬化笛", "超音波笛", "プチタル爆弾", "小タル爆弾", "大タル爆弾",
+    "大タル爆弾Ｇ", "特大タル爆弾", "打上げタル爆弾", "閃光爆弾", "設置型爆弾", "設置型爆弾Ｇ",
+    "落とし穴", "シビレ罠", "毒々落とし穴", "トランポリン", "ネコ式活力壺", "回復贈物",
+    "緊急撤退", "巨大ブーメラン", "貫通ブーメラン", "隠密防御", "武器強化", "憤怒",
+    "挑発", "オトモ鼓舞", "こやし玉", "応援ダンス", "治・ローリング", "爆・ローリング",
+    "ぶんどり", "遠隔ぶんどり", "ネコまっしぐら", "ネコ爪乱舞", "しこ踏みドン", "イガグリ大砲",
+    "電転虫発射", "ココ掘れニャン", "メガブーメラン", "ネコ式火竜車", "ビースト変化", "強化咆哮",
+    "ネコ式回復壺", "モドリ玉", "地中まっしぐら", "設置型砲台", "鉄・転がしニャン", "爆・転がしニャン",
+    "ネコ式広域笛", "ＳＰ笛", "キンダンドングリ", "NULL [57]",
+];
 
 /// C# PalicoSupportMoves1 (20 entries)
-pub static PALICO_SUPPORT_MOVES1: &[&str] = &["-----", "Chestnut Cannon", "Excavator", "Dung Bombay", "Sumo Stomp", "Felyne Comet", "Explosive Roll", "Ultrasonic Horn", "Bounce Bombay", "Shock Tripper", "Parting Gift", "Big Boomerangs", "Barrel Bombay", "Soothing Roll", "Felyne Cannon", "Wrecking Ball", "Enhanced Horn", "Bombing Ride", "Vase of Recovery", "Diving Attack"];
+pub static PALICO_SUPPORT_MOVES1: &[&str] = &["-----", "イガグリ大砲", "ココ掘れニャン", "こやし玉", "しこ踏みドン", "ネコまっしぐら", "爆・ローリング", "超音波笛", "打上げタル爆弾", "電転虫発射", "回復贈物", "巨大ブーメラン", "小タル爆弾", "治・ローリング", "設置型砲台", "鉄・転がしニャン", "ネコ式広域笛", "爆・転がしニャン", "ネコ式回復壺", "地中まっしぐら"];
 
 /// C# PalicoSupportMoves2 (14 entries)
-pub static PALICO_SUPPORT_MOVES2: &[&str] = &["-----", "Trampoliner", "Vase of Vitality", "Claw Dance", "Mega Boomerang", "Big Barrel Bombay", "Detox Horn", "Flash Bombay", "Anti-Monster Mine", "Weapon Upgrade", "Go, Fight, Win", "SP Horn", "Acorn Sacrifice", "Purr-Caster"];
+pub static PALICO_SUPPORT_MOVES2: &[&str] = &["-----", "トランポリン", "ネコ式活力壺", "ネコ爪乱舞", "メガブーメラン", "大タル爆弾", "解毒・消臭笛", "閃光爆弾", "設置型爆弾", "武器強化", "応援ダンス", "ＳＰ笛", "キンダンドングリ", "モドリ玉"];
 
 /// C# PalicoSupportMoves3 (8 entries)
-pub static PALICO_SUPPORT_MOVES3: &[&str] = &["-----", "Health Horn", "Shock Purr-ison", "Rath-of-Meow", "Pilfer", "Pitfall Purr-ison", "Anti-Monster Mine+", "Giga Barrel Bombay"];
+pub static PALICO_SUPPORT_MOVES3: &[&str] = &["-----", "回復笛", "シビレ罠", "ネコ式火竜車", "ぶんどり", "落とし穴", "設置型爆弾Ｇ", "特大タル爆弾"];
 
 /// C# PalicoActionRNG (7 entries)
 pub static PALICO_ACTION_R_N_G: &[&str] = &["000E", "010C", "020B", "030A", "040C", "050B", "060A"];
@@ -557,8 +575,46 @@ pub static PALICO_SKILL_R_N_G: &[&str] = &["000C", "010A", "0209", "0308", "040A
 /// C# PalicoSkillRNGAbbv (9 entries)
 pub static PALICO_SKILL_R_N_G_ABBV: &[&str] = &["CCCCCCCC", "BBCCCC", "BBBCC", "BBBB", "ACCCCC", "ABCCC", "ABBC", "AACC", "AAB"];
 
-/// C# MonsterHuntNames (137 entries)
-pub static MONSTER_HUNT_NAMES: &[&str] = &["Rathian", "Gold Rathian", "Dreadqueen Rathian", "Rathalos", "Silver Rathalos", "Dreadking Rathalos", "Khezu", "Yian Kut-ku", "Gypceros", "Plesioth", "Kirin", "Velocidrome", "Gendrome", "Iodrome", "Cephadrome", "Yian Garuga", "Deadeye Yian Garuga", "Daimyo Hermitaur", "Stonefist Hermitaur", "Shogun Ceanataur", "Blangonga", "Rajang", "Furious Rajang", "Kushala Daora", "Chameleos", "Teostra", "Bulldrome", "Tigrex", "Grimclaw Tigrex", "Akantor", "Lavasioth", "Nargacuga", "Silverwind Nargacuga", "Ukanlos", "Deviljho", "Savage Deviljho", "Uragaan", "Crystalbeard Uragaan", "Lagiacrus", "Royal Ludroth", "Agnaktor", "Alatreon", "Duramboros", "Niblesnarf", "Zinogre", "Thunderlord Zinogre", "Amatsu", "Arzuros", "Redhelm Arzuros", "Lagombi", "Snowbaron Lagombi", "Volvidon", "Brachydios", "Kecha Wacha", "Tetsucabra", "Drilltusk Tetsucabra", "Zamtrios", "Najarala", "Seltas Queen", "Gore Magala", "Shagaru Magala", "Seltas", "Seregios", "Malfestio", "Glavenus", "Hellblade Glavenus", "Astalos", "Mizutsune", "Gammoth", "Nakarkos", "Great Maccao", "Aptonoth", "Apceros", "Kelbi", "Mosswine", "Hornetaur", "Vespoid", "Felyne", "Melynx", "Velociprey", "Genprey", "Ioprey", "Cephalos", "Bullfango", "Popo", "Giaprey", "Anteka", "Remobra", "Hermitaur", "Ceanataur", "Blango", "Rhenophlos", "Bnahabra", "Altaroth", "Jaggi", "Jaggia", "Ludroth", "Uroktor", "Slagtoth", "Gargwa", "Zamite", "Konchu", "Maccao", "Larinoth", "Moofah", "Unknown [105]", "Unknown [106]", "Unknown [107]", "Unknown [108]", "Unknown [109]", "Unknown [110]", "Unknown [111]", "Basarios", "Gravios", "Diablos", "Bloodlust Diablos", "Lao-Shan Lung", "Fatalis", "Crimson Fatalis", "White Fatalis", "Shredclaw Ceanataur", "Congalala", "Giadrome", "Barioth", "Barroth", "Raging Brachydios", "Nerscylla", "Chaotic Gore Magala", "Hazewing Malfestio", "Azurebolt Astalos", "Divinesight Mizutsune", "Frostpeak Gammoth", "Valfalk", "Unknown[133]", "Atlal-ka", "Great Thunderbug", "Conga"];
+/// The 137 monsters of the hunt record, in save order, with their Japanese names.
+///
+/// The order is the save's own. The three hunt arrays are indexed by it, and the
+/// table these names come from carries each monster's offset in them
+/// (`0x5EA6 + 2i` slain, `0x5FB8 + 2i` captured, `0x60CA + 4i` size) - exactly
+/// what [`crate::hunts`] documents - so the alignment is arithmetic, not a guess.
+///
+/// The names are the game's: they are the `名称` column of the decrypted
+/// `MHXX_monster` table of the original Windows save editor (one row per
+/// monster: `id, guild-card order, name, slain offset, capture offset, size
+/// offset`). All 129 real names also occur in the user's own romfs text
+/// (`armorSeriesData_jpn`, `itemData_jpn`, `GC_Title_1_jpn`, ...). The eight
+/// rows that are not a name are the table's own: seven say 不明 (105..111)
+/// and the unused row 133 says "ROBOT", which is not a Japanese name, so that
+/// row keeps the English placeholder it has always had.
+pub static MONSTER_HUNT_NAMES: &[&str] = &[
+    "リオレイア", "リオレイア希少種", "紫毒姫リオレイア", "リオレウス", "リオレウス希少種", "黒炎王リオレウス",
+    "フルフル", "イャンクック", "ゲリョス", "ガノトトス", "キリン", "ドスランポス",
+    "ドスゲネポス", "ドスイーオス", "ドスガレオス", "イャンガルルガ", "隻眼イャンガルルガ", "ダイミョウザザミ",
+    "矛砕ダイミョウザザミ", "ショウグンギザミ", "ドドブランゴ", "ラージャン", "激昂したラージャン", "クシャルダオラ",
+    "オオナズチ", "テオ・テスカトル", "ドスファンゴ", "ティガレックス", "荒鉤爪ティガレックス", "アカムトルム",
+    "ヴォルガノス", "ナルガクルガ", "白疾風ナルガクルガ", "ウカムルバス", "イビルジョー", "怒り喰らうイビルジョー",
+    "ウラガンキン", "宝纏ウラガンキン", "ラギアクルス", "ロアルドロス", "アグナコトル", "アルバトリオン",
+    "ドボルベルク", "ハプルボッカ", "ジンオウガ", "金雷公ジンオウガ", "アマツマガツチ", "アオアシラ",
+    "紅兜アオアシラ", "ウルクスス", "大雪主ウルクスス", "ラングロトラ", "ブラキディオス", "ケチャワチャ",
+    "テツカブラ", "岩穿テツカブラ", "ザボアザギル", "ガララアジャラ", "ゲネル・セルタス", "ゴア・マガラ",
+    "シャガルマガラ", "アルセルタス", "セルレギオス", "ホロロホルル", "ディノバルド", "燼滅刃ディノバルド",
+    "ライゼクス", "タマミツネ", "ガムート", "オストガロア", "ドスマッカォ", "アプトノス",
+    "アプケロス", "ケルビ", "モス", "カンタロス", "ランゴスタ", "アイルー",
+    "メラルー", "ランポス", "ゲネポス", "イーオス", "ガレオス", "ブルファンゴ",
+    "ポポ", "ギアノス", "ガウシカ", "ガブラス", "ヤオザミ", "ガミザミ",
+    "ブランゴ", "リノプロス", "ブナハブラ", "オルタロス", "ジャギィ", "ジャギィノス",
+    "ルドロス", "ウロコトル", "ズワロポス", "ガーグァ", "スクアギル", "クンチュウ",
+    "マッカォ", "リモセトス", "ムーファ", "不明", "不明", "不明",
+    "不明", "不明", "不明", "不明", "バサルモス", "グラビモス",
+    "ディアブロス", "鏖魔ディアブロス", "ラオシャンロン", "ミラボレアス", "ミラボレアス【紅龍】", "ミラボレアス【祖龍】",
+    "鎧裂ショウグンギザミ", "ババコンガ", "ドスギアノス", "ベリオロス", "ボルボロス", "猛り爆ぜるブラキディオス",
+    "ネルスキュラ", "渾沌に呻くゴア・マガラ", "朧隠ホロロホルル", "青電主ライゼクス", "天眼タマミツネ", "銀嶺ガムート",
+    "バルファルク", "Unknown[133]", "アトラル・カ", "大雷光虫", "コンガ",
+];
 
 /// C# IgnoreList (55 entries)
 pub static IGNORE_LIST: &[&str] = &["Furious Rajang", "Savage Deviljho", "Akantor", "Ukanlos", "Amatsu", "Nakarkos", "Alatreon", "Aptonoth", "Apceros", "Kelbi", "Mosswine", "Hornetaur", "Vespoid", "Felyne", "Melynx", "Velociprey", "Genprey", "Ioprey", "Cephalos", "Bullfango", "Popo", "Giaprey", "Anteka", "Remobra", "Hermitaur", "Ceanataur", "Blango", "Rhenophlos", "Bnahabra", "Altaroth", "Jaggi", "Jaggia", "Ludroth", "Uroktor", "Slagtoth", "Gargwa", "Zamite", "Konchu", "Maccao", "Larinoth", "Moofah", "Lao-Shan Lung", "Unknown [105]", "Unknown [106]", "Unknown [107]", "Unknown [108]", "Unknown [109]", "Unknown [110]", "Unknown [111]", "Raging Brachydios", "Chaotic Gore Magala", "Unknown[133]", "Atlal-ka", "Great Thunderbug", "Conga"];

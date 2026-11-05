@@ -52,7 +52,7 @@ fn editor_with_kind(kind: u8, skill2: u8, points2: i8) -> Editor {
     ed.save = Some(save);
     ed.screen = Screen::Charms;
     ed.cursor = 0;
-    ed.input(Key::Y);
+    ed.input(Key::A);
     assert_eq!(ed.screen, Screen::CharmEdit, "the form is open");
     ed
 }

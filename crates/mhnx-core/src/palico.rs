@@ -160,8 +160,9 @@ pub fn skill_name(id: u8) -> String {
 
 /// Name of a support move, or a placeholder.
 ///
-/// The table is the English one the game data bundle carries; a move id past
-/// its end is shown as "#id" rather than guessed at.
+/// The table is the Japanese one the original editor shipped, indexed by the
+/// id the save stores; a move id past its end is shown as "#id" rather than
+/// guessed at.
 pub fn move_name(id: u8) -> String {
     #[cfg(feature = "gamedata")]
     {

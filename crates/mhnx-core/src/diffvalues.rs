@@ -1166,7 +1166,7 @@ mod tests {
         // The monster is named, or numbered when no name table is loaded: the
         // row has to say which monster moved either way.
         assert!(
-            text.contains("狩猟記録 ") && (text.contains("Rathalos") || text.contains("#6")),
+            text.contains("狩猟記録 ") && (text.contains("黒炎王リオレウス") || text.contains("#6")),
             "{}",
             text
         );

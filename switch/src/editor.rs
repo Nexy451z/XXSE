@@ -1050,12 +1050,15 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
 pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static str, &'static str)] {
     use mhnx_core::hbedit::Screen::*;
     match screen {
+        // Every line here is what the console's pad dispatch does, not what
+        // the state machine would do with the same key: L / R are the sub-tabs
+        // on this build (the transform screen is a section of its own) and X is
+        // the global save, so neither can be a screen-local tool.
         SaveList => &[
             ("A", "開く"),
-            ("Y", "クエスト"),
-            ("L", "変換"),
-            ("X", "設定"),
-            ("-", "再読込"),
+            ("Y", "再読込"),
+            ("L/R", "サブタブ"),
+            ("X", "保存"),
             ("+", "終了"),
         ],
         Convert => &[("A", "変換して保存"), ("Y", "名前"), ("B", "戻る")],
@@ -1069,21 +1072,24 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("B", "戻る"),
         ],
         Char => &[
-            ("A", "保存"),
+            ("A", "最大/編集"),
             ("</>", "値を変更"),
-            ("X", "刻み"),
+            ("Y", "刻み"),
             ("-", "狩猟記録"),
-            ("Y", "マイセット"),
+            ("X", "保存"),
             ("B", "戻る"),
         ],
+        // [Y] is the list's own state (所持品のみ <-> 空きも表示) and [A] opens
+        // the picker; the step the arrows use is the deck's button, because
+        // every key on this screen is spoken for.
         Items => &[
-            ("R", "種類を変える"),
+            ("A", "種類変更"),
             ("</>", "個数"),
+            ("R", "数値入力"),
             ("-", "一括操作"),
-            ("X", "刻み"),
             ("Y", "空き表示"),
             ("L", "元に戻す"),
-            ("A", "保存"),
+            ("X", "保存"),
             ("B", "戻る"),
         ],
         // The same three chips on every pick list: the direction keys are one
@@ -1098,11 +1104,15 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("B", "戻る"),
         ],
         // The console's pad dispatch, not the bare state machine: [A] on the
-        // charm list opens the form and [Y] is the two-press delete there.
+        // charm list opens the form, [Y] is the list's search (the same key as
+        // the equipment box and the quest list) and [-] is the two-press
+        // delete. It said [Y] 削除 while [Y] opened the form and [-] deleted:
+        // the one line that named the wrong key on the wrong action.
         Charms => &[
             ("A", "編集"),
-            ("Y", "削除(2回)"),
-            ("-", "新規"),
+            ("Y", "検索"),
+            ("-", "削除(2回)"),
+            ("+", "新規"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1130,8 +1140,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("-", "削除(2回)"),
             ("+", "新規"),
             ("X", "保存"),
-            ("L", "ギルド"),
-            ("R", "オトモ"),
+            ("L/R", "サブタブ"),
             ("B", "戻る"),
         ],
         // [A] is the row's own action (hbedit::EquipFormAction): the three
@@ -1167,12 +1176,15 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("B", "戻る"),
         ],
         QuestEquip => &[("A", "中身を開く/変更"), ("B", "戻る")],
+        // [-] is the two-press delete on every quest list, [Y] the search.
+        // The whole-save SD write is the deck's button, because [R] (its old
+        // key) is the sub-tab on this build.
         SaveQuests => &[
-            ("A", "編集"),
-            ("-", "書き出す"),
-            ("R", "全部"),
+            ("A", "編集/導入"),
+            ("-", "削除(2回)"),
             ("Y", "検索"),
-            ("L", "装備"),
+            ("L/R", "サブタブ"),
+            ("X", "保存"),
             ("B", "戻る"),
         ],
         ArcList => &[("A", "開く"), ("Z", "クエスト追加"), ("X", "セーブ内"), ("Y", "セーブ編集"), ("+", "終了")],
@@ -1200,7 +1212,15 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Mib => &[("</>", "値変更"), ("X", "刻み"), ("A", ".arc 保存"), ("B", "戻る")],
         Gmd => &[("A", "文章編集"), ("X", ".arc 保存"), ("B", "戻る")],
         Check => &[("A", "修正"), ("X", ".arc 保存"), ("B", "戻る")],
-        Hunts => &[("</>", "値"), ("X", "項目"), ("A", "反映"), ("B", "戻る")],
+        Hunts => &[
+            ("</>", "値"),
+            ("Y", "列切替"),
+            ("A", "刻み"),
+            ("R", "数値入力"),
+            ("-", "表示切替"),
+            ("X", "保存"),
+            ("B", "戻る"),
+        ],
         // Minus on the card opens this screen; here the three views are the
         // sub-tabs above, so Y is the second bit of the quest view (seen) and
         // the view key on the other two - the footer names which, per view.
@@ -1208,6 +1228,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         // arena log is the other view of this screen, reached with L / R.
         Guild => &[
             ("</>", "値"),
+            ("R", "数値入力"),
             ("A", "コメント"),
             ("-", "進行状況"),
             ("L/R", "闘技大会"),
@@ -1258,8 +1279,8 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         ],
         Options => &[
             ("</>", "値変更"),
-            ("A", "保存"),
             ("Y", "スナップショット"),
+            ("X", "保存"),
             ("B", "戻る"),
         ],
         // Twice for the apply: it replaces a whole box.
