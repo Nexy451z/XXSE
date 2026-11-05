@@ -143,7 +143,13 @@ const THEME_V1_HORIZON: Theme = Theme {
     accent_danger: rgb(238, 108, 116),
     text_primary: rgb(240, 244, 250),
     text_secondary: rgb(156, 170, 188),
-    text_muted: rgb(106, 118, 136),
+    // The caption ink. At (106,118,136) it measured 3.8-4.0:1 against the guide
+    // and footer bands, under the 4.5:1 AA floor, and it is the colour the one
+    // line a first-time player reads is drawn in. (122,134,154) is 4.97:1 on
+    // this theme's subbar and 5.05:1 on the bento one, so both variants clear
+    // it without the strip growing (a 22px line needs a 26px box, and taking
+    // those 6px off CONTENT_H drops every list from nine rows to eight).
+    text_muted: rgb(122, 134, 154),
     corner_r: 7,
 };
 
@@ -170,7 +176,8 @@ const THEME_V2_BENTO: Theme = Theme {
     accent_danger: rgb(236, 112, 104),
     text_primary: rgb(245, 239, 230),
     text_secondary: rgb(182, 170, 154),
-    text_muted: rgb(128, 116, 104),
+    // Same reason as the horizon theme: 5.0:1 rather than 4.0:1.
+    text_muted: rgb(146, 132, 120),
     corner_r: 10,
 };
 
@@ -213,7 +220,9 @@ const FOOTER_Y: i32 = 668;
 const FOOTER_H: i32 = 52;
 const CONTENT_H: i32 = FOOTER_Y - CONTENT_Y - 8; // 546
 
-/// The [詳細] pill on the sub-tab bar: the one button every screen carries.
+/// The [生データ] / [ファイル] pill on the sub-tab bar: the one button every
+/// screen carries. It is labelled by `Editor::detail_pill_label`, so it says
+/// 生データ where it opens the hex view and ファイル on クエスト改造.
 ///
 /// It sits between the [R] button (which ends at 850 at the widest) and the
 /// screen's own tool pills (which start at 964), so it is in the same band as
@@ -315,7 +324,7 @@ pub fn section_of(screen: Screen) -> MainSection {
             MainSection::PalicoRecord
         }
         // 詳細・ツール: the three screens that read the file rather than the
-        // play. 生データ is the one every record screen's [詳細] lands on.
+        // play. 生データ is the one every record screen's pill lands on.
         Screen::SaveMap | Screen::Csv | Screen::Options => MainSection::Tools,
     }
 }
@@ -360,6 +369,10 @@ pub enum UiAction {
     /// underneath it.
     ModalBlank,
     SelectSlot(usize),
+    /// The slot badge in the header: one tap switches the hunter who is being
+    /// edited, so it asks first. A card on the スロット screen selects a slot
+    /// and changes nothing, so that one is still [UiAction::SelectSlot].
+    SlotBadge(usize),
     GotoSection(MainSection),
     SelectSubTab(usize),
     CycleSection(bool),
@@ -380,6 +393,8 @@ pub enum UiAction {
     QuickSave,
     /// The whole-save undo (L held down, or the footer pill).
     Undo,
+    /// The footer's 終了 pill: the touch route for [＋].
+    Quit,
     /// The save review: A on the dialog.
     CommitReview,
     /// The save review: B on the dialog.
@@ -404,10 +419,17 @@ pub enum UiAction {
     MibPickerClose,
     MibPreset(u8),
     SemPreset(u8),
-    /// クエスト改造 -> the file-by-file screens behind 詳細.
-    QuestDetail,
-    /// The `[詳細]` pill / `R 長押し`: the raw bytes behind this screen.
+    // クエスト改造's file-by-file screens have one door: the [ファイル] pill
+    // (UiAction::OpenDetail, which open_detail routes to open_quest_detail).
+    // The screen used to have three - the pill, a chip on the bar and a row the
+    // list ended with - and they were named two different things.
+    /// The `[生データ]` / `[ファイル]` pill / `R 長押し`: the view behind this screen.
     OpenDetail,
+    /// The talisman list's name search. It has to be an action of its own: that
+    /// screen's keys are all spoken for ([-] deletes, [＋] creates, L/R are the
+    /// sub-tabs), so unlike the equipment box it has no free key to give the
+    /// filter, and the button says [検索] rather than naming one.
+    FilterCharms,
     InstallAllPalicoes,
     TogglePalicoLang,
     ExtractOfficialArcs,
@@ -573,6 +595,10 @@ pub struct GuiState {
     pub pending_snapshot: Option<crate::editor::SnapshotRestore>,
     /// The whole-save undo asked for once, waiting for the second answer.
     undo_press: mhnx_core::confirm::ConfirmPress,
+    /// The header slot badge's tap: the first one only names the slot it would
+    /// switch to. Changing the slot changes whose save every screen is editing,
+    /// which is not something one stray tap may do.
+    slot_press: mhnx_core::confirm::ConfirmPress,
     /// The roster's bulk MAX asked for once, waiting for the second answer.
     roster_max: mhnx_core::confirm::ConfirmPress,
     /// The scrollbar the last frame drew, with the row ids behind it.
@@ -611,6 +637,7 @@ impl GuiState {
             sets_tab: 0,
             pending_snapshot: None,
             undo_press: mhnx_core::confirm::ConfirmPress::new(),
+            slot_press: mhnx_core::confirm::ConfirmPress::new(),
             roster_max: mhnx_core::confirm::ConfirmPress::new(),
             bar: None,
             bar_drag: None,
@@ -1761,7 +1788,7 @@ impl GuiState {
         ed.flush_quest_edit();
         ed.screen = Screen::ArcEntries;
         ed.cursor = ed.entry;
-        ed.message = String::from("詳細: ファイル単位の画面です（[B] でクエスト改造へ戻ります）");
+        ed.message = String::from("ファイル: ファイル単位の画面です（[B] でクエスト改造へ戻ります）");
     }
 
     /// 詳細: the raw bytes behind the screen that is showing.
@@ -1798,7 +1825,7 @@ impl GuiState {
             ed.screen,
             Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
         ) {
-            ed.message = String::from("選択中は詳細を開けません（[B] で戻ってから）");
+            ed.message = String::from("選択中は生データを開けません（[B] で戻ってから）");
             return;
         }
         if ed.save.is_none() {
@@ -2047,11 +2074,12 @@ impl GuiState {
                 // (hbedit::Editor::charm_delete_armed); this layer only moves
                 // the cursor, and that goes through as well.
                 Key::Up | Key::Down => ed.input(key),
-                // [A] and [Y] both open the selected talisman's form; neither of
-                // them deletes. [A] used to create when the box was empty and
-                // [Y] deleted, which is how one screen ended up with two
-                // different meanings for "the button".
-                Key::A | Key::Y => {
+                // [A] opens the selected talisman's form (or creates the first
+                // one when the box is empty) and never deletes. [Y] is the
+                // state machine's own and opens the same form, so it falls
+                // through to ed.input below with every other key this layer
+                // does not use.
+                Key::A => {
                     if ed.charms().is_empty() {
                         ed.input(Key::L);
                     } else {
@@ -2561,16 +2589,48 @@ impl GuiState {
         // they come back to a minute later.
         if !matches!(
             action,
-            UiAction::Undo | UiAction::RosterMaxAll | UiAction::CommitReview | UiAction::CancelReview
+            UiAction::Undo
+                | UiAction::RosterMaxAll
+                | UiAction::CommitReview
+                | UiAction::CancelReview
+                | UiAction::SlotBadge(_)
         ) {
             self.undo_press.clear();
             self.roster_max.clear();
+            // A slot switch offered once is offered for the next tap only: a
+            // card press or any other action takes the offer back, so a badge
+            // tap a minute later cannot switch the hunter on its own.
+            self.slot_press.clear();
         }
         match action {
             UiAction::Key(k) => self.handle_pad_key(ed, k, 0),
             // A tap outside a modal panel: it is here to stop, and stopping is
             // all it does.
             UiAction::ModalBlank => {}
+            // The way out for a finger. It goes through the same two-press
+            // quit as [＋] (hbedit::Editor::press_quit), so a dirty save is
+            // never discarded by one tap either.
+            UiAction::Quit => {
+                ed.press_quit();
+            }
+            UiAction::FilterCharms => {
+                ed.request_charm_filter();
+            }
+            UiAction::SlotBadge(s) => {
+                if s < 3 && s != ed.slot {
+                    if self.slot_press.press() {
+                        // The second tap: switch, through the same path a card
+                        // press takes, so the cursor and the message agree.
+                        self.apply_action(ed, UiAction::SelectSlot(s));
+                    } else {
+                        ed.message = format!(
+                            "もう一度タップすると Slot {} に切り替えます（今は Slot {}）",
+                            s + 1,
+                            ed.slot + 1
+                        );
+                    }
+                }
+            }
             UiAction::SelectSlot(s) => {
                 if s < 3 {
                     ed.slot = s;
@@ -2756,7 +2816,7 @@ impl GuiState {
                     ed.enter_quest_edit();
                 }
             }
-            UiAction::QuestDetail => self.open_quest_detail(ed),
+
             UiAction::OpenDetail => self.open_detail(ed),
             UiAction::OpenMibPicker(field_idx) => {
                 let _ = self.open_mib_picker(ed, field_idx);
@@ -3842,11 +3902,17 @@ impl GuiState {
 
         let mut right = 1262;
         // Not on 生データ itself: the note would advertise the screen that is
-        // already showing.
+        // already showing. It names the pill by the word the pill itself
+        // carries (Editor::detail_pill_label), so the two cannot drift into
+        // "詳細" and "生データ" for the same button.
         if detail_available(ed) && ed.screen != Screen::SaveMap {
-            let note = "[R長押し] 詳細";
-            let nw = c.text_width_sized(note, FontSize::Small);
-            c.text_right(right, GUIDE_Y + 2, note, t.text_muted, FontSize::Small);
+            let word = ed
+                .detail_pill_label()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            let note = format!("[R長押し] {}", word);
+            let nw = c.text_width_sized(&note, FontSize::Small);
+            c.text_right(right, GUIDE_Y + 2, &note, t.text_muted, FontSize::Small);
             right -= nw + 16;
         }
         let room = (right - (MAIN_X + 4)).max(120);
@@ -3935,7 +4001,7 @@ impl GuiState {
         if !second.is_empty() || slot_name.contains('\n') {
             c.text_clipped(slot_x + 10, 26, slot_w - 20, second, t.text_muted, FontSize::Small);
         }
-        self.add_hit(slot_x, 4, slot_w, 40, UiAction::SelectSlot((ed.slot + 1) % 3));
+        self.add_hit(slot_x, 4, slot_w, 40, UiAction::SlotBadge((ed.slot + 1) % 3));
 
         // [X] Save Button
         let save_x = 1116;
@@ -4017,8 +4083,23 @@ impl GuiState {
         };
         c.round_rect(DETAIL_X, sy, DETAIL_W, sh, 5, d_bg);
         c.round_rect_border(DETAIL_X, sy, DETAIL_W, sh, 5, 1, d_bd);
-        btn_text(c, DETAIL_X, sy, DETAIL_W, sh, "[詳細]", d_fg, FontSize::Small);
-        self.add_hit(DETAIL_X, sy, DETAIL_W, sh, UiAction::OpenDetail);
+        btn_text(
+            c,
+            DETAIL_X,
+            sy,
+            DETAIL_W,
+            sh,
+            ed.detail_pill_label(),
+            d_fg,
+            FontSize::Small,
+        );
+        // A dimmed pill takes no tap. It used to be drawn dim and still answer
+        // with a refusal, which is a button that invites a press it means to
+        // turn down: the dimming now *is* the answer, and the guide line says
+        // which screens have the bytes.
+        if detail_here {
+            self.add_hit(DETAIL_X, sy, DETAIL_W, sh, UiAction::OpenDetail);
+        }
 
         // Right side of Sub-Tab Bar: Concise Tool Pills (x = 964..1266)
         self.draw_sub_bar_quick_tools(c, ed, sy, sh);
@@ -4077,13 +4158,19 @@ impl GuiState {
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &chip, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
-
-                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
-                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[詳細] ファイル単位", t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::QuestDetail);
+                // The second pill used to be a third entry point to the file
+                // screens ("[詳細] ファイル単位") beside the [ファイル] pill on
+                // the tab bar and the row the list ends with. One screen with
+                // three doors named two different things is what the review
+                // found; the door that stays is the pill on the bar, because it
+                // is on every tab and every screen already carries it.
             }
             Screen::Charms => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[検索] 絞る", t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::FilterCharms);
+
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
                 btn_text(c, 1108, sy, 158, sh, "[＋] 新規護石", t.text_primary, FontSize::Small);
@@ -4191,6 +4278,64 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, &sem, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::SemPreset(0));
             }
+            // ---- the keys a finger had no way to reach ------------------
+            //
+            // These four are pad-only operations: nothing on screen ran them,
+            // and a touch-only player could not use them at all. Each is one
+            // pill in the deck, and each sends the same Key the pad sends, so
+            // there is one implementation of the action and not two.
+            Screen::Hunts => {
+                // 狩猟記録: [Y] walks the four numbers of a monster.
+                let step_lbl = if HUNT_STEPS[ed.step] < 0 {
+                    String::from("[A] 刻み 反転")
+                } else {
+                    format!("[A] 刻み ±{}", HUNT_STEPS[ed.step])
+                };
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::A));
+
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "[Y] 列切替", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
+            }
+            // 進行状況のクエスト view: [Y] is the second bit (既読). On the
+            // award and request views the same key only walks the three views,
+            // which the tab bar above already does for a finger.
+            Screen::Progress if ed.progress_view() == PROGRESS_QUESTS => {
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "[Y] 既読", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
+            }
+            // 環境設定: [Y] puts the newest snapshot back. It is the only
+            // destructive tool on the screen and the only one a finger had no
+            // route to; the label says 復元 because the review dialog that
+            // follows is the one that spells the rest out.
+            Screen::Options => {
+                c.round_rect(964, sy, 302, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(964, sy, 302, sh, 5, 1, t.accent_primary);
+                btn_text(
+                    c,
+                    964,
+                    sy,
+                    302,
+                    sh,
+                    "[Y] スナップショットへ戻す",
+                    t.text_primary,
+                    FontSize::Small,
+                );
+                self.add_hit(964, sy, 302, sh, UiAction::Key(Key::Y));
+            }
+            // セーブ内クエスト / 公式 / 没: [Y] is the search box.
+            Screen::SaveQuests => {
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, "[Y] 検索", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
+            }
             _ => {}
         }
     }
@@ -4198,11 +4343,11 @@ impl GuiState {
     /// The footer is two lines and only two: the keys on the first, the status
     /// message on the second.
     ///
-    /// Line 1: the whole-save undo pill on the left - both numbers the audit
-    /// asked for, how many steps are left of four and what one step costs, and
-    /// the touch target for it - and the screen's key guide on the right.
-    /// Line 2: the dirty dot, the message, and the one touch rule that is
-    /// invisible until it bites.
+    /// Line 1: the whole-save undo pill on the left (how many steps are left of
+    /// the four, and the two routes that reach it, because it is a tap target
+    /// as well as a key), the 終了 pill on the right, and the screen's key guide
+    /// between them. Line 2: the dirty dot, the message, and the input rules
+    /// that are invisible until they bite - touch, drag and the right stick.
     fn draw_footer(&mut self, c: &mut Canvas, ed: &Editor) {
         let t = theme();
         c.rect(0, FOOTER_Y, 1280, FOOTER_H, t.bg_footer);
@@ -4213,7 +4358,14 @@ impl GuiState {
         // Two holds run the undo (the first one only offers it), so the pill
         // says how many: a single "long press" would be a promise the second
         // hold does not keep.
-        let undo = format!("[L 長押し2回] {}", ed.undo_line());
+        // The pill is a touch target, so its label has to say that a tap runs
+        // it: it used to read "[L 長押し2回]" on the one control a finger was
+        // most likely to press, which is a key name a finger cannot use. The
+        // two routes are the same two presses either way.
+        let undo = format!(
+            "[タップ2回 / L 2回長押し] 元に戻す（{}）",
+            ed.undo_count_text()
+        );
         let undo_w = (c.text_width_sized(&undo, FontSize::Small) + 22).min(470);
         let has_undo = ed.undo_depth() > 0;
         let (undo_bg, undo_fg) = if has_undo {
@@ -4235,7 +4387,26 @@ impl GuiState {
         // drawn over it, which is what a bare right-aligned draw did.
         let hint = ed.footer_hint();
         let hint_left = 14 + undo_w + 12;
-        let hint_room = 1262 - hint_left;
+        // The way out, as a button. [＋] ends the session on every screen, and
+        // it was the one operation a finger could not reach at all: the pad's
+        // key is not on the glass. It sits at the right end of the key line,
+        // where nothing else is drawn, and it runs the same two-press quit the
+        // key does (a dirty save still asks first).
+        let quit_w = 84;
+        let quit_x = 1262 - quit_w;
+        c.round_rect(quit_x, FOOTER_Y + 4, quit_w, 26, 5, t.bg_btn);
+        c.round_rect_border(quit_x, FOOTER_Y + 4, quit_w, 26, 5, 1, t.border_subtle);
+        c.text_centered(
+            quit_x,
+            FOOTER_Y + 8,
+            quit_w,
+            22,
+            "終了",
+            t.text_primary,
+            FontSize::Small,
+        );
+        self.add_hit(quit_x, FOOTER_Y + 2, quit_w, 30, UiAction::Quit);
+        let hint_room = quit_x - 12 - hint_left;
         let hint_w = c.text_width_sized(&hint, FontSize::Small);
         if hint_room > 120 {
             if hint_w <= hint_room {
@@ -4261,8 +4432,12 @@ impl GuiState {
         };
         // Touch has one rule that is invisible until it bites: the first tap
         // only selects a row, the second one runs it. It is printed here rather
-        // than in a help screen nobody opens.
-        let tap_note = "[タップ] 1回=選択・2回=決定  [ドラッグ] スクロール";
+        // than in a help screen nobody opens. The right stick rides along on
+        // this line because the list header could drop it: the header only
+        // draws the note while it fits beside the counter and the filter chip,
+        // so a long heading was enough to hide the only words about the stick.
+        let tap_note =
+            "[タップ] 1回=選択・2回=決定  [ドラッグ] スクロール  [Rスティック] ▲▼=1頁 ◀▶=端";
         let tap_w = c.text_width_sized(tap_note, FontSize::Small);
         c.text_right(1262, FOOTER_Y + 30, tap_note, t.text_muted, FontSize::Small);
         let max_msg_w = (1262 - tap_w - 60).max(160);
@@ -4456,10 +4631,16 @@ impl GuiState {
     /// row's bytes on the right.
     ///
     /// Read-only, so the inspector has no stepper and no value box: the only
-    /// things a press can do on this screen are move the cursor and go back.
-    /// The list is wider than the usual 796 because the hex dump needs the room
-    /// - a 16 byte row is 57 characters, and 57 characters of the small font do
-    /// not fit in the 428px inspector the other screens use.
+    /// things a press can do on this screen are move the cursor and go back -
+    /// and going back is a button as well as [B], because a finger had no way
+    /// out of here at all.
+    ///
+    /// The split is the one every other screen uses (796 / 428). It used to be
+    /// 600 / 626 so a 16 byte hex line would fit whole, which made the
+    /// inspector wider than the list - the one screen whose shape said
+    /// "different program". The dump is cut to 8 bytes a line instead
+    /// (hbedit::rewrap_hex): same bytes, same offsets, in the panel the rest of
+    /// the tool has trained the eye on.
     fn draw_save_map(&mut self, c: &mut Canvas, ed: &Editor) {
         let t = theme();
         let fields = mhnx_core::savemap::fields();
@@ -4486,9 +4667,9 @@ impl GuiState {
         let body_h = FOOTER_Y - body_y - 10;
         const ROW_H: i32 = 50;
         const VIS: usize = 9;
-        let list_w = 600i32;
-        let insp_x = MAIN_X + list_w + 16; // 636
-        let insp_w = 1262 - insp_x; // 626
+        let list_w = V1_LIST_W;
+        let insp_x = V1_INSP_X; // 832
+        let insp_w = V1_INSP_W; // 428
         let start = window_start(ed.map_cursor, total, VIS);
         // The same 40px rule as the wide list: the row's tap area and its
         // right-hand text stop before the bar's touch area.
@@ -4588,6 +4769,27 @@ impl GuiState {
         c.round_rect(insp_x, body_y, insp_w, body_h, t.corner_r, t.bg_panel);
         c.round_rect_border(insp_x, body_y, insp_w, body_h, t.corner_r, 1, t.border_subtle);
 
+        // The way back, drawn before anything that can be missing: this button
+        // belongs to the panel and not to the selected row, so a save whose
+        // rows no longer resolve still offers a way out. [B] did the same
+        // thing, but the screen had no control a finger could press.
+        let back_w = 190;
+        let back_x = insp_x + insp_w - 20 - back_w;
+        let back_y = body_y + body_h - 44;
+        c.round_rect(back_x, back_y, back_w, 34, 5, t.bg_btn);
+        c.round_rect_border(back_x, back_y, back_w, 34, 5, 1, t.border_subtle);
+        btn_text(
+            c,
+            back_x,
+            back_y,
+            back_w,
+            34,
+            "[B] 元の画面へ",
+            t.text_primary,
+            FontSize::Small,
+        );
+        self.add_hit(back_x, back_y, back_w, 34, UiAction::Key(Key::B));
+
         let Some(field) = ed.save_map_field() else {
             c.text_clipped(
                 insp_x + 20,
@@ -4629,8 +4831,10 @@ impl GuiState {
         }
         c.hline(insp_x + 16, body_y + 100, insp_w - 32, t.border_subtle);
 
-        // The dump: 16 bytes a line, at the one size that fits 57 characters.
-        let dump = ed.save_map_dump();
+        // The dump: 8 bytes a line. 16 was what the wider panel could hold;
+        // the inspector here is the standard 428 and 57 characters do not fit
+        // it. The bytes and their offsets are untouched (hbedit::rewrap_hex).
+        let dump = mhnx_core::hbedit::Editor::rewrap_hex(&ed.save_map_dump(), 8);
         if dump.is_empty() {
             c.text_clipped(
                 insp_x + 20,
@@ -4642,7 +4846,8 @@ impl GuiState {
             );
         } else {
             let line_h = c.line_height_sized(FontSize::Small).max(18);
-            let room = (body_h - 124) / line_h.max(1);
+            // The back button owns the bottom 46px of this panel.
+            let room = (body_h - 124 - 46) / line_h.max(1);
             for (i, line) in dump.iter().take(room.max(1) as usize).enumerate() {
                 c.text_clipped(
                     insp_x + 20,
@@ -4654,9 +4859,10 @@ impl GuiState {
                 );
             }
         }
-        c.text_right(
-            insp_x + insp_w - 20,
-            body_y + body_h - 26,
+        c.text_clipped(
+            insp_x + 20,
+            body_y + body_h - 34,
+            back_x - (insp_x + 20) - 12,
             &format!("{} / {} 行", ed.map_cursor + 1, total),
             t.text_muted,
             FontSize::Small,
@@ -4789,23 +4995,11 @@ impl GuiState {
                 right_limit -= chip_w + 14;
             }
         }
-        if total > vis {
-            // Named only where the key does something: a list that fits has no
-            // page to turn, and a key guide that lies is worse than none.
-            let keys = "[Rスティック] 1頁 / 端";
-            let keys_w = c.text_width_sized(keys, FontSize::Small).min(260);
-            if right_limit - keys_w > MAIN_X + 4 + title_w + 18 {
-                c.text_clipped(
-                    right_limit - keys_w,
-                    CONTENT_Y + 3,
-                    keys_w,
-                    keys,
-                    t.text_muted,
-                    FontSize::Small,
-                );
-                right_limit -= keys_w + 14;
-            }
-        }
+        // The right stick's rule is not here any more: it is drawn in the
+        // footer's second line (draw_footer), which is always on screen. Here
+        // it was the first thing squeezed out - the note only drew while it fit
+        // beside the counter and the filter chip - so a long heading was enough
+        // to hide the only words that named the stick.
 
         // The subtitle sits on the same line, right of the title. Screens that
         // have a second fact worth saying at all times (the talisman form's
@@ -6193,9 +6387,25 @@ impl GuiState {
                 t.text_secondary
             };
             c.round_rect(x + 20, btn_y, card_w - 40, 42, 6, btn_bg);
-            btn_text(c, x + 20, btn_y, card_w - 40, 42, "[A] 選択", btn_fg, FontSize::Medium);
+            btn_text(
+                c,
+                x + 20,
+                btn_y,
+                card_w - 40,
+                42,
+                "[A] このキャラを編集",
+                btn_fg,
+                FontSize::Medium,
+            );
 
+            // The whole card selects the slot; the button opens the character.
+            // It had no target of its own, so a press on the one control that
+            // is drawn as a button only moved the highlight under it: the card
+            // and the button answered the same tap with two different promises,
+            // and the drawn one was the false one. Pushed after the card, so
+            // `hits` (searched newest first) finds this one first.
             self.add_hit(x, y, card_w, card_h, UiAction::SelectSlot(s));
+            self.add_hit(x + 20, btn_y, card_w - 40, 42, UiAction::Key(Key::A));
         }
     }
 
@@ -6643,7 +6853,7 @@ impl GuiState {
         self.draw_adaptive_rows(
             c,
             ed,
-            "護石一覧",
+            &ed.charm_filter_heading(),
             "",
             &rows,
             ed.cursor.min(rows.len().saturating_sub(1)),
@@ -9028,6 +9238,17 @@ fn filter_chip(ed: &Editor) -> Option<String> {
                 Some(format!("絞込: {}", needle))
             }
         }
+        // The talisman list's name filter. Its heading carries the needle too
+        // (hbedit::Editor::charm_filter_heading), but the heading is the first
+        // thing clipped on a narrow panel and this chip is not.
+        Screen::Charms => {
+            let needle = ed.charm_filter.trim();
+            if needle.is_empty() {
+                None
+            } else {
+                Some(format!("絞込: {}", needle))
+            }
+        }
         _ => None,
     }
 }
@@ -9066,7 +9287,7 @@ fn bundled_quests_for_tab(
         .collect()
 }
 
-/// The 詳細 row every クエスト改造 tab ends with.
+/// The ファイル row every クエスト改造 tab ends with.
 ///
 /// It is a row, not only a chip, so the pad can reach the file-by-file
 /// screens: the chip on the bar is a one-tap shortcut to the same action,
@@ -9074,10 +9295,10 @@ fn bundled_quests_for_tab(
 fn detail_row(idx: usize) -> (usize, String, String, String, String) {
     (
         idx,
-        String::from("▸ 詳細（ファイル単位の画面へ）"),
-        String::from(".mib / .gmd / .rem / .sup / .sem を個別に開きます"),
+        String::from("▸ ファイル（.mib / .gmd / .rem / .sup / .sem）"),
+        String::from("ファイル単位の画面を開きます（[ファイル] と同じ）"),
         String::from("開く"),
-        String::from("詳細"),
+        String::from("ファイル"),
     )
 }
 

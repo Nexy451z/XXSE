@@ -1343,6 +1343,10 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.apply_equip_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
         ed.apply_jewel_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_CHARM_FILTER {
+        // The talisman list's name filter: an empty answer is the whole box
+        // again, the same rule the equipment box's filter follows.
+        ed.apply_charm_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
         // Through the editor: an empty answer is the whole list again, which is
         // the same rule the item picker's filter follows.
@@ -1615,6 +1619,10 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("装備名か種類で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
             ("装飾品名で絞り込み", 60)
+        } else if idx == mhnx_core::hbedit::TEXT_CHARM_FILTER {
+            // A talisman has no name of its own, so the box says what it will
+            // match: the kind the game calls it and both skill names.
+            ("護石の種類かスキル名で絞り込み", 60)
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
             // Which of the two searches the picker will run: the names when
             // this build has them, the hex ids when it does not. The state

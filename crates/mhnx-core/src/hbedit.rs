@@ -2145,6 +2145,12 @@ pub const TEXT_GUILD_COMMENT: usize = usize::MAX - 1_009;
 pub const TEXT_EQUIP_FILTER: usize = usize::MAX - 5;
 /// Sentinel id for "ask for a decoration name to filter the jewel picker by".
 pub const TEXT_JEWEL_FILTER: usize = usize::MAX - 6;
+/// Sentinel id for "ask for a name to filter the talisman list by".
+///
+/// The talisman box is the one list that had no way to narrow: 188 records and
+/// a cursor. [Y] was a second copy of [A] there (both opened the form), so the
+/// key moved to the search the equipment box already has.
+pub const TEXT_CHARM_FILTER: usize = usize::MAX - 7;
 /// Sentinel id for "ask for the name of the equipment set being edited".
 ///
 /// It has to stay **below** `TEXT_PALICO_NAME`, because the console layer
@@ -4222,6 +4228,11 @@ pub struct Editor {
     pub qe_item_cursor: usize,
     /// The entry the item picker will write to when it is opened from there.
     pub qe_target: crate::dlc::QuestEquipItem,
+    /// Talisman list filter, applied by [Editor::charms].
+    ///
+    /// Empty means every record: the box is 188 rows and a search that cannot
+    /// be cleared is worse than no search at all, so an empty answer clears it.
+    pub charm_filter: String,
     /// Equipment list filter and cursor.
     pub equip_filter: String,
     /// Cursor over the filtered equipment list.
@@ -4510,6 +4521,7 @@ impl Editor {
                 item: 0,
                 count: 0,
             },
+            charm_filter: String::new(),
             equip_filter: String::new(),
             equip_cursor: 0,
             equip_edit: None,
@@ -5081,7 +5093,11 @@ impl Editor {
     fn static_footer(&self) -> &'static str {
         let base = match self.screen {
             Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
-            Screen::Slots => "[◀/▶] 枠選択  [A] 決定  [Y] 一括MAX  [L/R] サブタブ",
+            // [A] opens the character that is highlighted, so the guide names
+            // the character and not a bare 決定: the card's button says the same
+            // words (ui.rs draw_slots) and a touch and a pad press must not read
+            // as two different promises.
+            Screen::Slots => "[◀/▶] 枠選択  [A] このキャラを編集  [Y] 一括MAX  [L/R] サブタブ",
             // Row 0 is the name: ◀ / ▶ opens the keyboard, and the name may hold
             // a line break, which the footer says because no key hints at it.
             Screen::Char => "[◀/▶] 増減（0行目=名前・改行可）  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
@@ -5207,16 +5223,21 @@ impl Editor {
             // that is, [Y] opens the ▸詳細 rows, [A] opens the row's own
             // chooser or keyboard, and 詳細 is a bar button on the console.
             Screen::QuestEdit => {
-                // The last row of every tab is 詳細, so no key is spent on it:
-                // ZR belongs to the sidebar, and the chip on the bar does the
-                // same thing for a finger.
+                // The file screens are reached by the [ファイル] pill on the
+                // touched route and by [R 長押し] on the pad. ZR is the
+                // section key (the console answers it before the editor sees
+                // it), so it cannot be the pad's way in.
                 if self.quest_edit_tab == QUEST_TAB_BASIC {
-                    "[▲/▼] 行  [A] 文字編集  [◀/▶] 制限時間  [L/R] タブ  [最下行] 詳細"
+                    "[▲/▼] 行  [A] 文字編集  [◀/▶] 制限時間  [L/R] タブ  [R長押し] ファイル"
                 } else {
-                    "[▲/▼] 行  [◀/▶] 値  [-] 項目切替  [A] 選択  [Y] 詳細行  [L/R] タブ  [最下行] 詳細"
+                    "[▲/▼] 行  [◀/▶] 値  [-] 項目切替  [A] 選択  [Y] 詳細行  [L/R] タブ  [R長押し] ファイル"
                 }
             }
-            Screen::Convert => "[◀/▶] 値変更  [X] 保存  [B] 戻る",
+            // Conversion is the one screen whose keys are not the usual set:
+            // ◀ / ▶ change nothing, and [X] saves the *open* save rather than
+            // writing the converted file, so a guide that promised both was
+            // three keys wrong on a screen with three working ones.
+            Screen::Convert => "[A] 変換出力  [Y] 出力名変更  [B] 戻る",
             // 生データ: no key writes anything here, so the line says so and
             // names the two that move the cursor and the one that goes back.
             Screen::SaveMap => {
@@ -7506,17 +7527,97 @@ impl Editor {
         self.screen = Screen::Charms;
         self.cursor = 0;
         if self.charms().is_empty() {
-            // One delete key on every screen ([-], twice) means create cannot
-            // be [-]: it is [＋] now, and the line names it so the empty box
-            // cannot send the user at the key that removes a talisman.
-            self.message =
-                String::from("お守りがありません（[＋] で作成 / [A] でも作成できます）");
+            // An empty list has two causes now, and they need different words:
+            // a box with no talisman is created into, a filtered box is cleared.
+            if self.charm_filter.trim().is_empty() {
+                // One delete key on every screen ([-], twice) means create
+                // cannot be [-]: it is [＋] now, and the line names it so the
+                // empty box cannot send the user at the key that removes one.
+                self.message =
+                    String::from("お守りがありません（[＋] で作成 / [A] でも作成できます）");
+            } else {
+                self.message = alloc::format!(
+                    "絞り込み「{}」に一致するお守りがありません（[Y] で変える・空で解除）",
+                    self.charm_filter.trim()
+                );
+            }
         }
     }
 
-    /// The talismans of the current slot.
+    /// The talismans of the current slot, after the filter.
+    ///
+    /// The filter matches the kind the game calls the talisman (龍の護石) and
+    /// both skill names, because that is what a row of this list shows: a
+    /// record has no name of its own, so a search that only looked at "the
+    /// name" would match nothing on every row.
     pub fn charms(&self) -> Vec<Charm> {
-        self.save.as_ref().and_then(|s| s.charms(self.slot)).unwrap_or_default()
+        let all: Vec<Charm> = self
+            .save
+            .as_ref()
+            .and_then(|s| s.charms(self.slot))
+            .unwrap_or_default();
+        let needle = self.charm_filter.trim().to_lowercase();
+        if needle.is_empty() {
+            return all;
+        }
+        let Some(save) = &self.save else {
+            return all;
+        };
+        let slot = self.slot;
+        let hit = |id: u8| {
+            crate::skills::skill_name(id)
+                .map(|n| n.to_lowercase().contains(&needle))
+                .unwrap_or(false)
+        };
+        all.into_iter()
+            .filter(|c| {
+                save.charm_kind_name(slot, c.index)
+                    .map(|k| k.to_lowercase().contains(&needle))
+                    .unwrap_or(false)
+                    || hit(c.skill1)
+                    || hit(c.skill2)
+            })
+            .collect()
+    }
+
+    /// The talisman list's header, with the filter state on it.
+    ///
+    /// A narrowed list that says nothing reads as a box that lost its records;
+    /// the equipment box learned this first (equip_filter_heading).
+    pub fn charm_filter_heading(&self) -> String {
+        let needle = self.charm_filter.trim();
+        if needle.is_empty() {
+            String::from("護石一覧")
+        } else {
+            alloc::format!("護石一覧（絞り込み: {}）[Y] で変更・空で解除", needle)
+        }
+    }
+
+    /// [Y] on the talisman list: ask the I/O layer for a name to filter by.
+    pub fn request_charm_filter(&mut self) {
+        self.pending_text = Some((TEXT_CHARM_FILTER, self.charm_filter.clone()));
+    }
+
+    /// The I/O layer answers a talisman filter request with this.
+    ///
+    /// An empty answer clears the filter. Clearing also drops an armed delete
+    /// and a form, both of which index the list that was on screen.
+    pub fn apply_charm_filter(&mut self, text: String) {
+        let cleared = text.trim().is_empty();
+        self.charm_filter = text;
+        self.charm_cursor = 0;
+        self.cursor = 0;
+        self.charm_delete_armed = None;
+        self.charm_edit = None;
+        self.message = if cleared {
+            String::from("絞り込みを解除しました（全件表示）")
+        } else {
+            alloc::format!(
+                "絞り込み「{}」— {} 件。[Y] で変更、空にすると解除",
+                self.charm_filter.trim(),
+                self.charms().len()
+            )
+        };
     }
 
     /// Open the charm form, either on the selected charm or on a free slot.
@@ -7628,6 +7729,11 @@ impl Editor {
             // had. Neither of them deletes any more - [A] used to be the
             // delete key in the console model while [Y] deleted on the console,
             // which is how the two paths ended up disagreeing.
+            //
+            // The name search is the console's [検索] pill rather than a key:
+            // every key this screen has is spoken for ([-] deletes, [＋]
+            // creates, L/R are the sub-tabs), and the equipment box's [Y] is
+            // the filter only because its [Y] was free.
             Key::A | Key::Y => {
                 self.charm_delete_armed = None;
                 self.open_charm_editor(false);
@@ -8389,8 +8495,11 @@ impl Editor {
             return true;
         }
         self.quit_armed = true;
+        // Both routes to the same offer: the pad's key and the footer's 終了
+        // pill. The message names the key first because every other message on
+        // this line does, and the pill is on screen with the same word.
         self.message = String::from(
-            "未保存の変更があります。もう一度 [＋] で終了します（2回・変更は破棄されます）",
+            "未保存の変更があります。もう一度 [＋]（画面下の [終了]）で終了します（2回・変更は破棄されます）",
         );
         false
     }
@@ -10211,6 +10320,22 @@ impl Editor {
             .or_else(|| rows.iter().position(|f| f.name == name))
     }
 
+    /// The label on the one pill every screen carries (drawn by the console).
+    ///
+    /// The pill opens a read-only view of the bytes - never an editor - so it
+    /// says 生データ rather than 詳細: a button named 詳細 promises a deeper
+    /// edit screen, and a user who presses one and lands on a hex dump learns
+    /// the wrong thing about the tool. クエスト改造 is the one screen whose
+    /// detail is a *file* list rather than a byte view, so there the same pill
+    /// says ファイル (its row list is files, not bytes).
+    pub fn detail_pill_label(&self) -> &'static str {
+        if self.screen == Screen::QuestEdit {
+            "[ファイル]"
+        } else {
+            "[生データ]"
+        }
+    }
+
     /// The row a screen's 詳細 opens on, resolved for one slot.
     pub fn detail_row_for(screen: Screen, slot: usize) -> Option<usize> {
         let name = Self::detail_field_name(screen)?;
@@ -10264,6 +10389,58 @@ impl Editor {
             .unwrap_or_default()
     }
 
+    /// Re-cut a hex dump into `columns` bytes a line.
+    ///
+    /// [crate::savemap] writes 16 bytes a line because that is what its own
+    /// panel holds. 生データ draws the dump in the inspector every other screen
+    /// uses, which is narrower, so the console asks for the same bytes cut at
+    /// 8: the offsets are re-numbered from the line they came from, and a line
+    /// that is not a hex row (the "… ほか N バイト" tail) is passed through
+    /// untouched. Pure string work, so it is pinned here rather than in the
+    /// drawing code where no test can reach it.
+    pub fn rewrap_hex(lines: &[String], columns: usize) -> Vec<String> {
+        let columns = columns.clamp(1, 32);
+        let mut out: Vec<String> = Vec::with_capacity(lines.len() + lines.len() / 2);
+        for line in lines {
+            let mut tokens = line.split_whitespace();
+            let head = match tokens.next() {
+                Some(h) => h,
+                None => {
+                    out.push(line.clone());
+                    continue;
+                }
+            };
+            let is_hex = |s: &str| s.len() == 2 && s.chars().all(|c| c.is_ascii_hexdigit());
+            if head.len() != 6 || !head.chars().all(|c| c.is_ascii_hexdigit()) {
+                out.push(line.clone());
+                continue;
+            }
+            let bytes: Vec<&str> = tokens.collect();
+            if bytes.is_empty() || !bytes.iter().all(|b| is_hex(b)) {
+                out.push(line.clone());
+                continue;
+            }
+            let Ok(base) = usize::from_str_radix(head, 16) else {
+                out.push(line.clone());
+                continue;
+            };
+            let mut at = 0usize;
+            while at < bytes.len() {
+                let n = columns.min(bytes.len() - at);
+                let mut s = format!("{:06X}  ", base + at);
+                for (i, b) in bytes[at..at + n].iter().enumerate() {
+                    if i > 0 {
+                        s.push(' ');
+                    }
+                    s.push_str(b);
+                }
+                out.push(s);
+                at += n;
+            }
+        }
+        out
+    }
+
     /// The line the 生データ screen prints about the row under the cursor:
     /// where it lives, how long it is and what the table calls it.
     pub fn save_map_meta(&self) -> String {
@@ -10311,10 +10488,10 @@ impl Editor {
         self.map_cursor = pos;
         self.message = match self.save_map_field() {
             Some(f) => alloc::format!(
-                "詳細: {} の生データです（[▲/▼] 行 / [B] で戻る・読み取り専用）",
+                "生データ: {} の領域です（[▲/▼] 行 / [B] か下のボタンで戻る・読み取り専用）",
                 f.name
             ),
-            None => String::from("詳細: 生データを表示できません（セーブを開いてください）"),
+            None => String::from("生データを表示できません（セーブを開いてください）"),
         };
     }
 
@@ -10358,7 +10535,7 @@ impl Editor {
             }
             Key::B => {
                 self.screen = self.map_return;
-                self.message = String::from("詳細から戻りました");
+                self.message = String::from("生データから戻りました");
             }
             _ => {}
         }
@@ -10374,36 +10551,41 @@ impl Editor {
     pub fn screen_guide(&self) -> &'static str {
         match self.screen {
             Screen::SaveList => "セーブを選んで [A] で開きます。[Y] でカードを読み直します。",
-            Screen::Slots => "キャラを選んで [A] で編集。[◀/▶] で枠、[Y] で一括MAX。",
-            Screen::Char => "行を選んで [◀/▶] で変更、[A] で最大。[詳細] で生データ。",
-            Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[詳細] で生データ。",
+            // The card's [A] button and this line say the same words: the
+            // highlighted slot is the one the edit opens, so the guide names
+            // the character rather than a bare 編集.
+            Screen::Slots => "キャラを選んで [A] でこのキャラを編集。[◀/▶] で枠、[Y] で一括MAX。",
+            Screen::Char => "行を選んで [◀/▶] で変更、[A] で最大。[生データ] でこの画面のバイト。",
+            Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[生データ] でこの画面のバイト。",
             Screen::ItemPick => "名前で絞って [A] で決定。[B] で元の画面へ。",
-            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[詳細] で生データ。",
+            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[検索] で種類やスキル名から絞れます。",
             Screen::CharmEdit => "行ごとに [A] で操作（スキルは一覧）、[◀/▶] で値。[B] で一覧へ。",
             Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を絞れます。",
-            Screen::Equip => "装備を選んで [A] で編集、[＋] で新規。[詳細] で装備BOXの生データ。",
+            Screen::Equip => "装備を選んで [A] で編集、[Y] で名前を絞る、[＋] で新規。[生データ] で装備BOXのバイト。",
             Screen::EquipEdit => "行ごとに [A] で選択、[◀/▶] で10件/値。[B] で一覧へ。",
             Screen::JewelPick => "装飾品を選んで [A] で決定。[Y] で名前を絞れます。",
             Screen::EquipPick => "装備を名前で選んで [A] で決定。[-] で種別を切り替え。",
             Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
             Screen::Hunts => "狩猟記録の行を選んで [◀/▶] で増減。[Y] で項目切替。",
-            Screen::Guild => "ギルドカードの行を [◀/▶] で変更、[-] で進行状況。[詳細] で生データ。",
-            Screen::Progress => "[A] でビットを切替、[L/R] でビット列を切替。[詳細] で生データ。",
+            Screen::Guild => "ギルドカードの行を [◀/▶] で変更、[-] で進行状況。[生データ] でこの画面のバイト。",
+            Screen::Progress => "[A] でビットを切替、[L/R] でビット列を切替。[生データ] でこの画面のバイト。",
             Screen::Roster => "オトモを選んで [A] で名前、[-] で装備、[＋] でスキル。",
             Screen::Palico => "配信オトモを選んで [A] で導入/解除、[Y] で全導入。",
-            Screen::Convert => "3DS と Switch の形式を変換して保存します。[A] で実行。",
-            Screen::Options => "設定の行を [◀/▶] で変更、[A] で保存。[詳細] で生データ。",
+            // Only three keys answer here, so the line names those three and
+            // nothing else: [X] saves the open save, not the converted file.
+            Screen::Convert => "3DS と Switch の形式を変換します。[A] で変換出力、[Y] で出力名、[B] で戻る。",
+            Screen::Options => "設定の行を [◀/▶] で変更、[A] で保存、[Y] で直近スナップショットへ戻す。",
             Screen::Csv => "CSV を選んで [A] で適用（2回）、[Y] で書き出し。",
             Screen::SaveQuests => "クエストを選んで [A] で改造、[-] で書き出し。[L/R] で一覧切替。",
             Screen::QuestEquip => "固定装備の枠を [A] で開いて編集します。",
-            Screen::QuestEdit => "4つのタブでクエストを作ります。[詳細] でファイル単位の画面へ。",
+            Screen::QuestEdit => "4つのタブでクエストを作ります。[ファイル] でファイル単位の画面へ。",
             Screen::ArcList => ".arc を選んで [A] で開きます。[Y] でセーブへ導入、[-] で書き出し。",
             Screen::ArcEntries => "クエストの構成ファイルです。[A] で中身、[L/R] でタブ切替。",
             Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み幅。",
             Screen::Mib => "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。",
             Screen::Gmd => "クエストの文章です。[A] でテキスト編集、[X] で保存。",
             Screen::Check => "クエストの検査結果です。[A] で直せる項目を修正します。",
-            Screen::SaveMap => "生データ（セーブマップ）です。読み取り専用で、[B] で元の画面へ。",
+            Screen::SaveMap => "生データ（セーブマップ）です。読み取り専用で、[B] か下のボタンで元の画面へ。",
         }
     }
 
@@ -18786,11 +18968,14 @@ mod tests {
             );
         }
         // The guide of the two screens the task quotes names the two facts a
-        // newcomer needs: the first key, and where 詳細 is.
+        // newcomer needs: the first key, and where the bytes behind the screen
+        // are. The pill is called 生データ because that is what it opens - a
+        // read-only hex view, not a deeper editor - so the guide uses that
+        // word too (Editor::detail_pill_label).
         ed.screen = Screen::Equip;
         let guide = ed.screen_guide();
         assert!(guide.contains("[A]"), "{}", guide);
-        assert!(guide.contains("詳細"), "{}", guide);
+        assert!(guide.contains("[生データ]"), "{}", guide);
         ed.screen = Screen::SaveMap;
         assert!(ed.screen_guide().contains("読み取り専用"));
     }
@@ -19092,11 +19277,12 @@ mod tests {
 
     #[test]
     fn no_row_and_no_value_reach_the_bars_touch_area() {
-        // The three panels that draw a bar: the 796px list, the 600px save map
-        // and the 912px picker. Each row draws its value right aligned at
-        // text_right and its tap area from row_right, so the arithmetic is the
-        // same check on all three - and the check is the one the console's
-        // geometry uses.
+        // The three panels that draw a bar: the 796px list (生データ uses it too
+        // since the screen moved to the standard split), the narrower 600px
+        // panel the same model is asked to lay out, and the 912px picker. Each
+        // row draws its value right aligned at text_right and its tap area from
+        // row_right, so the arithmetic is the same check on all three - and the
+        // check is the one the console's geometry uses.
         for (panel_x, panel_w, row_x) in [(20, 796, 28), (20, 600, 28), (184, 912, 192)] {
             let track = scroll_track(panel_x, panel_w);
             // The row's tap area stops exactly at the bar's zone.
@@ -19150,5 +19336,172 @@ mod tests {
         }
         assert!(NameTarget::Hunter.spec().multiline);
         assert!(!NameSpec::singleline(60).multiline);
+    }
+
+    // -----------------------------------------------------------------------
+    // The discovery review: the words on screen and the keys behind them
+    // -----------------------------------------------------------------------
+
+    /// 形式変換 answers three keys. The footer named two that do nothing there
+    /// (◀ / ▶) and one that saves the *open* save rather than the converted
+    /// file ([X]), which is the worst kind of guide: a key that appears to
+    /// work and silently does something else.
+    #[test]
+    fn the_convert_screen_names_only_the_keys_it_answers() {
+        let mut ed = Editor::new();
+        ed.screen = Screen::Convert;
+        let hint = ed.footer_hint();
+        for key in ["[A] 変換出力", "[Y] 出力名変更", "[B] 戻る"] {
+            assert!(hint.contains(key), "{key} is missing from {hint}");
+        }
+        for wrong in ["[◀/▶] 値変更", "[X] 保存"] {
+            assert!(!hint.contains(wrong), "{wrong} is on a screen that ignores it");
+        }
+        // The guide says the same three things, in the same words.
+        let guide = ed.screen_guide();
+        assert!(guide.contains("変換出力"), "{guide}");
+        assert!(guide.contains("出力名"), "{guide}");
+        assert!(!guide.contains("[X]"), "{guide}");
+    }
+
+    /// The slot card's button opens the character under it, so both the card's
+    /// button and the guide have to name the character - "決定" read like a
+    /// cursor move and the button underneath did exactly nothing.
+    #[test]
+    fn the_slot_card_promises_the_character_a_opens() {
+        let mut ed = Editor::new();
+        ed.screen = Screen::Slots;
+        assert!(ed.screen_guide().contains("[A] でこのキャラを編集"), "{}", ed.screen_guide());
+        assert!(ed.footer_hint().contains("[A] このキャラを編集"), "{}", ed.footer_hint());
+    }
+
+    /// The pill is named for the screen it opens: 生データ is a read-only byte
+    /// view, and クエスト改造's is a list of files, not of bytes.
+    #[test]
+    fn the_pill_is_named_for_the_view_behind_it() {
+        let mut ed = Editor::new();
+        ed.screen = Screen::Char;
+        assert_eq!(ed.detail_pill_label(), "[生データ]");
+        ed.screen = Screen::Charms;
+        assert_eq!(ed.detail_pill_label(), "[生データ]");
+        ed.screen = Screen::QuestEdit;
+        assert_eq!(ed.detail_pill_label(), "[ファイル]");
+        ed.screen = Screen::SaveMap;
+        assert_eq!(ed.detail_pill_label(), "[生データ]");
+        // No guide on any screen advertises the old name for the same pill.
+        for screen in [
+            Screen::Char,
+            Screen::Items,
+            Screen::Charms,
+            Screen::Equip,
+            Screen::Hunts,
+            Screen::Guild,
+            Screen::Progress,
+            Screen::Options,
+            Screen::QuestEdit,
+            Screen::Slots,
+            Screen::Convert,
+            Screen::SaveMap,
+        ] {
+            ed.screen = screen;
+            assert!(
+                !ed.screen_guide().contains("[詳細]"),
+                "{} still says [詳細]",
+                ed.screen_guide()
+            );
+        }
+    }
+
+    /// The hex dump is re-cut for the inspector it is drawn in: same bytes,
+    /// same offsets, eight to a line instead of sixteen.
+    #[test]
+    fn a_hex_line_is_recut_for_the_inspector_it_is_drawn_in() {
+        let wide = alloc::vec![
+            String::from("000000  00 11 22 33 44 55 66 77 88 99 AA BB CC DD EE FF"),
+            String::from("000010  0F 1E 2D 3C"),
+            String::from("… ほか 12 バイト"),
+        ];
+        let cut = Editor::rewrap_hex(&wide, 8);
+        // Two 8 byte halves, the short row, and the tail passed through.
+        assert_eq!(cut.len(), 4, "{:?}", cut);
+        assert_eq!(cut[0], "000000  00 11 22 33 44 55 66 77");
+        assert_eq!(cut[1], "000008  88 99 AA BB CC DD EE FF");
+        assert_eq!(cut[2], "000010  0F 1E 2D 3C");
+        assert_eq!(cut[3], "… ほか 12 バイト");
+        // Every byte survives the cut, and the offsets keep counting.
+        let bytes = |s: &str| s.split_whitespace().skip(1).count();
+        assert_eq!(bytes(&cut[0]) + bytes(&cut[1]), 16);
+        assert_eq!(bytes(&cut[2]), 4);
+        // Sixteen is the identity: the wide form is what savemap already emits.
+        assert_eq!(Editor::rewrap_hex(&wide[..2], 16), wide[..2]);
+    }
+
+    /// The talisman list can be narrowed by the name the game calls the kind or
+    /// either skill, and an empty answer is the whole box again. Its heading
+    /// says the filter is on: a narrowed list that says nothing reads as a box
+    /// that lost its records.
+    #[test]
+    fn the_talisman_list_can_be_narrowed_and_an_empty_answer_clears_it() {
+        use crate::charm;
+        let mut save = crate::save::empty_switch_save();
+        save.set_slot_used(0, true);
+        // Two talismans of the same kind with different skills.
+        for (slot, first, second) in [(0usize, 74u8, 70u8), (1, 1, 0)] {
+            let mut r = [0u8; charm::CHARM_RECORD];
+            r[0x00] = 0x06;
+            r[0x02] = 10;
+            r[0x0C] = first;
+            r[0x0D] = second;
+            r[0x0E] = 6;
+            r[0x0F] = 10;
+            r[0x10] = 3;
+            r[0x12] = 100;
+            r[0x13] = 1;
+            let at = slot * charm::CHARM_RECORD;
+            let box_ = save.equipment_box_mut(0).expect("the box exists");
+            box_[at..at + charm::CHARM_RECORD].copy_from_slice(&r);
+        }
+        let mut ed = Editor::new();
+        ed.slot = 0;
+        ed.save = Some(save);
+        ed.screen = Screen::Charms;
+        assert_eq!(ed.charms().len(), 2, "both talismans before the search");
+        assert_eq!(ed.charm_filter_heading(), "護石一覧");
+
+        // The second talisman's first skill, by the name the list prints.
+        let needle = crate::skills::skill_name(1).expect("a named skill");
+        assert_ne!(needle, crate::skills::skill_name(74).expect("a named skill"));
+        ed.apply_charm_filter(String::from(needle));
+        let hits = ed.charms();
+        assert_eq!(hits.len(), 1, "only the talisman that carries {needle}");
+        assert_eq!(hits[0].index, 1, "the second box record");
+        assert!(ed.charm_filter_heading().contains("絞り込み"), "{}", ed.charm_filter_heading());
+        assert_eq!(ed.cursor, 0, "the cursor goes back to the top of the new list");
+
+        // An empty answer is the whole box again, and says so.
+        ed.apply_charm_filter(String::new());
+        assert_eq!(ed.charms().len(), 2);
+        assert_eq!(ed.charm_filter_heading(), "護石一覧");
+        assert!(ed.message.contains("解除"), "{}", ed.message);
+
+        // A name nothing carries is an empty list, not an unfiltered one.
+        ed.apply_charm_filter(String::from("そんな護石はない"));
+        assert!(ed.charms().is_empty());
+        assert!(ed.message.contains("件"), "{}", ed.message);
+    }
+
+    /// The talisman search is asked for by the console's [検索] pill (there is
+    /// no free key on that screen), and the request the editor hands back is
+    /// the one the keyboard answers.
+    #[test]
+    fn the_talisman_search_is_a_request_the_keyboard_answers() {
+        let mut ed = Editor::new();
+        ed.screen = Screen::Charms;
+        ed.request_charm_filter();
+        assert_eq!(
+            ed.take_text_request().map(|(id, _)| id),
+            Some(TEXT_CHARM_FILTER),
+            "the pill asks the I/O layer, it does not filter by itself"
+        );
     }
 }

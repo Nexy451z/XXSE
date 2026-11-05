@@ -271,12 +271,12 @@ impl Tab {
                 "キャラ名・所持金・HR をここで直せます。分からないときは右下の [詳細]"
             }
             Tab::Items => {
-                "アイテムを選んで数を変えます（CSV は一覧の下）。分からないときは右下の [詳細]"
+                "アイテムを選んで数を変えます（CSV は一覧の上）。分からないときは右下の [詳細]"
             }
             Tab::Charm => "お守りを選ぶとスキルとスロットを編集できます。分からないときは右下の [詳細]",
             Tab::Equip => "装備を選ぶと右の欄で編集できます。分からないときは右下の [詳細]",
             Tab::QuestWork => {
-                "クエストを名前で選んで編集します。分からないときは右上の [詳細]（ファイル単位）"
+                "クエストを名前で選んで編集します。分からないときは右下の [詳細]（ファイル単位）"
             }
             Tab::Palico => "オトモを選んでレベル・スキルを編集できます。分からないときは右下の [詳細]",
             Tab::Sets => "アイテムセットと装備セットを呼び出す・保存できます。分からないときは右下の [詳細]",
@@ -435,6 +435,35 @@ struct SaveMapRow {
     /// The 現在値 column: [mhnx_core::savemap::value_text], or why there is
     /// none for this save.
     value: String,
+}
+
+/// Japanese name of one of the fifteen guild card weapon kinds.
+///
+/// The card's own table (`mhnx_core::gamedata::HUNT_WEAPONS`) is English, and
+/// the ギルド tab printed it beside Japanese headings: one screen, two
+/// languages, on the same row. `equip::type_name` already names the same
+/// weapons in Japanese for the 装備 tab, so the card uses those words, in the
+/// card's own order.
+pub fn weapon_kind_name(index: usize) -> &'static str {
+    /// The card's order, as equipment types (equip::type_name).
+    const KINDS: [&str; 15] = [
+        "大剣",                  // Great Sword
+        "片手剣",                // Sword and Shield
+        "ハンマー",              // Hammer
+        "ランス",                // Lance
+        "ヘビィボウガン",        // Heavy Bowgun
+        "ライトボウガン",        // Light Bowgun
+        "太刀",                  // Longsword
+        "スラッシュアックス",    // Switch Axe
+        "ガンランス",            // Gunlance
+        "弓",                    // Bow
+        "双剣",                  // Dual Blades
+        "狩猟笛",                // Hunting Horn
+        "操虫棍",                // Insect Glaive
+        "チャージアックス",      // Charge Blade
+        "ニャンター",            // Prowler
+    ];
+    KINDS.get(index).copied().unwrap_or("?")
 }
 
 /// `n` with thousands separators, for the save map's 長さ column.
@@ -969,6 +998,52 @@ impl ProgressSection {
     }
 }
 
+/// Which section of the ギルド tab is on screen.
+///
+/// The tab used to stack all six sections vertically, which put 闘技大会 and the
+/// received-card list below the window on a 740 point screen: the sections are
+/// one row of buttons now, the way 進行状況 already worked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GuildSection {
+    /// 名前・ハンターランク・コメント and the arena summary line.
+    #[default]
+    Basic,
+    /// 武器使用数.
+    Weapons,
+    /// 称号.
+    Titles,
+    /// クエスト履歴.
+    History,
+    /// The kept and received cards.
+    Cards,
+    /// 闘技大会の記録.
+    Arena,
+}
+
+impl GuildSection {
+    /// The six sections in the order the bar draws them.
+    pub const ALL: [GuildSection; 6] = [
+        GuildSection::Basic,
+        GuildSection::Weapons,
+        GuildSection::Titles,
+        GuildSection::History,
+        GuildSection::Cards,
+        GuildSection::Arena,
+    ];
+
+    /// The label on its button.
+    pub fn label(self) -> &'static str {
+        match self {
+            GuildSection::Basic => "基本",
+            GuildSection::Weapons => "武器使用数",
+            GuildSection::Titles => "称号",
+            GuildSection::History => "履歴",
+            GuildSection::Cards => "カード一覧",
+            GuildSection::Arena => "闘技大会",
+        }
+    }
+}
+
 /// One step of the 進行状況 undo stack.
 ///
 /// All three sections change bits inside fixed, known ranges of a character
@@ -1381,6 +1456,11 @@ pub struct MhnxEditor {
     /// frame, so the cursor lands there once and a later frame does not take
     /// the focus back from wherever the user clicked.
     pub focus_filter: bool,
+    /// Set by Ctrl+F together with [MhnxEditor::focus_filter] and answered
+    /// after the frame drew: the line under the window says the cursor moved
+    /// only when a filter box really took it, instead of announcing a move on
+    /// a screen that has no box at all.
+    pub filter_focus_pending: bool,
 
     // ---- progress (進行状況) ----
     /// romfs folder the user typed or picked. Nothing is read from it until
@@ -1400,6 +1480,15 @@ pub struct MhnxEditor {
     pub progress_section: ProgressSection,
     /// Undo steps of the three sections, newest last.
     pub progress_undo: Vec<ProgressUndo>,
+    /// Which ギルド section is on screen.
+    pub guild_section: GuildSection,
+    /// Text filter of the ギルド card list (name, id, rank).
+    pub guild_filter: String,
+    /// Text filter of the 進行状況 section on screen (award / request / quest
+    /// name, or a number).
+    pub progress_filter: String,
+    /// Text filter of the 変更一覧 table.
+    pub review_filter: String,
     /// Text filter of the request list.
     pub request_filter: String,
     /// Text filter of the quest list.
@@ -1419,8 +1508,13 @@ pub struct MhnxEditor {
     /// record box. Cleared when another row is picked.
     pub detail_focus: Option<DetailFocus>,
     /// The screen the `詳細` button was pressed on, so the tool screen can
-    /// offer the way back. Cleared as soon as the bar is used to change screen.
+    /// offer the way back. A screen opened from the bar keeps the screen the
+    /// bar left, so the same button is there on both routes.
     pub detail_return: Option<Tab>,
+    /// Row of [MhnxEditor::detail_rows_for] the bottom-right `詳細` control
+    /// opens, when the screen holds more than one. Reset when the screen
+    /// changes, so each one starts at its own first row.
+    pub detail_pick: usize,
 
     // ---- database (データベース) ----
     /// The tables last read out of the romfs folder, in file name order.
@@ -1471,9 +1565,12 @@ pub struct MhnxEditor {
 impl Default for MhnxEditor {
     fn default() -> Self {
         MhnxEditor {
-            // クエスト改造 is the way in: a quest is chosen by name, and the
-            // file-by-file screen is one 詳細 button away.
-            tab: Tab::QuestWork,
+            // キャラ is the way in: it is the one edit screen that says what to
+            // do with no save, and the クエスト改造 screen (which opened here
+            // first) needs either a save or an .arc before it has anything to
+            // show. A window that opened on an empty list under "一覧から選べ"
+            // was the first thing a new user saw.
+            tab: Tab::Save,
             status: String::new(),
             message: String::new(),
             save_path: None,
@@ -1607,12 +1704,17 @@ impl Default for MhnxEditor {
             snapshots: Vec::new(),
             compare: None,
             focus_filter: false,
+            filter_focus_pending: false,
             romfs_path: String::new(),
             romfs_status: String::new(),
             romfs_dir: None,
             award_names: Vec::new(),
             request_names: Vec::new(),
             request_records: Vec::new(),
+            guild_section: GuildSection::default(),
+            guild_filter: String::new(),
+            progress_filter: String::new(),
+            review_filter: String::new(),
             progress_section: ProgressSection::default(),
             progress_undo: Vec::new(),
             request_filter: String::new(),
@@ -1622,6 +1724,7 @@ impl Default for MhnxEditor {
             savemap_selected: None,
             detail_focus: None,
             detail_return: None,
+            detail_pick: 0,
             show_tools: false,
             db_tables: Vec::new(),
             db_selected: None,
@@ -3751,6 +3854,9 @@ impl eframe::App for MhnxEditor {
             if self.tab == Tab::QuestWork {
                 self.qw_rows_stale = true;
             }
+            // 詳細 opens the row the screen starts on: a choice made on one
+            // screen must not follow the user to the next.
+            self.detail_pick = 0;
             self.shown_tab = Some(self.tab);
         }
         // The keyboard shortcuts, in one place: Ctrl+S / Ctrl+O / Ctrl+Z /
@@ -3808,7 +3914,10 @@ impl eframe::App for MhnxEditor {
         });
 
         // A Ctrl+F request the tab did not consume (an empty list draws no
-        // filter at all) must not take the focus on some later frame.
+        // filter at all) must not take the focus on some later frame. The
+        // answer is written first, because the flag is what tells it whether a
+        // box really took the focus.
+        self.settle_filter_focus();
         self.focus_filter = false;
         self.drive_screenshot(ctx);
     }
@@ -3884,8 +3993,8 @@ impl MhnxEditor {
     const SHORTCUTS: &'static [(&'static str, &'static str)] = &[
         ("Ctrl+S", "上書き保存"),
         ("Ctrl+O", "セーブを開く"),
-        ("Ctrl+Z", "元に戻す"),
-        ("Ctrl+Shift+Z", "やり直す"),
+        ("Ctrl+Z", "元に戻す（セーブ全体）"),
+        ("Ctrl+Shift+Z", "やり直す（セーブ全体）"),
         ("Ctrl+F", "現在のタブの絞り込みへ"),
     ];
 
@@ -3909,9 +4018,11 @@ impl MhnxEditor {
                 | Tab::Charm
                 | Tab::Equip
                 | Tab::Hunts
+                | Tab::Guild
                 | Tab::Progress
                 | Tab::Palico
                 | Tab::SaveMap
+                | Tab::Review
                 | Tab::Database
         )
     }
@@ -3980,7 +4091,26 @@ impl MhnxEditor {
             return;
         }
         self.focus_filter = true;
-        self.message = String::from("絞り込み欄へ移動しました（Ctrl+F）");
+        self.filter_focus_pending = true;
+    }
+
+    /// What Ctrl+F actually did, said after the frame drew.
+    ///
+    /// [MhnxEditor::focus_filter] is cleared by the filter box that takes it, so
+    /// a flag still set here means no box was drawn: an empty list draws none,
+    /// and a screen without one never had a box to move to. The old wording
+    /// said "移動しました" before anything had been drawn, which was false on
+    /// every one of those screens.
+    fn settle_filter_focus(&mut self) {
+        if !self.filter_focus_pending {
+            return;
+        }
+        self.filter_focus_pending = false;
+        self.message = if self.focus_filter {
+            String::from("この画面にはいまフォーカスできる絞り込み欄がありません（一覧が空か、欄のない画面です）")
+        } else {
+            String::from("絞り込み欄へ移動しました（Ctrl+F）")
+        };
     }
 
     /// One tab's filter box, with the Ctrl+F request applied when it is set.
@@ -4018,7 +4148,11 @@ impl MhnxEditor {
                     self.pick_and_open_save();
                 }
                 let has_save = self.save.is_some();
-                if ui.add_enabled(has_save, egui::Button::new("上書き保存")).clicked() {
+                if ui
+                    .add_enabled(has_save, egui::Button::new("上書き保存"))
+                    .on_hover_text("Ctrl+S")
+                    .clicked()
+                {
                     if let Some(p) = self.save_path.clone() {
                         self.write_current(p);
                     }
@@ -4063,8 +4197,11 @@ impl MhnxEditor {
                     ),
                     None => String::from("戻せる操作がありません（Ctrl+Z）"),
                 };
+                // Named in full: the item tab has an undo of its own, and two
+                // buttons called 元に戻す on one window made the reader guess
+                // which one takes back what.
                 if ui
-                    .add_enabled(depth > 0, egui::Button::new("元に戻す"))
+                    .add_enabled(depth > 0, egui::Button::new("元に戻す（セーブ全体）"))
                     .on_hover_text(hover)
                     .clicked()
                 {
@@ -4087,7 +4224,7 @@ impl MhnxEditor {
                     None => String::from("やり直せる操作がありません（Ctrl+Shift+Z / Ctrl+Y）"),
                 };
                 if ui
-                    .add_enabled(redo_depth > 0, egui::Button::new("やり直す"))
+                    .add_enabled(redo_depth > 0, egui::Button::new("やり直す（セーブ全体）"))
                     .on_hover_text(redo_hover)
                     .clicked()
                 {
@@ -4204,6 +4341,7 @@ impl MhnxEditor {
             let opened = self.tab;
             // The first layer: an ordinary session never leaves this row.
             ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(TabShelf::Everyday.heading()).weak().small());
                 for tab in TabShelf::Everyday.tabs() {
                     self.shelf_tab(ui, *tab);
                 }
@@ -4229,11 +4367,22 @@ impl MhnxEditor {
                 if ui
                     .selectable_label(on_tools, label)
                     .on_hover_text(
-                        "セーブマップ・変更一覧・データベースなど、生のバイトを扱う画面を開きます",
+                        "セーブマップ・変更一覧・データベースなど、生のバイトを扱う画面を開きます（もう一度押すと畳みます）",
                     )
                     .clicked()
                 {
-                    self.show_tools = !tools_open;
+                    if tools_open {
+                        // Folding the shelf while standing on one of its
+                        // screens used to be a no-op: the open screen kept the
+                        // shelf open. The way back is taken first, so the fold
+                        // is what it says.
+                        if on_tools {
+                            self.go_back();
+                        }
+                        self.show_tools = false;
+                    } else {
+                        self.show_tools = true;
+                    }
                 }
                 if self.save.is_none() {
                     ui.label(
@@ -4251,12 +4400,20 @@ impl MhnxEditor {
                     }
                 });
             }
-            // A click on the bar is a different route from the 詳細 button: the
-            // way back and the record that button landed on belong to that
-            // route, so using the bar drops both.
+            // A click on the bar is a different route from the 詳細 button, but
+            // it still leaves somewhere to go back to: the screen the user was
+            // on. The record a 詳細 button landed on belongs to that button, so
+            // it is dropped either way.
             if self.tab != opened {
-                self.detail_return = None;
                 self.detail_focus = None;
+                self.detail_pick = 0;
+                self.detail_return = if self.tab.shelf() == TabShelf::Tools
+                    && opened.shelf() != TabShelf::Tools
+                {
+                    Some(opened)
+                } else {
+                    None
+                };
             }
         });
     }
@@ -4274,81 +4431,203 @@ impl MhnxEditor {
         });
     }
 
-    /// The line above every screen: what the screen is for, and the `詳細`
-    /// button that goes to the bytes behind it.
+    /// The line above every screen: the way back on the left, what the screen
+    /// is for beside it.
     ///
-    /// Returns true when the button moved the editor to another screen, so the
-    /// caller skips this frame's body: the next frame draws the screen that was
-    /// opened, and drawing the old body underneath it would show the wrong
-    /// screen for a moment.
+    /// The `詳細` button is not on this line any more. It sits at the bottom
+    /// right of the window ([MhnxEditor::detail_control]) so the sentence
+    /// "右下の [詳細]" is true on every screen and at every scroll position; it
+    /// used to sit at the top right while ten guide lines sent the reader to
+    /// the bottom right.
+    ///
+    /// Returns true when the way back moved the editor, so the caller skips
+    /// this frame's body: the next frame draws the screen that was opened, and
+    /// drawing the old body underneath it would show the wrong screen for a
+    /// moment.
     fn screen_header(&mut self, ui: &mut egui::Ui) -> bool {
         let tab = self.tab;
-        let mut jump: Option<DetailJump> = None;
         let mut back = false;
-        ui.horizontal(|ui| {
-            // Laid out from the right first: the button keeps its place
-            // whatever the length of the sentence beside it.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                match self.detail_jump_for(tab) {
-                    Some(target) => {
-                        let enabled = self.save.is_some();
-                        let what = target.field.unwrap_or(tab.label(self.lang));
-                        let hover = if enabled {
-                            format!("この画面の生データを開きます（セーブマップの「{}」）", what)
-                        } else {
-                            String::from("セーブを開くと詳細へ飛べます")
-                        };
-                        if ui
-                            .add_enabled(
-                                enabled,
-                                egui::Button::new(egui::RichText::new("詳細").small()),
-                            )
-                            .on_hover_text(hover)
-                            .clicked()
-                        {
-                            jump = Some(target);
-                        }
-                    }
-                    // A tool screen opened from a 詳細 button gets the way back
-                    // on the same line. One opened from the bar has nothing to
-                    // go back to, so it shows no button at all.
-                    None => {
-                        if let Some(origin) = self.detail_return {
-                            if tab.shelf() == TabShelf::Tools && tab != Tab::Quest {
-                                let label = format!("← {} へ戻る", origin.label(self.lang));
-                                if ui
-                                    .small_button(label)
-                                    .on_hover_text("詳細を開く前の画面へ戻ります")
-                                    .clicked()
-                                {
-                                    back = true;
-                                }
-                            }
-                        }
-                    }
+        ui.horizontal_wrapped(|ui| {
+            // Left first: 戻る keeps the top-left corner whatever the sentence
+            // beside it says, and a tool screen opened from the bar has one
+            // just like a tool screen opened by a 詳細 button.
+            if let Some(origin) = self.back_target() {
+                let label = format!("← {} へ戻る", origin.label(self.lang));
+                if ui
+                    .add(egui::Button::new(label))
+                    .on_hover_text("左上の「戻る」: この画面を開く前の画面へ戻ります")
+                    .clicked()
+                {
+                    back = true;
                 }
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    let guide = tab.guide();
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(guide).weak().small()).truncate(),
-                    )
-                    .on_hover_text(guide);
-                });
-            });
+                ui.separator();
+            }
+            // The guide in the reading size and wrapped. At 11px, weak and
+            // truncated it was a caption nobody could read, on the one line
+            // that says how the screen works.
+            let guide = self.guide_text(tab);
+            ui.add(egui::Label::new(egui::RichText::new(guide)).wrap());
         });
-        if let Some(target) = jump {
-            self.open_detail(target);
+        if back {
+            self.go_back();
             return true;
         }
-        if back {
-            if let Some(origin) = self.detail_return.take() {
-                self.tab = origin;
-                self.detail_focus = None;
-                self.message = format!("{} に戻りました", origin.label(self.lang));
-                return true;
+        false
+    }
+
+    /// The guide line, with the state the screen is in appended.
+    ///
+    /// The screens whose guide already names 左上の「戻る」 keep it; the rest of
+    /// the tool shelf gets the destination named, because which screen 戻る
+    /// goes to depends on the route that opened it.
+    pub fn guide_text(&self, tab: Tab) -> String {
+        let mut text = String::from(tab.guide());
+        if let Some(origin) = self.back_target() {
+            if !text.contains("戻る") {
+                text.push_str(&format!(
+                    "。左上の「戻る」で「{}」へ",
+                    origin.label(self.lang)
+                ));
             }
         }
-        false
+        text
+    }
+
+    /// Where the top-left `戻る` goes, or `None` on a screen the bar opens
+    /// directly.
+    ///
+    /// A tool screen always has one: a 詳細 button leaves the screen it was
+    /// pressed on in [MhnxEditor::detail_return], a click on the bar leaves the
+    /// screen the user came from there, and クエスト（ファイル） is the 詳細 of
+    /// クエスト改造, so it goes back to it.
+    pub fn back_target(&self) -> Option<Tab> {
+        if self.tab.shelf() != TabShelf::Tools {
+            return None;
+        }
+        if self.tab == Tab::Quest {
+            return Some(Tab::QuestWork);
+        }
+        Some(self.detail_return.unwrap_or(Tab::Save))
+    }
+
+    /// The top-left `戻る`.
+    fn go_back(&mut self) {
+        let Some(origin) = self.back_target() else {
+            return;
+        };
+        if self.tab == Tab::Quest {
+            self.back_to_quest_work();
+        } else {
+            self.tab = origin;
+            self.detail_focus = None;
+        }
+        self.message = format!("{} に戻りました", origin.label(self.lang));
+    }
+
+    /// The `詳細` control, in the bottom-right corner of the window.
+    ///
+    /// It lives in the bottom bar rather than in the screen header so that the
+    /// place the guide names is the place it stays. Screens whose bytes are
+    /// several rows offer the row as a choice ([MhnxEditor::detail_rows_for]);
+    /// a screen that is itself the bytes shows nothing.
+    fn detail_control(&mut self, ui: &mut egui::Ui) {
+        let tab = self.tab;
+        if tab == Tab::QuestWork {
+            // The file-by-file screen is this screen's 詳細, so it is the same
+            // control with the same place, not a second small button inside
+            // the header.
+            let enabled = self.arc.is_some();
+            let resp = ui.add_enabled(
+                enabled,
+                egui::Button::new("詳細（ファイル単位の編集を開く）"),
+            );
+            let resp = if enabled {
+                resp.on_hover_text("クエストのファイルを 1 つずつ編集する画面へ（上級者向け）")
+            } else {
+                resp.on_hover_text("クエストを開くと使えます")
+            };
+            if resp.clicked() {
+                self.open_quest_detail();
+            }
+            return;
+        }
+        let rows = Self::detail_rows_for(tab);
+        let Some(jump) = self.detail_jump_for(tab) else {
+            return;
+        };
+        if rows.len() > 1 {
+            let pick = self.detail_pick.min(rows.len() - 1);
+            let mut chosen = pick;
+            egui::ComboBox::from_id_salt("detailrow")
+                .width(180.0)
+                .selected_text(rows[pick])
+                .show_ui(ui, |ui| {
+                    for (i, name) in rows.iter().enumerate() {
+                        ui.selectable_value(&mut chosen, i, *name);
+                    }
+                });
+            self.detail_pick = chosen;
+        }
+        let what = jump.field.unwrap_or(tab.label(self.lang));
+        let enabled = self.save.is_some();
+        // The guide line above every screen sends the reader to 右下の [詳細],
+        // so the button keeps that word and adds what it does: a bare 詳細 said
+        // neither where it goes nor what it shows.
+        let resp = ui
+            .add_enabled(enabled, egui::Button::new("詳細（生データを見る）"))
+            .on_hover_text(if enabled {
+                format!("この画面の生データをバイトで開きます（セーブマップの「{}」）", what)
+            } else {
+                String::from("セーブを開くと詳細へ飛べます")
+            });
+        if resp.clicked() {
+            if let Some(target) = self.detail_jump_for(tab) {
+                self.open_detail(target);
+            }
+        }
+    }
+
+    /// Rows of the save map that hold a screen's bytes.
+    ///
+    /// One entry for most screens. The ones whose screen is several sections -
+    /// マイセット (item sets / equipment sets / pouch), 設定/オトモ (the body
+    /// options and the two shout-out lists) and 狩猟記録 (slain / captured /
+    /// size) - list all of them, and the bottom-right control offers the choice
+    /// instead of naming one row and leaving the others unfindable.
+    pub fn detail_rows_for(tab: Tab) -> &'static [&'static str] {
+        match tab {
+            Tab::Save => &["名前"],
+            Tab::Items => &["アイテムボックス"],
+            Tab::Charm => &["護石"],
+            Tab::Equip => &["装備ボックス"],
+            Tab::Palico => &["オトモ"],
+            Tab::Sets => &["アイテムマイセット", "装備マイセット", "ポーチ"],
+            Tab::Extras => &[
+                "画面の明るさ",
+                "振動",
+                "定型文（手動）",
+                "定型文（自動）",
+                "DLC オトモ（共通プール）",
+            ],
+            Tab::Dlc => &["DLC クエスト（205 枠）"],
+            Tab::Hunts => &["狩猟記録（討伐）", "狩猟記録（捕獲）", "狩猟記録（サイズ）"],
+            // 進行状況 and ギルド depend on the section / list on screen, so
+            // their row is worked out in detail_jump_for rather than listed.
+            _ => &[],
+        }
+    }
+
+    /// The record inside the row that the screen had selected, so a jump lands
+    /// where the list was rather than at the top of a 2,000 record box.
+    fn detail_record_for(&self, tab: Tab) -> Option<usize> {
+        match tab {
+            Tab::Charm => Some(self.charm_index),
+            Tab::Equip => self.equip_selected,
+            Tab::Palico => self.palico_selected,
+            Tab::Sets => self.item_set_selected,
+            Tab::Guild => self.card_selected,
+            _ => None,
+        }
     }
 
     /// Where a screen's `詳細` button goes, or `None` for a screen that is
@@ -4365,38 +4644,41 @@ impl MhnxEditor {
             field: Some(field),
             record,
         };
+        // 進行状況 and ギルド name the row of the section that is on screen,
+        // so neither of them is a fixed list.
         match tab {
-            Tab::Save => Some(row("名前", None)),
-            Tab::Items => Some(row("アイテムボックス", None)),
-            Tab::Charm => Some(row("護石", Some(self.charm_index))),
-            Tab::Equip => Some(row("装備ボックス", self.equip_selected)),
-            Tab::Palico => Some(row("オトモ", self.palico_selected)),
-            Tab::Sets => Some(row("アイテムマイセット", self.item_set_selected)),
-            Tab::Dlc => Some(row("DLC クエスト（205 枠）", None)),
-            Tab::Hunts => Some(row("狩猟記録（討伐）", None)),
-            Tab::Guild => Some(match self.card_selected {
-                Some(card) => row(
-                    match self.card_list {
-                        mhnx_core::guildcard::CardList::Stored => "受信カード（保存 100 枚）",
-                        mhnx_core::guildcard::CardList::Inbox => "受信カード（受信箱 50 枚）",
+            Tab::Progress => {
+                return Some(row(
+                    match self.progress_section {
+                        ProgressSection::Awards => "勲章（解禁マップ）",
+                        ProgressSection::Requests => "依頼フラグ",
+                        ProgressSection::Quests => "クエスト（クリア）",
                     },
-                    Some(card),
-                ),
-                None => row("ギルドカード", None),
-            }),
-            Tab::Progress => Some(row(
-                match self.progress_section {
-                    ProgressSection::Awards => "勲章（解禁マップ）",
-                    ProgressSection::Requests => "依頼フラグ",
-                    ProgressSection::Quests => "クエスト（クリア）",
-                },
-                None,
-            )),
-            Tab::Extras => Some(row("画面の明るさ", None)),
-            // クエスト改造 and クエスト carry their own 詳細 / 戻る in their
-            // headers, and the tool screens are the destination.
-            _ => None,
+                    None,
+                ))
+            }
+            Tab::Guild => {
+                return Some(match self.card_selected {
+                    Some(card) => row(
+                        match self.card_list {
+                            mhnx_core::guildcard::CardList::Stored => "受信カード（保存 100 枚）",
+                            mhnx_core::guildcard::CardList::Inbox => "受信カード（受信箱 50 枚）",
+                        },
+                        Some(card),
+                    ),
+                    None => row("ギルドカード", None),
+                })
+            }
+            _ => {}
         }
+        let rows = Self::detail_rows_for(tab);
+        if rows.is_empty() {
+            // クエスト改造 and クエスト carry their own 詳細 / 戻る, and the
+            // tool screens are the destination.
+            return None;
+        }
+        let pick = self.detail_pick.min(rows.len() - 1);
+        Some(row(rows[pick], self.detail_record_for(tab)))
     }
 
     /// The `詳細` button: leave this screen for the tool that shows its bytes.
@@ -4526,19 +4808,32 @@ impl MhnxEditor {
                                 ui.label("本体サイズ");
                                 ui.label(format!("{} B", s.body().len()));
                                 ui.end_row();
-                                ui.label("DLC セクション");
-                                ui.label(format!("0x{:X}", s.dlc_section_offset()));
-                                ui.end_row();
-                                for (i, b) in s.slot_bases().iter().enumerate() {
-                                    ui.label(format!("スロット{} 基点", i + 1));
-                                    ui.label(format!("0x{:X} ({})", b, b));
+                            });
+                            // The raw offsets are what a bug report needs and
+                            // what an ordinary edit does not: folded away, so
+                            // the panel starts with what the save is rather
+                            // than with where its bytes sit.
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new("オフセット（生バイトの位置）").weak(),
+                            )
+                            .id_salt("saveoffsets")
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                egui::Grid::new("saveoffsets").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+                                    ui.label("DLC セクション");
+                                    ui.label(format!("0x{:X}", s.dlc_section_offset()));
                                     ui.end_row();
-                                }
-                                ui.label("ヘッダ +0x14");
-                                ui.label(format!("0x{:08X}", u32::from_le_bytes([
-                                    s.header()[0x14], s.header()[0x15], s.header()[0x16], s.header()[0x17]
-                                ])));
-                                ui.end_row();
+                                    for (i, b) in s.slot_bases().iter().enumerate() {
+                                        ui.label(format!("スロット{} 基点", i + 1));
+                                        ui.label(format!("0x{:X} ({})", b, b));
+                                        ui.end_row();
+                                    }
+                                    ui.label("ヘッダ +0x14");
+                                    ui.label(format!("0x{:08X}", u32::from_le_bytes([
+                                        s.header()[0x14], s.header()[0x15], s.header()[0x16], s.header()[0x17]
+                                    ])));
+                                    ui.end_row();
+                                });
                             });
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("保存スロット").strong());
@@ -4830,11 +5125,16 @@ impl MhnxEditor {
                 ui.horizontal_wrapped(|ui| {
                     for choice in mhnx_core::strings::LANGS {
                         // A language is named in itself: an English reader has
-                        // to find "English" without reading Japanese.
-                        if ui
-                            .selectable_label(lang == *choice, choice.label())
-                            .clicked()
-                        {
+                        // to find "English" without reading Japanese. The
+                        // suffix is the honest part: only the item tab reads the
+                        // catalogue, and a label that just said "English" read
+                        // as a promise the window does not keep.
+                        let label = if *choice == Lang::Ja {
+                            String::from(choice.label())
+                        } else {
+                            format!("{}（一部のみ / partial）", choice.label())
+                        };
+                        if ui.selectable_label(lang == *choice, label).clicked() {
                             language = Some(*choice);
                         }
                     }
@@ -5001,6 +5301,13 @@ impl MhnxEditor {
             if !self.status.is_empty() {
                 ui.label(egui::RichText::new(self.status.clone()).weak().small());
             }
+            // The 詳細 control, at the bottom right of the window: the one
+            // place it is drawn, and the place every guide line names.
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.detail_control(ui);
+                });
+            });
         });
     }
 
@@ -5098,7 +5405,42 @@ impl MhnxEditor {
 
     fn tab_save(&mut self, ui: &mut egui::Ui) {
         if self.save.is_none() {
-            ui.centered_and_justified(|ui| ui.label("左上の「セーブを開く」から system ファイルを選んでください"));
+            // The screen the window opens on, so its empty state is the way in:
+            // a sentence pointing at a button elsewhere was the first thing a
+            // first-run user had to work out.
+            let mut open = false;
+            ui.add_space(ui.available_height() * 0.22);
+            ui.vertical_centered(|ui| {
+                ui.heading("セーブが開かれていません");
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Switch は system / system_backup（4,726,188 バイト）、3DS は system（4,726,152 バイト）を選びます。",
+                    )
+                    .weak(),
+                );
+                ui.add_space(16.0);
+                if ui
+                    .add_sized(
+                        [280.0, 46.0],
+                        egui::Button::new(egui::RichText::new("セーブを開く").heading()),
+                    )
+                    .on_hover_text("Ctrl+O でも開けます")
+                    .clicked()
+                {
+                    open = true;
+                }
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(
+                        "開くと、左の欄にスロットとセーブ情報が出て、上のタブが使えるようになります。",
+                    )
+                    .weak(),
+                );
+            });
+            if open {
+                self.pick_and_open_save();
+            }
             return;
         }
         ui.heading(format!("キャラクター スロット {}", self.slot + 1));
@@ -6181,8 +6523,12 @@ impl MhnxEditor {
             .sense(egui::Sense::click())
             .column(Column::exact(70.0))
             .column(Column::exact(80.0))
-            .column(Column::remainder())
-            .column(Column::exact(90.0));
+            // The name column used to take every spare point, which pushed
+            // 個数 to the far right of a wide window - the two things the row
+            // is read for sat at opposite ends of the screen.
+            .column(Column::initial(340.0).at_least(180.0).clip(true))
+            .column(Column::exact(90.0))
+            .column(Column::remainder());
         if let Some(pos) = scroll_target {
             table = table.scroll_to_row(pos, Some(egui::Align::Center));
         }
@@ -6713,22 +7059,14 @@ impl MhnxEditor {
 
     fn quest_tab_body(&mut self, ui: &mut egui::Ui) {
         // クエスト改造 is the way in; this screen is its 詳細 view. The way
-        // back sits at the top, where the user left it.
-        ui.horizontal(|ui| {
-            if ui
-                .small_button("← クエスト改造へ戻る")
-                .on_hover_text("名前でクエストを選ぶ画面へ戻ります")
-                .clicked()
-            {
-                self.back_to_quest_work();
-                return;
-            }
-            ui.label(
-                egui::RichText::new("詳細（ファイル単位の編集）")
-                    .weak()
-                    .small(),
-            );
-        });
+        // back is the shared top-left button of the screen header
+        // ([MhnxEditor::screen_header]), so it sits in the same corner here as
+        // on every other tool screen.
+        ui.label(
+            egui::RichText::new("詳細（ファイル単位の編集）")
+                .weak()
+                .small(),
+        );
         ui.separator();
         if self.arc.is_none() {
             ui.centered_and_justified(|ui| {
@@ -7128,6 +7466,14 @@ impl MhnxEditor {
     /// test can read one frame of it.
     fn quest_work_body(&mut self, ui: &mut egui::Ui) {
         self.quest_work_ensure_rows();
+        // Nothing open: there is no list to choose from and no filter to reach,
+        // so the screen shows the two ways in and nothing else. It used to draw
+        // the picker, the 絞り込み box and a 詳細 button over an empty list and
+        // tell the reader to pick from it.
+        if self.save.is_none() && self.arc.is_none() {
+            self.quest_work_open_panel(ui);
+            return;
+        }
         self.quest_work_header(ui);
         ui.separator();
         if self.arc.is_none() {
@@ -7138,10 +7484,9 @@ impl MhnxEditor {
             );
             ui.label(
                 egui::RichText::new(
-                    "この画面では拡張子を選びません。セーブのクエスト一覧から名前で選んでください。",
+                    "この画面では拡張子を選びません。上の一覧から名前で選んでください。",
                 )
-                .weak()
-                .small(),
+                .weak(),
             );
             return;
         }
@@ -7203,11 +7548,59 @@ impl MhnxEditor {
         };
     }
 
-    /// The picker, the 再読込 button and the small 詳細 button.
+    /// The クエスト改造 screen with nothing open: セーブを開く or .arc を開く.
+    ///
+    /// Two buttons and one sentence, because those are the only things that
+    /// work before either is done. The picker and the section bar used to be
+    /// drawn anyway, which read as "choose a quest" over an empty list.
+    fn quest_work_open_panel(&mut self, ui: &mut egui::Ui) {
+        let mut open_save = false;
+        let mut open_arc = false;
+        ui.add_space(ui.available_height() * 0.2);
+        ui.vertical_centered(|ui| {
+            ui.heading("クエスト改造");
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(
+                    "クエストは、開いているセーブの一覧から名前で選びます。まだ何も開いていません。",
+                )
+                .weak(),
+            );
+            ui.add_space(14.0);
+            if ui
+                .add_sized([280.0, 40.0], egui::Button::new("セーブを開く（system）"))
+                .on_hover_text("Switch の system / system_backup、3DS の system")
+                .clicked()
+            {
+                open_save = true;
+            }
+            ui.add_space(8.0);
+            if ui
+                .add_sized([280.0, 40.0], egui::Button::new(".arc を開く（クエスト単体）"))
+                .on_hover_text("セーブを持っていなくても、クエストの .arc だけを編集できます")
+                .clicked()
+            {
+                open_arc = true;
+            }
+        });
+        if open_save {
+            self.pick_and_open_save();
+        }
+        if open_arc {
+            if let Some(p) = rfd::FileDialog::new()
+                .add_filter("quest archive", &["arc"])
+                .set_title("クエスト .arc を選択")
+                .pick_file()
+            {
+                self.open_arc(p);
+            }
+        }
+    }
+
+    /// The picker, the 再読込 button.
     fn quest_work_header(&mut self, ui: &mut egui::Ui) {
         let mut open_id: Option<i32> = None;
         let mut open_path: Option<PathBuf> = None;
-        let mut detail = false;
         let mut write = false;
         let mut reopen = false;
         let current_id = self
@@ -7310,19 +7703,6 @@ impl MhnxEditor {
                     open_path = Some(p);
                 }
             }
-            // The way to the file-by-file screens, small and at the top right:
-            // it is the advanced view, not the way in.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let resp = ui
-                    .add_enabled(
-                        self.arc.is_some(),
-                        egui::Button::new(egui::RichText::new("詳細").small()),
-                    )
-                    .on_hover_text("ファイル単位の編集画面へ（上級者向け）");
-                if resp.clicked() {
-                    detail = true;
-                }
-            });
         });
         ui.horizontal(|ui| {
             ui.label("絞り込み");
@@ -7374,9 +7754,6 @@ impl MhnxEditor {
         });
         if reopen {
             self.qw_rows_stale = true;
-        }
-        if detail {
-            self.open_quest_detail();
         }
         if write {
             self.write_quest_work_to_save();
@@ -11628,11 +12005,36 @@ impl MhnxEditor {
 
     fn tab_guild(&mut self, ui: &mut egui::Ui) {
         ui.heading("ギルドカード");
+        // Six sections, one row of buttons. Stacked, the last two - the card
+        // list and 闘技大会 - sat below the window at the size it opens with,
+        // so the section the guide line points at was one nobody could reach
+        // without knowing to scroll.
+        if self.save.is_none() {
+            ui.label("セーブを開くと、ギルドカードと闘技大会の記録を表示します");
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for section in GuildSection::ALL {
+                ui.selectable_value(&mut self.guild_section, section, section.label());
+            }
+        });
+        ui.separator();
+        match self.guild_section {
+            GuildSection::Basic => self.guild_basic(ui),
+            GuildSection::Weapons => self.guild_weapon_usage(ui),
+            GuildSection::Titles => self.guild_title(ui),
+            GuildSection::History => self.guild_history(ui),
+            GuildSection::Cards => self.guild_cards(ui),
+            GuildSection::Arena => self.guild_arena(ui),
+        }
+    }
+
+    /// 基本: the card's own name, rank, clock and comment.
+    fn guild_basic(&mut self, ui: &mut egui::Ui) {
         // Everything below is copied out first: the edit controls need a
         // mutable borrow of the save, which cannot coexist with reading it.
-        let (name, hr, time, id, comment, log) = {
+        let (name, hr, time, id, comment, _log) = {
             let Some(save) = &self.save else {
-                ui.label("セーブを開くと、ギルドカードと闘技大会の記録を表示します");
                 return;
             };
             let slot = self.slot;
@@ -11804,19 +12206,20 @@ impl MhnxEditor {
                 self.message = msg;
             }
         }
-        ui.separator();
-        self.guild_weapon_usage(ui);
-        ui.separator();
-        self.guild_title(ui);
-        ui.separator();
-        self.guild_history(ui);
-        ui.separator();
-        self.guild_cards(ui);
-        ui.separator();
+    }
+
+    /// 闘技大会の記録: the summary and the five rank fields.
+    fn guild_arena(&mut self, ui: &mut egui::Ui) {
+        let log = {
+            let Some(save) = &self.save else {
+                return;
+            };
+            mhnx_core::guildcard::arena(save, self.slot)
+        };
         ui.label(egui::RichText::new("闘技大会の記録").strong());
         // The summary is read-only; the editor below writes through
-        // set_arena_time. Both read the copy taken at the top of the tab, so
-        // the save is not borrowed while the fields are drawn.
+        // set_arena_time. Both read the copy taken at the top of the section,
+        // so the save is not borrowed while the fields are drawn.
         let mut pick: Option<usize> = None;
         if log.iter().all(|e| e.is_empty()) {
             ui.label("記録はありません");
@@ -11935,12 +12338,7 @@ impl MhnxEditor {
                 }
                 ui.end_row();
                 for w in 0..mhnx_core::guildcard::WEAPON_TYPES {
-                    ui.label(
-                        mhnx_core::gamedata::HUNT_WEAPONS
-                            .get(w)
-                            .copied()
-                            .unwrap_or("?"),
-                    );
+                    ui.label(weapon_kind_name(w));
                     let mut total = 0u32;
                     for (vi, venue) in venues.iter().enumerate() {
                         let mut value = usage
@@ -12280,16 +12678,52 @@ impl MhnxEditor {
             self.card_list = list;
             self.card_selected = None;
         }
-        let rows: &Vec<CardRow> = if self.card_list == CardList::Stored {
+        let all: &Vec<CardRow> = if self.card_list == CardList::Stored {
             &stored
         } else {
             &inbox
         };
-        if rows.is_empty() {
+        if all.is_empty() {
             ui.label(match self.card_list {
                 CardList::Stored => "カード一覧は空です（まだ誰からも受け取っていません）",
                 CardList::Inbox => "受信箱は空です",
             });
+            return;
+        }
+        // 150 cards is too many to read down: the filter is the same one Ctrl+F
+        // reaches, and it matches the name, the card id, the rank and the slot.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("絞り込み");
+            Self::filter_edit(
+                ui,
+                &mut self.guild_filter,
+                180.0,
+                "名前・カードID・HR・枠",
+                &mut self.focus_filter,
+            );
+            if ui.small_button("クリア").clicked() {
+                self.guild_filter.clear();
+            }
+        });
+        let needle = self.guild_filter.trim().to_lowercase();
+        let rows: Vec<&CardRow> = all
+            .iter()
+            .filter(|row| {
+                needle.is_empty()
+                    || row.name.to_lowercase().contains(&needle)
+                    || row.id.to_lowercase().contains(&needle)
+                    || format!("{}", row.hunter_rank) == needle
+                    || format!("{}", row.slot + 1) == needle
+            })
+            .collect();
+        if rows.is_empty() {
+            ui.label(
+                egui::RichText::new(format!(
+                    "この絞り込みに一致するカードはありません（{} 枚中）",
+                    all.len()
+                ))
+                .weak(),
+            );
             return;
         }
         let mut pick: Option<usize> = None;
@@ -12473,13 +12907,7 @@ impl MhnxEditor {
             .into_iter()
             .enumerate()
             .filter(|(_, count)| *count > 0)
-            .map(|(index, count)| {
-                let name = mhnx_core::gamedata::HUNT_WEAPONS
-                    .get(index)
-                    .copied()
-                    .unwrap_or("?");
-                (String::from(name), count)
-            })
+            .map(|(index, count)| (String::from(weapon_kind_name(index)), count))
             .collect();
         let history = mhnx_core::guildcard::history_in(&data)
             .into_iter()
@@ -12729,11 +13157,16 @@ impl MhnxEditor {
         if self.equip_selected.is_none() {
             self.equip_selected = rows.iter().find(|e| !e.is_empty()).map(|e| e.index);
         }
-        // The editor needs about this much; the list gets what is left.
-        const PANEL_W: f32 = 360.0;
+        // The editor and the list share the width the window gives the screen.
+        // A fixed 360 point editor beside a fixed 420 point table is 794 points
+        // and the centre panel at the window's default size does not have them:
+        // the editor's right edge was cut off on the screen the window opens
+        // with, which is where every first-time reader sees it.
+        let avail = ui.available_width();
+        let panel_w = (avail * 0.42).clamp(300.0, 420.0);
+        let table_w = (avail - panel_w - 14.0).max(300.0);
         let mut pick: Option<usize> = None;
         ui.horizontal_top(|ui| {
-            let table_w = (ui.available_width() - PANEL_W - 14.0).max(420.0);
             ui.vertical(|ui| {
                 ui.set_width(table_w);
                 ui.set_height(ui.available_height());
@@ -12795,8 +13228,8 @@ impl MhnxEditor {
             });
             ui.separator();
             ui.vertical(|ui| {
-                ui.set_min_width(PANEL_W);
-                ui.set_max_width(PANEL_W + 80.0);
+                ui.set_min_width(panel_w);
+                ui.set_max_width(panel_w);
                 match pick.or(self.equip_selected) {
                     Some(index) => self.equip_edit_panel(ui, index, &boxv),
                     None => {
@@ -13671,6 +14104,9 @@ impl MhnxEditor {
                 egui::Grid::new("dlcg")
                     .striped(true)
                     .num_columns(5)
+                    // No spacing at all: "1234 B" and the title beside it read
+                    // as one word ("1234 Bタイトル").
+                    .spacing([12.0, 4.0])
                     .show(ui, |ui| {
                         for h in ["枠", "クエスト ID", "サイズ", "タイトル", ""] {
                             ui.strong(h);
@@ -13981,8 +14417,21 @@ impl MhnxEditor {
                     // forbids writing it, not reading it), which is what
                     // grade_warnings below reports.
                     for n in 0..=max_slots {
+                        // 0 used to be an empty label, so "no decoration
+                        // slots" was a button with nothing written on it and
+                        // no way to tell it was a choice at all.
+                        let label = if n == 0 {
+                            String::from("なし")
+                        } else {
+                            "●".repeat(n as usize)
+                        };
                         if ui
-                            .selectable_label(self.charm_slots == n, "●".repeat(n as usize))
+                            .selectable_label(self.charm_slots == n, label)
+                            .on_hover_text(if n == 0 {
+                                "装飾品を挿せないお守りにします"
+                            } else {
+                                "装飾スロットの数"
+                            })
                             .clicked()
                         {
                             self.charm_slots = n;
@@ -14009,9 +14458,15 @@ impl MhnxEditor {
                         &allowed_first,
                         true,
                     );
-                    ui.label("ポイント");
-                    let allowed = Self::charm_allowed(bound, shown_kind, self.charm_skill1, false);
-                    Self::charm_points_field(ui, allowed, &mut self.charm_points1);
+                    // The word ポイント and its field are one thing: wrapped
+                    // as separate items, the label could end a line with the
+                    // field starting the next one.
+                    ui.horizontal(|ui| {
+                        ui.label("ポイント");
+                        let allowed =
+                            Self::charm_allowed(bound, shown_kind, self.charm_skill1, false);
+                        Self::charm_points_field(ui, allowed, &mut self.charm_points1);
+                    });
                 });
                 // Read after the row, so switching the skill in the combo above
                 // is explained on the same frame.
@@ -14033,9 +14488,12 @@ impl MhnxEditor {
                         &allowed_second,
                         second_ok,
                     );
-                    ui.label("ポイント");
-                    let allowed = Self::charm_allowed(bound, shown_kind, self.charm_skill2, true);
-                    Self::charm_points_field(ui, allowed, &mut self.charm_points2);
+                    ui.horizontal(|ui| {
+                        ui.label("ポイント");
+                        let allowed =
+                            Self::charm_allowed(bound, shown_kind, self.charm_skill2, true);
+                        Self::charm_points_field(ui, allowed, &mut self.charm_points2);
+                    });
                 });
                 // 兵士 / 闘士 carry no second skill, so the row above is drawn
                 // disabled and this line says why. A record that holds one
@@ -15994,7 +16452,7 @@ impl MhnxEditor {
             .max_height(height)
             .show(ui, |ui| {
                 ui.add(egui::Label::new(
-                    egui::RichText::new(text).monospace().small(),
+                    egui::RichText::new(text).monospace().size(14.0),
                 ));
             });
     }
@@ -16172,6 +16630,42 @@ impl MhnxEditor {
             .small(),
         );
         ui.add_space(4.0);
+        // The list can run to hundreds of rows after a bulk edit; the filter
+        // narrows it to one area or one field.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("絞り込み");
+            Self::filter_edit(
+                ui,
+                &mut self.review_filter,
+                200.0,
+                "領域・項目・値",
+                &mut self.focus_filter,
+            );
+            if ui.small_button("クリア").clicked() {
+                self.review_filter.clear();
+            }
+        });
+        let needle = self.review_filter.trim().to_lowercase();
+        let shown: Vec<usize> = list
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                needle.is_empty()
+                    || item.area.to_lowercase().contains(&needle)
+                    || item.change.field.to_lowercase().contains(&needle)
+                    || Self::review_cell(&item.change.old).to_lowercase().contains(&needle)
+                    || Self::review_cell(&item.change.new).to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if shown.is_empty() {
+            ui.label(
+                egui::RichText::new("この絞り込みに一致する行はありません（上の件数は全件です）")
+                    .weak(),
+            );
+            return;
+        }
         let mut restore: Option<(usize, String)> = None;
         // Wrapped: a value can be a whole name or a comment, and the table
         // would otherwise stretch the window.
@@ -16194,8 +16688,8 @@ impl MhnxEditor {
                 }
             })
             .body(|body| {
-                body.rows(22.0, list.rows.len(), |mut row| {
-                    let index = row.index();
+                body.rows(22.0, shown.len(), |mut row| {
+                    let index = shown[row.index()];
                     let item = &list.rows[index];
                     let can = item.can_restore();
                     let mut pressed = false;
@@ -17358,7 +17852,12 @@ impl MhnxEditor {
             }
             ui.separator();
             let last = self.progress_undo.last().map(|u| u.label.clone());
-            let button = ui.add_enabled(last.is_some(), egui::Button::new("元に戻す"));
+            // Not 元に戻す: the bar has one for the whole save, and two buttons
+            // with one name made the reader guess which takes back what.
+            let button = ui.add_enabled(
+                last.is_some(),
+                egui::Button::new("この画面の変更を戻す"),
+            );
             let button = match &last {
                 Some(label) => button.on_hover_text(format!("{} を取り消します", label)),
                 None => button.on_hover_text("このタブで変更すると、ここから取り消せます"),
@@ -17416,11 +17915,44 @@ impl MhnxEditor {
                 .small(),
         );
         ui.add_space(4.0);
+        // 132 cells with no way to find one: the filter matches the name the
+        // romfs table gave it, and the number the grid prints.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("絞り込み");
+            Self::filter_edit(
+                ui,
+                &mut self.progress_filter,
+                180.0,
+                "勲章名・番号",
+                &mut self.focus_filter,
+            );
+            if ui.small_button("クリア").clicked() {
+                self.progress_filter.clear();
+            }
+        });
+        let needle = self.progress_filter.trim().to_lowercase();
+        let shown: Vec<usize> = (0..total)
+            .filter(|a| {
+                if needle.is_empty() {
+                    return true;
+                }
+                let name = self
+                    .award_names
+                    .get(*a)
+                    .map(|n| n.to_lowercase())
+                    .unwrap_or_default();
+                name.contains(&needle) || format!("{}", a + 1) == needle
+            })
+            .collect();
+        if shown.is_empty() {
+            ui.label(egui::RichText::new("この絞り込みに一致する勲章はありません").weak());
+            return;
+        }
         egui::ScrollArea::vertical()
             .id_salt("awardgrid")
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for a in 0..total {
+                    for a in shown.iter().copied() {
                         let on = states[a];
                         let label = self.award_label(a);
                         let full = self
@@ -20962,6 +21494,19 @@ mod tests {
         assert!(app.tab_has_filter());
         app.focus_current_filter();
         assert!(app.focus_filter, "the request waits for the tab to draw");
+        assert!(app.filter_focus_pending, "the request left no answer behind");
+        // Nothing drew this frame, so nothing may claim the cursor moved.
+        app.settle_filter_focus();
+        assert!(
+            app.message.contains("フォーカスできる絞り込み欄がありません"),
+            "{}",
+            app.message
+        );
+        // A box that did take it leaves focus_filter clear, and then the move
+        // is real and is what the line says.
+        app.focus_filter = false;
+        app.filter_focus_pending = true;
+        app.settle_filter_focus();
         assert!(app.message.contains("Ctrl+F"), "{}", app.message);
 
         // A tab with no list filter says so instead of doing nothing.
@@ -21030,6 +21575,19 @@ mod tests {
         app.tab = Tab::Items;
         let _ = ctx.run(key(egui::Key::F), |ctx| app.keyboard_shortcuts(ctx));
         assert!(app.focus_filter, "{}", app.message);
+        // The item tab drew no frame here, so the same end-of-frame step
+        // answers it. No box drew, so the line must not claim a move.
+        app.settle_filter_focus();
+        assert!(
+            app.message.contains("フォーカスできる絞り込み欄がありません"),
+            "{}",
+            app.message
+        );
+        // A frame that does draw the box clears the flag, and then the move is
+        // real and is what the line says.
+        app.focus_filter = false;
+        app.filter_focus_pending = true;
+        app.settle_filter_focus();
         assert!(app.message.contains("Ctrl+F"), "{}", app.message);
 
         // A text field holding the keyboard keeps its own keys: the rule the
@@ -24415,21 +24973,41 @@ mod tests {
         assert_eq!(table.records[0].count, 7);
     }
 
-    /// The new screen is the way in, adds no chord, and keeps Ctrl+F working
-    /// on its own filter box.
+    /// The window opens on キャラ, the screen that says what to do with no save.
+    ///
+    /// クエスト改造 needs a save or an .arc before it has a list to choose from,
+    /// so opening on it meant the first thing a new user saw was "一覧から
+    /// 選べ" over an empty list.
     #[test]
-    fn the_quest_work_screen_is_the_default_and_adds_no_keyboard_shortcut() {
+    fn the_save_screen_is_the_default_and_says_how_to_open_one() {
         assert_eq!(
             MhnxEditor::default().tab,
-            Tab::QuestWork,
-            "the editor does not open on the quest screen"
+            Tab::Save,
+            "the editor does not open on the save screen"
         );
+        // Its empty state is the way in: a big セーブを開く, not a sentence
+        // pointing at a button in another corner of the window.
+        let mut app = MhnxEditor::default();
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.tab_save(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("セーブが開かれていません"), "{text}");
+        assert!(text.contains("セーブを開く"), "no way in on the empty screen: {text}");
+
+        // The quest screen is one click away and keeps Ctrl+F working on its
+        // own filter box.
         let mut app = MhnxEditor::default();
         app.tab = Tab::QuestWork;
-        assert!(app.tab_has_filter(), "Ctrl+F cannot reach the new screen");
+        assert!(app.tab_has_filter(), "Ctrl+F cannot reach the quest screen");
         app.focus_current_filter();
         assert!(app.focus_filter, "Ctrl+F did not ask for the filter");
-        assert!(app.message.contains("Ctrl+F"), "{}", app.message);
+        assert!(
+            !app.message.contains("移動しました"),
+            "the move is announced before a box took the focus: {}",
+            app.message
+        );
 
         // One table drives both the line on screen and the handler, so a key
         // listed twice is a key two actions would answer.
@@ -24462,6 +25040,147 @@ mod tests {
         });
         assert!(!output.shapes.is_empty(), "the screen drew nothing");
         assert!(!app.focus_filter, "the new screen never took the Ctrl+F focus");
+    }
+
+    /// With nothing open, クエスト改造 offers the two ways in and nothing else.
+    #[test]
+    fn the_quest_work_screen_with_nothing_open_offers_only_the_two_ways_in() {
+        let mut app = MhnxEditor::default();
+        app.tab = Tab::QuestWork;
+        assert!(app.save.is_none() && app.arc.is_none());
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.quest_work_body(ui));
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("セーブを開く（system）"), "{text}");
+        assert!(text.contains(".arc を開く（クエスト単体）"), "{text}");
+        assert!(
+            !text.contains("絞り込み"),
+            "a filter over an empty list is still drawn: {text}"
+        );
+        assert!(
+            !text.contains("上の一覧から"),
+            "the screen points at a list it does not draw: {text}"
+        );
+    }
+
+    /// The 詳細 control is at the bottom right, is an ordinary button, and says
+    /// what it opens instead of the bare word 詳細.
+    #[test]
+    fn the_detail_control_sits_at_the_bottom_right_and_names_what_it_opens() {
+        let dir = Scratch::new("detailcontrol");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        // The sentence and the button now name the same corner.
+        for tab in TabShelf::Everyday.tabs().iter().chain(TabShelf::Record.tabs()) {
+            assert!(
+                tab.guide().contains("右下"),
+                "{:?} does not send the reader to the bottom right: {}",
+                tab,
+                tab.guide()
+            );
+        }
+        app.tab = Tab::Equip;
+        let ctx = egui::Context::default();
+        let output = ctx.run(tall_frame_input(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::BOTTOM), |ui| {
+                    app.detail_control(ui);
+                });
+            });
+        });
+        let text = drawn_text(&output);
+        assert!(text.contains("詳細（生データを見る）"), "{text}");
+        assert!(
+            !text.trim_end().ends_with("詳細"),
+            "the bare 詳細 label is back: {text}"
+        );
+    }
+
+    /// 戻る is on the top left of every tool screen, whichever route opened it.
+    #[test]
+    fn every_tool_screen_has_a_way_back_on_the_top_left() {
+        let mut app = MhnxEditor::default();
+        let ctx = egui::Context::default();
+        for tab in TabShelf::Tools.tabs() {
+            app.tab = *tab;
+            // The bar route leaves nothing behind; the button is still there.
+            app.detail_return = None;
+            let want = if *tab == Tab::Quest {
+                Tab::QuestWork
+            } else {
+                Tab::Save
+            };
+            assert_eq!(app.back_target(), Some(want), "{:?} lost its way back", tab);
+            let output = ctx.run(frame_input(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.screen_header(ui));
+            });
+            let text = drawn_text(&output);
+            assert!(text.contains("へ戻る"), "{:?} draws no way back: {text}", tab);
+        }
+        // An everyday screen is where a session starts: nothing to go back to.
+        for tab in TabShelf::Everyday.tabs() {
+            app.tab = *tab;
+            assert!(app.back_target().is_none(), "{:?} shows a 戻る", tab);
+        }
+    }
+
+    /// A screen whose bytes are several rows offers all of them, not one.
+    #[test]
+    fn the_screens_with_several_rows_offer_each_of_them() {
+        assert_eq!(MhnxEditor::detail_rows_for(Tab::Sets).len(), 3);
+        assert_eq!(MhnxEditor::detail_rows_for(Tab::Extras).len(), 5);
+        assert_eq!(MhnxEditor::detail_rows_for(Tab::Hunts).len(), 3);
+        // A screen whose row depends on the section on screen still names it.
+        assert!(MhnxEditor::detail_rows_for(Tab::Progress).is_empty());
+        let dir = Scratch::new("detailrows");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        for tab in ALL_TABS {
+            let rows = MhnxEditor::detail_rows_for(tab);
+            for (i, name) in rows.iter().enumerate() {
+                assert!(
+                    MhnxEditor::savemap_index_named(name).is_some(),
+                    "{:?} offers {name}, which is not a row of the save map",
+                    tab
+                );
+                app.detail_pick = i;
+                let jump = app.detail_jump_for(tab).expect("the screen has a detail");
+                assert_eq!(jump.field, Some(*name), "{:?} opened the wrong row", tab);
+            }
+        }
+    }
+
+    /// Ctrl+F reaches the three lists that gained a filter.
+    #[test]
+    fn ctrl_f_reaches_the_guild_progress_and_review_filters() {
+        let mut app = MhnxEditor::default();
+        for tab in [Tab::Guild, Tab::Progress, Tab::Review] {
+            app.tab = tab;
+            assert!(app.tab_has_filter(), "Ctrl+F cannot reach {:?}", tab);
+        }
+    }
+
+    /// The guild card's weapon table speaks the same language as the 装備 tab.
+    #[test]
+    fn the_guild_card_names_weapons_in_japanese() {
+        assert_eq!(weapon_kind_name(0), "大剣");
+        assert_eq!(weapon_kind_name(1), "片手剣");
+        assert_eq!(weapon_kind_name(14), "ニャンター");
+        assert_eq!(weapon_kind_name(15), "?");
+        for i in 0..mhnx_core::guildcard::WEAPON_TYPES {
+            let name = weapon_kind_name(i);
+            assert!(name != "?", "weapon {i} has no Japanese name");
+            assert!(
+                name.chars().any(|c| c as u32 >= 0x3000),
+                "{name} is not Japanese"
+            );
+        }
     }
 
     #[test]
