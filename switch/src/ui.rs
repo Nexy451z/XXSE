@@ -1772,6 +1772,45 @@ impl GuiState {
         true
     }
 
+    /// Open whatever [A] opens on one .mib row, and say what happened.
+    ///
+    /// One row of the .mib screen is not "a monster" by itself: the 種類 byte
+    /// beside the id decides whether the list is the monster table (狩猟/討伐,
+    /// 部位破壊, ...) or the item picker (納品, 採取), and a kind that carries no
+    /// id has no list at all. Both the pad and the touch chip come through here,
+    /// so a tap cannot open a different table from [A].
+    fn open_mib_row_picker(&mut self, ed: &mut Editor, field_idx: usize) -> bool {
+        match mhnx_core::hbedit::mib_pick_kind(ed.mib_bytes(), field_idx) {
+            mhnx_core::hbedit::MibPickKind::Item => {
+                if ed.open_mib_item_pick(field_idx) {
+                    true
+                } else {
+                    ed.message = String::from("対象アイテムの一覧を開けません");
+                    false
+                }
+            }
+            mhnx_core::hbedit::MibPickKind::Monster => {
+                if self.open_mib_picker(ed, field_idx) {
+                    true
+                } else {
+                    ed.message = String::from("モンスターの一覧を作れません");
+                    false
+                }
+            }
+            mhnx_core::hbedit::MibPickKind::None => {
+                ed.message = match ed.mib_target_info(field_idx) {
+                    Some(info) => format!(
+                        "{} は {} です（一覧で選ぶ対象IDがありません。[◀/▶] で数値を変更）",
+                        info.kind_label,
+                        mhnx_core::hbedit::target_id_word(info.id_kind)
+                    ),
+                    None => String::from("この項目は [◀ / ▶] キーで数値を直接変更できます"),
+                };
+                false
+            }
+        }
+    }
+
     pub fn handle_mib_picker_key(&mut self, ed: &mut Editor, key: Key) -> bool {
         let Some(mut picker) = self.mib_picker.take() else {
             return false;
@@ -2408,9 +2447,8 @@ impl GuiState {
                     .unwrap_or(false);
                 match key {
                     Key::A => {
-                        if !self.open_mib_picker(ed, ed.mib_cursor) {
-                            ed.message = String::from("この項目は [◀ / ▶] キーで数値を直接変更できます");
-                        }
+                        let idx = ed.mib_cursor;
+                        self.open_mib_row_picker(ed, idx);
                     }
                     Key::Minus if is_mob => {
                         self.mib_mob_sub = (self.mib_mob_sub + 1) % 8;
@@ -2881,8 +2919,11 @@ impl GuiState {
             }
 
             UiAction::OpenDetail => self.open_detail(ed),
+            // The tap path and the pad path open the same thing: what the
+            // row's 種類 byte names. Before this, a tapped 納品 row opened the
+            // monster list (or, after the first fix, nothing at all).
             UiAction::OpenMibPicker(field_idx) => {
-                let _ = self.open_mib_picker(ed, field_idx);
+                let _ = self.open_mib_row_picker(ed, field_idx);
             }
             UiAction::MibPickerSelect(idx) => {
                 if let Some(mut picker) = self.mib_picker.take() {
@@ -8808,24 +8849,32 @@ impl GuiState {
                     format!("{} ({})", label, raw_val),
                 )
             } else {
-                (
-                    format!("offset +0x{:03X} ({}B)", f.offset, f.size),
-                    mib_extra_value_label(f.key, raw_val),
-                )
+                // A com* row says which 種類 byte gave the number its meaning,
+                // so a 納品 row can never be read as a monster.
+                let meta = match mhnx_core::hbedit::quest_target_info(mib, f.key) {
+                    Some(info) => format!(
+                        "+0x{:03X}  {}={}",
+                        f.offset, info.kind_key, info.kind_label
+                    ),
+                    None => format!("offset +0x{:03X} ({}B)", f.offset, f.size),
+                };
+                (meta, mib_extra_value_label(mib, f.key, raw_val))
             };
 
-            rows.push((i, f.ja.to_string(), meta, val_str, format!("#{:02}", i + 1)));
+            // The row is headed with what the id names: 対象モンスター /
+            // 対象アイテム / 対象ID（未確定）. One word, from the 種類 byte.
+            let title = match mhnx_core::hbedit::quest_target_info(mib, f.key) {
+                Some(info) => info.row_title(f.ja),
+                None => f.ja.to_string(),
+            };
+            rows.push((i, title, meta, val_str, format!("#{:02}", i + 1)));
         }
 
         let cur = ed.mib_cursor.min(total.saturating_sub(1));
-        let a_lbl = if questfields::MIB_FIELDS
-            .get(cur)
-            .map(|f| mib_has_picker(f))
-            .unwrap_or(false)
-        {
-            "一覧選択"
-        } else {
-            "変更"
+        let a_lbl = match mhnx_core::hbedit::mib_pick_kind(mib, cur) {
+            mhnx_core::hbedit::MibPickKind::Item => "アイテム選択",
+            _ if mib_has_picker(mib, cur) => "一覧選択",
+            _ => "変更",
         };
 
         self.draw_adaptive_rows(
@@ -9554,36 +9603,27 @@ fn monster_name_for_mint(v: u32) -> &'static str {
     "?"
 }
 
-fn mib_has_picker(f: &questfields::FieldDef) -> bool {
+fn mib_has_picker(mib: &[u8], field_idx: usize) -> bool {
+    let Some(f) = questfields::MIB_FIELDS.get(field_idx) else {
+        return false;
+    };
     if f.enum_name.is_some() {
         return true;
     }
-    if f.key.starts_with("mob_slot[") {
+    // A com* row only has a list when its 種類 names one: the monster table
+    // for 狩猟/討伐, the item picker for 納品, nothing for 大連続 and the rest.
+    if mhnx_core::hbedit::mib_pick_kind(mib, field_idx) != mhnx_core::hbedit::MibPickKind::None {
         return true;
     }
-    matches!(
-        f.key,
-        "com0"
-            | "com1"
-            | "com2"
-            | "com3"
-            | "com4"
-            | "com5"
-            | "com6"
-            | "com7"
-            | "com8"
-            | "com9"
-            | "ko1"
-            | "ko2"
-            | "ko3"
-            | "map_id"
-            | "quest_level"
-            | "icn1"
-            | "icn2"
-            | "icn3"
-            | "icn4"
-            | "icn5"
-    )
+    matches!(f.key, "map_id" | "quest_level" | "icn1" | "icn2" | "icn3" | "icn4" | "icn5")
+}
+
+/// The monster table as the .mib picker lists it: name first, hex id beside.
+fn mib_monster_items() -> Vec<(u32, String)> {
+    mhnx_core::hbedit::monster_id_choices()
+        .into_iter()
+        .map(|(id, name)| (id as u32, format!("{} 0x{:X}", name, id)))
+        .collect()
 }
 
 fn mib_field_choices(mib: &[u8], field_idx: usize) -> Option<(String, Vec<(u32, String)>, u32)> {
@@ -9594,41 +9634,30 @@ fn mib_field_choices(mib: &[u8], field_idx: usize) -> Option<(String, Vec<(u32, 
         } else {
             0
         };
-        let mut items = Vec::with_capacity(questfields::ENUM_MONS_.len());
-        for (i, (&id_str, &mname)) in questfields::ENUM_MINT_
-            .iter()
-            .zip(questfields::ENUM_MONS_.iter())
-            .enumerate()
-        {
-            if i == questfields::ENUM_MINT_.len() - 1 && id_str == "0" && i > 0 {
-                continue;
-            }
-            if let Ok(raw_id) = id_str.parse::<u32>() {
-                items.push((raw_id, format!("{} 0x{:X}", mname, raw_id)));
-            }
-        }
-        return Some((format!("{} (モンスター選択)", f.ja), items, cur));
+        return Some((format!("{} (モンスター選択)", f.ja), mib_monster_items(), cur));
     }
 
     let cur = questfields::read_u32(mib, f.offset, f.kind).unwrap_or(0);
+    // A com* row is not "a monster id" by itself: the 種類 byte beside it says
+    // whether the game reads the number as a monster or as an item. 納品 and
+    // 採取 rows are item ids, and their list is the item picker's own screen
+    // (Editor::open_mib_item_pick), so this function answers None for them.
+    if let Some(info) = mhnx_core::hbedit::quest_target_info(mib, f.key) {
+        if info.id_kind != mhnx_core::hbedit::QuestTargetId::Monster {
+            return None;
+        }
+        return Some((
+            format!("{}を選ぶ", info.row_title(f.ja)),
+            mib_monster_items(),
+            cur,
+        ));
+    }
     match f.key {
-        "com0" | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
-        | "ko1" | "ko2" | "ko3" => {
-            let mut items = Vec::with_capacity(questfields::ENUM_MONS_.len());
-            for (i, (&id_str, &mname)) in questfields::ENUM_MINT_
-                .iter()
-                .zip(questfields::ENUM_MONS_.iter())
-                .enumerate()
-            {
-                if i == questfields::ENUM_MINT_.len() - 1 && id_str == "0" && i > 0 {
-                    continue;
-                }
-                if let Ok(raw_id) = id_str.parse::<u32>() {
-                    if f.size == 1 && raw_id > 255 {
-                        continue;
-                    }
-                    items.push((raw_id, format!("{} 0x{:X}", mname, raw_id)));
-                }
+        "ko1" | "ko2" | "ko3" => {
+            // The small monsters are a byte: only the ids it can hold.
+            let mut items = mib_monster_items();
+            if f.size == 1 {
+                items.retain(|(id, _)| *id <= 255);
             }
             Some((format!("{} (モンスター選択)", f.ja), items, cur))
         }
@@ -9704,10 +9733,18 @@ fn apply_mib_choice(ed: &mut Editor, field_idx: usize, raw_val: u32, label: &str
     }
 }
 
-fn mib_extra_value_label(key: &str, v: u32) -> String {
+/// The value column of one .mib row that carries no enum table.
+///
+/// For a com* row the number is named in the space its 種類 byte names: a
+/// 狩猟/討伐 row prints the monster, a 納品 row prints the item. Printing the
+/// monster name and falling back to the item name (what this used to do) made
+/// a delivery target read like a monster that happened to share the id.
+fn mib_extra_value_label(mib: &[u8], key: &str, v: u32) -> String {
+    if let Some(info) = mhnx_core::hbedit::quest_target_info(mib, key) {
+        return format!("{} ({})", info.label, info.kind_label);
+    }
     match key {
-        "com0" | "com1" | "com2" | "com3" | "com4" | "com5" | "com6" | "com7" | "com8" | "com9"
-        | "ko1" | "ko2" | "ko3" => {
+        "ko1" | "ko2" | "ko3" => {
             if v == 0 {
                 String::from("なし")
             } else {

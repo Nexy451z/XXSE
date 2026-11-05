@@ -1285,6 +1285,8 @@ pub struct MhnxEditor {
     /// Search text of the five monster-name pickers of the .mib panel, one per
     /// slot: each of them narrows the name list on its own.
     pub mib_mob_search: [String; 5],
+    /// Filter boxes of the 対象ID pickers of the .mib table, one per com0..com9.
+    pub mib_target_filter: [String; 10],
     pub gmd: Option<Gmd>,
     /// クエスト改造: which of its four sections is on screen.
     pub qw_tab: QuestWorkTab,
@@ -1670,7 +1672,19 @@ impl Default for MhnxEditor {
             arc_from_save: None,
             mib: None,
             mib_bytes: Vec::new(),
-            mib_mob_search: [
+            mib_target_filter: [
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+        mib_mob_search: [
                 String::new(),
                 String::new(),
                 String::new(),
@@ -7367,6 +7381,10 @@ impl MhnxEditor {
                     .small(),
             );
             let mut new_id: Option<u32> = None;
+            // The per-row filter boxes of the 対象ID pickers live in self, and
+            // the grid needs them beside the bytes: take them out for the draw
+            // and put them back after it (the same rule the monster table uses).
+            let mut target_search = std::mem::take(&mut self.mib_target_filter);
             egui::ScrollArea::vertical()
                 .id_salt("mibfields")
                 .max_height(420.0)
@@ -7389,7 +7407,17 @@ impl MhnxEditor {
                                     .monospace()
                                     .color(color),
                             );
-                            ui.label(egui::RichText::new(f.ja).color(color));
+                            // A com* row is headed with what its 種類 byte
+                            // names - 対象モンスター / 対象アイテム / 未確定 -
+                            // so a 納品 row cannot read like a monster.
+                            let target =
+                                mhnx_core::hbedit::quest_target_info(&self.mib_bytes, f.key);
+                            match &target {
+                                Some(info) => ui.label(
+                                    egui::RichText::new(info.row_title(f.ja)).color(color),
+                                ),
+                                None => ui.label(egui::RichText::new(f.ja).color(color)),
+                            };
                             let cur = mhnx_core::questfields::read_u32(
                                 &self.mib_bytes, f.offset, f.kind,
                             )
@@ -7397,7 +7425,167 @@ impl MhnxEditor {
                             let table = f
                                 .enum_name
                                 .and_then(mhnx_core::questfields::enum_table);
-                            if let Some(t) = table {
+                            if let Some(info) = target.as_ref() {
+                                // 対象ID: the name and the list both follow the
+                                // 種類 byte beside it. 納品 / 採取 open the item
+                                // table, 狩猟/討伐 the monster table, and a kind
+                                // with no measured id keeps a plain number.
+                                let slot = com_slot_of(f.key);
+                                let mut picked: Option<u16> = None;
+                                ui.horizontal(|ui| {
+                                    match info.id_kind {
+                                        mhnx_core::hbedit::QuestTargetId::Monster => {
+                                            egui::ComboBox::from_id_salt(("mibtgt", slot))
+                                                .selected_text(info.label.clone())
+                                                .width(230.0)
+                                                .show_ui(ui, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(
+                                                            &mut target_search[slot],
+                                                        )
+                                                        .hint_text(
+                                                            "モンスター名・ID（16 進）で絞り込み",
+                                                        )
+                                                        .desired_width(230.0),
+                                                    );
+                                                    if ui.small_button("クリア").clicked() {
+                                                        target_search[slot].clear();
+                                                    }
+                                                    if info.id != 0
+                                                        && ui.small_button("なしにする").clicked()
+                                                    {
+                                                        picked = Some(0);
+                                                    }
+                                                    let needle =
+                                                        target_search[slot].trim().to_lowercase();
+                                                    egui::ScrollArea::vertical()
+                                                        .id_salt(("mibtgtlist", slot))
+                                                        .max_height(260.0)
+                                                        .show(ui, |ui| {
+                                                            for (mid, name) in monster_choices() {
+                                                                let hex = format!("0x{:X}", mid);
+                                                                if !needle.is_empty()
+                                                                    && !name
+                                                                        .to_lowercase()
+                                                                        .contains(&needle)
+                                                                    && !hex
+                                                                        .to_lowercase()
+                                                                        .contains(&needle)
+                                                                {
+                                                                    continue;
+                                                                }
+                                                                if ui
+                                                                    .selectable_label(
+                                                                        info.id == mid,
+                                                                        format!("{} {}", name, hex),
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    picked = Some(mid);
+                                                                }
+                                                            }
+                                                        });
+                                                });
+                                        }
+                                        mhnx_core::hbedit::QuestTargetId::Item => {
+                                            egui::ComboBox::from_id_salt(("mibtgt", slot))
+                                                .selected_text(info.label.clone())
+                                                .width(230.0)
+                                                .show_ui(ui, |ui| {
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(
+                                                            &mut target_search[slot],
+                                                        )
+                                                        .hint_text(
+                                                            "アイテム名・ID（16 進）で絞り込み",
+                                                        )
+                                                        .desired_width(230.0),
+                                                    );
+                                                    if ui.small_button("クリア").clicked() {
+                                                        target_search[slot].clear();
+                                                    }
+                                                    if info.id != 0
+                                                        && ui.small_button("なしにする").clicked()
+                                                    {
+                                                        picked = Some(0);
+                                                    }
+                                                    let needle =
+                                                        target_search[slot].trim().to_lowercase();
+                                                    if needle.is_empty() {
+                                                        // 2991 items is not a list to
+                                                        // scroll: the box is the way
+                                                        // in, and the first 60 are
+                                                        // only a starting point.
+                                                        ui.label(
+                                                            egui::RichText::new(
+                                                                "名前の一部を入れると絞り込めます（今は先頭 60 件）",
+                                                            )
+                                                            .small()
+                                                            .weak(),
+                                                        );
+                                                    }
+                                                    egui::ScrollArea::vertical()
+                                                        .id_salt(("mibtgtlist", slot))
+                                                        .max_height(260.0)
+                                                        .show(ui, |ui| {
+                                                            for (id, name) in
+                                                                quest_work_item_matches(&needle, 60)
+                                                            {
+                                                                if ui
+                                                                    .selectable_label(
+                                                                        info.id == id,
+                                                                        format!(
+                                                                            "{} 0x{:X}",
+                                                                            name, id
+                                                                        ),
+                                                                    )
+                                                                    .clicked()
+                                                                {
+                                                                    picked = Some(id);
+                                                                }
+                                                            }
+                                                        });
+                                                });
+                                        }
+                                        // 大連続 / RRP納品 / ネコタク / 乗りダウン
+                                        // carry no id, and a 種類 no shipped quest
+                                        // uses is not given an invented one: the
+                                        // number stays editable and unnamed.
+                                        _ => {
+                                            ui.label(
+                                                egui::RichText::new(info.label.clone())
+                                                    .monospace(),
+                                            );
+                                            let mut v = info.id as i64;
+                                            let resp = ui.add(
+                                                egui::DragValue::new(&mut v)
+                                                    .range(0..=0xFFFFi64)
+                                                    .speed(1.0),
+                                            );
+                                            if resp.changed() {
+                                                picked = Some(v as u16);
+                                            }
+                                        }
+                                    }
+                                    if let Some(w) =
+                                        mhnx_core::hbedit::target_id_warning(&self.mib_bytes, f.key)
+                                    {
+                                        ui.label(
+                                            egui::RichText::new(format!("⚠ {}", w))
+                                                .small()
+                                                .color(egui::Color32::from_rgb(235, 190, 90)),
+                                        );
+                                    }
+                                });
+                                if let Some(id) = picked {
+                                    mhnx_core::questfields::write_u32(
+                                        &mut self.mib_bytes,
+                                        f.offset,
+                                        f.kind,
+                                        id as u32,
+                                    );
+                                }
+                            } else if let Some(t) = table {
                                 let shown = t.get(cur as usize).copied().unwrap_or("?");
                                 egui::ComboBox::from_id_salt(("mibf", f.offset))
                                     .selected_text(format!("{} ({})", shown, cur))
@@ -7419,6 +7607,28 @@ impl MhnxEditor {
                                                 );
                                                 if f.key == "quest_id" {
                                                     new_id = Some(i as u32);
+                                                }
+                                                // A 種類 change re-points the id
+                                                // beside it (納品 is an item id,
+                                                // 狩猟/討伐 a monster id). Say so
+                                                // and leave the id alone: the
+                                                // number is the user's.
+                                                if let Some((_, id_key)) =
+                                                    mhnx_core::hbedit::QUEST_TARGET_PAIRS
+                                                        .iter()
+                                                        .find(|(k, _)| *k == f.key)
+                                                {
+                                                    self.message =
+                                                        mhnx_core::hbedit::target_id_warning(
+                                                            &self.mib_bytes,
+                                                            id_key,
+                                                        )
+                                                        .unwrap_or_else(|| {
+                                                            format!(
+                                                                "{} を {} に変更しました（対象ID はそのままです）",
+                                                                f.ja, name
+                                                            )
+                                                        });
                                                 }
                                             }
                                         }
@@ -7502,6 +7712,7 @@ impl MhnxEditor {
                         }
                     });
                 });
+            self.mib_target_filter = target_search;
             if let Some(id) = new_id {
                 if let Some(m) = &mut self.mib {
                     m.set_quest_id(id);
@@ -27162,6 +27373,18 @@ pub fn item_name_hex(id: u16) -> String {
 /// The .mib field with this key, from the table the file-by-file screen reads.
 fn mib_field(key: &str) -> Option<&'static mhnx_core::questfields::FieldDef> {
     mhnx_core::questfields::MIB_FIELDS.iter().find(|f| f.key == key)
+}
+
+/// The 0..10 index of one 対象 id field, for its own filter box.
+///
+/// The order is the one the .mib stores the pairs in
+/// (mhnx_core::hbedit::QUEST_TARGET_PAIRS), so a com* row keeps its filter text
+/// while the rows above it change.
+fn com_slot_of(key: &str) -> usize {
+    mhnx_core::hbedit::QUEST_TARGET_PAIRS
+        .iter()
+        .position(|(_, id)| *id == key)
+        .unwrap_or(0)
 }
 
 /// Item ids and names that match a needle, in id order.

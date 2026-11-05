@@ -499,6 +499,302 @@ pub fn mib_field_index(key: &str) -> Option<usize> {
     questfields::MIB_FIELDS.iter().position(|f| f.key == key)
 }
 
+// ---------------------------------------------------------------------------
+// 対象 ids: what `com0..com9` hold
+// ---------------------------------------------------------------------------
+//
+// A .mib keeps every target as two bytes: the 種類 (`tt1..tt10`) and the id
+// (`com0..com9`). They are one value, and which table the id is keyed by is
+// decided by the 種類 beside it - 狩猟/討伐 names a monster, 納品 names an item.
+// Reading the id as a monster unconditionally is what made a delivery quest
+// impossible to write: the picker offered the monster table for a byte that the
+// game reads as an item id.
+//
+// The mapping below is measured, not assumed. Every shipped quest was read
+// (the dump in C:\anyWorkspace\nx\mhxx\save_editor\mhxx_quetool\quest, 141
+// archives) and each 種類 was checked against both tables: an id counts as a
+// monster when `mint_` has it and as an item when the item table has it. The
+// counts are on each arm and re-checked by tests/quest_targets.rs, which reads
+// the same 141 files when they are present.
+//
+// (The generated note on `com0` in questfields.rs says "comt[0]=2 なら
+// モンスターID / comt[0]=1 ならアイテムID". `comt[]` is Quedixx's own derived
+// array, not a byte in the record: the stored 種類 is `tt1`, and on the item
+// rows it reads 5 (納品), never 1. The measurement above is the stored byte.)
+
+/// The ten (種類, ID) pairs of one .mib, in file order.
+///
+/// tt1..tt3 are the three targets (the 成功条件 rows) and read the `syu_`
+/// table; tt4..tt10 are the seven 配置 rows and read `syu2_`.
+pub const QUEST_TARGET_PAIRS: [(&str, &str); 10] = [
+    ("tt1", "com0"),
+    ("tt2", "com1"),
+    ("tt3", "com2"),
+    ("tt4", "com3"),
+    ("tt5", "com4"),
+    ("tt6", "com5"),
+    ("tt7", "com6"),
+    ("tt8", "com7"),
+    ("tt9", "com8"),
+    ("tt10", "com9"),
+];
+
+/// What the id of one 対象 row means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuestTargetId {
+    /// The kind carries no id at all: 大連続 / RRP納品 / ネコタク / 乗りダウン.
+    /// (The 数 column is what those rows use - RRP納品 stores the points there.)
+    None,
+    /// A monster id in the `mint_` space, the same space `mob_slot[n]` uses.
+    Monster,
+    /// An item id.
+    Item,
+    /// A kind no shipped quest carries, so this table cannot say what the id
+    /// means. Nothing is guessed for these: the id stays whatever it was.
+    Unmeasured,
+}
+
+/// One of the three target rows (tt1..tt3) rather than a 配置 row (tt4..tt10).
+fn is_target_kind_key(kind_key: &str) -> bool {
+    matches!(kind_key, "tt1" | "tt2" | "tt3")
+}
+
+/// The 種類 field that governs one id field, or None when the key is not one.
+pub fn target_kind_key(id_key: &str) -> Option<&'static str> {
+    QUEST_TARGET_PAIRS
+        .iter()
+        .find(|(_, id)| *id == id_key)
+        .map(|(k, _)| *k)
+}
+
+/// What one 対象 id means, from its 種類 byte alone.
+///
+/// The counts in the comments are the rows of the 141 shipped quests that carry
+/// that kind; a kind whose id is 0 in every one of them says so.
+pub fn target_id_kind(kind_key: &str, value: u8) -> QuestTargetId {
+    if !QUEST_TARGET_PAIRS.iter().any(|(k, _)| *k == kind_key) {
+        return QuestTargetId::Unmeasured;
+    }
+    if is_target_kind_key(kind_key) {
+        // enum syu_ (20 rows)
+        match value {
+            0 => QuestTargetId::None,       // なし
+            1 => QuestTargetId::Monster,    // 狩猟/討伐 - 97 rows
+            2 => QuestTargetId::Monster,    // 捕獲 - 1 row (q1011001: 77 = セルレギオス)
+            3 => QuestTargetId::None,       // 大連続 - 25 rows, every id 0
+            4 => QuestTargetId::Monster,    // 討伐合計 - 3 rows (small monsters)
+            5 => QuestTargetId::Item,       // 納品 - 6 rows, every id a named item
+            6 => QuestTargetId::None,       // RRP納品 - 2 rows, id 0, 数 = points
+            7 => QuestTargetId::None,       // ネコタク - 2 rows, id 0
+            8 => QuestTargetId::Monster,    // 部位破壊 - 42 rows (6 + 36)
+            9 => QuestTargetId::None,       // 乗りダウン - 16 rows, every id 0
+            // 罠ダウン / 討伐 / ギルド旗 / 失敗 / 不明 / 成功: no shipped quest
+            // uses one, so the id's table is not known here.
+            _ => QuestTargetId::Unmeasured,
+        }
+    } else {
+        // enum syu2_ (4 rows: なし / 狩猟討伐 / 採取 / 納品)
+        match value {
+            0 => QuestTargetId::None,     // なし
+            2 | 3 => QuestTargetId::Item, // 採取 / 納品 - 4 rows, every id a named item
+            // 1 (狩猟/討伐) and every value past the table: no shipped quest
+            // carries one of these in a 配置 row, so nothing is claimed.
+            _ => QuestTargetId::Unmeasured,
+        }
+    }
+}
+
+/// The name of one 種類 value, from the table that governs that row.
+pub fn target_kind_label(kind_key: &str, value: u8) -> &'static str {
+    let table = if is_target_kind_key(kind_key) {
+        questfields::ENUM_SYU_
+    } else if QUEST_TARGET_PAIRS.iter().any(|(k, _)| *k == kind_key) {
+        questfields::ENUM_SYU2_
+    } else {
+        return "?";
+    };
+    table.get(value as usize).copied().unwrap_or("?")
+}
+
+/// 「対象モンスター」「対象アイテム」 - the word a row is headed with.
+pub fn target_id_word(kind: QuestTargetId) -> &'static str {
+    match kind {
+        QuestTargetId::Monster => "対象モンスター",
+        QuestTargetId::Item => "対象アイテム",
+        QuestTargetId::None => "対象ID（この種別では使いません）",
+        QuestTargetId::Unmeasured => "対象ID（未確定）",
+    }
+}
+
+/// The row heading for one 対象 id: the kind's word plus the field's own name.
+pub fn target_row_title(field_ja: &str, kind: QuestTargetId) -> String {
+    format!("{}（{}）", target_id_word(kind), field_ja)
+}
+
+/// The name of the table an id of this kind lives in, for warnings.
+fn id_space_word(kind: QuestTargetId) -> &'static str {
+    match kind {
+        QuestTargetId::Monster => "モンスター",
+        QuestTargetId::Item => "アイテム",
+        _ => "対象",
+    }
+}
+
+/// 「名前 0xID」 for one 対象 id, in the space its kind names.
+pub fn target_id_label(kind: QuestTargetId, id: u16) -> String {
+    match kind {
+        QuestTargetId::Monster => {
+            if id == 0 {
+                String::from("なし")
+            } else {
+                named_hex(monster_name_of(id), id as u32)
+            }
+        }
+        QuestTargetId::Item => {
+            if id == 0 {
+                String::from("なし")
+            } else {
+                named_hex(item_name_or_none(id).as_deref(), id as u32)
+            }
+        }
+        QuestTargetId::None => {
+            if id == 0 {
+                String::from("なし")
+            } else {
+                alloc::format!("使わない 0x{:X}", id)
+            }
+        }
+        QuestTargetId::Unmeasured => alloc::format!("未確定 0x{:X}", id),
+    }
+}
+
+/// Is this id inside the table its kind points at?
+///
+/// The two spaces are the ones the pickers read: `mint_` for monsters and the
+/// item name table for items. An id the table does not cover is reported, never
+/// replaced - 269 and 525 are real monster ids that the shipped mint_ table
+/// does not list, and rewriting them would break those quests.
+pub fn target_id_fits(kind: QuestTargetId, id: u16) -> bool {
+    if id == 0 {
+        return true;
+    }
+    match kind {
+        QuestTargetId::Monster => monster_name_of(id).is_some(),
+        QuestTargetId::Item => item_name_or_none(id).is_some(),
+        QuestTargetId::None | QuestTargetId::Unmeasured => true,
+    }
+}
+
+/// One 対象 row of a .mib, decoded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestTargetInfo {
+    /// The 種類 field the row's meaning comes from ("tt1".."tt10").
+    pub kind_key: &'static str,
+    /// The 種類 byte as stored.
+    pub kind_value: u8,
+    /// 狩猟/討伐, 納品, ... (or "?" when the value is past the table).
+    pub kind_label: &'static str,
+    /// What the id field means under that kind.
+    pub id_kind: QuestTargetId,
+    /// The id as stored (0 = empty).
+    pub id: u16,
+    /// 「名前 0xID」 / 「なし」 / 「未確定 0xID」.
+    pub label: String,
+}
+
+impl QuestTargetInfo {
+    /// The heading of the row, e.g. 「対象アイテム（ターゲット1 ID）」.
+    pub fn row_title(&self, field_ja: &str) -> String {
+        target_row_title(field_ja, self.id_kind)
+    }
+}
+
+/// Decode one 対象 row by the id field's key ("com0".."com9").
+pub fn quest_target_info(mib: &[u8], id_key: &str) -> Option<QuestTargetInfo> {
+    let kind_key = target_kind_key(id_key)?;
+    let f = questfields::MIB_FIELDS.iter().find(|f| f.key == id_key)?;
+    let kf = questfields::MIB_FIELDS.iter().find(|f| f.key == kind_key)?;
+    let id = questfields::read_u32(mib, f.offset, f.kind)? as u16;
+    let kind_value = questfields::read_u32(mib, kf.offset, kf.kind)? as u8;
+    let id_kind = target_id_kind(kind_key, kind_value);
+    Some(QuestTargetInfo {
+        kind_key,
+        kind_value,
+        kind_label: target_kind_label(kind_key, kind_value),
+        id_kind,
+        id,
+        label: target_id_label(id_kind, id),
+    })
+}
+
+/// The line to say when a 種類 change left an id that its new table lacks.
+///
+/// It never rewrites the id: the number is the user's, and a 種類 that was
+/// picked by accident must not cost them the id they had.
+pub fn target_id_warning(mib: &[u8], id_key: &str) -> Option<String> {
+    let info = quest_target_info(mib, id_key)?;
+    if target_id_fits(info.id_kind, info.id) {
+        return None;
+    }
+    Some(alloc::format!(
+        "対象ID 0x{:X} は{}の表にありません（対象ID はそのままにしています）",
+        info.id,
+        id_space_word(info.id_kind)
+    ))
+}
+
+/// What [A] on one .mib field opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MibPickKind {
+    /// A field with no list of its own: [◀/▶] changes it.
+    None,
+    /// The monster table (a `mob_slot[n]` row or a monster-kind target).
+    Monster,
+    /// The item table (a 納品 / 採取 target).
+    Item,
+}
+
+/// What [A] on one .mib field opens.
+pub fn mib_pick_kind(mib: &[u8], field_idx: usize) -> MibPickKind {
+    let Some(f) = questfields::MIB_FIELDS.get(field_idx) else {
+        return MibPickKind::None;
+    };
+    if f.key.starts_with("mob_slot[") {
+        return MibPickKind::Monster;
+    }
+    match quest_target_info(mib, f.key) {
+        Some(info) => match info.id_kind {
+            QuestTargetId::Monster => MibPickKind::Monster,
+            QuestTargetId::Item => MibPickKind::Item,
+            QuestTargetId::None | QuestTargetId::Unmeasured => MibPickKind::None,
+        },
+        None => MibPickKind::None,
+    }
+}
+
+/// The monster table the .mib stores ids from, as (id, name) in id order.
+///
+/// `mint_` and `mons_` are the same list seen twice: the id the record stores
+/// and the name the game prints. The trailing duplicate 0 is dropped - it is
+/// the same "no monster" entry the empty slot already says.
+pub fn monster_id_choices() -> Vec<(u16, &'static str)> {
+    let mut out: Vec<(u16, &'static str)> = Vec::new();
+    let mint = questfields::ENUM_MINT_;
+    for (i, (&id_str, &name)) in questfields::ENUM_MINT_
+        .iter()
+        .zip(questfields::ENUM_MONS_.iter())
+        .enumerate()
+    {
+        if i == mint.len() - 1 && id_str == "0" && i > 0 {
+            continue;
+        }
+        if let Ok(raw) = id_str.parse::<u16>() {
+            out.push((raw, name));
+        }
+    }
+    out
+}
+
 /// A button press.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
@@ -4299,8 +4595,11 @@ pub struct Editor {
     /// Which talisman skill the picker writes: 1 or 2.
     pub skill_pick_field: u8,
     /// What the item picker writes: 0 = the item box, 1 = a record inside
-    /// the .rem / .sup entry that is being viewed.
+    /// the .rem / .sup entry that is being viewed, 2 = a quest-equipment
+    /// entry, 3 = the two-stage bulk add, 4 = the 対象ID of one .mib field.
     pub item_pick_mode: u8,
+    /// Which .mib field mode 4 writes (the .mib field index of a com*).
+    pub item_pick_mib_field: usize,
     /// Which reward record the picker will write.
     pub entry_item_row: usize,
     /// Cursor over the records of the open reward table.
@@ -4722,6 +5021,7 @@ impl Editor {
             equip_pick_kind: 0,
             equip_pick_cursor: 0,
             item_pick_mode: 0,
+            item_pick_mib_field: 0,
             entry_item_row: 0,
             entry_row_cursor: 0,
             entry_field: 0,
@@ -6431,6 +6731,68 @@ impl Editor {
         };
         self.dirty = true;
         self.message = format!("{}: {} を {} に変更しました", f.ja, label, next);
+    }
+
+    /// The 対象 row whose id field is `field_idx`, decoded.
+    ///
+    /// None when the field is not one of the ten com* rows. The meaning comes
+    /// from the 種類 byte beside it (hbedit::quest_target_info), so the screen
+    /// and the picker cannot disagree about what the id is.
+    pub fn mib_target_info(&self, field_idx: usize) -> Option<QuestTargetInfo> {
+        let f = questfields::MIB_FIELDS.get(field_idx)?;
+        quest_target_info(&self.mib_bytes, f.key)
+    }
+
+    /// Write one 対象 id, saying what it now names.
+    ///
+    /// A 種類 that points at the item table takes an item id; nothing here
+    /// changes the 種類, so the caller's own table stays what it is.
+    pub fn mib_set_target_id(&mut self, field_idx: usize, id: u16) -> bool {
+        let Some(f) = questfields::MIB_FIELDS.get(field_idx).copied() else {
+            return false;
+        };
+        if !questfields::write_u32(&mut self.mib_bytes, f.offset, f.kind, id as u32) {
+            return false;
+        }
+        self.dirty = true;
+        self.message = match quest_target_info(&self.mib_bytes, f.key) {
+            Some(info) => alloc::format!("{}: {}", f.ja, info.label),
+            None => alloc::format!("{}: 0x{:X}", f.ja, id),
+        };
+        true
+    }
+
+    /// [A] on a 対象 row whose 種類 points at the item table.
+    ///
+    /// The item list is the same picker the reward rows use (mode 1) with one
+    /// writing difference (mode 4): it searches by name, and the pick lands in
+    /// the .mib instead of in a .rem record. False means the row is not an
+    /// item-kind target, and the console layer says what the row is instead.
+    pub fn open_mib_item_pick(&mut self, field_idx: usize) -> bool {
+        let Some(f) = questfields::MIB_FIELDS.get(field_idx).copied() else {
+            return false;
+        };
+        let Some(info) = quest_target_info(&self.mib_bytes, f.key) else {
+            return false;
+        };
+        if info.id_kind != QuestTargetId::Item {
+            return false;
+        }
+        self.mib_cursor = field_idx;
+        self.cursor = field_idx;
+        self.item_pick_mib_field = field_idx;
+        self.item_pick_mode = 4;
+        self.item_pick_cursor = 0;
+        self.item_pick_filter.clear();
+        self.screen = Screen::ItemPick;
+        let hint = self.pick_key_hint();
+        self.message = alloc::format!("{} を選んでください — {}", info.row_title(f.ja), hint);
+        true
+    }
+
+    /// What [A] opens on the .mib row under the cursor.
+    pub fn mib_pick_kind_at_cursor(&self) -> MibPickKind {
+        mib_pick_kind(&self.mib_bytes, self.mib_cursor)
     }
 
     /// Step one number of the .sem placement that places monster slot sem_k.
@@ -14612,6 +14974,19 @@ impl Editor {
                     self.screen = Screen::QuestEquip;
                     return;
                 }
+                // Mode 4 writes the 対象ID of a .mib row: the same list and
+                // the same search as a reward row, and the pick goes back to
+                // the .mib screen instead of into a .rem record.
+                if self.item_pick_mode == 4 {
+                    if let Some(&id) = matches.get(self.item_pick_cursor) {
+                        let field = self.item_pick_mib_field;
+                        self.mib_set_target_id(field, id);
+                        self.screen = Screen::Mib;
+                        self.mib_cursor = field;
+                        self.cursor = field;
+                    }
+                    return;
+                }
                 // Mode 3 is the bulk add: A only chooses the item, the count
                 // comes next and nothing is written yet.
                 if self.item_pick_mode == 3 {
@@ -14648,7 +15023,9 @@ impl Editor {
                 }
             }
             Key::B => {
-                if self.item_pick_mode == 1 {
+                if self.item_pick_mode == 4 {
+                    self.screen = Screen::Mib;
+                } else if self.item_pick_mode == 1 {
                     self.screen = Screen::EntryView;
                 } else if self.item_pick_mode == 2 {
                     self.screen = Screen::QuestEquip;
@@ -15219,7 +15596,29 @@ impl Editor {
                 // the クエスト改造 screen's 制限時間 row runs the same
                 // arithmetic, so the two can never drift apart.
                 let d = if key == Key::Right { 1 } else { -1 } * STEPS[self.step] as i32;
+                let stepped_key = fields[self.mib_cursor].key;
                 self.step_mib_field(self.mib_cursor, d);
+                // A 種類 step changes what the id beside it means. The id
+                // itself is never rewritten: a 種別 picked by accident must
+                // not cost the number the user had.
+                if let Some((_, id_key)) = QUEST_TARGET_PAIRS
+                    .iter()
+                    .find(|(k, _)| *k == stepped_key)
+                {
+                    if let Some(info) = quest_target_info(&self.mib_bytes, id_key) {
+                        self.message = alloc::format!(
+                            "{}: {} — {} は {}",
+                            fields[self.mib_cursor].ja,
+                            info.kind_label,
+                            target_id_word(info.id_kind),
+                            info.label
+                        );
+                        if let Some(warning) = target_id_warning(&self.mib_bytes, id_key) {
+                            self.message.push_str("。");
+                            self.message.push_str(&warning);
+                        }
+                    }
+                }
             }
             Key::A => self.request_write_arc(),
             Key::B => {
@@ -15774,6 +16173,48 @@ impl Editor {
             }
             Screen::ItemPick => {
                 let matches = self.item_pick_matches();
+                if self.item_pick_mode == 4 {
+                    // The 対象ID of a .mib row: the header names the row, its
+                    // 種類 and the id it holds now, so the list underneath is
+                    // never mistaken for the item box.
+                    let field = questfields::MIB_FIELDS.get(self.item_pick_mib_field);
+                    let (title, now) = match field {
+                        Some(f) => (
+                            f.ja,
+                            quest_target_info(&self.mib_bytes, f.key)
+                                .map(|i| alloc::format!("{} [{}]", i.label, i.kind_label))
+                                .unwrap_or_else(|| String::from("—")),
+                        ),
+                        None => ("対象アイテム", String::from("—")),
+                    };
+                    push(
+                        &mut out,
+                        alloc::format!("PICK ITEM   {}   now: {}", title, now),
+                        false,
+                        false,
+                    );
+                    let search = self.item_pick_search_line(matches.len());
+                    push(&mut out, search, false, false);
+                    let mut start = self.item_pick_cursor.saturating_sub(8);
+                    if start + 16 > matches.len() {
+                        start = matches.len().saturating_sub(16);
+                    }
+                    for (i, id) in matches.iter().enumerate().skip(start).take(16) {
+                        push(
+                            &mut out,
+                            alloc::format!("  {:<6} {}", id, item_name_of(*id)),
+                            true,
+                            i == self.item_pick_cursor,
+                        );
+                    }
+                    push(
+                        &mut out,
+                        String::from("  A choose  Y type filter  X clear  Up/Down 1  Left/Right 10  B back"),
+                        false,
+                        false,
+                    );
+                    return out;
+                }
                 if self.item_pick_mode == 3 {
                     // The bulk add has two stages and the header says which
                     // one is showing, because the list looks the same in both.
