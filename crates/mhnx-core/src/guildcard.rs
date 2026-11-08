@@ -138,6 +138,45 @@ pub const GC_WEAPON: usize = 0x8BA;
 /// Bytes one venue array occupies (15 u16).
 pub const WEAPON_VENUE_BYTES: usize = WEAPON_TYPES * 2;
 
+/// Japanese name of one of the fifteen weapon kinds the usage graph counts.
+///
+/// The storage order (see [WEAPON_TYPES]), not the on-screen bar order. The
+/// card's own gamedata table (HUNT_WEAPONS) is English, and both editors show
+/// these names beside Japanese headings, so the words come from the same
+/// equipment vocabulary the 装備 screen uses (equip::type_name) in the card's
+/// order - with the Prowler last, which the equipment box does not hold.
+pub const WEAPON_TYPE_NAMES: [&str; WEAPON_TYPES] = [
+    "大剣",
+    "片手剣",
+    "ハンマー",
+    "ランス",
+    "ヘビィボウガン",
+    "ライトボウガン",
+    "太刀",
+    "スラッシュアックス",
+    "ガンランス",
+    "弓",
+    "双剣",
+    "狩猟笛",
+    "操虫棍",
+    "チャージアックス",
+    "ニャンター",
+];
+
+/// Japanese name of one weapon kind, or "?" past the end.
+pub fn weapon_type_name(index: usize) -> &'static str {
+    WEAPON_TYPE_NAMES.get(index).copied().unwrap_or("?")
+}
+
+/// Japanese name of one venue, in the order the card stores them.
+pub fn venue_name(venue: Venue) -> &'static str {
+    match venue {
+        Venue::Village => "村",
+        Venue::Hub => "集会所",
+        Venue::Arena => "闘技場",
+    }
+}
+
 /// Which quest venue a usage array counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Venue {
@@ -222,6 +261,26 @@ pub const GC_TITLE_LINK_MAP_NEW: usize = 0x311F;
 pub const GC_QUESTS: usize = 0x85E;
 /// How many quest counters there are.
 pub const QUEST_COUNTS: usize = 7;
+
+/// What each of the seven counters counts, in the order they are stored.
+///
+/// The card draws one bar per counter and the sum above them; the two editors
+/// print these words beside the numbers, so the two screens and the game say
+/// the same thing.
+pub const QUEST_COUNT_LABELS: [&str; QUEST_COUNTS] = [
+    "村（下位）",
+    "村（上位）",
+    "集会所（下位）",
+    "集会所（上位）",
+    "集会所（G）",
+    "特別許可",
+    "闘技大会",
+];
+
+/// The name of one of the seven counters, or "?" past the end.
+pub fn quest_count_label(index: usize) -> &'static str {
+    QUEST_COUNT_LABELS.get(index).copied().unwrap_or("?")
+}
 /// The cap the game applies to the total it shows.
 pub const QUEST_TOTAL_CAP: u32 = 99_999;
 

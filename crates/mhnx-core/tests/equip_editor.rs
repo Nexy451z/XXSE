@@ -272,6 +272,14 @@ fn changing_the_type_in_the_form_replaces_the_record() {
     while ed.equip_edit.map(|e| e.field) != Some(0) {
         ed.input(Key::Up);
     }
+    // A type change asks once before it writes: the first [A] only says what
+    // the change costs, so a record cannot be retyped by one press. The second
+    // [A] is the replace (hbedit::Editor::equip_kind_pending).
+    let depth = ed.undo_depth();
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
+    assert!(ed.equip_kind_pending().is_some(), "{}", ed.message);
+    assert_eq!(ed.undo_depth(), depth, "the ask is not an edit");
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Equip);
     assert!(

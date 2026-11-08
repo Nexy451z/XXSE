@@ -2905,6 +2905,15 @@ pub const TEXT_EQUIP_ID: usize = usize::MAX - 1_012;
 /// reason the other one-offs are: the console reads one contiguous range above
 /// that base as palico names.
 pub const TEXT_ITEM_BOX_FILTER: usize = usize::MAX - 1_013;
+/// Sentinel id for "type the quest count under the cursor".
+///
+/// The seven counters run to 65,535, and the arrow keys move by the step; the
+/// keyboard is how a user writes 1,234 without 1,234 presses. Below
+/// `TEXT_PALICO_NAME` like the other one-offs: the console reads one contiguous
+/// range above that base as palico names.
+pub const TEXT_GUILD_QUEST_COUNT: usize = usize::MAX - 1_014;
+/// Sentinel id for "type the weapon usage count under the cursor".
+pub const TEXT_GUILD_WEAPON_COUNT: usize = usize::MAX - 1_015;
 /// Sentinel base for "ask for the name of item set N": N is added to this.
 ///
 /// The two my-set names sit in one field of the same width, so the base is
@@ -3225,8 +3234,27 @@ pub fn name_preview(text: &str) -> String {
 pub const GUILD_TAB_CARD: usize = 0;
 /// View 1 of the guild screen: the arena log.
 pub const GUILD_TAB_ARENA: usize = 1;
+/// View 2 of the guild screen: the seven quest counters.
+///
+/// guildcard::quest_counts reads them as seven u16 behind the title, and
+/// guildcard::set_quest_count writes one. The same seven the PC build edits on
+/// its ギルド tab's クエスト回数 grid, in the same order.
+pub const GUILD_TAB_COUNTS: usize = 2;
+/// View 3 of the guild screen: 15 weapon kinds by the three venues.
+///
+/// One array per venue (村 / 集会所 / 闘技場), fifteen u16 each, and the card's
+/// "All" graph is the sum of the three - which the game computes at display
+/// time, so the total row here is a reading, not a field.
+pub const GUILD_TAB_WEAPONS: usize = 3;
 /// Views the guild screen has.
-pub const GUILD_TABS: usize = 2;
+pub const GUILD_TABS: usize = 4;
+
+/// Rows of the quest-counter view: the seven counters of guildcard::GC_QUESTS.
+pub const GUILD_COUNT_ROWS: usize = crate::guildcard::QUEST_COUNTS;
+/// Rows of the weapon-usage view: the fifteen kinds the card counts.
+pub const GUILD_WEAPON_ROWS: usize = crate::guildcard::WEAPON_TYPES;
+/// Venue columns of the weapon-usage view: 村 / 集会所 / 闘技場.
+pub const GUILD_VENUES: usize = 3;
 
 /// Rows of the guild card view: HR, the clock, the comment, and the name the
 /// card carries. The name is last so the three rows the screen always had keep
@@ -5010,6 +5038,26 @@ pub struct Editor {
     /// arena and the rank - stays put so the number being changed cannot move
     /// out from under the press.
     pub arena_edit: bool,
+    /// Row under the cursor on the quest-counter view (0..GUILD_COUNT_ROWS).
+    pub guild_count_cursor: usize,
+    /// Weapon row under the cursor on the weapon-usage view.
+    pub guild_wpn_row: usize,
+    /// Venue column under the cursor on the weapon-usage view (0..GUILD_VENUES).
+    pub guild_wpn_venue: usize,
+    /// Is the weapon-usage cell being stepped? [A] starts it, [A] and [B] end
+    /// it.
+    ///
+    /// The same mode the arena view uses, for the same reason: the cell has a
+    /// row and a column, so one pair of directions has to move the cursor and
+    /// the other pair has to change the number.
+    pub guild_wpn_edit: bool,
+    /// A type change waiting for its second [A] on the equipment form.
+    ///
+    /// (record index, type it would become). The form's [A] writes the record,
+    /// and moving its type is the one write that makes the bytes behind +0x02
+    /// mean something else - so it asks once, here, instead of firing on one
+    /// press. Any other key drops it.
+    pub equip_kind_armed: Option<(usize, u8)>,
     /// Which view of the progress screen is showing.
     ///
     /// One of PROGRESS_AWARDS / PROGRESS_REQUESTS / PROGRESS_QUESTS. The three
@@ -5357,6 +5405,11 @@ impl Editor {
             arena_rank: 0,
             arena_part: ARENA_PART_CS,
             arena_edit: false,
+            guild_count_cursor: 0,
+            guild_wpn_row: 0,
+            guild_wpn_venue: 0,
+            guild_wpn_edit: false,
+            equip_kind_armed: None,
             progress_tab: 0,
             award_cursor: 0,
             request_cursor: 0,
@@ -5666,12 +5719,23 @@ impl Editor {
     pub fn set_guild_view(&mut self, view: usize) {
         self.guild_tab = view.min(GUILD_TABS - 1);
         self.arena_edit = false;
+        self.guild_wpn_edit = false;
         self.arena_row = self.arena_row.min(ARENA_ROWS.saturating_sub(1));
         self.arena_rank = self.arena_rank.min(ARENA_COLUMNS.saturating_sub(1));
-        self.message = if self.guild_tab == GUILD_TAB_ARENA {
-            String::from("闘技大会: ▲▼ アリーナ / ◀▶ 順位 / [A] 編集 / [Y] 直接入力 / [X] 保存")
-        } else {
-            String::from("ギルドカード: ▼ 項目 / ◀▶ 増減 / [A] コメント / [-] 進行状況 / [X] 保存")
+        self.guild_count_cursor = self.guild_count_cursor.min(GUILD_COUNT_ROWS.saturating_sub(1));
+        self.guild_wpn_row = self.guild_wpn_row.min(GUILD_WEAPON_ROWS.saturating_sub(1));
+        self.guild_wpn_venue = self.guild_wpn_venue.min(GUILD_VENUES.saturating_sub(1));
+        self.message = match self.guild_tab {
+            GUILD_TAB_ARENA => String::from(
+                "闘技大会: ▲▼ アリーナ / ◀▶ 順位 / [A] 編集 / [Y] 直接入力 / [X] 保存",
+            ),
+            GUILD_TAB_COUNTS => String::from(
+                "クエスト回数: ▼ 項目 / ◀▶ 増減 / [R] 数値入力 / [X] 保存（[-] 進行状況）",
+            ),
+            GUILD_TAB_WEAPONS => String::from(
+                "武器使用数: ▲▼ 武器 / ◀▶ 会場 / [A] 編集 / [R] 数値入力 / [X] 保存",
+            ),
+            _ => String::from("ギルドカード: ▼ 項目 / ◀▶ 増減 / [A] コメント / [-] 進行状況 / [X] 保存"),
         };
     }
 
@@ -5937,8 +6001,24 @@ impl Editor {
             }
             // The card's [A] is the row's own action too: the comment opens the
             // keyboard and the two numbers take a step.
+            // Three of the four views answer [A] differently, so the line is
+            // written per view rather than once for the screen.
+            Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => String::from(
+                "[▲/▼] 項目  [◀/▶] 増減  [R] 数値入力  [A] +刻み  [-] 進行状況  [B] カード  [X] 保存",
+            ),
+            Screen::Guild if self.guild_view() == GUILD_TAB_WEAPONS => {
+                if self.guild_wpn_edit {
+                    String::from(
+                        "[▲/▼] ±刻み  [◀/▶] ±10  [R] 数値入力  [A] 終了  [X] 保存",
+                    )
+                } else {
+                    String::from(
+                        "[▲/▼] 武器  [◀/▶] 会場  [A] 編集  [R] 数値入力  [B] カード  [X] 保存",
+                    )
+                }
+            }
             Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => format!(
-                "[▼] 項目  [◀/▶] 増減  [R] 数値入力  [A] {}  [-] 進行状況  [L/R] タブ  [X] 保存",
+                "[▼] 項目  [◀/▶] 増減  [R] 数値入力  [Y] 回数/武器  [A] {}  [-] 進行状況  [X] 保存",
                 self.guild_a_label()
             ),
             _ => String::from(self.static_footer()),
@@ -7620,17 +7700,31 @@ impl Editor {
         )
     }
 
-    /// What [A] does on one row of the guild card.
+    /// What [A] does on the guild screen, for the view that is showing.
     ///
-    /// The comment is text and needs the keyboard; the rank and the clock are
-    /// numbers, and [A] there adds one step to the value - the same step
+    /// The card's comment is text and needs the keyboard; its rank and clock
+    /// are numbers, and [A] there adds one step to the value - the same step
     /// [◀/▶] take. It used to print 編集 on every row and do nothing on two of
-    /// them.
+    /// them. The two newer views answer for themselves: a counter steps, and a
+    /// weapon cell opens its editor rather than moving (its row and column are
+    /// two different things, so [A] is the mode switch the arena view uses).
     pub fn guild_a_label(&self) -> &'static str {
-        if self.guild_field >= 2 {
-            "編集"
-        } else {
-            "+刻み"
+        match self.guild_view() {
+            GUILD_TAB_COUNTS => "+刻み",
+            GUILD_TAB_WEAPONS => {
+                if self.guild_wpn_edit {
+                    "編集を終了"
+                } else {
+                    "編集"
+                }
+            }
+            _ => {
+                if self.guild_field >= 2 {
+                    "編集"
+                } else {
+                    "+刻み"
+                }
+            }
         }
     }
 
@@ -7663,6 +7757,78 @@ impl Editor {
             self.dirty = true;
         }
         ok
+    }
+
+    /// [MAX] on the quest-counter view: the row under the cursor to u16::MAX.
+    ///
+    /// The seven counters are plain u16, so the ceiling is the field's own
+    /// width rather than a number the game applies - the card only caps the
+    /// sum it draws ([crate::guildcard::QUEST_TOTAL_CAP]).
+    pub fn guild_count_row_max(&mut self, row: usize) -> bool {
+        let kind = row.min(GUILD_COUNT_ROWS.saturating_sub(1));
+        let slot = self.slot;
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        self.push_undo("クエスト回数");
+        let Some(save) = &mut self.save else { return false };
+        if crate::guildcard::set_quest_count(save, slot, kind, u16::MAX as u32) {
+            self.dirty = true;
+            self.guild_count_cursor = kind;
+            self.message = alloc::format!(
+                "{} を {}（u16 の上限）にしました",
+                crate::guildcard::quest_count_label(kind),
+                u16::MAX
+            );
+            true
+        } else {
+            self.message = String::from("クエスト回数を書き換えられません");
+            false
+        }
+    }
+
+    /// [MAX] on the weapon-usage view: the cell under the cursor to u16::MAX.
+    pub fn guild_weapon_row_max(&mut self) -> bool {
+        let (row, venue) = self.guild_weapon_selected();
+        let v = crate::guildcard::Venue::ALL[venue];
+        let slot = self.slot;
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        self.push_undo("武器使用数");
+        let Some(save) = &mut self.save else { return false };
+        if crate::guildcard::set_weapon_usage(save, slot, v, row, u16::MAX) {
+            self.dirty = true;
+            self.message = alloc::format!(
+                "{} {} を {}（u16 の上限）にしました",
+                crate::guildcard::weapon_type_name(row),
+                crate::guildcard::venue_name(v),
+                u16::MAX
+            );
+            true
+        } else {
+            self.message = String::from("武器使用数を書き換えられません");
+            false
+        }
+    }
+
+    /// Walk the three views that hold the card's numbers: カード → 回数 → 武器.
+    ///
+    /// The section's sub-tab bar already fills its width with six labels and
+    /// drops whatever would run under the tool pills, so two more tabs would be
+    /// labels nobody could tap. The two record views are therefore reached with
+    /// [Y] from the card and from one another - the key is free on all three
+    /// views - while the arena log keeps its own tab (and its own [Y], which
+    /// types a time).
+    pub fn guild_next_view(&mut self) {
+        let next = match self.guild_view() {
+            GUILD_TAB_COUNTS => GUILD_TAB_WEAPONS,
+            GUILD_TAB_WEAPONS => GUILD_TAB_CARD,
+            _ => GUILD_TAB_COUNTS,
+        };
+        self.set_guild_view(next);
     }
 
     /// Ask the I/O layer to write the highlighted save quest out as a file.
@@ -11135,11 +11301,15 @@ impl Editor {
     }
 
     fn input_guild(&mut self, key: Key) {
-        // The guild screen carries two views. The arena log is the second one,
-        // and while it is showing it owns every key: the card's fields are not
-        // on screen, so a press must not reach them.
-        if self.guild_view() == GUILD_TAB_ARENA {
-            return self.input_arena(key);
+        // The guild screen carries four views, and the showing one owns every
+        // key: the card's fields are not on screen while the arena log is, so a
+        // press must not reach them. Each of the other three views reads the
+        // same seven fields and the same box, so one dispatch is enough.
+        match self.guild_view() {
+            GUILD_TAB_ARENA => return self.input_arena(key),
+            GUILD_TAB_COUNTS => return self.input_guild_counts(key),
+            GUILD_TAB_WEAPONS => return self.input_guild_weapons(key),
+            _ => {}
         }
         // Field 0 is the rank, 1 is the card's own clock, 2 the comment and 3
         // the name the card carries (its own copy of the hunter name).
@@ -11185,6 +11355,11 @@ impl Editor {
             Key::R => {
                 self.request_guild_text();
             }
+            // [Y] walks the three views that hold the card's numbers - the
+            // card itself, the seven counters and the weapon grid. The two
+            // record views have no sub-tab of their own (the bar is full), and
+            // this key is free on all three; the arena log keeps its own [Y].
+            Key::Y => self.guild_next_view(),
             // [A] is the row's own action (Editor::guild_a_label): the comment
             // needs the keyboard, and the rank / clock take one step more,
             // exactly what [▶] would add. It used to print 編集 on every row
@@ -11337,6 +11512,385 @@ impl Editor {
             arena_rank_name(rank),
             arena_clock(self.arena_centis_at(row, rank))
         );
+    }
+    // ------------------------------------------- quest counters view (3/4)
+    //
+    // The card counts seven things (village low/high, hub low/high/G, special
+    // permit, arena) as seven u16, and shows their sum capped at 99,999. The
+    // sum is not stored: guildcard::quest_total adds it up the way the game
+    // does, so this view writes one counter at a time and prints the total.
+
+    /// The card's seven quest counters, in guildcard::QUEST_COUNT_LABELS order.
+    pub fn guild_counts(&self) -> Vec<u32> {
+        match &self.save {
+            Some(save) => crate::guildcard::quest_counts(save, self.slot),
+            None => Vec::new(),
+        }
+    }
+
+    /// Row the counter cursor is on.
+    pub fn guild_count_selected(&self) -> usize {
+        self.guild_count_cursor
+            .min(GUILD_COUNT_ROWS.saturating_sub(1))
+    }
+
+    /// One counter, 0 when there is no save behind the view.
+    pub fn guild_count_at(&self, row: usize) -> u32 {
+        self.guild_counts().get(row).copied().unwrap_or(0)
+    }
+
+    /// The total the card draws: the seven added up, capped like the game.
+    pub fn guild_count_total(&self) -> u32 {
+        let sum: u32 = self.guild_counts().iter().sum();
+        sum.min(crate::guildcard::QUEST_TOTAL_CAP)
+    }
+
+    /// Add `delta` to the counter under the cursor, clamped to a u16.
+    ///
+    /// One counter per press, the same rule the card's own rows follow: the
+    /// field is a u16, so a value past 65,535 is clamped rather than wrapped,
+    /// and the status line re-reads the box so what it says is what is stored.
+    pub fn adjust_guild_count(&mut self, delta: i64) -> bool {
+        let kind = self.guild_count_selected();
+        let cur = self.guild_count_at(kind) as i64;
+        let value = (cur + delta).clamp(0, u16::MAX as i64) as u32;
+        let slot = self.slot;
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        self.push_undo("クエスト回数");
+        let Some(save) = &mut self.save else { return false };
+        if crate::guildcard::set_quest_count(save, slot, kind, value) {
+            self.dirty = true;
+            self.describe_guild_count();
+            true
+        } else {
+            self.message = String::from("クエスト回数を書き換えられません");
+            false
+        }
+    }
+
+    /// Put the counter under the cursor into the status line, with its total.
+    fn describe_guild_count(&mut self) {
+        let kind = self.guild_count_selected();
+        let sum: u32 = self.guild_counts().iter().sum();
+        self.message = alloc::format!(
+            "{}: {}（7 欄の合計 {} / カード表示 {}） [R] 直接入力",
+            crate::guildcard::quest_count_label(kind),
+            self.guild_count_at(kind),
+            sum,
+            self.guild_count_total()
+        );
+    }
+
+    /// Ask the keyboard for the counter under the cursor.
+    pub fn request_guild_count_text(&mut self) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let kind = self.guild_count_selected();
+        self.pending_text = Some((
+            TEXT_GUILD_QUEST_COUNT,
+            alloc::format!("{}", self.guild_count_at(kind)),
+        ));
+        true
+    }
+
+    /// Apply a typed quest count to the counter under the cursor.
+    ///
+    /// The seven fields are u16, so a number past 65,535 is clamped the same
+    /// way the arrow keys clamp it, and the status line names the ceiling.
+    pub fn apply_guild_quest_count_text(&mut self, text: &str) -> bool {
+        let Some(n) = parse_leading_u32(text) else {
+            self.message = String::from("回数を数字で入力してください（0〜65535）");
+            return false;
+        };
+        let kind = self.guild_count_selected();
+        let slot = self.slot;
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        self.push_undo("クエスト回数");
+        let Some(save) = &mut self.save else { return false };
+        let v = n.min(u16::MAX as u32);
+        if crate::guildcard::set_quest_count(save, slot, kind, v) {
+            self.dirty = true;
+            self.message = alloc::format!(
+                "{} を {} にしました（u16 の上限 {}）",
+                crate::guildcard::quest_count_label(kind),
+                v,
+                u16::MAX
+            );
+            true
+        } else {
+            self.message = String::from("クエスト回数を書き換えられません");
+            false
+        }
+    }
+
+    fn input_guild_counts(&mut self, key: Key) {
+        match key {
+            Key::Up => {
+                self.guild_count_cursor =
+                    (self.guild_count_selected() + GUILD_COUNT_ROWS - 1) % GUILD_COUNT_ROWS;
+                self.describe_guild_count();
+            }
+            Key::Down => {
+                self.guild_count_cursor =
+                    (self.guild_count_selected() + 1) % GUILD_COUNT_ROWS;
+                self.describe_guild_count();
+            }
+            // Left / Right step the number: the row is the list, so the other
+            // pair of directions has to be the value.
+            Key::Left | Key::Right => {
+                let step = STEPS[self.step].max(1) as i64;
+                let d = if key == Key::Right { step } else { -step };
+                self.adjust_guild_count(d);
+            }
+            // [A] adds one step, exactly what ▶ does: the same rule the card's
+            // rank and clock rows follow.
+            Key::A => {
+                let step = STEPS[self.step].max(1) as i64;
+                self.adjust_guild_count(step);
+            }
+            Key::R => {
+                self.request_guild_count_text();
+            }
+            Key::Y => self.guild_next_view(),
+            Key::X => self.request_write_save(),
+            Key::Minus => self.open_progress(),
+            Key::B => self.set_guild_view(GUILD_TAB_CARD),
+            Key::Plus => {
+                self.press_quit();
+            }
+            other => {
+                self.message = alloc::format!(
+                    "この画面では {} は使いません（▲▼ 項目 / ◀▶ 増減 / [R] 数値入力）",
+                    key_name(other)
+                );
+            }
+        }
+    }
+
+    // -------------------------------------------- weapon usage view (4/4)
+    //
+    // Three independent u16 arrays of fifteen (village, hub, arena). The card
+    // adds them up when it draws the "All" graph and stores no total, so this
+    // view writes one cell of one venue and prints the row's total - the same
+    // split the PC build's grid has, and the reason it has no "set the total"
+    // operation either.
+
+    /// The three venue arrays, `[venue][weapon]`.
+    pub fn guild_weapon_usage(&self) -> Vec<Vec<u32>> {
+        let Some(save) = &self.save else {
+            return Vec::new();
+        };
+        crate::guildcard::Venue::ALL
+            .iter()
+            .map(|v| crate::guildcard::venue_usage(save, self.slot, *v))
+            .collect()
+    }
+
+    /// The (weapon, venue) cell under the cursor.
+    pub fn guild_weapon_selected(&self) -> (usize, usize) {
+        (
+            self.guild_wpn_row
+                .min(GUILD_WEAPON_ROWS.saturating_sub(1)),
+            self.guild_wpn_venue.min(GUILD_VENUES.saturating_sub(1)),
+        )
+    }
+
+    /// One cell, 0 when there is no save behind the view.
+    pub fn guild_weapon_at(&self, weapon: usize, venue: usize) -> u32 {
+        self.guild_weapon_usage()
+            .get(venue)
+            .and_then(|v| v.get(weapon))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// One weapon's three venues added up: the number the card's graph draws.
+    pub fn guild_weapon_total(&self, weapon: usize) -> u32 {
+        (0..GUILD_VENUES)
+            .map(|v| self.guild_weapon_at(weapon, v))
+            .sum()
+    }
+
+    /// Add `delta` to the cell under the cursor, clamped to a u16.
+    pub fn adjust_guild_weapon(&mut self, delta: i64) -> bool {
+        let (row, venue) = self.guild_weapon_selected();
+        let cur = self.guild_weapon_at(row, venue) as i64;
+        let value = (cur + delta).clamp(0, u16::MAX as i64) as u16;
+        let v = crate::guildcard::Venue::ALL[venue];
+        let slot = self.slot;
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        self.push_undo("武器使用数");
+        let Some(save) = &mut self.save else { return false };
+        if crate::guildcard::set_weapon_usage(save, slot, v, row, value) {
+            self.dirty = true;
+            self.describe_guild_weapon();
+            true
+        } else {
+            self.message = String::from("武器使用数を書き換えられません");
+            false
+        }
+    }
+
+    /// Put the cell under the cursor into the status line, with its total.
+    fn describe_guild_weapon(&mut self) {
+        let (row, venue) = self.guild_weapon_selected();
+        self.message = alloc::format!(
+            "{} {}: {}（3 会場の合計 {}）{}",
+            crate::guildcard::weapon_type_name(row),
+            crate::guildcard::venue_name(crate::guildcard::Venue::ALL[venue]),
+            self.guild_weapon_at(row, venue),
+            self.guild_weapon_total(row),
+            if self.guild_wpn_edit {
+                " 編集中 [A] 終了"
+            } else {
+                " [R] 直接入力"
+            }
+        );
+    }
+
+    /// Ask the keyboard for the cell under the cursor.
+    pub fn request_guild_weapon_text(&mut self) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let (row, venue) = self.guild_weapon_selected();
+        self.pending_text = Some((
+            TEXT_GUILD_WEAPON_COUNT,
+            alloc::format!("{}", self.guild_weapon_at(row, venue)),
+        ));
+        true
+    }
+
+    /// Apply a typed count to the cell under the cursor.
+    pub fn apply_guild_weapon_count_text(&mut self, text: &str) -> bool {
+        let Some(n) = parse_leading_u32(text) else {
+            self.message = String::from("使用数を数字で入力してください（0〜65535）");
+            return false;
+        };
+        let (row, venue) = self.guild_weapon_selected();
+        let v = crate::guildcard::Venue::ALL[venue];
+        let slot = self.slot;
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        self.push_undo("武器使用数");
+        let Some(save) = &mut self.save else { return false };
+        let value = n.min(u16::MAX as u32) as u16;
+        if crate::guildcard::set_weapon_usage(save, slot, v, row, value) {
+            self.dirty = true;
+            self.message = alloc::format!(
+                "{} {} を {} にしました（合計 {} / u16 の上限 {}）",
+                crate::guildcard::weapon_type_name(row),
+                crate::guildcard::venue_name(v),
+                value,
+                self.guild_weapon_total(row),
+                u16::MAX
+            );
+            true
+        } else {
+            self.message = String::from("武器使用数を書き換えられません");
+            false
+        }
+    }
+
+    fn input_guild_weapons(&mut self, key: Key) {
+        // Two modes, the same shape the arena view uses: the cell has a row
+        // and a column, so one pair of directions moves the cursor and the
+        // other pair changes the number. [A] switches between them.
+        if self.guild_wpn_edit {
+            match key {
+                Key::Up => {
+                    let step = STEPS[self.step].max(1) as i64;
+                    self.adjust_guild_weapon(step);
+                }
+                Key::Down => {
+                    let step = STEPS[self.step].max(1) as i64;
+                    self.adjust_guild_weapon(-step);
+                }
+                // The count reaches 65,535, so the other pair takes a ten-jump
+                // - the big step the pick lists use.
+                Key::Right => {
+                    self.adjust_guild_weapon(10);
+                }
+                Key::Left => {
+                    self.adjust_guild_weapon(-10);
+                }
+                Key::A | Key::B => {
+                    self.guild_wpn_edit = false;
+                    self.describe_guild_weapon();
+                }
+                Key::R => {
+                    self.request_guild_weapon_text();
+                }
+                Key::X => self.request_write_save(),
+                Key::Minus => {
+                    self.guild_wpn_edit = false;
+                    self.open_progress();
+                }
+                Key::Plus => {
+                    self.press_quit();
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            Key::Up => {
+                self.guild_wpn_row =
+                    (self.guild_weapon_selected().0 + GUILD_WEAPON_ROWS - 1) % GUILD_WEAPON_ROWS;
+                self.describe_guild_weapon();
+            }
+            Key::Down => {
+                self.guild_wpn_row = (self.guild_weapon_selected().0 + 1) % GUILD_WEAPON_ROWS;
+                self.describe_guild_weapon();
+            }
+            Key::Left => {
+                self.guild_wpn_venue =
+                    (self.guild_weapon_selected().1 + GUILD_VENUES - 1) % GUILD_VENUES;
+                self.describe_guild_weapon();
+            }
+            Key::Right => {
+                self.guild_wpn_venue = (self.guild_weapon_selected().1 + 1) % GUILD_VENUES;
+                self.describe_guild_weapon();
+            }
+            Key::A => {
+                if self.save.is_none() {
+                    self.message = String::from("先にセーブを開いてください");
+                    return;
+                }
+                self.guild_wpn_edit = true;
+                self.describe_guild_weapon();
+            }
+            Key::R => {
+                self.request_guild_weapon_text();
+            }
+            Key::Y => self.guild_next_view(),
+            Key::X => self.request_write_save(),
+            Key::Minus => self.open_progress(),
+            Key::B => self.set_guild_view(GUILD_TAB_CARD),
+            Key::Plus => {
+                self.press_quit();
+            }
+            other => {
+                self.message = alloc::format!(
+                    "この画面では {} は使いません（▲▼ 武器 / ◀▶ 会場 / [A] 編集）",
+                    key_name(other)
+                );
+            }
+        }
     }
 
 
@@ -14515,6 +15069,24 @@ impl Editor {
         Some((index, count, text))
     }
 
+    /// A type change waiting for its second [A], for the screens and the tests.
+    ///
+    /// `None` when the form would write immediately. Otherwise the box index
+    /// and the type it would become, and the line the status row already holds:
+    /// the same shape [Editor::equip_delete_pending] has, so a screen can draw
+    /// both one-press-away writes the same way.
+    pub fn equip_kind_pending(&self) -> Option<(usize, u8, alloc::string::String)> {
+        let (index, kind) = self.equip_kind_armed?;
+        let save = self.save.as_ref()?;
+        let from = save.equipment_at(self.slot, index)?.kind;
+        let text = alloc::format!(
+            "種別を {} → {} に変えます: もう一度 [A] で実行 / [B] で取りやめ",
+            crate::equip::type_name(from),
+            crate::equip::type_name(kind)
+        );
+        Some((index, kind, text))
+    }
+
     /// Open the form in its create mode (type, id, level; no record behind it
     /// yet, so no layer or sockets to show).
     fn open_equip_creator(&mut self) {
@@ -14580,8 +15152,11 @@ impl Editor {
         let Some(eq) = crate::equip::decode_record(index, rec) else {
             return false;
         };
-        // Moving off the armed record is a cursor move like any other.
+        // Moving off the armed record is a cursor move like any other, and so
+        // is opening the form: the type-change ask is about one record at one
+        // target type.
         self.equip_delete_armed = None;
+        self.equip_kind_armed = None;
         let field = self
             .equip_edit
             .map(|e| e.field)
@@ -14771,8 +15346,10 @@ impl Editor {
                 }
             }
             Key::B => {
-                // The working copy is dropped: only A writes.
+                // The working copy is dropped: only A writes. The type-change
+                // ask belongs to that copy, so it goes with it.
                 self.equip_edit = None;
+                self.equip_kind_armed = None;
                 self.screen = Screen::Equip;
                 return;
             }
@@ -15089,6 +15666,35 @@ impl Editor {
                 return;
             }
         };
+        // A type change is the one identity edit that makes the bytes behind
+        // +0x02 mean something else, so it asks once before it fires: the first
+        // [A] says what the change costs, the second one writes. Nothing is
+        // pushed on the first press because nothing is written by it.
+        if current.kind != e.kind && self.equip_kind_armed != Some((idx, e.kind)) {
+            self.equip_kind_armed = Some((idx, e.kind));
+            let what = if e.kind != crate::charm::CHARM_TYPE {
+                String::from("前の種別のデータは意味を失います。バイトは消しません（警告のみ）")
+            } else if u8::try_from(e.id).map(crate::charm::is_kind).unwrap_or(false) {
+                // The id of a talisman is its kind code, so a picked 護石 name
+                // (1..=10) is what makes the pair writable at all.
+                alloc::format!(
+                    "護石の種別コード（{}）と護石ID も書きます。前の装備のバイトは消しません",
+                    crate::charm::kind_name(e.id as u8).unwrap_or("?")
+                )
+            } else {
+                String::from(
+                    "ID が護石の種類（1〜10）ではないため、種別コードは書けません。ID 行で選び直してください",
+                )
+            };
+            self.message = alloc::format!(
+                "種別を {} → {} に変えます（{}）。もう一度 [A] で実行 / [B] で取りやめ",
+                crate::equip::type_name(current.kind),
+                crate::equip::type_name(e.kind),
+                what
+            );
+            return;
+        }
+        self.equip_kind_armed = None;
         self.push_undo("装備の編集");
         let identity_changed = current.kind != e.kind || current.id != e.id;
 
@@ -15116,13 +15722,32 @@ impl Editor {
             self.dirty = true;
             let pos = self.equipment().iter().position(|q| q.index == idx).unwrap_or(0);
             self.equip_cursor = pos;
-            self.message = alloc::format!(
+            // What the record is now: a type change keeps every byte, so the
+            // lines worth saying are the ones about bytes that no longer mean
+            // what the old type said they did. Nothing here was repaired.
+            let warnings = self
+                .save
+                .as_ref()
+                .map(|s| equipops::kind_warnings(s, slot, idx))
+                .unwrap_or_default();
+            let mut msg = alloc::format!(
                 "枠 #{} を {} ID {} に差し替えました（装飾品は外れました / Lv{}）",
                 idx,
                 crate::equip::type_name(e.kind),
                 e.id,
                 e.level
             );
+            if e.kind == crate::charm::CHARM_TYPE {
+                msg.push_str(" / 護石の種別コードと護石IDも書きました");
+            }
+            for w in warnings.iter().take(2) {
+                msg.push_str(" — ");
+                msg.push_str(w);
+            }
+            if warnings.len() > 2 {
+                msg.push_str(&alloc::format!(" ほか {} 件", warnings.len() - 2));
+            }
+            self.message = msg;
             self.equip_edit = None;
             self.screen = Screen::Equip;
             return;
@@ -17153,7 +17778,7 @@ impl Editor {
                 // the columns after it out of line.
                 push(
                     &mut out,
-                    alloc::format!("ARENA LOG   slot {}   view 2/2 闘技大会", self.slot + 1),
+                    alloc::format!("ARENA LOG   slot {}   view 2/4 闘技大会", self.slot + 1),
                     false,
                     false,
                 );
@@ -17225,10 +17850,122 @@ impl Editor {
                     false,
                 );
             }
+            Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => {
+                push(
+                    &mut out,
+                    alloc::format!("QUEST COUNTS   slot {}   view 3/4", self.slot + 1),
+                    false,
+                    false,
+                );
+                if self.save.is_none() {
+                    push(&mut out, String::from("  no save"), false, false);
+                    return out;
+                }
+                let counts = self.guild_counts();
+                for row in 0..GUILD_COUNT_ROWS {
+                    let cur = row == self.guild_count_selected();
+                    push(
+                        &mut out,
+                        alloc::format!(
+                            "{} {} : {:>5}",
+                            if cur { ">" } else { " " },
+                            pad_cells(crate::guildcard::quest_count_label(row), 16),
+                            counts.get(row).copied().unwrap_or(0)
+                        ),
+                        true,
+                        cur,
+                    );
+                }
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "  7 欄の合計 {} / カード表示 {}（上限 {}）",
+                        counts.iter().sum::<u32>(),
+                        self.guild_count_total(),
+                        crate::guildcard::QUEST_TOTAL_CAP
+                    ),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    String::from("  Up/Down 項目  Left/Right 増減  A +刻み  R 数値入力  X save  B カードへ"),
+                    false,
+                    false,
+                );
+            }
+            Screen::Guild if self.guild_view() == GUILD_TAB_WEAPONS => {
+                push(
+                    &mut out,
+                    alloc::format!("WEAPON USAGE   slot {}   view 4/4", self.slot + 1),
+                    false,
+                    false,
+                );
+                if self.save.is_none() {
+                    push(&mut out, String::from("  no save"), false, false);
+                    return out;
+                }
+                let usage = self.guild_weapon_usage();
+                let (cur_row, cur_venue) = self.guild_weapon_selected();
+                let mut head = alloc::format!("  {} ", pad_cells("武器", 18));
+                for v in 0..GUILD_VENUES {
+                    head.push_str(&pad_cells_left(
+                        crate::guildcard::venue_name(crate::guildcard::Venue::ALL[v]),
+                        9,
+                    ));
+                }
+                head.push_str(&pad_cells_left("合計", 9));
+                push(&mut out, head, false, false);
+                for row in 0..GUILD_WEAPON_ROWS {
+                    let mut line = alloc::format!(
+                        "{} {} ",
+                        if row == cur_row { ">" } else { " " },
+                        pad_cells(crate::guildcard::weapon_type_name(row), 18)
+                    );
+                    for v in 0..GUILD_VENUES {
+                        let n = usage.get(v).and_then(|a| a.get(row)).copied().unwrap_or(0);
+                        let cell = pad_cells_left(&alloc::format!("{}", n), 7);
+                        if row == cur_row && v == cur_venue {
+                            line.push_str(&alloc::format!("[{}] ", cell));
+                        } else {
+                            line.push_str(&alloc::format!(" {}  ", cell));
+                        }
+                    }
+                    line.push_str(&pad_cells_left(
+                        &alloc::format!("{}", self.guild_weapon_total(row)),
+                        7,
+                    ));
+                    push(&mut out, line, true, row == cur_row);
+                }
+                push(
+                    &mut out,
+                    alloc::format!(
+                        "  {} {} : {}{}",
+                        crate::guildcard::weapon_type_name(cur_row),
+                        crate::guildcard::venue_name(crate::guildcard::Venue::ALL[cur_venue]),
+                        self.guild_weapon_at(cur_row, cur_venue),
+                        if self.guild_wpn_edit { " 編集中" } else { "" }
+                    ),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    String::from("  Up/Down 武器  Left/Right 会場  A 編集  R 数値入力  X save  B カードへ"),
+                    false,
+                    false,
+                );
+                push(
+                    &mut out,
+                    String::from("  編集中: Up/Down ±刻み  Left/Right ±10  A 終了  R 数値入力"),
+                    false,
+                    false,
+                );
+            }
             Screen::Guild => {
                 push(
                     &mut out,
-                    alloc::format!("GUILD CARD   slot {}   view 1/2", self.slot + 1),
+                    alloc::format!("GUILD CARD   slot {}   view 1/4", self.slot + 1),
                     false,
                     false,
                 );
@@ -20147,6 +20884,236 @@ mod tests {
         assert_eq!(ed.undo_depth(), UNDO_STEPS);
     }
 
+    // ---------------------------------------- guild card: the two record views
+
+    /// The card's number views have no sub-tab of their own (the section's bar
+    /// is full), so [Y] walks them: カード → 回数 → 武器 → カード. The arena log
+    /// keeps its own [Y], which types a time there.
+    #[test]
+    fn the_guild_screen_walks_the_two_record_views_with_y() {
+        let mut ed = editor_with_a_blank_save();
+        ed.screen = Screen::Guild;
+        ed.set_guild_view(GUILD_TAB_CARD);
+        assert_eq!(ed.guild_view(), GUILD_TAB_CARD);
+        ed.input(Key::Y);
+        assert_eq!(ed.guild_view(), GUILD_TAB_COUNTS, "{}", ed.message);
+        ed.input(Key::Y);
+        assert_eq!(ed.guild_view(), GUILD_TAB_WEAPONS, "{}", ed.message);
+        ed.input(Key::Y);
+        assert_eq!(ed.guild_view(), GUILD_TAB_CARD, "{}", ed.message);
+
+        // The arena view is the one view where [Y] is not the walk: it asks for
+        // a time as text, exactly as before.
+        ed.set_guild_view(GUILD_TAB_ARENA);
+        ed.input(Key::Y);
+        assert_eq!(ed.guild_view(), GUILD_TAB_ARENA);
+        match ed.take_text_request() {
+            Some((TEXT_ARENA_TIME, _)) => {}
+            other => panic!("the arena [Y] must still type a time, got {:?}", other),
+        }
+        // [A] means the row's own thing on the card, and each of the two record
+        // views says its own word.
+        ed.set_guild_view(GUILD_TAB_CARD);
+        ed.guild_field = 0;
+        assert_eq!(ed.guild_a_label(), "+刻み", "the rank row steps");
+        ed.guild_field = GUILD_ROW_COMMENT;
+        assert_eq!(ed.guild_a_label(), "編集", "the comment row opens the keyboard");
+        ed.guild_field = 0;
+        ed.set_guild_view(GUILD_TAB_COUNTS);
+        assert_eq!(ed.guild_a_label(), "+刻み");
+        ed.set_guild_view(GUILD_TAB_WEAPONS);
+        assert_eq!(ed.guild_a_label(), "編集");
+        ed.guild_wpn_edit = true;
+        assert_eq!(ed.guild_a_label(), "編集を終了");
+    }
+
+    #[test]
+    fn the_quest_counters_step_type_and_cap_at_a_u16() {
+        use crate::guildcard;
+        let mut ed = editor_with_a_blank_save();
+        ed.screen = Screen::Guild;
+        ed.set_guild_view(GUILD_TAB_COUNTS);
+        assert_eq!(ed.guild_counts().len(), GUILD_COUNT_ROWS);
+        assert_eq!(ed.guild_count_at(0), 0);
+
+        // Left / Right step the number; ▲ / ▼ move the row and write nothing.
+        ed.input(Key::Right);
+        assert_eq!(ed.guild_count_at(0), 1, "{}", ed.message);
+        assert_eq!(ed.undo_label(), Some("クエスト回数"));
+        assert_eq!(guildcard::quest_counts(ed.save.as_ref().unwrap(), 0)[0], 1);
+        ed.input(Key::Down);
+        assert_eq!(ed.guild_count_selected(), 1);
+        ed.input(Key::Right);
+        assert_eq!(ed.guild_count_at(1), 1);
+        assert_eq!(ed.guild_count_at(0), 1, "the row left behind keeps its value");
+
+        // The total the card draws is the seven added up, capped like the game.
+        assert_eq!(ed.guild_count_total(), 2);
+        // [R] asks the keyboard for the row under the cursor.
+        assert!(ed.request_guild_count_text());
+        match ed.take_text_request() {
+            Some((TEXT_GUILD_QUEST_COUNT, s)) => assert_eq!(s, "1"),
+            other => panic!("the counter row must ask for its number, got {:?}", other),
+        }
+        // A typed value lands; a value past the field is clamped, not wrapped.
+        assert!(ed.apply_guild_quest_count_text("1234"));
+        assert_eq!(ed.guild_count_at(1), 1234);
+        assert!(ed.apply_guild_quest_count_text("70000"));
+        assert_eq!(ed.guild_count_at(1), u16::MAX as u32);
+        // Text that is not a number writes nothing and says why.
+        assert!(!ed.apply_guild_quest_count_text("abc"));
+        assert_eq!(ed.guild_count_at(1), u16::MAX as u32);
+        // And the deck's [MAX] takes a row to the field's own ceiling.
+        assert!(ed.guild_count_row_max(2));
+        assert_eq!(ed.guild_count_at(2), u16::MAX as u32);
+    }
+
+    #[test]
+    fn the_weapon_usage_grid_edits_one_cell_of_one_venue() {
+        use crate::guildcard;
+        let mut ed = editor_with_a_blank_save();
+        ed.screen = Screen::Guild;
+        ed.set_guild_view(GUILD_TAB_WEAPONS);
+        assert_eq!(ed.guild_weapon_usage().len(), GUILD_VENUES);
+        assert_eq!(ed.guild_weapon_selected(), (0, 0));
+
+        // The cursor moves first and writes nothing: ◀ / ▶ walk the venues and
+        // ▲ / ▼ the weapons, the same split the arena grid has.
+        ed.input(Key::Right);
+        assert_eq!(ed.guild_weapon_selected(), (0, 1));
+        ed.input(Key::Down);
+        assert_eq!(ed.guild_weapon_selected(), (1, 1));
+        assert_eq!(ed.undo_label(), None, "a cursor move is not an edit");
+
+        // [A] arms the stepper; the arrows change the number only while it is on.
+        ed.input(Key::A);
+        assert!(ed.guild_wpn_edit);
+        ed.input(Key::Up);
+        assert_eq!(ed.guild_weapon_at(1, 1), 1, "{}", ed.message);
+        ed.input(Key::Right);
+        assert_eq!(ed.guild_weapon_at(1, 1), 11, "▶ is the ten-jump here");
+        // The village array of the same weapon is untouched: three arrays.
+        assert_eq!(ed.guild_weapon_at(1, 0), 0);
+        assert_eq!(ed.guild_weapon_total(1), 11);
+        ed.input(Key::A);
+        assert!(!ed.guild_wpn_edit);
+
+        // The keyboard writes the cell under the cursor, clamped to a u16.
+        assert!(ed.request_guild_weapon_text());
+        match ed.take_text_request() {
+            Some((TEXT_GUILD_WEAPON_COUNT, s)) => assert_eq!(s, "11"),
+            other => panic!("the cell must ask for its number, got {:?}", other),
+        }
+        assert!(ed.apply_guild_weapon_count_text("4321"));
+        assert_eq!(ed.guild_weapon_at(1, 1), 4321);
+        assert!(ed.apply_guild_weapon_count_text("99999"));
+        assert_eq!(ed.guild_weapon_at(1, 1), u16::MAX as u32);
+        assert_eq!(ed.guild_weapon_total(1), u16::MAX as u32);
+        // And what the writer put in the save is what the readers see.
+        let save = ed.save.as_ref().unwrap();
+        assert_eq!(
+            guildcard::venue_usage(save, 0, guildcard::Venue::Hub)[1],
+            u16::MAX as u32
+        );
+        assert_eq!(
+            guildcard::venue_usage(save, 0, guildcard::Venue::Village)[1],
+            0
+        );
+        assert!(ed.guild_weapon_row_max());
+        assert_eq!(ed.guild_weapon_at(1, 1), u16::MAX as u32);
+    }
+
+    // ---------------------------------------------- equipment type change
+
+    /// Changing a record's type is the one equipment write whose damage is
+    /// invisible: the bytes all stay, and only what they mean changes. The form
+    /// therefore asks once, writes on the second [A], and reports what is now
+    /// inconsistent instead of repairing it.
+    #[test]
+    fn a_type_change_asks_once_then_writes_the_talisman_pair() {
+        use crate::charm;
+        let mut ed = editor_with_a_blank_save();
+        let idx = crate::equipops::create(ed.save.as_mut().expect("save"), 0, 7, 26, 5)
+            .expect("a blank record");
+        ed.screen = Screen::Equip;
+        ed.equip_cursor = 0;
+        ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
+        {
+            let e = ed.equip_edit.as_mut().expect("the form");
+            e.kind = charm::CHARM_TYPE;
+            // For a talisman the id row *is* the kind code: 10 is 天の護石.
+            e.id = 10;
+            e.field = 0; // 装備枠: the row whose [A] writes
+        }
+
+        // The first [A] only says what would be lost: no undo step, no write,
+        // and the form stays open so the second press can land.
+        let depth = ed.undo_depth();
+        ed.input(Key::A);
+        assert_eq!(ed.undo_depth(), depth, "the ask is not an edit:",);
+        assert!(ed.equip_kind_pending().is_some(), "{}", ed.message);
+        assert_eq!(ed.equip_edit.map(|e| e.index), Some(idx));
+        let before = ed.save.as_ref().unwrap().equipment_at(0, idx).expect("record");
+        assert_eq!(before.kind, 7, "nothing was written yet");
+
+        // The second [A] writes, through equipops::replace, which writes the
+        // talisman pair as well.
+        ed.input(Key::A);
+        assert_eq!(ed.undo_label(), Some("装備の編集"));
+        assert_eq!(ed.screen, Screen::Equip);
+        assert!(ed.equip_kind_pending().is_none());
+        let save = ed.save.as_ref().unwrap();
+        let after = save.equipment_at(0, idx).expect("record");
+        assert_eq!(after.kind, charm::CHARM_TYPE);
+        assert_eq!(after.id, 10, "a talisman's id is its kind code");
+        let box_ = save.equipment_box(0).expect("box");
+        let at = idx * crate::equip::EQUIP_RECORD;
+        assert_eq!(box_[at + 0x12], 100, "天 is rarity 100");
+        assert_eq!(box_[at + 0x13], 1);
+        assert!(charm::is_talisman(&box_[at..at + crate::equip::EQUIP_RECORD]));
+        // Both lists show it: the talisman reader finds it, and the equipment
+        // box decodes the same record as 護石.
+        assert!(charm::decode_box(box_).iter().any(|c| c.index == idx));
+        ed.open_charms();
+        assert!(ed.charms().iter().any(|c| c.index == idx));
+        // The status line carries what is left to fix (the weapon's tail is
+        // still there and means nothing any more).
+        assert!(
+            ed.message.contains("護石") || ed.message.contains("スキル"),
+            "{}",
+            ed.message
+        );
+    }
+
+    /// A type change that is cancelled writes nothing, and the arm does not
+    /// survive leaving the form.
+    #[test]
+    fn a_cancelled_type_change_writes_nothing() {
+        use crate::charm;
+        let mut ed = editor_with_a_blank_save();
+        let idx = crate::equipops::create(ed.save.as_mut().expect("save"), 0, 7, 26, 5)
+            .expect("a blank record");
+        ed.screen = Screen::Equip;
+        ed.equip_cursor = 0;
+        ed.input(Key::A);
+        {
+            let e = ed.equip_edit.as_mut().expect("the form");
+            e.kind = charm::CHARM_TYPE;
+            e.id = 10;
+            e.field = 0;
+        }
+        let depth = ed.undo_depth();
+        ed.input(Key::A);
+        assert!(ed.equip_kind_pending().is_some());
+        // [B] leaves the form: the working copy is dropped with the arm.
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::Equip);
+        assert!(ed.equip_kind_pending().is_none());
+        assert_eq!(ed.undo_depth(), depth);
+        let after = ed.save.as_ref().unwrap().equipment_at(0, idx).expect("record");
+        assert_eq!(after.kind, 7, "nothing was written");
+    }
     #[test]
     fn one_press_of_the_bulk_max_is_one_undo_step() {
         let mut ed = editor_on_a_used_slot();

@@ -100,6 +100,50 @@ pub fn decode_record(index: usize, rec: &[u8]) -> Option<Equipment> {
 }
 
 
+/// Rewrite the type field, keeping the level, the transmog level and every
+/// byte from +0x02 on.
+///
+/// The type is the low five bits of the same first word the level lives in, so
+/// this is [set_level]'s mirror: only bits 0..5 move, and the two other fields
+/// of the word survive byte for byte. The caller owns what the change means
+/// (see equipops::change_kind) - this function only writes the number.
+pub fn set_kind(rec: &mut [u8], kind: u8) -> bool {
+    if rec.len() < EQUIP_RECORD {
+        return false;
+    }
+    let mut head = u16::from_le_bytes([rec[0], rec[1]]);
+    head &= !0x1F;
+    head |= (kind as u16) & 0x1F;
+    rec[..2].copy_from_slice(&head.to_le_bytes());
+    true
+}
+
+/// The highest type number the table in [type_name] names.
+///
+/// 24 is オトモ防具(胴). The field is five bits wide, so 31 can be written, but
+/// 25..31 name nothing at all and no picker offers them.
+pub const MAX_KIND: u8 = 24;
+
+/// The kinds a hunter's own box holds, in the order the pickers show them.
+///
+/// The five armour parts (1..=5), the talisman (6) and the fourteen weapons
+/// (7..=21). Two groups are deliberately left out:
+///
+/// * 12 - the unused weapon slot. The JP weapon tables have their own
+///   numbering where 5 is the gap, and type_id + 7 maps one to the other, so
+///   the number exists in the table but no weapon ever carries it.
+/// * 22..=24 - the palico's three kinds. They are decoded by the same record
+///   shape but they live in the palico box, and writing one into a hunter's
+///   record would name nothing (see [name]).
+pub const HUNTER_KINDS: [u8; 20] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+];
+
+/// Is this a type a hunter's box can hold? See [HUNTER_KINDS].
+pub fn is_hunter_kind(kind: u8) -> bool {
+    HUNTER_KINDS.contains(&kind)
+}
+
 /// Rewrite the level field, keeping the type and the transmog level.
 ///
 /// The level is stored minus one in five bits, so it runs 1..=32. A level of

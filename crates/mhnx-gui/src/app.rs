@@ -482,25 +482,10 @@ struct SaveMapRow {
 /// weapons in Japanese for the 装備 tab, so the card uses those words, in the
 /// card's own order.
 pub fn weapon_kind_name(index: usize) -> &'static str {
-    /// The card's order, as equipment types (equip::type_name).
-    const KINDS: [&str; 15] = [
-        "大剣",                  // Great Sword
-        "片手剣",                // Sword and Shield
-        "ハンマー",              // Hammer
-        "ランス",                // Lance
-        "ヘビィボウガン",        // Heavy Bowgun
-        "ライトボウガン",        // Light Bowgun
-        "太刀",                  // Longsword
-        "スラッシュアックス",    // Switch Axe
-        "ガンランス",            // Gunlance
-        "弓",                    // Bow
-        "双剣",                  // Dual Blades
-        "狩猟笛",                // Hunting Horn
-        "操虫棍",                // Insect Glaive
-        "チャージアックス",      // Charge Blade
-        "ニャンター",            // Prowler
-    ];
-    KINDS.get(index).copied().unwrap_or("?")
+    // One table for both builds: the console's guild screen prints the same
+    // fifteen words, so the list lives in guildcard::WEAPON_TYPE_NAMES and
+    // neither screen can drift from the other.
+    mhnx_core::guildcard::weapon_type_name(index)
 }
 
 /// `n` with thousands separators, for the save map's 長さ column.
@@ -613,6 +598,23 @@ pub enum Confirm {
         id: u16,
         /// Level to write.
         level: u16,
+    },
+    /// Change one record's type, keeping the id where the new type has a use
+    /// for it.
+    ///
+    /// This is the ask the type field cannot make on its own: every byte of
+    /// the record stays, and what changes is what those bytes mean. A talisman
+    /// is the exception in the other direction - it needs the paired bytes at
+    /// +0x02/+0x12 written - which is why `charm_code` rides along.
+    EquipKind {
+        /// Box index of the record.
+        index: usize,
+        /// Type the record has now, so the dialog can name both sides.
+        from: u8,
+        /// Type it would become.
+        kind: u8,
+        /// 護石 kind code (1 兵士 .. 10 天) written when `kind` is お守り.
+        charm_code: u8,
     },
     /// Let a request's 完了 flag go. The dialog asks whether 受理 goes with it:
     /// the pair is consecutive flags, and clearing only one of them leaves a
@@ -1385,6 +1387,14 @@ pub struct MhnxEditor {
     pub equip_rep_kind: u8,
     pub equip_rep_id: u16,
     pub equip_rep_level: u16,
+    /// The kind the 種別の変更 row would change the selected record to, the
+    /// 護石 kind code that goes with it, and which record they were seeded
+    /// from. Kept apart from the replace row because the two ask different
+    /// questions: 差し替え moves the type together with the id, this moves the
+    /// type alone and keeps the id.
+    pub equip_kind_for: Option<usize>,
+    pub equip_kind_target: u8,
+    pub equip_kind_charm: u8,
     pub item_pick_keep_filter: bool,
     /// Row selected inside the .rem / .sup reward table.
     pub entry_item_sel: Option<usize>,
@@ -1751,6 +1761,11 @@ impl Default for MhnxEditor {
             equip_rep_kind: 7,
             equip_rep_id: 1,
             equip_rep_level: 1,
+            equip_kind_for: None,
+            equip_kind_target: 7,
+            // 天の護石: the shape the sample saves are full of, and the one
+            // the 護石 tab's new-record form defaults to as well.
+            equip_kind_charm: 10,
             item_pick_keep_filter: true,
             entry_item_sel: None,
             charm_filter: String::new(),
@@ -6065,6 +6080,38 @@ impl MhnxEditor {
                 ),
                 "差し替える",
             ),
+            Confirm::EquipKind {
+                index,
+                from,
+                kind,
+                charm_code,
+            } => {
+                // What the old type owned and the new one does not. The bytes
+                // are kept either way; the line exists so the answer is not
+                // given blind.
+                let mut body = format!(
+                    "枠 {} の種別を「{}」→「{}」に変えます。\n",
+                    index,
+                    mhnx_core::equip::type_name(*from),
+                    mhnx_core::equip::type_name(*kind)
+                );
+                if *kind == mhnx_core::charm::CHARM_TYPE {
+                    let name = mhnx_core::charm::kind_name(*charm_code).unwrap_or("?");
+                    body += "・お守りにするため、護石の種別コード（+0x02）と護石ID（+0x12/+0x13）を書きます\n";
+                    body += "・護石の種類は";
+                    body += name;
+                    body += " です\n";
+                    body += "・前の装備のバイト（スキル・ポイント・スロット）は消しません。お守りとして整えるには護石タブで編集してください\n";
+                } else if *from == mhnx_core::charm::CHARM_TYPE {
+                    body += "・お守りの種別コードと護石IDは消さずに残します（装備BOX は読みません）\n";
+                    body += "・お守りのスキル・ポイント・スロットは意味を失います\n";
+                } else {
+                    body += "・前の種別の固有データ（強化情報・装飾品・着せ替え）は意味を失います\n";
+                }
+                body += "・+0x0C 以降のバイトは消しません。変えたあとに整合性の警告を出します";
+                warn = true;
+                ("装備の種別を変えます", body, "種別を変える")
+            }
             Confirm::RequestIncomplete { record } => {
                 let title = self.request_title(*record);
                 (
@@ -6369,6 +6416,14 @@ impl MhnxEditor {
                         level,
                     } => {
                         self.equip_replace(index, kind, id, level);
+                    }
+                    Confirm::EquipKind {
+                        index,
+                        kind,
+                        charm_code,
+                        ..
+                    } => {
+                        self.equip_change_kind(index, kind, charm_code);
                     }
                     // The two answers differ in one bit: 受理 follows 完了
                     // only when the user said so.
@@ -12806,7 +12861,8 @@ impl MhnxEditor {
         ui.label(
             egui::RichText::new(
                 "村・集会所・闘技場は別々に保存されています。合計はカードが表示のために\
-                 足した値で、セーブには入りません。",
+                 足した値で、セーブには入りません。各欄はクリックで数値を直接入力できます\
+                 （Switch 版は [R] の画面キーボード）。",
             )
             .weak()
             .small(),
@@ -12994,20 +13050,15 @@ impl MhnxEditor {
         ui.label(
             egui::RichText::new(
                 "7 つの欄はそれぞれ u16 です。カードはその合計を 99,999 で切って表示し、\
-                 合計そのものはセーブに入りません。",
+                 合計そのものはセーブに入りません。各欄はクリックで数値を直接入力できます\
+                 （Switch 版は [R] の画面キーボード）。",
             )
             .weak()
             .small(),
         );
-        let labels = [
-            "村（下位）",
-            "村（上位）",
-            "集会所（下位）",
-            "集会所（上位）",
-            "集会所（G）",
-            "特別許可",
-            "闘技大会",
-        ];
+        // One table for both builds: the console's guild screen names the
+        // same seven counters, so the words live in guildcard.
+        let labels = mhnx_core::guildcard::QUEST_COUNT_LABELS;
         // New values are collected while the grid draws and written after it,
         // the way the weapon usage grid above does it: the fields borrow the
         // numbers, and the save cannot be borrowed mutably at the same time.
@@ -13728,6 +13779,20 @@ impl MhnxEditor {
                 ui.label(format!("{} (0x{:04X})", eq.id, eq.id));
                 ui.end_row();
             });
+        // What does not fit the type this record carries.
+        //
+        // A kind change keeps every byte of the record, so the only thing
+        // wrong with a converted one is that some of those bytes no longer
+        // mean anything. That is exactly what equipops::kind_warnings names,
+        // and reading it again every frame is what makes the warning stay
+        // under the record instead of scrolling away in the status row.
+        let kind_warns = match &self.save {
+            Some(save) => equipops::kind_warnings(save, self.slot, index),
+            None => Vec::new(),
+        };
+        for w in &kind_warns {
+            ui.colored_label(warning_color(), w);
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("レベル");
@@ -13810,11 +13875,89 @@ impl MhnxEditor {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "先頭 12 バイト（種別・Lv・ID・着せ替え・装飾品）だけを書き換えます。+0x0C 以降の持ち物は保持します。",
+                "先頭 12 バイト（種別・Lv・ID・着せ替え・装飾品）だけを書き換えます。+0x0C 以降の持ち物は保持します。\
+                 種別を変えたときは、お守りに必要な +0x02 / +0x12 / +0x13 だけを追加で書きます。",
             )
             .weak()
             .small(),
         );
+        ui.separator();
+        // 種別の変更: the type on its own.
+        //
+        // The replace row below asks "put that item here instead" and moves the
+        // type together with the id; this one asks "this record is a talisman
+        // now" and keeps the id where the new type can still use it. A
+        // talisman is the one case that must write more than the type - the
+        // paired bytes at +0x02/+0x12 - which is why the 護石 kind is picked
+        // here and rides along in the dialog.
+        if self.equip_kind_for != Some(index) {
+            self.equip_kind_for = Some(index);
+            self.equip_kind_target = eq.kind;
+            // A record that is already a talisman keeps its own grade, so
+            // opening this row on a 龍 does not silently re-type it as a 天.
+            self.equip_kind_charm = if eq.kind == mhnx_core::charm::CHARM_TYPE
+                && u8::try_from(eq.id)
+                    .map(mhnx_core::charm::is_kind)
+                    .unwrap_or(false)
+            {
+                eq.id as u8
+            } else {
+                10
+            };
+        }
+        ui.label(egui::RichText::new("種別の変更").strong());
+        ui.horizontal_wrapped(|ui| {
+            Self::equip_kind_combo(ui, "equipkindtarget", &mut self.equip_kind_target);
+            if self.equip_kind_target == mhnx_core::charm::CHARM_TYPE {
+                ui.label("護石の種類");
+                egui::ComboBox::from_id_salt("equipkindcharm")
+                    .selected_text(
+                        mhnx_core::charm::kind_name(self.equip_kind_charm).unwrap_or("?"),
+                    )
+                    .width(150.0)
+                    .show_ui(ui, |ui| {
+                        // The ten rows the game ships. Row 0 (装備なし) is not
+                        // offered: it is not a grade, and a record carrying it
+                        // is one the game never wrote.
+                        for k in 1..=mhnx_core::charm::TALISMAN_KIND_COUNT {
+                            ui.selectable_value(
+                                &mut self.equip_kind_charm,
+                                k,
+                                mhnx_core::charm::kind_name(k).unwrap_or("?"),
+                            );
+                        }
+                    });
+            }
+        });
+        if self.equip_kind_target == mhnx_core::charm::CHARM_TYPE {
+            if let Some(line) = mhnx_core::charm::kind_limit_line(self.equip_kind_charm) {
+                ui.label(egui::RichText::new(line).weak().small());
+            }
+        }
+        let same_as_now = self.equip_kind_target == eq.kind
+            && (self.equip_kind_target != mhnx_core::charm::CHARM_TYPE
+                || self.equip_kind_charm as u16 == eq.id);
+        ui.horizontal_wrapped(|ui| {
+            let button = ui
+                .add_enabled(!same_as_now, egui::Button::new("種別を変更"))
+                .on_hover_text(
+                    "確認を挟んでから変えます。前の種別のデータは消しません（警告のみ）。\
+                     お守りに変えるときは種別コードと護石IDを書きます",
+                );
+            if button.clicked() {
+                self.confirm = Confirm::EquipKind {
+                    index,
+                    from: eq.kind,
+                    kind: self.equip_kind_target,
+                    charm_code: self.equip_kind_charm,
+                };
+            }
+            ui.label(
+                egui::RichText::new("ID・Lv・着せ替えはそのまま")
+                    .weak()
+                    .small(),
+            );
+        });
         ui.separator();
         // Seeded from the record the first time it is drawn, so the row starts
         // out as "this very item" and only differs once the user changes it.
@@ -13957,6 +14100,45 @@ impl MhnxEditor {
         }
     }
 
+    /// Change one record's type, keeping every byte that still means something.
+    ///
+    /// The operation itself is equipops::change_kind, which owns the type field
+    /// and the talisman pair; this takes the undo step, moves the selection and
+    /// folds what was written plus what is now inconsistent into the status row.
+    /// Nothing is repaired: the panel reads equipops::kind_warnings again every
+    /// frame, so the lines stay under the record until the user fixes them.
+    pub fn equip_change_kind(&mut self, index: usize, kind: u8, charm_code: u8) -> bool {
+        if self.save.is_none() {
+            self.message = String::from("セーブが開かれていません");
+            return false;
+        }
+        self.push_undo(format!("装備 {} の種別変更", index));
+        let slot = self.slot;
+        let Some(save) = &mut self.save else { return false };
+        match equipops::change_kind(save, slot, index, kind, charm_code) {
+            Ok(changed) => {
+                self.dirty = true;
+                self.equip_selected = Some(index);
+                // The row above the editor is seeded from the record, so a
+                // kind that just moved must not leave the old one in the box.
+                self.equip_kind_for = None;
+                let mut msg = changed.text();
+                if !changed.warnings.is_empty() {
+                    msg.push_str(" — 整合性警告: ");
+                    msg.push_str(&changed.warnings.join(" / "));
+                }
+                self.message = msg;
+                true
+            }
+            Err(e) => {
+                // Nothing was written, so the undo step goes back with it.
+                self.undo.pop();
+                self.message = e.text();
+                false
+            }
+        }
+    }
+
     /// Clear one record. With force = false this refuses while anything still
     /// names the record, and hands those references back in the error.
     pub fn equip_delete(&mut self, index: usize, force: bool) -> Result<(), EquipError> {
@@ -13992,7 +14174,13 @@ impl MhnxEditor {
         }
     }
 
-    /// Pick one of the 21 hunter equipment types.
+    /// Pick one of the twenty-one equipment types a record can hold.
+    ///
+    /// 1..=21 including 12, which the game never uses: the field is five bits
+    /// wide and the console's form walks the same range, so an editor that
+    /// silently skipped a number would be lying about the field (see
+    /// hbedit::cycle_equip_kind). The palico kinds 22..=24 are left out because
+    /// they live in the otomo box, not in this one.
     fn equip_kind_combo(ui: &mut egui::Ui, salt: &str, kind: &mut u8) {
         egui::ComboBox::from_id_salt(salt)
             .selected_text(mhnx_core::equip::type_name(*kind))
@@ -19916,6 +20104,97 @@ mod tests {
         assert!(!app.dirty, "a refused write must not make the save look edited");
     }
 
+    /// The type alone can be changed, and the record stays whole: the tail is
+    /// not eaten, and a talisman gets the pair `charm.rs` needs.
+    #[test]
+    fn a_kind_change_retypes_the_record_and_keeps_what_it_can() {
+        let dir = Scratch::new("equipkind");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+
+        // A weapon in slot 5, with a tail the change must not eat.
+        let mut rec = [0u8; mhnx_core::equip::EQUIP_RECORD];
+        rec[0] = 7;
+        rec[1] = 0x02;
+        rec[2] = 40;
+        for (i, b) in rec[0x0C..].iter_mut().enumerate() {
+            *b = (i as u8) + 1;
+        }
+        let tail: Vec<u8> = rec[0x0C..].to_vec();
+        {
+            let dst = app
+                .save
+                .as_mut()
+                .and_then(|s| s.equipment_record_mut(0, 5))
+                .expect("record 5");
+            dst.copy_from_slice(&rec);
+        }
+        app.dirty = false;
+
+        assert!(
+            app.equip_change_kind(5, mhnx_core::charm::CHARM_TYPE, 10),
+            "{}",
+            app.message
+        );
+        assert!(app.dirty, "a kind change is an edit");
+        assert!(app.message.contains("護石"), "{}", app.message);
+
+        let (eq, box_bytes) = {
+            let save = app.save.as_ref().expect("save");
+            (
+                save.equipment_at(0, 5).expect("record"),
+                save.equipment_box(0).expect("box").to_vec(),
+            )
+        };
+        assert_eq!(eq.kind, mhnx_core::charm::CHARM_TYPE);
+        assert_eq!(eq.id, 10, "a talisman's id is its kind code");
+        let at = 5 * mhnx_core::equip::EQUIP_RECORD;
+        assert_eq!(box_bytes[at + 0x02], 10);
+        assert_eq!(box_bytes[at + 0x12], 100, "天 is rarity 100");
+        assert_eq!(box_bytes[at + 0x13], 1);
+        // Every byte past the head survives except the pair the talisman type
+        // owns: +0x02 is the kind code and +0x12/+0x13 its rarity.
+        for off in 0x0C..mhnx_core::equip::EQUIP_RECORD {
+            if matches!(off, 0x12 | 0x13) {
+                continue;
+            }
+            assert_eq!(
+                box_bytes[at + off],
+                tail[off - 0x0C],
+                "byte {:#04x} must not move",
+                off
+            );
+        }
+        // Both screens see it: the box decodes it as 護石 and the talisman
+        // reader lists it.
+        assert_eq!(mhnx_core::equip::type_name(eq.kind), "護石");
+        assert!(mhnx_core::charm::decode_box(&box_bytes)
+            .iter()
+            .any(|c| c.index == 5));
+        // The panel's warning line is the same one the operation reports, and
+        // it does not claim the pair is missing.
+        let warns = mhnx_core::equipops::kind_warnings(app.save.as_ref().unwrap(), 0, 5);
+        assert!(
+            !warns.iter().any(|w| w.contains("種別コード（+0x02）が 0")),
+            "{:?}",
+            warns
+        );
+        assert_eq!(app.undo.len(), 1, "one edit, one undo step");
+
+        // The three refusals write nothing and leave the undo stack alone.
+        app.dirty = false;
+        assert!(!app.equip_change_kind(5, 0, 0));
+        assert!(!app.equip_change_kind(5, 30, 0));
+        assert!(!app.equip_change_kind(5, mhnx_core::charm::CHARM_TYPE, 11));
+        assert!(!app.dirty, "a refused change must not mark the save edited");
+        assert_eq!(app.undo.len(), 1);
+        assert_eq!(
+            app.message,
+            mhnx_core::equipops::EquipError::BadCharmKind.text()
+        );
+    }
     #[test]
     fn a_new_record_lands_in_a_blank_slot_and_is_selected() {
         let dir = Scratch::new("equipnew");

@@ -1226,10 +1226,13 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         // the view key on the other two - the footer names which, per view.
         // The card's own view: [X] is the save key on every screen, and the
         // arena log is the other view of this screen, reached with L / R.
+        // カード / クエスト回数 / 武器使用数 are the card's own three views and
+        // [Y] walks them; the arena log keeps its own bar tab.
         Guild => &[
             ("</>", "値"),
             ("R", "数値入力"),
-            ("A", "コメント"),
+            ("Y", "回数/武器"),
+            ("A", "行の操作"),
             ("-", "進行状況"),
             ("L/R", "闘技大会"),
             ("X", "保存"),
@@ -1396,6 +1399,13 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.apply_guild_hr_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_GUILD_TIME {
         ed.apply_guild_time_text(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_GUILD_QUEST_COUNT {
+        // The two guild card grids: one cell each, clamped to the u16 the save
+        // stores. The core owns the parse and the message, so the layer only
+        // hands the text over - the same rule the arena time follows.
+        ed.apply_guild_quest_count_text(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_GUILD_WEAPON_COUNT {
+        ed.apply_guild_weapon_count_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
         ed.apply_hunt_count_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB
@@ -1688,6 +1698,13 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             ("狩猟数 (0〜9999) / サイズ % (0〜300)", 6)
         } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB {
             ("報酬の確率 % (0〜100)", 4)
+        } else if idx == mhnx_core::hbedit::TEXT_GUILD_QUEST_COUNT {
+            // Seven u16 counters: at most five digits, and the parser clamps to
+            // 65,535 so a sixth digit cannot wrap the field.
+            ("クエスト回数 (0〜65535)", 6)
+        } else if idx == mhnx_core::hbedit::TEXT_GUILD_WEAPON_COUNT {
+            // Three venues of fifteen u16 each; the same ceiling.
+            ("武器使用数 (0〜65535)", 6)
         } else if idx == mhnx_core::hbedit::TEXT_REWARD_COUNT {
             ("報酬の個数 (0〜99)", 4)
         } else {

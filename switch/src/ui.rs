@@ -75,7 +75,8 @@ use mhnx_core::hbedit::{
     arena_clock, arena_name, arena_part_name, arena_rank_name, charm_form_rows, decoration_name_of,
     item_name_of, monster_name, palico_part_name, palico_skill_tab_name, Editor, ItemSetOp, Key,
     PalicoEquipRow, PalicoSkillRow, Screen, ARENA_COLUMNS, ARENA_PARTS, ARENA_ROWS, CHAR_FIELDS,
-    CHARM_EDIT_ROWS, CONSOLE_SAVE, CSV_DIR, GUILD_TAB_ARENA, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT,
+    CHARM_EDIT_ROWS, CONSOLE_SAVE, CSV_DIR, GUILD_TAB_ARENA, GUILD_TAB_CARD, GUILD_TAB_COUNTS,
+    GUILD_TAB_WEAPONS, GUILD_VENUES, GUILD_WEAPON_ROWS, ITEM_OP_ADD, ITEM_OP_CLAMP, ITEM_OP_COMPACT,
     ITEM_OP_DEDUPE, ITEM_OP_UNDO, ITEM_OPS, ITEM_SET_EDIT_ROWS, PALICO_EQUIP_NAME_NOTE,
     PALICO_EQUIP_ROWS, PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS, SET_EDIT_ROWS,
     SET_ROW_NAME, STEPS,
@@ -395,6 +396,12 @@ pub enum UiAction {
     ActivateRow(usize),
     /// One cell of the arena grid: (arena row, rank column).
     ArenaCell(usize, usize),
+    /// One cell of the guild card's weapon-usage grid: (weapon row, venue).
+    ///
+    /// A tap moves the cursor and nothing else, the same rule ArenaCell
+    /// follows: the write still starts with [A], so a tap cannot change a
+    /// count.
+    GuildWeaponCell(usize, usize),
     AdjustRow(usize, Key),
     AdjustBy(i64),
     SetRowMax(usize),
@@ -2262,15 +2269,11 @@ impl GuiState {
                 }
                 other => ed.input(other),
             },
-            // The arena view of the guild screen owns every key: there [Y] is
-            // the direct time input, not the card's step key.
-            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => ed.input(key),
-            Screen::Guild => match key {
-                Key::Y => {
-                    ed.step = (ed.step + 1) % STEPS.len();
-                }
-                other => ed.input(other),
-            },
+            // The guild screen's views own every key: on the arena log [Y] is
+            // the direct time input, and on the other three it walks the
+            // card's record views. The step is the deck's pill on this screen
+            // now (it used to be [Y], which the view walk needs).
+            Screen::Guild => ed.input(key),
             // The set editor is a mode of this screen: while it is open every
             // key belongs to it and the list underneath cannot move, the same
             // shape the item bulk menu uses. The list's own cursor lives in
@@ -2771,6 +2774,13 @@ impl GuiState {
                 ed.arena_rank = rank.min(ARENA_COLUMNS.saturating_sub(1));
                 ed.arena_edit = false;
             }
+            UiAction::GuildWeaponCell(row, venue) => {
+                ed.guild_wpn_row = row.min(mhnx_core::hbedit::GUILD_WEAPON_ROWS.saturating_sub(1));
+                ed.guild_wpn_venue = venue.min(mhnx_core::hbedit::GUILD_VENUES.saturating_sub(1));
+                // A tap on another cell is a cursor move: the step editor
+                // belongs to the cell it was armed on.
+                ed.guild_wpn_edit = false;
+            }
             UiAction::ActivateRow(idx) => {
                 set_active_cursor(ed, self, idx);
                 if ed.screen == Screen::SaveQuests && self.quest_tab > 0 {
@@ -3181,13 +3191,12 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::JewelPick => ed.jewel_pick_cursor,
         Screen::EquipPick => ed.equip_pick_cursor,
         Screen::Hunts => ed.hunt_cursor,
-        Screen::Guild => {
-            if ed.guild_view() == GUILD_TAB_ARENA {
-                ed.arena_row
-            } else {
-                ed.guild_field
-            }
-        }
+        Screen::Guild => match ed.guild_view() {
+            GUILD_TAB_ARENA => ed.arena_row,
+            GUILD_TAB_COUNTS => ed.guild_count_selected(),
+            GUILD_TAB_WEAPONS => ed.guild_weapon_selected().0,
+            _ => ed.guild_field,
+        },
         // One cursor per view: the screen swaps the list under it.
         Screen::Progress => ed.progress_cursor(),
         // A mode's row while one is open, the list's row otherwise.
@@ -3262,13 +3271,13 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::JewelPick => ed.jewel_pick_matches().len(),
         Screen::EquipPick => ed.equip_pick_choices().len(),
         Screen::Hunts => ed.hunt_rows().len(),
-        Screen::Guild => {
-            if ed.guild_view() == GUILD_TAB_ARENA {
-                ARENA_ROWS
-            } else {
-                3
-            }
-        }
+        Screen::Guild => match ed.guild_view() {
+            GUILD_TAB_ARENA => ARENA_ROWS,
+            GUILD_TAB_COUNTS => mhnx_core::hbedit::GUILD_COUNT_ROWS,
+            GUILD_TAB_WEAPONS => mhnx_core::hbedit::GUILD_WEAPON_ROWS,
+            // The card's four rows: HR, clock, comment, card name.
+            _ => mhnx_core::hbedit::GUILD_FIELDS,
+        },
         Screen::Progress => ed.progress_len(),
         Screen::Roster => match ed.palico_skill {
             Some(_) => ed.palico_skill_list_len(),
@@ -3431,14 +3440,24 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
             }
         }
         Screen::Hunts => ed.hunt_cursor = clamped,
-        Screen::Guild => {
-            if ed.guild_view() == GUILD_TAB_ARENA {
+        Screen::Guild => match ed.guild_view() {
+            GUILD_TAB_ARENA => {
                 ed.arena_row = clamped.min(ARENA_ROWS.saturating_sub(1));
                 ed.arena_edit = false;
-            } else {
+            }
+            GUILD_TAB_COUNTS => {
+                ed.guild_count_cursor =
+                    clamped.min(mhnx_core::hbedit::GUILD_COUNT_ROWS.saturating_sub(1));
+            }
+            GUILD_TAB_WEAPONS => {
+                ed.guild_wpn_row =
+                    clamped.min(mhnx_core::hbedit::GUILD_WEAPON_ROWS.saturating_sub(1));
+                ed.guild_wpn_edit = false;
+            }
+            _ => {
                 ed.guild_field = clamped.min(mhnx_core::hbedit::GUILD_FIELDS - 1);
             }
-        }
+        },
         Screen::Progress => ed.set_progress_cursor(clamped),
         Screen::Roster => {
             if let Some(mut state) = ed.palico_skill {
@@ -3532,14 +3551,21 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
         Screen::Hunts => {
             ed.hunt_row_max(idx);
         }
-        Screen::Guild => {
-            if ed.guild_view() == GUILD_TAB_ARENA {
+        Screen::Guild => match ed.guild_view() {
+            GUILD_TAB_ARENA => {
                 ed.message =
                     String::from("闘技大会の行に最大値はありません（[Y] で直接入力）");
-            } else {
+            }
+            GUILD_TAB_COUNTS => {
+                ed.guild_count_row_max(idx);
+            }
+            GUILD_TAB_WEAPONS => {
+                ed.guild_weapon_row_max();
+            }
+            _ => {
                 ed.guild_row_max(idx);
             }
-        }
+        },
         Screen::Roster => {
             ed.roster_row_max(idx);
         }
@@ -3708,7 +3734,13 @@ fn max_is_available(ed: &Editor, row: usize) -> bool {
         // Both set forms edit a list of candidate records, not numbers.
         Screen::Sets => false,
         Screen::Items | Screen::Options | Screen::Roster | Screen::Hunts => true,
-        Screen::Guild => ed.guild_view() != GUILD_TAB_ARENA && row <= 1,
+        // The card's rank and clock rows, and every row of the two record
+        // views: those are all u16 numbers with a ceiling.
+        Screen::Guild => match ed.guild_view() {
+            GUILD_TAB_COUNTS | GUILD_TAB_WEAPONS => true,
+            GUILD_TAB_ARENA => false,
+            _ => row <= 1,
+        },
         // 種類上限: slots and the two point rows. The kind row prints its
         // ceiling instead of jumping to it, and the box-slot row names a slot.
         Screen::CharmEdit => matches!(row, 2 | 4 | 6),
@@ -3729,6 +3761,8 @@ fn max_is_available(ed: &Editor, row: usize) -> bool {
 fn supports_direct_input(ed: &Editor, row: usize) -> bool {
     match ed.screen {
         Screen::Items | Screen::Hunts => true,
+        // The card's two numbers, and every row of the two record views: [R]
+        // types the value instead of stepping it.
         Screen::Guild => ed.guild_view() != GUILD_TAB_ARENA,
         // A reward / supply row has a number [R] can type.
         Screen::EntryView => ed.entry_has_numbers(),
@@ -4399,6 +4433,30 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, lbl, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
             }
+            // The guild card's two record views have no sub-tab (the bar is
+            // full), so the key that opens them gets two pills - the touch
+            // route to the same key, so the pad and a finger cannot disagree.
+            Screen::Guild => {
+                let (label, action) = match ed.guild_view() {
+                    GUILD_TAB_CARD => (String::from("[Y] クエスト回数"), UiAction::Key(Key::Y)),
+                    GUILD_TAB_COUNTS => (String::from("[Y] 武器使用数"), UiAction::Key(Key::Y)),
+                    GUILD_TAB_WEAPONS => (String::from("[Y] カードへ"), UiAction::Key(Key::Y)),
+                    _ => (String::from("[B] カードへ"), UiAction::Key(Key::B)),
+                };
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, &label, t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, action);
+
+                // The step the ◀ / ▶ pair uses: the key it had on this screen
+                // ([Y]) now walks the views, so the deck carries it - the
+                // same solution the quest screen's step chip uses.
+                let step_lbl = format!("刻み ±{}", STEPS[ed.step]);
+                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1108, sy, 158, sh, &step_lbl, t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::SetStep(next_step));
+            }
             Screen::EntryView => {
                 let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
@@ -4746,6 +4804,10 @@ impl GuiState {
             Screen::Palico => self.draw_palico(c, ed),
             Screen::Hunts => self.draw_hunts(c, ed),
             Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => self.draw_arena(c, ed),
+            Screen::Guild if ed.guild_view() == GUILD_TAB_COUNTS => self.draw_guild_counts(c, ed),
+            Screen::Guild if ed.guild_view() == GUILD_TAB_WEAPONS => {
+                self.draw_guild_weapons(c, ed)
+            }
             Screen::Guild => self.draw_guild(c, ed),
             Screen::Progress => self.draw_progress(c, ed),
             Screen::SaveQuests => self.draw_save_quests(c, ed),
@@ -7211,26 +7273,44 @@ impl GuiState {
                 tname.to_string(),
             ));
         }
-        // The amber strip is where a pending delete explains itself: the key
-        // guide cannot say which record is armed, and a delete that fires on
-        // one press is exactly what this screen must not do.
-        let notice = match ed.equip_delete_pending() {
-            Some((index, refs, _)) => {
-                let mut v = alloc::vec![format!(
-                    "削除の確認中: 枠 #{:04} / 参照 {} 件",
-                    index, refs
-                )];
-                v.push(if refs == 0 {
-                    String::from("もう一度 [-] で削除確定 / [B] で取りやめ")
-                } else {
-                    String::from("もう一度 [-] で強制削除 / 参照は下のメッセージ")
-                });
-                v
-            }
-            None => alloc::vec![String::from(
+        // The amber strip is where a pending operation explains itself: the key
+        // guide cannot say which record is armed, and both a delete and a type
+        // change fire on one press unless the screen says they are waiting.
+        let mut notice: Vec<String> = Vec::new();
+        if let Some((index, refs, _)) = ed.equip_delete_pending() {
+            notice.push(format!(
+                "削除の確認中: 枠 #{:04} / 参照 {} 件",
+                index, refs
+            ));
+            notice.push(if refs == 0 {
+                String::from("もう一度 [-] で削除確定 / [B] で取りやめ")
+            } else {
+                String::from("もう一度 [-] で強制削除 / 参照は下のメッセージ")
+            });
+        } else if let Some((_, _, text)) = ed.equip_kind_pending() {
+            // The second [A] writes; anything else (a cursor move, [B]) drops
+            // it, so the line has to say what the press is waiting for.
+            notice.push(text);
+            notice.push(String::from("前の種別のデータは消しません（警告のみ）"));
+        } else {
+            notice.push(String::from(
                 "[-] 2回で削除 / [＋] 新規追加 / [A] 編集・種別やIDを変えると差し替え",
-            )],
-        };
+            ));
+        }
+        // The record under the cursor: what does not fit the type it carries.
+        // A kind change keeps every byte, so this is where a converted record
+        // shows why it reads oddly - and it is the same list the PC build
+        // prints under the record (equipops::kind_warnings).
+        if let Some(save) = &ed.save {
+            if let Some(eq) = all.get(ed.equip_cursor) {
+                for w in mhnx_core::equipops::kind_warnings(save, ed.slot, eq.index)
+                    .into_iter()
+                    .take(2)
+                {
+                    notice.push(w);
+                }
+            }
+        }
         // The heading carries the filter: a filtered list that said nothing
         // looked like a box that had lost rows, and the key that cleared it
         // was [X], which is the save key everywhere.
@@ -7300,10 +7380,18 @@ impl GuiState {
             .map(|q| q.kind != ee.kind || q.id != ee.id)
             .unwrap_or(false);
         let notice = if identity_changed {
-            alloc::vec![
+            let mut v = alloc::vec![
                 String::from("種別/ID を変えて書き込むと差し替えます（装飾品3枠は外れます）"),
-                String::from("名前行は [A] で一覧、書き込みは「装備枠」の行の [A] です"),
-            ]
+            ];
+            v.push(if eq.as_ref().map(|q| q.kind != ee.kind).unwrap_or(false) {
+                // A type change asks once more before it writes: the first [A]
+                // only says what the change costs (hbedit::Editor::
+                // equip_kind_pending).
+                String::from("種別が変わります: もう一度 [A] で実行 / [B] で取りやめ")
+            } else {
+                String::from("名前行は [A] で一覧、書き込みは「装備枠」の行の [A] です")
+            });
+            v
         } else {
             alloc::vec![
                 String::from("[A] は行ごとの操作です（選ぶ / 値を増やす / 書き込み）"),
@@ -7936,8 +8024,13 @@ impl GuiState {
         // view is: the user reported the log as missing, and a tab that is only
         // in the bar is the kind of thing that stays missing.
         let mut warnings: Vec<String> = Vec::new();
+        // The two record views are one [Y] away, and the bar cannot name them:
+        // the guide line is where a user finds out.
         warnings.push(String::from(
-            "[L/R] 闘技大会タブ: アリーナ 17 × 順位 5 のタイムを編集（[R] で数値入力）",
+            "[Y] クエスト回数 → 武器使用数（15 種 × 3 会場、[R] で数値入力）",
+        ));
+        warnings.push(String::from(
+            "[L/R] 闘技大会タブ: アリーナ 17 × 順位 5 のタイムを編集",
         ));
         let sub = format!(
             "HR 上限 {} / 時間 上限 {}h",
@@ -7959,6 +8052,367 @@ impl GuiState {
         );
     }
 
+    /// クエスト回数: the card's seven u16 counters, one row each.
+    ///
+    /// The card draws one bar per counter and shows their sum capped at 99,999;
+    /// the sum is not a field of the save, so the header carries it and the rows
+    /// are the seven things a write can touch. Each row is one u16, so the
+    /// stepper and the keyboard both stop at 65,535 - the ceiling the PC build's
+    /// grid prints beside the number.
+    fn draw_guild_counts(&mut self, c: &mut Canvas, ed: &Editor) {
+        let counts = ed.guild_counts();
+        let mut rows: Vec<(usize, String, String, String, String)> = Vec::new();
+        for i in 0..mhnx_core::hbedit::GUILD_COUNT_ROWS {
+            rows.push((
+                i,
+                String::from(mhnx_core::guildcard::quest_count_label(i)),
+                format!("u16 #{:02}", i + 1),
+                format!("{}", counts.get(i).copied().unwrap_or(0)),
+                format!("#{:02}", i + 1),
+            ));
+        }
+        let sum: u32 = counts.iter().sum();
+        let sub = format!(
+            "合計 {} / カード表示 {}（上限 {}）",
+            sum,
+            ed.guild_count_total(),
+            mhnx_core::guildcard::QUEST_TOTAL_CAP
+        );
+        let warnings = alloc::vec![
+            String::from("[Y] 武器使用数へ / [R] で数値を直接入力"),
+            String::from("合計はセーブに入りません（カードが表示のため足す値）"),
+        ];
+        self.draw_adaptive_rows_warn(
+            c,
+            ed,
+            "クエスト回数",
+            &sub,
+            &rows,
+            ed.guild_count_selected(),
+            true,
+            ed.guild_a_label(),
+            &warnings,
+        );
+    }
+
+    /// 武器使用数: fifteen weapon kinds by the three venues, on one grid.
+    ///
+    /// The card stores three independent u16 arrays and no total; the "All"
+    /// graph is the sum the game computes at display time. So the grid is the
+    /// whole screen - one row per weapon, one column per venue, the row's total
+    /// on the right - and the inspector edits the one cell the pad is on.
+    ///
+    /// Geometry, from the same 796 wide list panel the other screens use:
+    ///
+    ///   title    y 100..130, heading plus the cell counter on the right
+    ///   header   y 140..172, the five column names
+    ///   rows     y 172 + i*28 for i in 0..15, last row 564..592, panel ends 658
+    ///     index  right-aligned to x 58 (two digits, 18px)
+    ///     name   x 66..256 (190 wide; the longest name is 9 CJK = 153)
+    ///     cells  x 262 + v*118, 110 wide -> 262/380/498, last ends 608
+    ///     total  right-aligned to x 790
+    ///   inspector x 832..1260: the cell's value, the three venues under it,
+    ///     then the [A] / [R] / [X] / [B] buttons, the same shape draw_arena has.
+    fn draw_guild_weapons(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        let usage = ed.guild_weapon_usage();
+        let (cur_row, cur_venue) = ed.guild_weapon_selected();
+
+        c.text_clipped(
+            MAIN_X + 4,
+            CONTENT_Y,
+            620,
+            &format!("武器使用数  slot {}", ed.slot + 1),
+            t.text_primary,
+            FontSize::Medium,
+        );
+        c.text_right(
+            MAIN_X + V1_LIST_W - 4,
+            CONTENT_Y + 3,
+            &format!("{} 種 × {} 会場", GUILD_WEAPON_ROWS, GUILD_VENUES),
+            t.text_secondary,
+            FontSize::Small,
+        );
+
+        let body_y = CONTENT_Y + 30; // 132
+        let body_h = FOOTER_Y - body_y - 10; // 526
+
+        c.round_rect(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, 1, t.border_subtle);
+
+        const IDX_R: i32 = MAIN_X + 38; // 58
+        const NAME_X: i32 = MAIN_X + 46; // 66
+        const NAME_W: i32 = 190;
+        const CELL_X: i32 = MAIN_X + 242; // 262
+        const CELL_W: i32 = 110;
+        const CELL_GAP: i32 = 8;
+        const TOTAL_R: i32 = MAIN_X + 770; // 790
+        const ROW_H: i32 = 28;
+        let rows_y = body_y + 40;
+
+        c.text_sized(NAME_X, body_y + 8, "武器", t.text_muted, FontSize::Small);
+        for v in 0..GUILD_VENUES {
+            let ven = mhnx_core::guildcard::Venue::ALL[v];
+            let sel = v == cur_venue;
+            c.text_centered(
+                CELL_X + (v as i32) * (CELL_W + CELL_GAP),
+                body_y + 8,
+                CELL_W,
+                18,
+                mhnx_core::guildcard::venue_name(ven),
+                if sel { t.accent_primary } else { t.text_muted },
+                FontSize::Small,
+            );
+        }
+        c.text_right(TOTAL_R, body_y + 8, "合計", t.text_muted, FontSize::Small);
+        c.hline(MAIN_X + 12, body_y + 32, V1_LIST_W - 24, t.border_subtle);
+
+        for row in 0..GUILD_WEAPON_ROWS {
+            let ry = rows_y + (row as i32) * ROW_H;
+            let is_row = row == cur_row;
+            if is_row {
+                c.round_rect(MAIN_X + 8, ry, V1_LIST_W - 16, ROW_H, 5, t.bg_selected);
+            } else if row % 2 == 1 {
+                c.round_rect(MAIN_X + 8, ry, V1_LIST_W - 16, ROW_H, 5, t.bg_row_odd);
+            }
+            // A tap on the name moves the row and keeps the venue; the cells
+            // add their own, narrower hits on top of it.
+            self.add_hit(
+                MAIN_X + 8,
+                ry,
+                CELL_X - MAIN_X - 8,
+                ROW_H,
+                UiAction::GuildWeaponCell(row, cur_venue),
+            );
+            c.text_right(
+                IDX_R,
+                ry + 6,
+                &format!("{:02}", row + 1),
+                if is_row { t.accent_primary } else { t.text_muted },
+                FontSize::Small,
+            );
+            c.text_clipped(
+                NAME_X,
+                ry + 6,
+                NAME_W,
+                mhnx_core::guildcard::weapon_type_name(row),
+                if is_row { t.text_primary } else { t.text_secondary },
+                FontSize::Small,
+            );
+            for v in 0..GUILD_VENUES {
+                let cx = CELL_X + (v as i32) * (CELL_W + CELL_GAP);
+                let n = usage.get(v).and_then(|a| a.get(row)).copied().unwrap_or(0);
+                let sel = is_row && v == cur_venue;
+                self.add_hit(cx, ry, CELL_W, ROW_H, UiAction::GuildWeaponCell(row, v));
+                if sel {
+                    c.round_rect(cx + 2, ry + 2, CELL_W - 4, ROW_H - 4, 4, t.bg_val_box);
+                    c.round_rect_border(
+                        cx + 2,
+                        ry + 2,
+                        CELL_W - 4,
+                        ROW_H - 4,
+                        4,
+                        1,
+                        t.border_focus,
+                    );
+                }
+                // Zero is what an unused weapon reads as, and the game writes
+                // it as 0 rather than leaving the cell out, so it is printed as
+                // a number here instead of as a dash.
+                c.text_right(
+                    cx + CELL_W - 8,
+                    ry + 6,
+                    &format!("{}", n),
+                    if sel {
+                        t.accent_primary
+                    } else if is_row {
+                        t.text_primary
+                    } else {
+                        t.text_secondary
+                    },
+                    FontSize::Small,
+                );
+            }
+            c.text_right(
+                TOTAL_R,
+                ry + 6,
+                &format!("{}", ed.guild_weapon_total(row)),
+                if is_row { t.text_primary } else { t.text_muted },
+                FontSize::Small,
+            );
+        }
+
+        self.draw_guild_weapon_inspector(c, ed, body_y, body_h, cur_row, cur_venue);
+    }
+
+    /// The right-hand panel of the weapon-usage grid: the cell the pad is on.
+    fn draw_guild_weapon_inspector(
+        &mut self,
+        c: &mut Canvas,
+        ed: &Editor,
+        iy: i32,
+        ih: i32,
+        cur_row: usize,
+        cur_venue: usize,
+    ) {
+        let t = theme();
+        let ix = V1_INSP_X; // 832
+        let iw = V1_INSP_W; // 428
+        c.round_rect(ix, iy, iw, ih, t.corner_r, t.bg_panel);
+        c.round_rect_border(ix, iy, iw, ih, t.corner_r, 1, t.border_subtle);
+
+        c.text_sized(ix + 20, iy + 14, "選択中", t.accent_primary, FontSize::Small);
+        c.text_right(
+            ix + iw - 20,
+            iy + 14,
+            &format!("#{} / {}", cur_row + 1, GUILD_WEAPON_ROWS),
+            t.text_muted,
+            FontSize::Small,
+        );
+        c.text_clipped(
+            ix + 20,
+            iy + 40,
+            iw - 40,
+            mhnx_core::guildcard::weapon_type_name(cur_row),
+            t.text_primary,
+            FontSize::Medium,
+        );
+        let venue = mhnx_core::guildcard::Venue::ALL[cur_venue];
+        c.text_clipped(
+            ix + 20,
+            iy + 68,
+            iw - 40,
+            &format!("{} の使用数", mhnx_core::guildcard::venue_name(venue)),
+            t.text_secondary,
+            FontSize::Small,
+        );
+
+        // The value: the cell in the largest size the panel has, with the three
+        // venues underneath so a step has somewhere to show.
+        let value = ed.guild_weapon_at(cur_row, cur_venue);
+        c.round_rect(ix + 20, iy + 92, iw - 40, 54, 6, t.bg_val_box);
+        c.round_rect_border(ix + 20, iy + 92, iw - 40, 54, 6, 1, t.border_subtle);
+        btn_text(
+            c,
+            ix + 20,
+            iy + 92,
+            iw - 40,
+            54,
+            &format!("{}", value),
+            if value == 0 { t.text_muted } else { t.accent_primary },
+            FontSize::Large,
+        );
+
+        let part_w = (iw - 56) / 3; // 124
+        for v in 0..GUILD_VENUES {
+            let px = ix + 20 + (v as i32) * (part_w + 8);
+            let active = v == cur_venue;
+            let bg = if active { t.bg_selected } else { t.bg_val_box };
+            c.round_rect(px, iy + 156, part_w, 64, 6, bg);
+            c.round_rect_border(
+                px,
+                iy + 156,
+                part_w,
+                64,
+                6,
+                1,
+                if active { t.border_focus } else { t.border_subtle },
+            );
+            let ven = mhnx_core::guildcard::Venue::ALL[v];
+            let n = ed.guild_weapon_at(cur_row, v);
+            c.text_sized(
+                px + 10,
+                iy + 164,
+                mhnx_core::guildcard::venue_name(ven),
+                if active { t.accent_primary } else { t.text_muted },
+                FontSize::Small,
+            );
+            c.text_right(
+                px + part_w - 10,
+                iy + 186,
+                &format!("{}", n),
+                if active { t.accent_primary } else { t.text_primary },
+                FontSize::Medium,
+            );
+            self.add_hit(
+                px,
+                iy + 156,
+                part_w,
+                64,
+                UiAction::GuildWeaponCell(cur_row, v),
+            );
+        }
+
+        c.hline(ix + 16, iy + 232, iw - 32, t.border_subtle);
+        c.text_clipped(
+            ix + 20,
+            iy + 242,
+            iw - 40,
+            if ed.guild_wpn_edit {
+                "編集中: [▲/▼] ±刻み  [◀/▶] ±10  [A] 終了"
+            } else {
+                "[A] で編集開始（値の増減）/ [R] で数値入力"
+            },
+            if ed.guild_wpn_edit { t.accent_warn } else { t.text_muted },
+            FontSize::Small,
+        );
+
+        let a_label = if ed.guild_wpn_edit {
+            "[A] 編集を終了"
+        } else {
+            "[A] 編集を開始"
+        };
+        c.round_rect(ix + 20, iy + 268, iw - 40, 44, 6, t.accent_primary);
+        btn_text(
+            c,
+            ix + 20,
+            iy + 268,
+            iw - 40,
+            44,
+            a_label,
+            white_or_dark(t.accent_primary),
+            FontSize::Medium,
+        );
+        self.add_hit(ix + 20, iy + 268, iw - 40, 44, UiAction::Key(Key::A));
+
+        let half = (iw - 48) / 2; // 190
+        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, "[R] 数値入力", UiAction::Key(Key::R));
+        self.draw_tool_button(
+            c,
+            ix + 28 + half,
+            iy + 322,
+            half,
+            40,
+            "[X] 保存",
+            UiAction::QuickSave,
+        );
+        self.draw_tool_button(
+            c,
+            ix + 20,
+            iy + 372,
+            iw - 40,
+            40,
+            "[B] ギルドカードへ",
+            UiAction::Key(Key::B),
+        );
+
+        c.text_clipped(
+            ix + 20,
+            iy + 424,
+            iw - 40,
+            &format!("3 会場の合計 {}（カードが表示のため足す値）", ed.guild_weapon_total(cur_row)),
+            t.text_muted,
+            FontSize::Small,
+        );
+        c.text_clipped(
+            ix + 20,
+            iy + 448,
+            iw - 40,
+            "各欄は u16。上限 65535 で頭打ちです",
+            t.text_muted,
+            FontSize::Small,
+        );
+    }
     /// 闘技大会: the arena log at the end of the guild card.
     ///
     /// The PC build edits the same entries on its ギルド tab through
