@@ -339,7 +339,11 @@ pub fn section_of(screen: Screen) -> MainSection {
         }
         // 詳細・ツール: the three screens that read the file rather than the
         // play. 生データ is the one every record screen's pill lands on.
-        Screen::SaveMap | Screen::Csv | Screen::Options => MainSection::Tools,
+        // 詳細・ツール: the screens that read the file rather than the play.
+        // 変更一覧 belongs here for the same reason 生データ does - it names
+        // bytes, not a record - and it is the one screen on this shelf that
+        // edits (one value at a time) instead of only showing.
+        Screen::SaveMap | Screen::Review | Screen::Csv | Screen::Options => MainSection::Tools,
     }
 }
 
@@ -1110,11 +1114,17 @@ impl GuiState {
             // row. セーブマップ is 生データ - the same screen every record
             // screen's [詳細] opens.
             MainSection::Tools => {
-                let labels: &'static [&'static str] = &["セーブマップ", "CSV入出力", "環境設定"];
+                let labels: &'static [&'static str] = &[
+                    "セーブマップ",
+                    "変更一覧",
+                    "CSV入出力",
+                    "環境設定",
+                ];
                 let active = match ed.screen {
                     Screen::SaveMap => 0,
-                    Screen::Csv => 1,
-                    Screen::Options => 2,
+                    Screen::Review => 1,
+                    Screen::Csv => 2,
+                    Screen::Options => 3,
                     _ => 0,
                 };
                 (labels, active)
@@ -1246,7 +1256,19 @@ impl GuiState {
                         ed.open_save_map(from);
                     }
                 }
-                1 => ed.open_csv(),
+                // 変更一覧 builds its list on the way in; the screen's own [Y]
+                // rebuilds it, and a save with no reference says so instead of
+                // showing an empty list.
+                1 => {
+                    if ed.save.is_none() {
+                        ed.message = String::from(
+                            "変更一覧を見るには先にセーブデータを開いてください",
+                        );
+                    } else {
+                        ed.open_review();
+                    }
+                }
+                2 => ed.open_csv(),
                 _ => {
                     if ed.save.is_none() {
                         ed.message = String::from("設定を開くには先にセーブデータを開いてください");
@@ -3243,6 +3265,8 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Options => ed.option_cursor,
         // 生データ: a position in the filtered save map, not a body offset.
         Screen::SaveMap => ed.map_cursor,
+        // 変更一覧: a position in the value list.
+        Screen::Review => ed.rev_cursor,
         _ => ed.cursor,
     }
 }
@@ -3340,6 +3364,9 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Options => 4,
         Screen::Convert => 0,
         Screen::SaveMap => ed.save_map_rows().len(),
+        // 変更一覧: one row per value that differs, so an empty list is a save
+        // identical to the card and the length is 0 rather than a placeholder.
+        Screen::Review => ed.review_len(),
     }
 }
 
@@ -3520,6 +3547,12 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
                 ed.map_edit = None;
             }
             ed.map_cursor = clamped;
+        }
+        Screen::Review => {
+            // A tap on another line drops an armed 戻す, the same rule every
+            // other two-press operation follows.
+            ed.rev_armed = None;
+            ed.rev_cursor = clamped;
         }
         _ => ed.cursor = clamped,
     }
@@ -4528,6 +4561,29 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, "[Y] 検索", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
             }
+            // 生データ: the list is about a hundred named stretches, three of
+            // them the same box for the other two characters. [Y] narrows it by
+            // name or offset; the pill says so and, while a filter is on, names
+            // it rather than leaving the shortened list unexplained.
+            Screen::SaveMap if !ed.map_edit_open() => {
+                let label = if ed.map_filter.trim().is_empty() {
+                    String::from("[Y] 領域を検索")
+                } else {
+                    format!("[Y] 「{}」", ed.map_filter)
+                };
+                c.round_rect(964, sy, 302, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 302, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 302, sh, &label, t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 302, sh, UiAction::Key(Key::Y));
+            }
+            // 変更一覧: [Y] re-walks the values. The list is built once, so the
+            // key is the one way to compare again after an edit made elsewhere.
+            Screen::Review => {
+                c.round_rect(964, sy, 302, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 302, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 302, sh, "[Y] 一覧を作り直す", t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 302, sh, UiAction::Key(Key::Y));
+            }
             _ => {}
         }
     }
@@ -4820,6 +4876,7 @@ impl GuiState {
             Screen::EntryView => self.draw_entry_view(c, ed),
             Screen::Check => self.draw_check(c, ed),
             Screen::SaveMap => self.draw_save_map(c, ed),
+            Screen::Review => self.draw_review_screen(c, ed),
         }
     }
 
@@ -5149,6 +5206,257 @@ impl GuiState {
                 FontSize::Small,
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    /// 変更一覧 (Screen::Review): the values the save differs from the card in,
+    /// one line each, with the one-item undo the pre-save dialog does not offer.
+    ///
+    /// The layout is the split every other screen uses (796 / 428). The list
+    /// prints the whole change ("スロット1 名前: ナナ → 差分テスト") so a value
+    /// is readable without opening anything; the panel repeats the selected line,
+    /// says which bytes it would put back - or why it cannot - and carries the
+    /// three keys: 戻す / 作り直す / 戻る. Everything the rows say comes from
+    /// mhnx_core::hbedit (ReviewRow), so the list and the pre-save review cannot
+    /// word the same change two ways.
+    fn draw_review_screen(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        let total = ed.review_len();
+        let armed = ed.review_armed_row();
+        let selected = ed.review_selected();
+
+        c.text_clipped(
+            MAIN_X + 4,
+            CONTENT_Y,
+            420,
+            "変更一覧",
+            t.text_primary,
+            FontSize::Medium,
+        );
+        c.text_right(
+            1262,
+            CONTENT_Y + 3,
+            &ed.review_heading(),
+            t.text_secondary,
+            FontSize::Small,
+        );
+
+        let body_y = CONTENT_Y + 30;
+        let body_h = FOOTER_Y - body_y - 10;
+        const ROW_H: i32 = 50;
+        const VIS: usize = mhnx_core::hbedit::REVIEW_VISIBLE;
+        let list_w = V1_LIST_W;
+        let insp_x = V1_INSP_X;
+        let insp_w = V1_INSP_W;
+        let start = window_start(ed.rev_cursor, total, VIS);
+        let track = scroll_track(MAIN_X, list_w);
+
+        // ---- left: one line per value
+        c.round_rect(MAIN_X, body_y, list_w, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(MAIN_X, body_y, list_w, body_h, t.corner_r, 1, t.border_subtle);
+        c.hline(MAIN_X + 12, body_y + 30, list_w - 24, t.border_subtle);
+
+        for i in 0..VIS {
+            let pos = start + i;
+            if pos >= total {
+                break;
+            }
+            let ry = body_y + 34 + (i as i32) * ROW_H;
+            let sel = pos == ed.rev_cursor;
+            let bg = if sel {
+                t.bg_selected
+            } else if i % 2 == 1 {
+                t.bg_row_odd
+            } else {
+                t.bg_row_even
+            };
+            c.round_rect(MAIN_X + 8, ry, list_w - 16, ROW_H - 4, 5, bg);
+            self.add_hit(
+                MAIN_X + 8,
+                ry,
+                track.row_right - (MAIN_X + 8),
+                ROW_H - 4,
+                UiAction::SelectRow(pos),
+            );
+            if sel {
+                c.rect(MAIN_X + 8, ry + 6, 3, ROW_H - 16, t.accent_primary);
+            }
+            c.text_clipped(
+                MAIN_X + 20,
+                ry + 6,
+                56,
+                &format!("#{:03}", pos + 1),
+                t.text_muted,
+                FontSize::Small,
+            );
+            let col = if sel { t.text_primary } else { t.text_secondary };
+            // The badge on the right is a fact about the line, not a key: a
+            // value whose bytes are shared with another cannot be put back on
+            // its own, and saying so here is what stops a press that refuses.
+            let badge_w = 104;
+            c.text_clipped(
+                MAIN_X + 80,
+                ry + 4,
+                track.text_right - (MAIN_X + 80) - badge_w,
+                &ed.review_line(pos),
+                col,
+                FontSize::Small,
+            );
+            let (badge, bcol) = if !ed.review_can_restore(pos) {
+                (String::from("戻せません"), t.text_muted)
+            } else if armed == Some(pos) {
+                (String::from("[A] 2回目"), t.accent_warn)
+            } else {
+                (String::from("戻せます"), t.accent_secondary)
+            };
+            c.text_right(track.text_right, ry + 15, &badge, bcol, FontSize::Small);
+        }
+        if total == 0 {
+            c.text_clipped(
+                MAIN_X + 20,
+                body_y + 44,
+                list_w - 40,
+                "保存した内容との違いはありません（[Y] で作り直せます）",
+                t.text_muted,
+                FontSize::Small,
+            );
+        }
+        let ids: Vec<usize> = (0..total).collect();
+        self.draw_list_bar(
+            c,
+            ed,
+            MAIN_X,
+            list_w,
+            body_y + 34,
+            (VIS as i32) * ROW_H,
+            ScrollBar::new(total, VIS, start),
+            &ids,
+            false,
+        );
+
+        // ---- right: the selected line, its bytes and the three keys
+        c.round_rect(insp_x, body_y, insp_w, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(insp_x, body_y, insp_w, body_h, t.corner_r, 1, t.border_subtle);
+
+        let can = selected.map(|row| ed.review_can_restore(row)).unwrap_or(false);
+        let btn_w = (insp_w - 48) / 2;
+        let a_x = insp_x + 20;
+        let b_x = a_x + btn_w + 8;
+        let btn_y = body_y + body_h - 44;
+        let (a_bg, a_fg) = if armed.is_some() {
+            (t.accent_warn, white_or_dark(t.accent_warn))
+        } else if can {
+            (t.bg_btn_primary, white_or_dark(t.bg_btn_primary))
+        } else {
+            (t.bg_btn, t.text_muted)
+        };
+        c.round_rect(a_x, btn_y, btn_w, 34, 5, a_bg);
+        c.round_rect_border(
+            a_x,
+            btn_y,
+            btn_w,
+            34,
+            5,
+            1,
+            if can { t.accent_primary } else { t.border_subtle },
+        );
+        btn_text(c, a_x, btn_y, btn_w, 34, ed.review_a_label(), a_fg, FontSize::Small);
+        self.add_hit(a_x, btn_y, btn_w, 34, UiAction::Key(Key::A));
+
+        c.round_rect(b_x, btn_y, btn_w, 34, 5, t.bg_btn);
+        c.round_rect_border(b_x, btn_y, btn_w, 34, 5, 1, t.border_subtle);
+        btn_text(c, b_x, btn_y, btn_w, 34, "[B] 戻る", t.text_primary, FontSize::Small);
+        self.add_hit(b_x, btn_y, btn_w, 34, UiAction::Key(Key::B));
+
+        // [Y] sits above the pair: the list is built once, so the key that
+        // rebuilds it is the one a finger needs between two edits.
+        let y_y = btn_y - 42;
+        c.round_rect(a_x, y_y, insp_w - 40, 34, 5, t.bg_btn);
+        c.round_rect_border(a_x, y_y, insp_w - 40, 34, 5, 1, t.border_subtle);
+        btn_text(
+            c,
+            a_x,
+            y_y,
+            insp_w - 40,
+            34,
+            "[Y] 一覧を作り直す",
+            t.text_primary,
+            FontSize::Small,
+        );
+        self.add_hit(a_x, y_y, insp_w - 40, 34, UiAction::Key(Key::Y));
+
+        let Some(row) = selected else {
+            c.text_clipped(
+                insp_x + 20,
+                body_y + 18,
+                insp_w - 40,
+                "保存した内容との違いはありません",
+                t.text_muted,
+                FontSize::Small,
+            );
+            return;
+        };
+        c.text_clipped(
+            insp_x + 20,
+            body_y + 18,
+            insp_w - 40,
+            &ed.review_line(row),
+            t.text_primary,
+            FontSize::Small,
+        );
+        let note = ed.review_note(row);
+        if !note.is_empty() {
+            c.text_clipped(
+                insp_x + 20,
+                body_y + 44,
+                insp_w - 40,
+                &note,
+                if ed.review_can_restore(row) {
+                    t.text_secondary
+                } else {
+                    t.accent_warn
+                },
+                FontSize::Small,
+            );
+        }
+        if let Some(list) = ed.review_list() {
+            c.text_clipped(
+                insp_x + 20,
+                body_y + 70,
+                insp_w - 40,
+                &format!(
+                    "変更 {} バイト（{} バイト → {} バイト）",
+                    list.changed,
+                    list.old.len(),
+                    list.new_len
+                ),
+                t.text_secondary,
+                FontSize::Small,
+            );
+            let mut y = body_y + 96;
+            for line in list.summary.iter().take(4) {
+                if y > y_y - 26 {
+                    break;
+                }
+                c.text_clipped(
+                    insp_x + 20,
+                    y,
+                    insp_w - 40,
+                    &format!("・{}", line),
+                    t.text_secondary,
+                    FontSize::Small,
+                );
+                y += 22;
+            }
+        }
+        c.text_clipped(
+            insp_x + 20,
+            y_y - 26,
+            insp_w - 40,
+            &format!("{} / {} 件（[▲/▼] 行）", row + 1, total),
+            t.text_muted,
+            FontSize::Small,
+        );
     }
 
     // -----------------------------------------------------------------------

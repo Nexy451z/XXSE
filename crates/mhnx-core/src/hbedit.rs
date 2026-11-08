@@ -156,6 +156,20 @@ pub enum Screen {
     /// [B] goes back to the screen 詳細 was pressed on, which is why the screen
     /// keeps the name of that screen rather than a stack.
     SaveMap,
+    /// 変更一覧 - every value that differs from the file on disk, one line
+    /// each, with the one-item undo the pre-save review does not offer.
+    ///
+    /// The same walk the pre-save dialog runs ([crate::diffvalues]) over the
+    /// save that is open and the bytes the card holds, so the two screens can
+    /// never name a change differently. The reference is the file as it was
+    /// last read or written ([Editor::set_review_reference]); a line is put back
+    /// by copying the bytes that line owns out of that reference, and the copy
+    /// is checked against the whole value walk before it is accepted - see
+    /// [plan_review_rows], which is the same rule the desktop review follows.
+    ///
+    /// Nothing here writes a file: the open save changes, the save key puts it
+    /// out, and the step goes onto the same LIFO history as every other edit.
+    Review,
 }
 
 /// The three views of [Screen::Progress], in the order L / R walks them.
@@ -177,6 +191,15 @@ pub const PROGRESS_JUMP: usize = 50;
 pub const SAVE_MAP_VISIBLE: usize = 9;
 /// Rows [◀] / [▶] jump on the 生データ list.
 pub const SAVE_MAP_JUMP: usize = 10;
+
+/// Rows the 変更一覧 list shows at once.
+///
+/// Nine like the save map's list: the console draws the same row height on both
+/// screens, and a screen that held one more line would be the only list whose
+/// scrollbar is a different length.
+pub const REVIEW_VISIBLE: usize = 9;
+/// Rows [◀] / [▶] jump on the 変更一覧 list.
+pub const REVIEW_JUMP: usize = 10;
 
 /// The first row of the 生データ list: the save's own body header.
 ///
@@ -233,7 +256,13 @@ pub const REQUEST_ROWS: usize =
 
 /// How many tabs [Screen::QuestEdit] carries, in the order L / R walks them.
 pub const QUEST_TABS: usize = 4;
-/// 基本: クエスト名 / 依頼主 / 目的 / 制限時間.
+/// 基本: the seven .gmd text lines of the quest, then the .mib time limit.
+///
+/// The seven are [crate::quest::Gmd::LABELS] in its own order, so the labels the
+/// row prints and the index the keyboard writes cannot drift apart. The desktop
+/// screen edits three of them (name / client / request); the console lists all
+/// seven because a custom quest's success and fail conditions are text the game
+/// draws, and leaving them out is the one thing a player cannot fix elsewhere.
 pub const QUEST_TAB_BASIC: usize = 0;
 /// モンスター: the five slots of the .mib, plus their .sem placement.
 pub const QUEST_TAB_MONSTERS: usize = 1;
@@ -2919,6 +2948,13 @@ pub const TEXT_GUILD_WEAPON_COUNT: usize = usize::MAX - 1_015;
 /// The two my-set names sit in one field of the same width, so the base is
 /// given a band of its own instead of a single id.
 pub const TEXT_ITEM_SET_NAME: usize = usize::MAX - 1_100;
+/// Sentinel id for "type a name or an offset to narrow the 生データ list".
+///
+/// The list is about a hundred rows and three of them name the same box for the
+/// other two characters, so a search is how a user finds 護石 without walking
+/// the map. Its own id rather than a reuse: the console answers each sentinel
+/// with a different title and a different apply method.
+pub const TEXT_SAVE_MAP_FILTER: usize = usize::MAX - 1_016;
 
 // ---------------------------------------------------------------------------
 // Names: the six fields the screens edit, and what a text field accepts
@@ -4953,6 +4989,368 @@ impl SaveReview {
     }
 }
 
+/// One line of the 変更一覧: a value that differs from the file on disk.
+///
+/// The value itself comes from the same walk the pre-save review runs
+/// ([crate::diffvalues]), so the two screens print the same words. What this
+/// row adds is [ReviewRow::atoms]: the stretches of bytes that belong to this
+/// one value and to nothing else, which is what lets it be put back on its own.
+/// A value that shares its bytes with another, or whose bytes cannot be found,
+/// carries an empty `atoms` and the reason in [ReviewRow::blocked] instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewRow {
+    /// "スロット1 名前: ナナ → 差分テスト".
+    pub change: ValueChange,
+    /// The stretches of the planned file this line owns, or None when only
+    /// part of the line's bytes - or none - could be attributed to it.
+    pub atoms: Option<Vec<(usize, usize)>>,
+    /// What the save map calls the bytes, e.g. "スロット1 名前".
+    pub area: String,
+    /// Why the line cannot be put back, empty when it can.
+    pub blocked: String,
+}
+
+impl ReviewRow {
+    /// What the list prints.
+    pub fn line(&self) -> String {
+        self.change.line()
+    }
+
+    /// Can this one line be put back?
+    pub fn can_restore(&self) -> bool {
+        self.atoms.is_some()
+    }
+
+    /// The one line under the list that explains the selected row.
+    pub fn note(&self) -> String {
+        if !self.blocked.is_empty() {
+            return self.blocked.clone();
+        }
+        if self.area.is_empty() {
+            String::new()
+        } else {
+            format!("戻すバイト: {}", self.area)
+        }
+    }
+}
+
+/// How many separate stretches a review may attribute before it stops trying.
+///
+/// Proving which bytes belong to a line means re-walking the values once per
+/// stretch, and a save-wide edit can move thousands of bits. Past this the list
+/// still names every value and refuses to put any of them back, which is the
+/// safe side: the undo stack covers the whole file anyway.
+pub const REVIEW_MAX_STRETCHES: usize = 64;
+
+/// The 変更一覧: every value that differs from the reference file, the byte
+/// stretches behind each one, and the reference itself.
+///
+/// `old` is kept because putting a line back means copying *the reference's*
+/// bytes over the planned file, and because [ReviewList::stamp] makes the plan
+/// refuse to land on a save that was edited after the list was built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewList {
+    /// The file the save is being compared with (what the card holds).
+    pub old: Vec<u8>,
+    /// Size of the planned bytes, so the header can say where it is going.
+    pub new_len: usize,
+    /// How many bytes differ.
+    pub changed: usize,
+    /// The feature level lines, e.g. "スロット1: 装備ボックス 1 枠".
+    pub summary: Vec<String>,
+    /// The named stretches, in file order.
+    pub ranges: Vec<DiffRange>,
+    /// One entry per value, in file order.
+    pub rows: Vec<ReviewRow>,
+    /// Cheap fingerprint of the planned bytes this plan was built from.
+    pub stamp: u64,
+}
+
+impl ReviewList {
+    /// Is there nothing to show? (No save, or a save identical to the file.)
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.changed == 0
+    }
+
+    /// How many lines the keys can put back.
+    pub fn restorable(&self) -> usize {
+        self.rows.iter().filter(|row| row.can_restore()).count()
+    }
+}
+
+/// Every contiguous stretch of bytes the planned save changes, in file order.
+///
+/// Not the same as [diff_ranges]: that groups stretches closer than 32 bytes so
+/// the review gets one line per record. A line can only be put back from bytes
+/// that really belong to it, so these are the raw runs of differing bytes, with
+/// nothing merged across a gap.
+fn review_changed_atoms(old: &[u8], new: &[u8]) -> Vec<(usize, usize)> {
+    let common = old.len().min(new.len());
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < common {
+        if old[at] == new[at] {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < common && old[at] != new[at] {
+            at += 1;
+        }
+        out.push((start, at - start));
+    }
+    out
+}
+
+/// A copy of `new` with the reference bytes of these stretches put back.
+fn review_put_back(old: &[u8], new: &[u8], atoms: &[(usize, usize)]) -> Option<Vec<u8>> {
+    if old.len() != new.len() {
+        return None;
+    }
+    let mut bytes = new.to_vec();
+    for (start, len) in atoms {
+        let end = start.checked_add(*len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        bytes[*start..end].copy_from_slice(&old[*start..end]);
+    }
+    Some(bytes)
+}
+
+/// What the layout calls the stretches `probe` differs from `new` in.
+fn review_range_heads(probe: &[u8], new: &[u8], header: usize, save: &Save) -> Vec<String> {
+    let mut heads: Vec<String> = Vec::new();
+    for range in diff_ranges(probe, new, header, save).1 {
+        let head = range.head();
+        if !heads.contains(&head) {
+            heads.push(head);
+        }
+    }
+    heads
+}
+
+/// Do two lines describe the same field?
+///
+/// A line's identity is its slot and its field: putting bytes back only changes
+/// the 新 side, never the 旧 one, so a line that is still there is the same line.
+fn review_same_field(a: &ValueChange, b: &ValueChange) -> bool {
+    a.slot == b.slot && a.field == b.field
+}
+
+/// A cheap fingerprint of the planned bytes (FNV-1a, 64 bit).
+///
+/// The list is built once and used later, and the save can be edited while it is
+/// on screen. A row is only applied when this still matches, so a plan can never
+/// land on bytes it was not built from.
+fn review_stamp(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Work out which bytes belong to which line.
+///
+/// Every contiguous stretch of changed bytes is put back into the planned save
+/// on its own and the value walk runs again: the lines that stop differing are
+/// the ones that stretch belongs to. A line made of several stretches is put
+/// back all at once and checked the same way against the whole list, so a plan
+/// is only accepted when the result is exactly "the list minus this line". A
+/// line that shares a stretch with another line is refused, because putting it
+/// back would take the other one with it.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_review_rows(
+    old: &[u8],
+    new: &[u8],
+    ranges: &[DiffRange],
+    old_save: &Save,
+    new_save: &Save,
+    values: &[ValueChange],
+    titles: Option<&crate::guildcard::TitleTable>,
+) -> Vec<ReviewRow> {
+    let mut rows: Vec<ReviewRow> = values
+        .iter()
+        .map(|value| ReviewRow {
+            change: value.clone(),
+            atoms: None,
+            area: String::new(),
+            blocked: String::new(),
+        })
+        .collect();
+    if rows.is_empty() {
+        return rows;
+    }
+    let refuse_all = |rows: &mut Vec<ReviewRow>, why: &str| {
+        for row in rows.iter_mut() {
+            row.blocked = String::from(why);
+        }
+    };
+    if old.len() != new.len() {
+        refuse_all(
+            &mut rows,
+            "ファイルのサイズが変わるため、項目ごとのバイト範囲を特定できません",
+        );
+        return rows;
+    }
+    let header = if new_save.kind().has_header() {
+        crate::save::SWITCH_HEADER_SIZE
+    } else {
+        0
+    };
+    let atoms = review_changed_atoms(old, new);
+    if atoms.len() > REVIEW_MAX_STRETCHES {
+        refuse_all(
+            &mut rows,
+            &format!(
+                "変更が {} か所に分かれているため、項目ごとのバイト範囲を特定できません（一度に扱えるのは {} か所まで）",
+                atoms.len(),
+                REVIEW_MAX_STRETCHES
+            ),
+        );
+        return rows;
+    }
+    // Which lines each stretch moves, and what the layout calls it.
+    let mut moved: Vec<Vec<usize>> = Vec::with_capacity(atoms.len());
+    let mut areas: Vec<String> = Vec::with_capacity(atoms.len());
+    for atom in &atoms {
+        let probe = review_put_back(old, new, core::slice::from_ref(atom))
+            .and_then(|bytes| Save::from_bytes(&bytes).ok().map(|save| (bytes, save)));
+        let Some((bytes, save)) = probe else {
+            moved.push(Vec::new());
+            areas.push(String::new());
+            continue;
+        };
+        areas.push(review_range_heads(&bytes, new, header, new_save).join("、"));
+        let after = diff_values(ranges, old_save, &save, titles);
+        moved.push(
+            values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| match after.iter().find(|other| review_same_field(other, value)) {
+                    Some(after) => after != *value,
+                    None => true,
+                })
+                .map(|(index, _)| index)
+                .collect(),
+        );
+    }
+    for (index, row) in rows.iter_mut().enumerate() {
+        let mine: Vec<usize> = (0..atoms.len())
+            .filter(|atom| moved[*atom].contains(&index))
+            .collect();
+        if mine.is_empty() {
+            row.blocked = String::from(
+                "この項目のバイト列を特定できませんでした（値が複数の場所から読まれているか、ほかの変更と同じ場所にあります）",
+            );
+            continue;
+        }
+        let mut others: Vec<String> = Vec::new();
+        for atom in &mine {
+            for other in &moved[*atom] {
+                if *other != index && !others.contains(&values[*other].field) {
+                    others.push(values[*other].field.clone());
+                }
+            }
+        }
+        if !others.is_empty() {
+            let shown: Vec<String> = others.iter().take(3).cloned().collect();
+            row.blocked = format!(
+                "同じバイト列に他の変更（{}）があるため、この項目だけは戻せません",
+                shown.join("、")
+            );
+            continue;
+        }
+        let set: Vec<(usize, usize)> = mine.iter().map(|atom| atoms[*atom]).collect();
+        let Some(bytes) = review_put_back(old, new, &set) else {
+            row.blocked = String::from("戻すバイト列を作れませんでした");
+            continue;
+        };
+        let Ok(save) = Save::from_bytes(&bytes) else {
+            row.blocked =
+                String::from("戻した内容がセーブとして読めないため、この項目は戻せません");
+            continue;
+        };
+        let after = diff_values(ranges, old_save, &save, titles);
+        let mut expected = values.to_vec();
+        expected.remove(index);
+        if after != expected {
+            row.blocked = String::from("戻すとほかの値も一緒に変わるため、この項目だけは戻せません");
+            continue;
+        }
+        let mut heads: Vec<String> = Vec::new();
+        for atom in &mine {
+            if !areas[*atom].is_empty() && !heads.contains(&areas[*atom]) {
+                heads.push(areas[*atom].clone());
+            }
+        }
+        row.area = heads.join("、");
+        row.atoms = Some(set);
+    }
+    rows
+}
+
+/// Build the 変更一覧 of one save against the bytes the card holds.
+///
+/// Both sides are parsed where they parse, so the ranges can be named; a file
+/// that changed kind still gets its byte count, with every line refused because
+/// nothing can say which bytes belong to which value.
+pub fn build_review_list(
+    old: &[u8],
+    planned: &Save,
+    titles: Option<&crate::guildcard::TitleTable>,
+) -> ReviewList {
+    let new = planned.to_bytes();
+    let header = if planned.kind().has_header() {
+        crate::save::SWITCH_HEADER_SIZE
+    } else {
+        0
+    };
+    let (changed, ranges) = diff_ranges(old, &new, header, planned);
+    let previous = Save::from_bytes(old).ok();
+    let comparable = matches!(&previous, Some(previous) if previous.kind() == planned.kind());
+    let (summary, values) = match &previous {
+        Some(previous) if comparable && changed > 0 => (
+            diff_summary(&ranges, previous, planned),
+            diff_values(&ranges, previous, planned, titles),
+        ),
+        _ => (Vec::new(), Vec::new()),
+    };
+    let rows = match &previous {
+        Some(previous) if comparable && changed > 0 => plan_review_rows(
+            old,
+            &new,
+            &ranges,
+            previous,
+            planned,
+            &values,
+            titles,
+        ),
+        _ => values
+            .iter()
+            .map(|value| ReviewRow {
+                change: value.clone(),
+                atoms: None,
+                area: String::new(),
+                blocked: String::from(
+                    "ディスク上のファイルがセーブとして読めない（または形式が違う）ため、戻す範囲を特定できません",
+                ),
+            })
+            .collect(),
+    };
+    ReviewList {
+        old: old.to_vec(),
+        new_len: new.len(),
+        changed,
+        summary,
+        ranges,
+        rows,
+        stamp: review_stamp(&new),
+    }
+}
+
 /// The editor.
 pub struct Editor {
     /// Current screen.
@@ -5294,6 +5692,37 @@ pub struct Editor {
     /// place underneath, and [B] leaves either the change or the mode before it
     /// leaves the screen.
     pub map_edit: Option<MapEdit>,
+    /// 変更一覧's list for the save that is open, `None` until it is built.
+    ///
+    /// Built on the press that opens the screen and again after every restore,
+    /// never while drawing: the plan re-walks the values once per changed
+    /// stretch, which is more than a redraw should do.
+    pub rev_list: Option<ReviewList>,
+    /// Cursor inside that list.
+    pub rev_cursor: usize,
+    /// The line whose 戻す is waiting for its second [A].
+    ///
+    /// Putting a value back is a one-press edit like every other, but it is the
+    /// one edit this screen exists for and it is undoable only from the same
+    /// stack the rest of the tool uses - so the first press only names the line
+    /// and any other key drops the offer.
+    pub rev_armed: Option<usize>,
+    /// The screen [B] returns to from 変更一覧.
+    pub rev_return: Screen,
+    /// The bytes the card held when the save was read, or last written.
+    ///
+    /// The reference 変更一覧 compares against and the source a restored line
+    /// copies from. The I/O layer owns the card, so this is handed over with
+    /// [Editor::set_review_reference] after every read and every accepted write;
+    /// a run that never calls it simply has no list to show.
+    pub rev_ref: Option<Vec<u8>>,
+    /// 生データ's name / offset filter.
+    ///
+    /// Empty means every row of the list. The screen is a list of about a
+    /// hundred named stretches, and a user looking for 護石 should not have to
+    /// walk the other three slots' rows to find it; [crate::savemap] already
+    /// names them, so this is a filter and not a new table.
+    pub map_filter: String,
     /// アイテムBOX name search (Screen::Items).
     ///
     /// The talisman and equipment boxes already carry one. The item box's [Y]
@@ -5482,6 +5911,12 @@ impl Editor {
             map_cursor: 0,
             map_return: Screen::SaveList,
             map_edit: None,
+            rev_list: None,
+            rev_cursor: 0,
+            rev_armed: None,
+            rev_return: Screen::SaveMap,
+            rev_ref: None,
+            map_filter: String::new(),
             item_box_filter: String::new(),
             item_box_hits: Vec::new(),
             csv_files: Vec::new(),
@@ -5544,6 +5979,15 @@ impl Editor {
     /// The I/O layer answers a .gmd text request with this.
     pub fn apply_text(&mut self, index: usize, text: String) {
         if let Some(g) = &mut self.gmd {
+            // The 基本 tab lists every line [Gmd::LABELS] names, including one a
+            // given file left out. Writing such a line grows the list rather
+            // than dropping the text: the .gmd screen only ever asks for an
+            // index it drew, so this cannot invent a string for it.
+            if index < Gmd::LABELS.len() {
+                while g.strings.len() <= index {
+                    g.strings.push(String::new());
+                }
+            }
             if index < g.strings.len() {
                 g.strings[index] = text;
                 self.dirty = true;
@@ -5937,6 +6381,12 @@ impl Editor {
                 // different file must not be able to reach it.
                 self.undo.clear();
                 self.review = None;
+                // The card's own bytes are the reference 変更一覧 compares
+                // against, so the screen works the moment the save opens.
+                self.rev_ref = Some(bytes.to_vec());
+                self.rev_list = None;
+                self.rev_armed = None;
+                self.rev_return = Screen::Slots;
                 self.screen = Screen::Slots;
                 self.cursor = 0;
             }
@@ -6196,7 +6646,13 @@ impl Editor {
             Screen::SaveMap if self.map_edit_open() => {
                 "[▲/▼] 1バイト移動  [◀/▶] 値の変更  [A] 決定  [B] 取消/戻る"
             }
-            Screen::SaveMap => "[▲/▼] 行  [◀/▶] 10行  [A] 編集  [B] 戻る"
+            // The list is a comparison, so the two keys that matter are the one
+            // that puts a line back and the one that rebuilds the list; [X] is
+            // the save key every screen has.
+            Screen::Review => {
+                "[▲/▼] 行  [◀/▶] 10行  [A] 戻す（2回）  [Y] 再読込  [X] 保存  [B] 戻る"
+            }
+            Screen::SaveMap => "[▲/▼] 行  [◀/▶] 10行  [A] 編集  [Y] 検索  [B] 戻る"
         };
         base
     }
@@ -6495,7 +6951,8 @@ impl Editor {
     /// .mib time limit, which is why the tab is the only place in the editor
     /// where those two files are one list.
     pub fn quest_basic_rows(&self) -> Vec<QuestBasicRow> {
-        let mut out = Vec::with_capacity(4);
+        let labels = Gmd::LABELS;
+        let mut out = Vec::with_capacity(labels.len() + 1);
         let text = |i: usize| -> String {
             self.gmd
                 .as_ref()
@@ -6503,31 +6960,22 @@ impl Editor {
                 .map(|s| s.replace('\n', " / "))
                 .unwrap_or_default()
         };
-        let name = text(0);
-        let client = text(1);
-        let objective = text(4);
-        let limit = self.quest_time_limit();
-        out.push(QuestBasicRow {
-            label: "クエスト名",
-            value: if name.is_empty() { String::from("(未設定)") } else { name },
-            text_index: Some(0),
-            hex: None,
-        });
-        out.push(QuestBasicRow {
-            label: "依頼主",
-            value: if client.is_empty() { String::from("(未設定)") } else { client },
-            text_index: Some(1),
-            hex: None,
-        });
-        out.push(QuestBasicRow {
-            label: "目的（成功条件）",
-            value: if objective.is_empty() { String::from("(未設定)") } else { objective },
-            text_index: Some(4),
-            hex: None,
-        });
+        for (index, label) in labels.iter().enumerate() {
+            let value = text(index);
+            out.push(QuestBasicRow {
+                label: *label,
+                value: if value.is_empty() {
+                    String::from("(未設定)")
+                } else {
+                    value
+                },
+                text_index: Some(index),
+                hex: None,
+            });
+        }
         out.push(QuestBasicRow {
             label: "制限時間",
-            value: format!("{} 分", limit),
+            value: format!("{} 分", self.quest_time_limit()),
             text_index: None,
             hex: None,
         });
@@ -6873,7 +7321,12 @@ impl Editor {
         let step = delta as i32;
         match self.quest_edit_tab {
             QUEST_TAB_BASIC => {
-                if self.quest_edit_cursor != 3 {
+                // The rows say which of them is text and which is the number:
+                // the two are interleaved in no way, and a cursor test against
+                // a literal row number broke as soon as a row was added.
+                let rows = self.quest_basic_rows();
+                let row = rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1)));
+                if row.map(|r| r.text_index.is_some()).unwrap_or(true) {
                     self.message = String::from("この行は [A] で文字を編集します");
                     return false;
                 }
@@ -8825,6 +9278,7 @@ impl Editor {
             Screen::Csv => self.input_csv(key),
             Screen::QuestEdit => self.input_quest_edit(key),
             Screen::SaveMap => self.input_save_map(key),
+            Screen::Review => self.input_review(key),
         }
     }
 
@@ -9913,6 +10367,11 @@ impl Editor {
         self.charm_delete_armed = None;
         self.csv_armed = None;
         self.review = None;
+        // The list names bytes the undo just replaced, so it is rebuilt rather
+        // than kept: a stale plan would refuse (the stamp catches it) but the
+        // screen would say "作り直してください" for an undo the user just made.
+        self.rev_list = None;
+        self.rev_armed = None;
         self.item_undo.clear();
         let charms = self.charms().len();
         self.charm_cursor = self.charm_cursor.min(charms.saturating_sub(1));
@@ -10001,6 +10460,298 @@ impl Editor {
                 });
                 self.message = String::from("セーブに書き込み中...");
             }
+        }
+    }
+
+    // ------------------------------------------------------- 変更一覧 (Review)
+    //
+    // The desktop build has had this screen since the audit that found "the
+    // review says what a save would change, and nothing lets a user keep one of
+    // those changes and drop the others". It is the same walk over the same
+    // bytes here: [build_review_list] compares the open save with the reference
+    // the I/O layer handed over, [plan_review_rows] works out which bytes belong
+    // to which line, and [Editor::review_restore] copies exactly those bytes
+    // back out of the reference. Nothing on this screen writes a file.
+
+    /// Hand over the bytes the card holds, for 変更一覧 to compare against.
+    ///
+    /// The I/O layer is the only thing that can read the card, so it hands the
+    /// bytes it read over here - once when a save is opened and again after a
+    /// write is accepted. A run that never calls this has no list to show, and
+    /// the screen says so rather than showing an empty one.
+    pub fn set_review_reference(&mut self, bytes: &[u8]) {
+        self.rev_ref = Some(bytes.to_vec());
+        self.rev_list = None;
+        self.rev_armed = None;
+    }
+
+    /// Note that a write landed: the reference is now what the card holds.
+    ///
+    /// Without this the list would keep comparing against the file *before* the
+    /// last save, so every value the write put out would still be listed as
+    /// changed - the one thing the screen must never say.
+    pub fn note_saved(&mut self, bytes: &[u8]) {
+        self.set_review_reference(bytes);
+    }
+
+    /// Open 変更一覧 and build its list from the save and the reference.
+    ///
+    /// Returns whether there was anything to compare: a save with no reference
+    /// (opened by a layer that never handed the file over) or no open save says
+    /// why on the status line and leaves the screen where it was.
+    pub fn open_review(&mut self) -> bool {
+        if self.screen != Screen::Review {
+            self.rev_return = self.screen;
+        }
+        self.screen = Screen::Review;
+        self.rev_cursor = 0;
+        let built = self.rebuild_review();
+        if built {
+            let (changed, rows, restorable) = match &self.rev_list {
+                Some(list) => (list.changed, list.rows.len(), list.restorable()),
+                None => (0, 0, 0),
+            };
+            self.message = if changed == 0 {
+                String::from("保存した内容との違いはありません")
+            } else {
+                format!(
+                    "変更 {} バイト / {} 項目（戻せるのは {} 項目・[A] 2回）",
+                    changed, rows, restorable
+                )
+            };
+        }
+        built
+    }
+
+    /// Rebuild the list in place, keeping the cursor where it was.
+    ///
+    /// Called by the screen's own [Y] and after a restore. Returns false (and
+    /// explains itself on the status line) when there is nothing to compare.
+    pub fn rebuild_review(&mut self) -> bool {
+        self.rev_list = None;
+        self.rev_armed = None;
+        if self.save.is_none() {
+            self.message = String::from("変更一覧を見るには先にセーブを開いてください");
+            return false;
+        }
+        let Some(old) = self.rev_ref.clone() else {
+            self.message = String::from(
+                "比較するファイルの内容がありません（セーブを開き直してください）",
+            );
+            return false;
+        };
+        let Some(planned) = self.save.as_ref() else {
+            return false;
+        };
+        // Game text (the guild-card title words) is the caller's business; the
+        // console never hand this crate a dump, so the ids are what it prints -
+        // the same rule the pre-save review follows.
+        let list = build_review_list(&old, planned, None);
+        self.rev_list = Some(list);
+        let len = self.review_len();
+        self.rev_cursor = self.rev_cursor.min(len.saturating_sub(1));
+        true
+    }
+
+    /// The list, when there is one.
+    pub fn review_list(&self) -> Option<&ReviewList> {
+        self.rev_list.as_ref()
+    }
+
+    /// How many lines the list holds.
+    pub fn review_len(&self) -> usize {
+        self.rev_list.as_ref().map(|l| l.rows.len()).unwrap_or(0)
+    }
+
+    /// The line the list prints for one row, or "" when it is not there.
+    pub fn review_line(&self, row: usize) -> String {
+        self.rev_list
+            .as_ref()
+            .and_then(|l| l.rows.get(row))
+            .map(|r| r.line())
+            .unwrap_or_default()
+    }
+
+    /// What the inspector says under the line: the bytes it would put back, or
+    /// the reason it cannot.
+    pub fn review_note(&self, row: usize) -> String {
+        self.rev_list
+            .as_ref()
+            .and_then(|l| l.rows.get(row))
+            .map(|r| r.note())
+            .unwrap_or_default()
+    }
+
+    /// Can the line be put back on its own?
+    pub fn review_can_restore(&self, row: usize) -> bool {
+        self.rev_list
+            .as_ref()
+            .and_then(|l| l.rows.get(row))
+            .map(|r| r.can_restore())
+            .unwrap_or(false)
+    }
+
+    /// One line above the list: what the comparison found.
+    pub fn review_heading(&self) -> String {
+        match &self.rev_list {
+            None => String::from("比較するファイルの内容がありません"),
+            Some(list) if list.changed == 0 => String::from("保存した内容との違いはありません"),
+            Some(list) => format!(
+                "変更 {} バイト / {} 件（戻せるのは {} 件）",
+                list.changed,
+                list.rows.len(),
+                list.restorable()
+            ),
+        }
+    }
+
+    /// The line the cursor is on, as an index into the list.
+    pub fn review_selected(&self) -> Option<usize> {
+        let len = self.review_len();
+        if len == 0 {
+            return None;
+        }
+        Some(self.rev_cursor.min(len - 1))
+    }
+
+    /// Move the cursor, wrapping at both ends, and drop any armed revert: a
+    /// pending 戻す must never land on a line the user has stopped looking at.
+    pub fn review_move(&mut self, delta: i32) {
+        let len = self.review_len();
+        self.rev_armed = None;
+        if len == 0 {
+            self.rev_cursor = 0;
+            return;
+        }
+        let len_i = len as i32;
+        let next = (self.rev_cursor as i32 + delta).rem_euclid(len_i);
+        self.rev_cursor = next as usize;
+    }
+
+    /// Is the line under the cursor waiting for its second [A]?
+    pub fn review_armed_row(&self) -> Option<usize> {
+        self.rev_armed
+    }
+
+    /// The word the [A] button and the footer print for the selected line.
+    pub fn review_a_label(&self) -> &'static str {
+        let Some(row) = self.review_selected() else {
+            return "[A] 戻す";
+        };
+        if self.rev_armed == Some(row) {
+            "[A] もう一度で戻す"
+        } else if self.review_can_restore(row) {
+            "[A] 戻す（2回）"
+        } else {
+            "[A] 戻せません"
+        }
+    }
+
+    /// [A] on the list: name the line first, put it back on the second press.
+    ///
+    /// Returns whether the save changed. A line with no bytes of its own is
+    /// refused with the reason the plan wrote, which is more useful than a
+    /// generic "できません".
+    pub fn review_activate(&mut self) -> bool {
+        let Some(row) = self.review_selected() else {
+            self.message = String::from("このセーブには戻せる違いがありません");
+            return false;
+        };
+        if !self.review_can_restore(row) {
+            let note = self.review_note(row);
+            self.message = if note.is_empty() {
+                String::from("この項目は戻せません")
+            } else {
+                format!("この項目は戻せません: {}", note)
+            };
+            return false;
+        }
+        if self.rev_armed != Some(row) {
+            self.rev_armed = Some(row);
+            let line = self.review_line(row);
+            self.message = format!("[A] もう一度で戻します: {}", line);
+            return false;
+        }
+        self.rev_armed = None;
+        self.review_restore(row)
+    }
+
+    /// Put one line back to the value the reference file holds.
+    ///
+    /// Only the bytes the plan decided belong to that line are copied, and only
+    /// after the saved fingerprint still matches, so a plan can never land on a
+    /// save that was edited after it was built. The step goes onto the same LIFO
+    /// history as every other edit, so the whole-save undo takes it back.
+    pub fn review_restore(&mut self, index: usize) -> bool {
+        let Some(list) = self.rev_list.as_ref() else {
+            self.message = String::from("変更一覧がありません（[Y] で作り直してください）");
+            return false;
+        };
+        let Some(row) = list.rows.get(index) else {
+            self.message = String::from("その行は一覧にありません（[Y] で作り直してください）");
+            return false;
+        };
+        let Some(atoms) = row.atoms.clone() else {
+            self.message = format!("この項目は戻せません: {}", row.blocked);
+            return false;
+        };
+        let line = row.line();
+        let old = list.old.clone();
+        let stamp = list.stamp;
+        let Some(planned) = self.save.as_ref() else {
+            self.message = String::from("戻す元のセーブがありません");
+            return false;
+        };
+        let bytes = planned.to_bytes();
+        if bytes.len() != old.len() || review_stamp(&bytes) != stamp {
+            self.message =
+                String::from("一覧を作ったあとにセーブが変わっています（[Y] で作り直してください）");
+            return false;
+        }
+        let Some(restored) = review_put_back(&old, &bytes, &atoms) else {
+            self.message = String::from("戻すバイト列を作れませんでした");
+            return false;
+        };
+        let Ok(save) = Save::from_bytes(&restored) else {
+            self.message = String::from("戻した内容がセーブとして読めないため、中止しました");
+            return false;
+        };
+        self.push_undo(format!("変更一覧から戻す: {}", line));
+        self.save = Some(save);
+        self.dirty = true;
+        self.message = format!("戻しました: {}（[X] で保存 / 元に戻すで取消）", line);
+        self.rebuild_review();
+        self.rev_armed = None;
+        true
+    }
+
+    /// Every key 変更一覧 answers.
+    fn input_review(&mut self, key: Key) {
+        match key {
+            Key::Up => self.review_move(-1),
+            Key::Down => self.review_move(1),
+            Key::Left => self.review_move(-(REVIEW_JUMP as i32)),
+            Key::Right => self.review_move(REVIEW_JUMP as i32),
+            Key::A => {
+                self.review_activate();
+            }
+            // [Y] re-reads the save: the list re-walks the values, which is the
+            // one thing that can cost a moment on a console.
+            Key::Y => {
+                self.rebuild_review();
+                let line = self.review_heading();
+                self.message = format!("変更一覧を作り直しました: {}", line);
+            }
+            Key::X => self.request_write_save(),
+            Key::B => {
+                self.rev_armed = None;
+                self.screen = self.rev_return;
+                self.message = String::from("変更一覧から戻りました");
+            }
+            Key::Plus => {
+                self.press_quit();
+            }
+            _ => {}
         }
     }
 
@@ -12011,7 +12762,8 @@ impl Editor {
             | Screen::Mib
             | Screen::Gmd
             | Screen::Check
-            | Screen::SaveMap => None,
+            | Screen::SaveMap
+            | Screen::Review => None,
         }
     }
 
@@ -12060,16 +12812,86 @@ impl Editor {
     /// see why a slot base or the download section points where it does.
     pub fn save_map_rows(&self) -> Vec<usize> {
         let fields = savemap::fields();
+        let needle = self.map_filter.trim().to_lowercase();
         let mut rows = Vec::with_capacity(fields.len() + 1);
-        rows.push(MAP_HEADER_ROW);
-        rows.extend(
-            fields
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| f.slot.is_none() || f.slot == Some(self.slot))
-                .map(|(i, _)| i),
-        );
+        let push = |row: usize, rows: &mut Vec<usize>| {
+            if needle.is_empty() || self.save_map_row_matches(row, &needle) {
+                rows.push(row);
+            }
+        };
+        push(MAP_HEADER_ROW, &mut rows);
+        for (i, f) in fields.iter().enumerate() {
+            if f.slot.is_some() && f.slot != Some(self.slot) {
+                continue;
+            }
+            push(i, &mut rows);
+        }
         rows
+    }
+
+    /// Does one row answer the filter's needle?
+    ///
+    /// Three ways in, because three different things are typed into that box:
+    /// the name the row prints, the region above it (so "スロット1" narrows to
+    /// one character), and the offset - matched as the hex `+0x0062EE` writes
+    /// it, as plain hex, or as the decimal `usize` a caller may have on hand.
+    /// The same three the desktop screen matches, so the two boxes are one rule.
+    fn save_map_row_matches(&self, row: usize, needle: &str) -> bool {
+        let name = self.save_map_row_name(row).to_lowercase();
+        if name.contains(needle) {
+            return true;
+        }
+        if self.save_map_row_region(row).to_lowercase().contains(needle) {
+            return true;
+        }
+        let Some(offset) = self.save_map_row_offset(row) else {
+            return false;
+        };
+        let hex = format!("{:06x}", offset);
+        let bare = needle.trim_start_matches("0x");
+        if hex.contains(bare) || format!("0x{}", hex).contains(needle) {
+            return true;
+        }
+        bare.parse::<usize>().map(|v| v == offset).unwrap_or(false)
+    }
+
+    /// Ask the I/O layer for the 生データ search text.
+    pub fn request_save_map_filter(&mut self) {
+        self.pending_text = Some((TEXT_SAVE_MAP_FILTER, self.map_filter.clone()));
+        self.message = String::from("領域名かオフセットで検索します（空にすると解除）");
+    }
+
+    /// The I/O layer answers the search with this.
+    ///
+    /// An empty answer is every row again, the same rule the item box, the
+    /// talisman box and the equipment box follow.
+    pub fn apply_save_map_filter(&mut self, text: String) {
+        self.map_filter = text;
+        self.map_cursor = 0;
+        // The byte editor names a row of the list the filter just changed, so
+        // it is put away rather than left pointing at a row that is gone.
+        self.map_edit = None;
+        self.message = self.save_map_filter_line();
+    }
+
+    /// The one line above the list that says what the filter is doing.
+    pub fn save_map_filter_line(&self) -> String {
+        let shown = self.save_map_rows().len();
+        let all = savemap::fields()
+            .iter()
+            .filter(|f| f.slot.is_none() || f.slot == Some(self.slot))
+            .count()
+            + 1;
+        if self.map_filter.trim().is_empty() {
+            alloc::format!("{} 行", shown)
+        } else {
+            alloc::format!(
+                "「{}」で {} / {} 行（[Y] で変更・空にすると解除）",
+                self.map_filter,
+                shown,
+                all
+            )
+        }
     }
 
     /// The row under the cursor, if any.
@@ -12332,6 +13154,10 @@ impl Editor {
             Key::A => {
                 self.map_edit_enter();
             }
+            // The list is about a hundred named stretches and three of them are
+            // the same box for the other two characters. [Y] narrows it by name
+            // or by offset; the pill on the bar sends the same key.
+            Key::Y => self.request_save_map_filter(),
             Key::B => {
                 self.screen = self.map_return;
                 self.message = String::from("生データから戻りました");
@@ -12734,7 +13560,8 @@ impl Editor {
             Screen::Mib => "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。",
             Screen::Gmd => "クエストの文章です。[A] でテキスト編集、[X] で保存。",
             Screen::Check => "クエストの検査結果です。[A] で直せる項目を修正します。",
-            Screen::SaveMap => "行を選んで [A] で編集、[◀/▶] で値の変更・[▲/▼] で1バイト移動。[B] で戻る。",
+            Screen::SaveMap => "行を選んで [A] で編集、[◀/▶] で値・[▲/▼] で1バイト。[Y] で検索。[B] で戻る。",
+            Screen::Review => "保存した内容との違いです。[A] を2回でその1項目だけ戻せます。",
         }
     }
 
@@ -19167,6 +19994,42 @@ impl Editor {
                     false,
                 );
             }
+            // 変更一覧: the values the save differs from the file in, one line
+            // each. The console draws its own list (ui.rs); this is the text
+            // shape the host tests read, like every other screen's row here.
+            Screen::Review => {
+                push(
+                    &mut out,
+                    alloc::format!("CHANGES  {}", self.review_heading()),
+                    false,
+                    false,
+                );
+                let total = self.review_len();
+                let start = self
+                    .rev_cursor
+                    .saturating_sub(4)
+                    .min(total.saturating_sub(1));
+                for row in (start..total).take(REVIEW_VISIBLE) {
+                    push(
+                        &mut out,
+                        alloc::format!("  {:>3}  {}", row + 1, self.review_line(row)),
+                        true,
+                        row == self.rev_cursor,
+                    );
+                }
+                if let Some(row) = self.review_selected() {
+                    let note = self.review_note(row);
+                    if !note.is_empty() {
+                        push(&mut out, alloc::format!("  {}", note), false, false);
+                    }
+                }
+                push(
+                    &mut out,
+                    String::from("  Up/Down row  Left/Right 10  A restore (2)  Y rebuild  X save  B back"),
+                    false,
+                    false,
+                );
+            }
         }
         out
     }
@@ -21400,7 +22263,7 @@ mod tests {
     /// Kept here as well as in the console audit because these are the rules
     /// the two-tier navigation rests on: every screen has a guide, and every
     /// record screen has a 詳細 destination.
-    const TWO_TIER_SCREENS: [Screen; 31] = [
+    const TWO_TIER_SCREENS: [Screen; 32] = [
         Screen::SaveList,
         Screen::Slots,
         Screen::Char,
@@ -21432,6 +22295,8 @@ mod tests {
         Screen::Csv,
         Screen::Progress,
         Screen::SaveMap,
+        // 変更一覧: the values the save differs from the card in.
+        Screen::Review,
     ];
 
     /// An editor holding a blank Switch save.
@@ -21478,6 +22343,10 @@ mod tests {
                             | Screen::QuestEdit
                             // 詳細 cannot open itself.
                             | Screen::SaveMap
+                            // 変更一覧 is a view of the whole save, so it has no
+                            // one region to open: 詳細 would have to pick one of
+                            // the rows it just listed.
+                            | Screen::Review
                     ),
                     "{:?} has no 詳細 destination and is not one of the documented exceptions",
                     screen
@@ -22513,5 +23382,257 @@ mod tests {
         // A word nothing carries is an empty list, not an unfiltered one.
         ed.apply_item_box_filter(String::from("そんなアイテムはない"));
         assert!(ed.visible_items().is_empty());
+    }
+
+    // ------------------------------------------------- 変更一覧 (Screen::Review)
+
+    /// The first line the list can put back, with the field name it prints.
+    ///
+    /// The cursor is moved onto it: [Editor::review_activate] acts on the
+    /// selected line, the same way every other screen's [A] does.
+    fn a_restorable_line(ed: &mut Editor) -> (usize, String) {
+        let list = ed.review_list().expect("a change list");
+        let row = list
+            .rows
+            .iter()
+            .position(|row| row.can_restore())
+            .unwrap_or_else(|| {
+                panic!(
+                    "no restorable line: {:?}",
+                    list.rows.iter().map(|r| &r.blocked).collect::<Vec<_>>()
+                )
+            });
+        let field = list.rows[row].change.field.clone();
+        ed.rev_cursor = row;
+        (row, field)
+    }
+
+    #[test]
+    fn the_change_list_puts_back_one_value_and_leaves_the_others() {
+        let mut ed = editor_on_a_used_slot();
+        // A save identical to the card has nothing to list.
+        assert!(ed.open_review());
+        assert_eq!(ed.review_len(), 0);
+        assert!(ed.message.contains("違いはありません"), "{}", ed.message);
+
+        // Two edits, made through the writers the screens use.
+        ed.maximize_character();
+        assert!(ed.open_review());
+        let list = ed.review_list().expect("a list").clone();
+        assert!(list.changed > 0, "{}", ed.message);
+        assert!(!list.rows.is_empty());
+        let (row, field) = a_restorable_line(&mut ed);
+        let old = list.rows[row].change.old.clone();
+
+        // One press names the line, the second one writes it back.
+        assert!(!ed.review_activate(), "the first press must not write");
+        assert_eq!(ed.review_armed_row(), Some(row));
+        assert!(ed.review_activate(), "{}", ed.message);
+        assert!(ed.dirty, "putting a value back is an edit");
+        assert!(ed.message.contains("戻しました"), "{}", ed.message);
+
+        // The list was rebuilt: that line is gone, the rest are still there.
+        let after = ed.review_list().expect("rebuilt").clone();
+        assert_eq!(after.rows.len() + 1, list.rows.len());
+        assert!(
+            after.rows.iter().all(|r| r.change.field != field),
+            "{} is still listed as changed",
+            field
+        );
+        // The bytes the line owned are the card's again, and the line that
+        // named them no longer differs.
+        let _ = old;
+    }
+
+    #[test]
+    fn a_plan_is_refused_when_the_save_moved_after_it_was_built() {
+        let mut ed = editor_on_a_used_slot();
+        ed.maximize_character();
+        assert!(ed.open_review());
+        let (row, _) = a_restorable_line(&mut ed);
+
+        // The plan belongs to the bytes it was built from: one byte changed
+        // afterwards and the restore must refuse rather than land on them.
+        let last = crate::save::BODY_SIZE - 1;
+        ed.save
+            .as_mut()
+            .expect("a save")
+            .body_mut()[last] ^= 0x01;
+        ed.dirty = false;
+        assert!(!ed.review_restore(row));
+        assert!(ed.message.contains("作り直して"), "{}", ed.message);
+        assert!(!ed.dirty, "a refused restore writes nothing");
+    }
+
+    #[test]
+    fn the_change_list_says_why_it_cannot_compare() {
+        // No save at all: the screen says what to do instead of showing an
+        // empty list that reads like "nothing changed".
+        let mut ed = Editor::new();
+        assert!(!ed.open_review());
+        assert_eq!(ed.screen, Screen::Review);
+        assert!(ed.message.contains("セーブ"), "{}", ed.message);
+        assert!(ed.review_list().is_none());
+        assert_eq!(ed.review_heading(), "比較するファイルの内容がありません");
+
+        // A save opened by a layer that never handed the card's bytes over.
+        let mut ed = Editor::new();
+        ed.save = Some(crate::save::empty_switch_save());
+        assert!(!ed.rebuild_review());
+        assert!(ed.message.contains("ファイル"), "{}", ed.message);
+
+        // With a reference and no change there is a list - an empty one, and
+        // the heading says which of the two emptinesses it is.
+        let mut ed = editor_on_a_used_slot();
+        assert!(ed.rebuild_review());
+        assert!(ed.review_list().is_some());
+        assert_eq!(ed.review_heading(), "保存した内容との違いはありません");
+    }
+
+    #[test]
+    fn a_restored_line_is_one_undo_step() {
+        let mut ed = editor_on_a_used_slot();
+        ed.maximize_character();
+        assert!(ed.open_review());
+        let (row, _) = a_restorable_line(&mut ed);
+        let before = ed.save.as_ref().expect("save").to_bytes();
+        let depth = ed.undo_depth();
+
+        assert!(!ed.review_activate());
+        assert!(ed.review_activate(), "{}", ed.message);
+        let after = ed.save.as_ref().expect("save").to_bytes();
+        assert_ne!(before, after, "the restore has to change bytes");
+        assert_eq!(ed.undo_depth(), depth + 1);
+        assert!(
+            ed.undo_label().unwrap_or("").contains("変更一覧"),
+            "{:?}",
+            ed.undo_label()
+        );
+
+        // 元に戻す takes the whole step back, the same stack as every edit.
+        assert!(ed.undo_last());
+        assert_eq!(ed.save.as_ref().expect("save").to_bytes(), before);
+        let _ = row;
+    }
+
+    #[test]
+    fn the_save_map_filter_narrows_by_name_and_by_offset() {
+        let mut ed = editor_on_a_used_slot();
+        let all = ed.save_map_rows().len();
+        assert!(all > 3, "the map lists every row of this slot");
+        assert!(ed.save_map_filter_line().contains("行"));
+
+        // The name the row prints.
+        ed.apply_save_map_filter(String::from("護石"));
+        let by_name = ed.save_map_rows();
+        assert!(by_name.len() < all, "{:?}", by_name);
+        assert!(!by_name.is_empty());
+        for row in &by_name {
+            assert!(
+                ed.save_map_row_name(*row).contains("護石"),
+                "{} does not answer 護石",
+                ed.save_map_row_name(*row)
+            );
+        }
+        // The box stays selectable: the cursor is put back at the top and the
+        // row under it is one of the filtered ones.
+        assert_eq!(ed.map_cursor, 0);
+        assert!(by_name.contains(&ed.save_map_selected().expect("a row")));
+
+        // The offset the row lives at, in the hex the list prints.
+        let row = Editor::save_map_row_named("護石", 0).expect("the talisman row");
+        let offset = ed.save_map_row_offset(row).expect("the row is in this save");
+        ed.apply_save_map_filter(alloc::format!("{:06X}", offset));
+        assert!(ed.save_map_rows().contains(&row));
+
+        // An empty answer is every row again, the same rule the other filters
+        // follow.
+        ed.apply_save_map_filter(String::new());
+        assert_eq!(ed.save_map_rows().len(), all);
+        assert!(ed.message.contains("行"), "{}", ed.message);
+    }
+
+    #[test]
+    fn the_save_map_filter_puts_the_byte_editor_away() {
+        let mut ed = editor_on_a_used_slot();
+        ed.screen = Screen::SaveMap;
+        assert!(ed.map_edit_enter(), "{}", ed.message);
+        assert!(ed.map_edit_open());
+        ed.apply_save_map_filter(String::from("護石"));
+        assert!(
+            !ed.map_edit_open(),
+            "the editor named a row the filter just moved"
+        );
+    }
+
+    #[test]
+    fn the_basic_tab_lists_every_gmd_line_and_only_the_time_limit_steps() {
+        let mut ed = Editor::new();
+        ed.screen = Screen::QuestEdit;
+        ed.gmd = Some(Gmd {
+            version: crate::quest::GMD_VERSION,
+            tag: crate::quest::GMD_TAG,
+            key: String::from("questData_1010165"),
+            strings: alloc::vec![
+                String::from("名前"),
+                String::from("依頼主"),
+                String::from("依頼内容"),
+                String::new(),
+                String::from("成功条件"),
+                String::from("失敗条件"),
+                String::new(),
+            ],
+        });
+        let mut mib = alloc::vec![0u8; crate::quest::MIB_SIZE];
+        let field = mib_field_index("time_limit").expect("the field");
+        let field = questfields::MIB_FIELDS[field];
+        assert!(questfields::write_u32(&mut mib, field.offset, field.kind, 50));
+        ed.mib_bytes = mib;
+
+        let rows = ed.quest_basic_rows();
+        assert_eq!(rows.len(), Gmd::LABELS.len() + 1);
+        for (index, row) in rows.iter().take(Gmd::LABELS.len()).enumerate() {
+            assert_eq!(row.label, Gmd::LABELS[index]);
+            assert_eq!(row.text_index, Some(index));
+        }
+        // A line the file left out is listed with the placeholder, so it can be
+        // written instead of being unreachable.
+        assert_eq!(rows[3].value, "(未設定)");
+        assert_eq!(rows[Gmd::LABELS.len()].label, "制限時間");
+        assert_eq!(rows[Gmd::LABELS.len()].value, "50 分");
+        assert_eq!(rows[Gmd::LABELS.len()].text_index, None);
+
+        // A text row asks for the keyboard, it does not step.
+        ed.quest_edit_cursor = 3;
+        assert!(!ed.quest_adjust(1));
+        assert!(ed.message.contains("文字"), "{}", ed.message);
+        // The last row is the number, and the step reaches the .mib.
+        ed.quest_edit_cursor = ed.quest_value_rows() - 1;
+        assert!(ed.quest_adjust(10), "{}", ed.message);
+        assert_eq!(ed.quest_time_limit(), 60);
+        assert!(ed.dirty);
+    }
+
+    #[test]
+    fn a_basic_line_the_file_left_out_is_created_when_it_is_written() {
+        let mut ed = Editor::new();
+        ed.screen = Screen::QuestEdit;
+        ed.gmd = Some(Gmd {
+            version: crate::quest::GMD_VERSION,
+            tag: crate::quest::GMD_TAG,
+            key: String::from("questData_1010165"),
+            strings: alloc::vec![String::from("名前")],
+        });
+        // 失敗条件 is row 5; the file only holds the title.
+        ed.quest_edit_cursor = 5;
+        ed.input(Key::A);
+        assert_eq!(ed.take_text_request().map(|t| t.0), Some(5));
+        ed.apply_text(5, String::from("失敗条件の文"));
+        let gmd = ed.gmd.as_ref().expect("the working copy");
+        assert_eq!(gmd.strings.len(), 6);
+        assert_eq!(gmd.strings[5], "失敗条件の文");
+        assert_eq!(gmd.strings[1], "", "the gap is padded, not shifted");
+        assert_eq!(gmd.strings[0], "名前", "the title did not move");
+        assert!(ed.dirty);
     }
 }

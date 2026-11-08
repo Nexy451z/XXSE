@@ -545,6 +545,11 @@ fn finish_console_write(ed: &mut Editor, bytes: &[u8], pre_read: Option<&[u8]>) 
             ed.message = match report.mismatch {
                 None => {
                     ed.dirty = false;
+                    // The card now holds exactly these bytes, so 変更一覧 must
+                    // compare against them and not against the file before the
+                    // save: otherwise every value the write put out would still
+                    // be listed as changed.
+                    ed.note_saved(bytes);
                     alloc::format!(
                         "本体のセーブに {} バイト書き込みました（控え: {}）。書き込みと照合が完了しました。{}",
                         n,
@@ -1040,6 +1045,9 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Csv => "CSV 入出力",
         // 詳細: the bytes behind the screen 詳細 was pressed on.
         SaveMap => "生データ（セーブマップ）",
+        // 変更一覧: what the open save differs from the card in, one value a
+        // line, each one restorable on its own.
+        Review => "変更一覧",
     }
 }
 
@@ -1301,6 +1309,16 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("▲/▼", "行"),
             ("◀/▶", "10行"),
             ("A", "編集"),
+            ("Y", "検索"),
+            ("B", "戻る"),
+        ],
+        // 変更一覧: the two-press 戻す and the rebuild. [X] is the save key
+        // every screen shares, and [B] leaves to the screen the tab came from.
+        Review => &[
+            ("▲/▼", "行"),
+            ("◀/▶", "10行"),
+            ("A", "戻す（2回）"),
+            ("Y", "作り直す"),
             ("B", "戻る"),
         ],
     }
@@ -1406,6 +1424,8 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.apply_guild_quest_count_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_GUILD_WEAPON_COUNT {
         ed.apply_guild_weapon_count_text(&s);
+    } else if idx == mhnx_core::hbedit::TEXT_SAVE_MAP_FILTER {
+        ed.apply_save_map_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
         ed.apply_hunt_count_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB
@@ -1598,6 +1618,11 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                     if !is_arc || ed.save.is_none() {
                         ed.dirty = false;
                     }
+                    // A save written to the SD card is the reference 変更一覧
+                    // compares against, exactly like the console save above.
+                    if !is_arc {
+                        ed.note_saved(&bytes);
+                    }
                     ed.message = if is_arc {
                         format!("クエストファイルを保存しました: {} ({} B)", path, n)
                     } else if kept {
@@ -1682,6 +1707,11 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             } else {
                 ("装備IDで検索（名前が読めません 16進 例: 28）", 60)
             }
+        } else if idx == mhnx_core::hbedit::TEXT_SAVE_MAP_FILTER {
+            // The list is about a hundred named stretches and three of them
+            // name the same box for the other two characters; the title says
+            // both of the things the filter matches.
+            ("領域名かオフセットで検索（空にすると解除）", 40)
         } else if idx == mhnx_core::hbedit::TEXT_EQUIP_ID {
             ("装備ID（16進 0x28 / 10進 40）", 8)
         } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {

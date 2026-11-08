@@ -208,17 +208,28 @@ fn one_screen_reads_every_file_of_the_quest_by_itself() {
     assert_eq!(ed.quest_id_hex(), "0xF69F5");
     assert!(ed.message.contains("クエスト改造"), "{}", ed.message);
 
-    // 基本: three .gmd strings and the .mib time limit, in one list.
+    // 基本: every .gmd line the file format names, then the .mib time limit, in
+    // one list. The labels are Gmd::LABELS, so the row and the string index
+    // cannot drift: 0 名前 / 1 依頼主 / 2 依頼内容 / 3 主なモンスター /
+    // 4 成功条件 / 5 失敗条件 / 6 サブ成功条件, then 7 制限時間.
     let basic = ed.quest_basic_rows();
-    assert_eq!(basic.len(), 4);
+    assert_eq!(basic.len(), Gmd::LABELS.len() + 1);
     assert_eq!(basic[0].label, "クエスト名");
     assert_eq!(basic[0].value, "テストクエスト");
     assert_eq!(basic[1].label, "依頼主");
     assert_eq!(basic[1].value, "受付嬢");
-    assert_eq!(basic[2].label, "目的（成功条件）");
-    assert_eq!(basic[2].value, "リオレウス1頭の狩猟");
-    assert_eq!(basic[3].label, "制限時間");
-    assert_eq!(basic[3].value, "50 分");
+    // 依頼内容 is the row the desktop screen edits as "目的" and the console
+    // never showed before: the label comes from Gmd::LABELS, so it is 依頼内容.
+    assert_eq!(basic[2].label, "依頼内容");
+    assert_eq!(basic[2].value, "依頼の内容");
+    assert_eq!(basic[4].label, "成功条件");
+    assert_eq!(basic[4].value, "リオレウス1頭の狩猟");
+    assert_eq!(basic[7].label, "制限時間");
+    assert_eq!(basic[7].value, "50 分");
+    for (index, row) in basic.iter().take(Gmd::LABELS.len()).enumerate() {
+        assert_eq!(row.text_index, Some(index), "row {}", index);
+    }
+    assert_eq!(basic[Gmd::LABELS.len()].text_index, None);
 
     // モンスター: five slots, each named with the hex id beside the name.
     let monsters = ed.quest_monsters();
@@ -265,8 +276,8 @@ fn one_screen_reads_every_file_of_the_quest_by_itself() {
     // The tabs are what L / R walks, and each tab counts its own rows plus
     // the 詳細 row every tab ends with.
     assert_eq!(ed.quest_edit_tab, QUEST_TAB_BASIC);
-    assert_eq!(ed.quest_value_rows(), 4);
-    assert_eq!(ed.quest_row_count(), 5);
+    assert_eq!(ed.quest_value_rows(), Gmd::LABELS.len() + 1);
+    assert_eq!(ed.quest_row_count(), Gmd::LABELS.len() + 2);
     ed.quest_set_tab(QUEST_TAB_MONSTERS);
     assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS + 1);
     ed.quest_set_tab(QUEST_TAB_REWARDS);
@@ -449,16 +460,21 @@ fn the_basic_tab_asks_for_the_keyboard_and_writes_the_gmd_text() {
     let parsed = Gmd::from_bytes(&gmd).expect("the .gmd still parses");
     assert_eq!(parsed.title(), Some("改造クエスト"));
 
-    // 依頼主 and 目的 are the other two text rows.
-    ed.quest_edit_cursor = 1;
-    ed.input(Key::A);
-    assert_eq!(ed.take_text_request().map(|t| t.0), Some(1));
-    ed.quest_edit_cursor = 2;
-    ed.input(Key::A);
-    assert_eq!(ed.take_text_request().map(|t| t.0), Some(4));
+    // Every other text row asks for its own .gmd index: the row number and the
+    // string index are the same number here, which is what Gmd::LABELS buys.
+    for (row, index) in [(1usize, 1usize), (2, 2), (4, 4), (6, 6)] {
+        ed.quest_edit_cursor = row;
+        ed.input(Key::A);
+        assert_eq!(
+            ed.take_text_request().map(|t| t.0),
+            Some(index),
+            "row {}",
+            row
+        );
+    }
 
     // 制限時間 is not text: [A] says which key does change it.
-    ed.quest_edit_cursor = 3;
+    ed.quest_edit_cursor = ed.quest_value_rows() - 1;
     ed.input(Key::A);
     assert_eq!(ed.take_text_request(), None);
     assert!(ed.message.contains("制限時間"), "{}", ed.message);
@@ -541,8 +557,8 @@ fn leaving_for_the_file_screens_keeps_the_edit_and_the_detail_stays_one_press() 
 #[test]
 fn the_last_row_of_every_tab_is_the_detail_button() {
     let mut ed = open_quest(1_010_165, 50);
-    // 基本: four values, then 詳細.
-    assert_eq!(ed.quest_value_rows(), 4);
+    // 基本: every Gmd::LABELS line and the time limit, then 詳細.
+    assert_eq!(ed.quest_value_rows(), Gmd::LABELS.len() + 1);
     assert!(!ed.quest_on_detail_row());
     ed.quest_edit_cursor = ed.quest_value_rows();
     assert!(ed.quest_on_detail_row());
