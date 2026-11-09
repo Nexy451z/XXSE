@@ -408,7 +408,7 @@ fn a_reward_row_steps_its_count_and_its_chance_through_the_rem_writer() {
     let mut ed = open_quest(1_010_165, 50);
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     ed.quest_edit_cursor = 0;
-    assert!(!ed.quest_edit_chance, "個数 is the field the tab starts on");
+    assert!(!ed.quest_edit_chance(), "個数 is the field the tab starts on");
 
     assert!(ed.quest_adjust(2));
     assert_eq!(ed.quest_rewards()[0].count, 3);
@@ -418,7 +418,7 @@ fn a_reward_row_steps_its_count_and_its_chance_through_the_rem_writer() {
 
     // [-] moves the same key pair to 確率%, like the .rem screen does.
     ed.quest_cycle_field();
-    assert!(ed.quest_edit_chance);
+    assert!(ed.quest_edit_chance());
     assert!(ed.quest_adjust(-10));
     assert_eq!(ed.quest_rewards()[0].chance, 40);
     let rewards = ed.quest_rewards();
@@ -491,7 +491,7 @@ fn a_supply_row_has_only_a_count_to_step() {
     // [ZR] cannot switch to a chance column a .sup does not have: the key is
     // the item-name search on this tab instead.
     ed.quest_cycle_field();
-    assert!(!ed.quest_edit_chance);
+    assert!(!ed.quest_edit_chance());
     assert_eq!(
         ed.take_text_request(),
         Some((mhnx_core::hbedit::TEXT_QUEST_ITEM, String::new())),

@@ -576,8 +576,23 @@ fn charm_screen_creates_and_deletes() {
     // the box rather than from invented defaults. Read them, then bump.
     let seed = ed.charm_edit.expect("the form is open");
     assert!(seed.skill1 > 0, "a new charm must start from a real talisman");
-    let want_skill1 = seed.skill1 as i32 + 1;
-    let want_points1 = seed.points1 as i32 + 1;
+    // The skill row walks the ids the picker lists, not the raw 0..=255 (the
+    // third review's finding 9), so the next value is the next allowed id.
+    let allowed = mhnx_core::charm::allowed_skill_ids(seed.kind, false);
+    let at = allowed.iter().position(|id| *id == seed.skill1).unwrap_or(0);
+    let want_skill1 = allowed[(at + 1) % allowed.len()] as i32;
+    // The writer clamps the points to what the new skill's row of the game's
+    // table allows (charm::clamp_points), so the value it lands on is the
+    // bumped one or that ceiling.
+    let stepped_points1 = seed.points1 as i32 + 1;
+    let want_points1 = match mhnx_core::charm::allowed_points_rarity(
+        seed.grade.rarity(),
+        want_skill1 as u8,
+        false,
+    ) {
+        Some(r) => stepped_points1.min(r.max as i32),
+        None => stepped_points1,
+    };
 
     // The form opens on the first skill row; bump it and its points, then write.
     ed.input(Key::Right);
@@ -2621,7 +2636,10 @@ fn the_console_equipment_filter_narrows_and_clears() {
     );
     ed.apply_equip_filter(String::new());
     assert_eq!(ed.equipment().len(), all, "an empty filter clears it");
-    assert_eq!(ed.equip_filter_heading(), "装備BOX");
+    // The heading names the box and says where the talismans are (the third
+    // review's finding 14); it is not just the two words.
+    assert!(ed.equip_filter_heading().starts_with("装備BOX"), "{}", ed.equip_filter_heading());
+    assert!(ed.equip_filter_heading().contains("護石一覧"), "{}", ed.equip_filter_heading());
     // Nothing matching must not panic.
     ed.equip_filter = String::from("zzzz");
     assert!(ed.equipment().is_empty());

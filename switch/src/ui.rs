@@ -654,15 +654,20 @@ pub struct GuiState {
     pub wants_install_arc_idx: Option<usize>,
     /// The snapshot button was pressed; the I/O layer owns the folder.
     pub wants_restore_snapshot: bool,
-    pub quest_tab: usize,
     /// Which tab of the クエスト section bar is lit.
     ///
     /// The bar used to derive it from the screen (SaveQuests -> 1 + quest_tab),
     /// so pressing クエスト改造 with no .arc open - which lands on the save's own
     /// list - lit セーブ内 instead of the tab that was pressed. The tab the user
     /// chose is the tab that stays lit.
+    ///
+    /// The *list* tab (セーブ内 / 公式 / 没クエ) and its three cursors live in the
+    /// state machine now (hbedit::Editor::quest_tab / quest_cat_cursor): the
+    /// guide under the bar and the extract button both depend on them, and both
+    /// answered for the save's list whatever tab was showing while this layer
+    /// kept them.
     pub quest_bar_tab: usize,
-    pub quest_cat_cursor: [usize; 4],
+
     pub mib_picker: Option<MibPickerState>,
     /// The monster slot whose エリア番号 chooser is open, if it is the one
     /// the shared picker modal is showing. The picker is the same modal the
@@ -730,9 +735,7 @@ impl GuiState {
             wants_extract_official_arcs: false,
             wants_install_arc_idx: None,
             wants_restore_snapshot: false,
-            quest_tab: 0,
             quest_bar_tab: 0,
-            quest_cat_cursor: [0; 4],
             mib_picker: None,
             quest_area_slot: None,
             equip_kind_picker: false,
@@ -1152,12 +1155,20 @@ impl GuiState {
                     "マイセット",
                 ];
                 let active = match ed.screen {
-                    Screen::Charms => 0,
                     Screen::CharmEdit | Screen::SkillPick => 1,
                     Screen::Equip | Screen::EquipEdit | Screen::JewelPick
                     | Screen::EquipPick => 2,
                     Screen::Sets => 3,
-                    _ => 0,
+                    // 護石一覧. The tab the user pressed stays lit even when the
+                    // form could not open (an empty box, or a search that found
+                    // nothing): the list on screen is the one the form would
+                    // have opened on, and the bar used to light 護石一覧 - a
+                    // press that moved the highlight to a tab nobody pressed
+                    // (the same rule the quest bar follows with quest_bar_tab).
+                    // The answer is the state machine's (Editor::charm_tab),
+                    // which is also the only place that knows the form could
+                    // not open.
+                    _ => ed.charm_tab.min(1),
                 };
                 (Self::statics(labels), active)
             }
@@ -1214,11 +1225,13 @@ impl GuiState {
                 (labels, active)
             }
             // 詳細・ツール: the technical screens, kept out of the everyday
-            // row. セーブマップ is 生データ - the same screen every record
-            // screen's [詳細] opens.
+            // row. The screen is called 生データ everywhere else in this build
+            // (the pill, the footer, the guide, the title), so the tab says the
+            // same word: it used to say セーブマップ, and the two names for one
+            // screen were printed side by side in the title.
             MainSection::Tools => {
                 let labels: &'static [&'static str] = &[
-                    "セーブマップ",
+                    "生データ",
                     "変更一覧",
                     "CSV入出力",
                     "環境設定",
@@ -1250,6 +1263,18 @@ impl GuiState {
     }
 
     pub fn select_sub_tab(&mut self, ed: &mut Editor, idx: usize) {
+        // A press on the tab that is already lit is not a move: it used to run
+        // the whole jump below, which put the list's cursor back at the top
+        // (護石 / 装備 / マイセット / オトモ / 狩猟記録) - so a tap on the tab the
+        // user was already on threw away the row they had reached. Nothing
+        // happens now. The two screens that keep their own tabs (進行状況 and
+        // クエスト改造) are exempt: their bar is the same state machine and a
+        // press there is already a no-op.
+        if !matches!(ed.screen, Screen::Progress | Screen::QuestEdit)
+            && idx == self.sub_tabs_for(ed).1
+        {
+            return;
+        }
         // A tab press that would leave a form asks first, exactly as [B] does:
         // the jump below closes the form, and a draft dropped by a shoulder
         // press is the same loss [B] asks about through a key nobody expects to
@@ -1444,7 +1469,9 @@ impl GuiState {
                 // call open_charms() - the same call the tab beside it makes -
                 // so pressing 護石編集 put the list back on screen, lit 護石一覧
                 // and left the form one more [A] away. The form opens on the
-                // record the list was on, and says so when there is none.
+                // record the list was on, and says so when there is none - and
+                // the tab stays lit in that case, because the press was still
+                // the press (hbedit::Editor::charm_tab).
                 1 => ed.open_charm_form_selected(),
                 2 => {
                     ed.screen = Screen::Equip;
@@ -1502,7 +1529,7 @@ impl GuiState {
                         let from = ed.screen;
                         ed.enter_quest_edit_from(from);
                     } else if ed.save.is_some() {
-                        self.quest_tab = 0;
+                        ed.set_quest_tab(0);
                         ed.refresh_quest_titles();
                         ed.screen = Screen::SaveQuests;
                         ed.message =
@@ -1518,7 +1545,7 @@ impl GuiState {
                         ed.message = String::from("先にセーブデータを開いてください");
                         return;
                     }
-                    self.quest_tab = idx - 1;
+                    ed.set_quest_tab(idx - 1);
                     self.quest_bar_tab = idx;
                     ed.refresh_quest_titles();
                     ed.screen = Screen::SaveQuests;
@@ -1546,12 +1573,15 @@ impl GuiState {
     // Page Scroll & MIB Picker Modal
     // -----------------------------------------------------------------------
     pub fn page_scroll(&mut self, ed: &mut Editor, delta: i32) {
-        if ed.screen == Screen::SaveQuests && self.quest_tab > 0 {
-            let len = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter).len();
+        if ed.screen == Screen::SaveQuests && ed.quest_tab > 0 {
+            // The tab on screen owns its cursor (hbedit::Editor::
+            // quest_list_cursor), so a page turn cannot move a list that is not
+            // showing.
+            let len = ed.quest_list_len();
             if len > 0 {
-                let cur = self.quest_cat_cursor[self.quest_tab] as i32;
+                let cur = ed.quest_list_cursor() as i32;
                 let next = (cur + delta).clamp(0, len as i32 - 1) as usize;
-                self.quest_cat_cursor[self.quest_tab] = next;
+                ed.set_quest_list_cursor(next);
             }
             return;
         }
@@ -2510,68 +2540,28 @@ impl GuiState {
                 }
                 _ => {}
             },
-            Screen::SaveQuests => match key {
-                Key::Up if self.quest_tab > 0 => {
-                    let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
-                    let n = list.len();
-                    if n > 0 {
-                        self.quest_cat_cursor[self.quest_tab] =
-                            (self.quest_cat_cursor[self.quest_tab] + n - 1) % n;
-                    }
+            // The three list tabs are one state machine now (hbedit::Editor::
+            // quest_tab / quest_list_move / bundled_quest_press): the tab on
+            // screen owns the cursor, so a row cannot be selected, deleted or
+            // written out of a list that is not showing. This arm used to keep
+            // its own copy of the tab and the two bundle cursors, and answered
+            // for the save's list whatever tab was lit.
+            Screen::SaveQuests => {
+                ed.input(key);
+                // Opening a quest from the save is the same promise the
+                // card's quest list makes: クエスト改造, not the file list.
+                // The state machine lands there itself now
+                // (Editor::open_quest_from_save); this only pins the return
+                // target, so [B] comes back to the list the quest was
+                // opened from.
+                if ed.quest_tab == 0
+                    && matches!(key, Key::A)
+                    && ed.screen == Screen::QuestEdit
+                    && ed.arc.is_some()
+                {
+                    ed.enter_quest_edit_from(Screen::SaveQuests);
                 }
-                Key::Down if self.quest_tab > 0 => {
-                    let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
-                    let n = list.len();
-                    if n > 0 {
-                        self.quest_cat_cursor[self.quest_tab] =
-                            (self.quest_cat_cursor[self.quest_tab] + 1) % n;
-                    }
-                }
-                Key::A if self.quest_tab > 0 => {
-                    let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
-                    let cur = self.quest_cat_cursor[self.quest_tab];
-                    if let Some(q) = list.get(cur) {
-                        // 導入 is additive and runs at once; 解除 removes a
-                        // record from the save and asks first.
-                        self.apply_action(ed, UiAction::ToggleBundledQuest(q.quest_id));
-                    }
-                }
-                // [A] on an empty list used to install all 189 bundled
-                // official quests, with nothing on screen saying so. The state
-                // machine answers that press with a message now, and the bulk
-                // install has its own button in this screen's tool deck.
-                // [-] and [R] act on the save's own list. On the two bundle
-                // tabs the list on screen is not that list, so the press is
-                // refused with a message rather than deleting (or extracting) a
-                // quest the user is not looking at.
-                Key::Minus | Key::R if self.quest_tab > 0 => {
-                    ed.message = String::from(
-                        "この一覧では [-] / [R] は使いません（「セーブ内」タブで削除・展開、[A] で導入/解除）",
-                    );
-                }
-                Key::Y => {
-                    ed.input(Key::Y); // Search filter
-                }
-                Key::Left | Key::Right => {
-                    // Do NOT switch tab on Left/Right; L/R handles tab switching!
-                }
-                other => {
-                    ed.input(other);
-                    // Opening a quest from the save is the same promise the
-                    // card's quest list makes: クエスト改造, not the file list.
-                    // The state machine lands there itself now
-                    // (Editor::open_quest_from_save); this only pins the return
-                    // target, so [B] comes back to the list the quest was
-                    // opened from.
-                    if self.quest_tab == 0
-                        && matches!(other, Key::A)
-                        && ed.screen == Screen::QuestEdit
-                        && ed.arc.is_some()
-                    {
-                        ed.enter_quest_edit_from(Screen::SaveQuests);
-                    }
-                }
-            },
+            }
             Screen::ArcList => match key {
                 // Through the action, so the pad and the deck's button run the
                 // same two-press install (hbedit::Editor::arc_install_press).
@@ -2824,11 +2814,11 @@ impl GuiState {
             if let Some(h) = hit {
                 if h.is_row_body {
                     if let UiAction::SelectRow(idx) = h.action {
-                        if ed.screen == Screen::SaveQuests && self.quest_tab > 0 {
-                            if self.quest_cat_cursor[self.quest_tab] == idx {
+                        if ed.screen == Screen::SaveQuests && ed.quest_tab > 0 {
+                            if ed.quest_list_cursor() == idx {
                                 self.pending_activate_row = Some(idx);
                             } else {
-                                self.quest_cat_cursor[self.quest_tab] = idx;
+                                ed.set_quest_list_cursor(idx);
                                 changed = true;
                             }
                         } else if active_cursor_of(ed, self) == idx {
@@ -3058,14 +3048,11 @@ impl GuiState {
             }
             UiAction::ActivateRow(idx) => {
                 set_active_cursor(ed, self, idx);
-                if ed.screen == Screen::SaveQuests && self.quest_tab > 0 {
-                    let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
-                    if let Some(q) = list.get(idx) {
-                        self.apply_action(ed, UiAction::ToggleBundledQuest(q.quest_id));
-                    }
-                } else {
-                    self.handle_pad_key(ed, Key::A, 0);
-                }
+                // The tap and the pad press the same key: the state machine
+                // answers a row of any of the three list tabs (Editor::
+                // input_save_quests), so a tap cannot install a quest the pad
+                // would refuse.
+                self.handle_pad_key(ed, Key::A, 0);
             }
             UiAction::AdjustRow(idx, key) => {
                 set_active_cursor(ed, self, idx);
@@ -3215,7 +3202,7 @@ impl GuiState {
                 }
             }
             UiAction::SetQuestTab(tab) => {
-                self.quest_tab = tab.min(2);
+                ed.set_quest_tab(tab);
                 ed.screen = Screen::SaveQuests;
             }
             // Installing is additive and stays one press; removing a quest
@@ -3551,13 +3538,9 @@ fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
             },
         },
         Screen::Csv => ed.csv_cursor,
-        Screen::SaveQuests => {
-            if gui.quest_tab > 0 {
-                gui.quest_cat_cursor[gui.quest_tab]
-            } else {
-                ed.save_quest_cursor
-            }
-        }
+        // The tab on screen owns the cursor (hbedit::Editor::quest_list_cursor),
+        // so a page turn, a tap and the scrollbar all move the same row.
+        Screen::SaveQuests => ed.quest_list_cursor(),
         Screen::QuestEquip => {
             if ed.qe_open {
                 ed.qe_item_cursor
@@ -3632,13 +3615,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
             }
         }
         Screen::Csv => ed.csv_files.len(),
-        Screen::SaveQuests => {
-            if gui.quest_tab > 0 {
-                bundled_quests_for_tab(gui.quest_tab, &ed.quest_filter).len()
-            } else {
-                ed.filtered_quests().len()
-            }
-        }
+        Screen::SaveQuests => ed.quest_list_len(),
         Screen::QuestEquip => {
             if ed.qe_open {
                 ed.quest_equip_items().len()
@@ -3683,11 +3660,8 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
 }
 
 fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
-    if ed.screen == Screen::SaveQuests && gui.quest_tab > 0 {
-        let n = bundled_quests_for_tab(gui.quest_tab, &ed.quest_filter).len();
-        if n > 0 {
-            gui.quest_cat_cursor[gui.quest_tab] = idx.min(n - 1);
-        }
+    if ed.screen == Screen::SaveQuests && ed.quest_tab > 0 {
+        ed.set_quest_list_cursor(idx);
         return;
     }
     if ed.screen == Screen::Sets {
@@ -4622,10 +4596,14 @@ impl GuiState {
                 let chip = if ed.quest_edit_tab == QUEST_TAB_MONSTERS {
                     format!("[ZR] {}", ed.quest_field_label())
                 } else if ed.quest_edit_tab == QUEST_TAB_REWARDS {
-                    if ed.quest_edit_chance {
-                        String::from("[ZR] 確率%")
-                    } else {
-                        String::from("[ZR] 個数")
+                    // The three stops [ZR] walks, named on the key that walks
+                    // them (hbedit::QUEST_REWARD_*). The chip used to have two
+                    // words because the third press opened a keyboard instead
+                    // of a third stop.
+                    match ed.quest_reward_field {
+                        mhnx_core::hbedit::QUEST_REWARD_CHANCE => String::from("[ZR] 確率%"),
+                        mhnx_core::hbedit::QUEST_REWARD_SEARCH => String::from("[ZR] 検索"),
+                        _ => String::from("[ZR] 個数"),
                     }
                 } else {
                     String::from("[ZR] 項目")
@@ -4634,9 +4612,10 @@ impl GuiState {
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &chip, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
-                // The two item tabs' search is [ZR]'s third stop (個数 →
-                // 確率% → 検索) and the pill is the touch route to the same
-                // request. [-] is the delete key and nothing else.
+                // The two item tabs' search is its own press: the 検索 pill
+                // here, and [R] on the pad - [ZR] only walks the three stops
+                // and never opens a keyboard on the user's behalf. [-] is the
+                // delete key and nothing else.
                 if matches!(ed.quest_edit_tab, QUEST_TAB_REWARDS | QUEST_TAB_SUPPLIES) {
                     let lbl = if ed.quest_item_filter.trim().is_empty() {
                         String::from("検索")
@@ -5360,7 +5339,7 @@ impl GuiState {
             MAIN_X + 4,
             CONTENT_Y,
             620,
-            "生データ（セーブマップ）",
+            "生データ",
             t.text_primary,
             FontSize::Medium,
         );
@@ -8280,14 +8259,12 @@ impl GuiState {
                 tname.to_string(),
             ));
         }
-        // The strip under the list carries two different things and they are
-        // drawn in two different colours now: a pending operation (amber - the
-        // key guide cannot say which record is armed, and both a delete and a
-        // type change fire on one press unless the screen says they are
-        // waiting) and the one line that explains the keys (grey). The
-        // explanation used to be amber too and it took both lines, so a record
-        // that does not fit its own type had nowhere to be said.
-        let mut notice: Vec<String> = Vec::new();
+        // The strip under the list is for warnings only: a pending operation
+        // (amber - the key guide cannot say which record is armed, and both a
+        // delete and a type change fire on one press unless the screen says
+        // they are waiting) and a record that does not fit its own type. The
+        // permanent key explanation that used to live here is the footer's job,
+        // and it cost the list a row: eight rows with nothing to warn about.
         let mut warnings: Vec<String> = Vec::new();
         if let Some((index, refs, _)) = ed.equip_delete_pending() {
             warnings.push(format!(
@@ -8304,10 +8281,6 @@ impl GuiState {
             // it, so the line has to say what the press is waiting for.
             warnings.push(text);
             warnings.push(String::from("前の種別のデータは消しません（警告のみ）"));
-        } else {
-            notice.push(String::from(
-                "[-] 2回で削除 / [＋] 新規 / [A] 編集（種別・ID を変えると差し替え）",
-            ));
         }
         // The record under the cursor: what does not fit the type it carries.
         // A kind change keeps every byte, so this is where a converted record
@@ -8335,7 +8308,7 @@ impl GuiState {
             ed.equip_cursor.min(rows.len().saturating_sub(1)),
             false,
             "編集",
-            &notice,
+            &[],
             &warnings,
         );
     }
@@ -8412,12 +8385,9 @@ impl GuiState {
             });
             (Vec::new(), w)
         } else {
-            (
-                alloc::vec![String::from(
-                    "[A] は行ごとの操作（選ぶ / 値を増やす / 書き込み）。X で保存",
-                )],
-                Vec::new(),
-            )
+            // Nothing to say: the footer names [A] 行の操作 and [X] 保存, and a
+            // strip here cost the nine-row form its ninth row.
+            (Vec::new(), Vec::new())
         };
 
         self.draw_adaptive_rows_warn(
@@ -9938,7 +9908,7 @@ impl GuiState {
     }
 
     fn draw_save_quests(&mut self, c: &mut Canvas, ed: &Editor) {
-        if self.quest_tab == 0 {
+        if ed.quest_tab == 0 {
             let list = ed.filtered_quests();
             let mut rows = Vec::with_capacity(list.len());
             for (i, q) in list.iter().enumerate() {
@@ -9961,12 +9931,12 @@ impl GuiState {
                 &format!("セーブ内クエスト ({})", rows.len()),
                 "",
                 &rows,
-                ed.save_quest_cursor.min(rows.len().saturating_sub(1)),
+                ed.quest_list_cursor().min(rows.len().saturating_sub(1)),
                 false,
                 "編集",
             );
         } else {
-            let list = bundled_quests_for_tab(self.quest_tab, &ed.quest_filter);
+            let list = ed.bundled_quests_for(ed.quest_tab);
             let in_save = ed.save_quests();
             let mut rows = Vec::with_capacity(list.len());
             for (i, q) in list.iter().enumerate() {
@@ -9983,12 +9953,12 @@ impl GuiState {
             // The count is the list's own length, not the table's: with a
             // filter on, the list is shorter and this heading used to keep
             // claiming the whole table.
-            let hdr = if self.quest_tab == 1 {
+            let hdr = if ed.quest_tab == 1 {
                 format!("公式イベントクエスト ({})", rows.len())
             } else {
                 format!("没クエスト ({})", rows.len())
             };
-            let cur = self.quest_cat_cursor[self.quest_tab].min(rows.len().saturating_sub(1));
+            let cur = ed.quest_list_cursor().min(rows.len().saturating_sub(1));
             self.draw_adaptive_rows(c, ed, &hdr, "", &rows, cur, false, "導入/解除");
         }
     }
@@ -10095,7 +10065,11 @@ impl GuiState {
                 // .gmd text ([A] opens the keyboard) and the fourth is the .mib
                 // 制限時間 (which steps with [◀/▶] and has no text at all).
                 let a_label = ed.quest_basic_a_label();
-                self.draw_adaptive_rows(c, ed, "クエスト改造", &sub, &rows, cur, false, a_label);
+                // The stepper is drawn on all four tabs: 制限時間 is a number
+                // the arrows step, and it was the one row of the screen a
+                // finger could not change (the other three tabs had the
+                // stepper and this one did not).
+                self.draw_adaptive_rows(c, ed, "クエスト改造", &sub, &rows, cur, true, a_label);
             }
             QUEST_TAB_MONSTERS => {
                 let monsters = ed.quest_monsters();
@@ -11079,28 +11053,6 @@ fn window_start(cursor: usize, total: usize, visible: usize) -> usize {
         start = total - visible;
     }
     start
-}
-
-fn bundled_quests_for_tab(
-    tab: usize,
-    filter: &str,
-) -> Vec<&'static mhnx_core::dlc_bundle::OfficialQuestMeta> {
-    use mhnx_core::dlc_bundle::{DlcQuestCategory, OFFICIAL_QUESTS};
-    let needle = filter.trim().to_lowercase();
-    let target_cat = match tab {
-        2 => DlcQuestCategory::Dead,
-        _ => DlcQuestCategory::Official,
-    };
-    OFFICIAL_QUESTS
-        .iter()
-        .filter(|q| q.category == target_cat)
-        .filter(|q| {
-            if needle.is_empty() {
-                return true;
-            }
-            format!("{}", q.quest_id).contains(&needle) || q.title.to_lowercase().contains(&needle)
-        })
-        .collect()
 }
 
 fn monster_name_for_mint(v: u32) -> &'static str {

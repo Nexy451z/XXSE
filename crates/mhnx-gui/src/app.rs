@@ -245,7 +245,7 @@ impl Tab {
             Tab::Quest => "クエスト（ファイル）",
             Tab::QuestWork => "クエスト改造",
             Tab::Dlc => "DLC",
-            Tab::Charm => "お守り",
+            Tab::Charm => "護石",
             Tab::Equip => "装備",
             Tab::Hunts => "狩猟記録",
             Tab::Guild => "ギルド",
@@ -274,7 +274,7 @@ impl Tab {
             Tab::Items => {
                 "アイテムを選んで数を変えます（CSV は一覧の上）。分からないときは右下の [詳細]"
             }
-            Tab::Charm => "お守りを選ぶとスキルとスロットを編集できます。分からないときは右下の [詳細]",
+            Tab::Charm => "護石を選ぶとスキルとスロットを編集できます。分からないときは右下の [詳細]",
             Tab::Equip => "装備を選ぶと右の欄で編集できます。分からないときは右下の [詳細]",
             Tab::QuestWork => {
                 "クエストを名前で選んで編集します。分からないときは右下の [詳細]（ファイル単位）"
@@ -614,7 +614,7 @@ pub enum Confirm {
         from: u8,
         /// Type it would become.
         kind: u8,
-        /// 護石 kind code (1 兵士 .. 10 天) written when `kind` is お守り.
+        /// 護石 kind code (1 兵士 .. 10 天) written when `kind` is 護石.
         charm_code: u8,
     },
     /// Let a request's 完了 flag go. The dialog asks whether 受理 goes with it:
@@ -5812,11 +5812,11 @@ impl MhnxEditor {
     /// The charm tab arms its own button instead of opening a modal, so this is
     /// reached from there rather than from [Confirm].
     pub fn delete_charm(&mut self, index: usize) {
-        self.push_undo(format!("お守り {} の削除", index));
+        self.push_undo(format!("護石 {} の削除", index));
         if let Some(s) = &mut self.save {
             if s.clear_charm(self.slot, index) {
                 self.dirty = true;
-                self.message = format!("お守り {} を削除しました", index);
+                self.message = format!("護石 {} を削除しました", index);
             }
         }
     }
@@ -6098,14 +6098,14 @@ impl MhnxEditor {
                 );
                 if *kind == mhnx_core::charm::CHARM_TYPE {
                     let name = mhnx_core::charm::kind_name(*charm_code).unwrap_or("?");
-                    body += "・お守りにするため、護石の種別コード（+0x02）と護石ID（+0x12/+0x13）を書きます\n";
+                    body += "・護石にするため、護石の種別コード（+0x02）と護石ID（+0x12/+0x13）を書きます\n";
                     body += "・護石の種類は";
                     body += name;
                     body += " です\n";
-                    body += "・前の装備のバイト（スキル・ポイント・スロット）は消しません。お守りとして整えるには護石タブで編集してください\n";
+                    body += "・前の装備のバイト（スキル・ポイント・スロット）は消しません。護石として整えるには護石タブで編集してください\n";
                 } else if *from == mhnx_core::charm::CHARM_TYPE {
-                    body += "・お守りの種別コードと護石IDは消さずに残します（装備BOX は読みません）\n";
-                    body += "・お守りのスキル・ポイント・スロットは意味を失います\n";
+                    body += "・護石の種別コードと護石IDは消さずに残します（装備BOX は読みません）\n";
+                    body += "・護石のスキル・ポイント・スロットは意味を失います\n";
                 } else {
                     body += "・前の種別の固有データ（強化情報・装飾品・着せ替え）は意味を失います\n";
                 }
@@ -6581,7 +6581,7 @@ impl MhnxEditor {
         ui.horizontal_wrapped(|ui| {
             // The word in front of the box is a pill, not a label: clicking it
             // puts the cursor in the box, which is the same move Ctrl+F makes.
-            // The お守り screen's search is opened from a control like this one;
+            // The 護石 screen's search is opened from a control like this one;
             // a box reachable only by a keyboard shortcut is one a mouse or a
             // finger never opens. The hint names what the box matches - the box
             // had none, so the search looked like an empty text field.
@@ -13877,7 +13877,7 @@ impl MhnxEditor {
         ui.label(
             egui::RichText::new(
                 "先頭 12 バイト（種別・Lv・ID・着せ替え・装飾品）だけを書き換えます。+0x0C 以降の持ち物は保持します。\
-                 種別を変えたときは、お守りに必要な +0x02 / +0x12 / +0x13 だけを追加で書きます。",
+                 種別を変えたときは、護石に必要な +0x02 / +0x12 / +0x13 だけを追加で書きます。",
             )
             .weak()
             .small(),
@@ -13943,7 +13943,7 @@ impl MhnxEditor {
                 .add_enabled(!same_as_now, egui::Button::new("種別を変更"))
                 .on_hover_text(
                     "確認を挟んでから変えます。前の種別のデータは消しません（警告のみ）。\
-                     お守りに変えるときは種別コードと護石IDを書きます",
+                     護石に変えるときは種別コードと護石IDを書きます",
                 );
             if button.clicked() {
                 self.confirm = Confirm::EquipKind {
@@ -14900,7 +14900,7 @@ impl MhnxEditor {
             .unwrap_or_default();
         let total = charms.len();
         ui.horizontal(|ui| {
-            ui.heading("お守り");
+            ui.heading("護石");
             ui.label(format!(
                 "スロット {} / {} 個（装備ボックス 2000 枠のうち）",
                 self.slot + 1,
@@ -14988,7 +14988,7 @@ impl MhnxEditor {
             ui.separator();
             ui.vertical(|ui| {
                 ui.set_min_width(360.0);
-                ui.label(egui::RichText::new("選択中のお守り").strong());
+                ui.label(egui::RichText::new("選択中の護石").strong());
                 // Everything this editor offers is bounded by the grade of the
                 // record on screen: how many decoration slots may be picked and
                 // how far each skill's points may go. A talisman has a grade of
@@ -15066,7 +15066,7 @@ impl MhnxEditor {
                         if ui
                             .selectable_label(self.charm_slots == n, label)
                             .on_hover_text(if n == 0 {
-                                "装飾品を挿せないお守りにします"
+                                "装飾品を挿せない護石にします"
                             } else {
                                 "装飾スロットの数"
                             })
@@ -15215,7 +15215,7 @@ impl MhnxEditor {
                         let mut written = false;
                         let mut ok = false;
                         if is_talisman_here {
-                            self.push_undo(format!("お守り {} の種類", self.charm_index));
+                            self.push_undo(format!("護石 {} の種類", self.charm_index));
                         }
                         if let Some(s) = &mut self.save {
                             if is_talisman_here {
@@ -15248,7 +15248,7 @@ impl MhnxEditor {
                                     .unwrap_or_default();
                                 self.message = format!("種類を {} に変更しました", name);
                             } else {
-                                self.message = format!("新しいお守りの種類を {} にしました", name);
+                                self.message = format!("新しい護石の種類を {} にしました", name);
                             }
                         } else {
                             self.message =
@@ -15360,7 +15360,7 @@ impl MhnxEditor {
                             None
                         }
                         .unwrap_or(self.charm_new_kind);
-                        self.push_undo(format!("お守り {} の更新", c.index));
+                        self.push_undo(format!("護石 {} の更新", c.index));
                         let written = match &mut self.save {
                             Some(s) => s.set_charm_with_kind(self.slot, &c, kind),
                             None => false,
@@ -15378,7 +15378,7 @@ impl MhnxEditor {
                             // a value it no longer holds.
                             self.charm_sync_from_record();
                             self.message = format!(
-                                "お守り {} を更新しました（{}）",
+                                "護石 {} を更新しました（{}）",
                                 c.index,
                                 mhnx_core::charm::kind_name(kind).unwrap_or("?")
                             );
@@ -15391,7 +15391,7 @@ impl MhnxEditor {
                     // type one: charm::first_free already knows where it is.
                     if ui
                         .button("空き枠に新規作成")
-                        .on_hover_text("最初の空きスロットにお守りを作ります")
+                        .on_hover_text("最初の空きスロットに護石を作ります")
                         .clicked()
                     {
                         let free = match &self.save {
@@ -15415,7 +15415,7 @@ impl MhnxEditor {
                         };
                         let kind = self.charm_new_kind;
                         let kind_label = mhnx_core::charm::kind_name(kind).unwrap_or("?");
-                        self.push_undo(format!("お守り {} の作成", self.charm_index));
+                        self.push_undo(format!("護石 {} の作成", self.charm_index));
                         if let Some(s) = &mut self.save {
                             if s.set_charm_with_kind(self.slot, &new, kind) {
                                 self.dirty = true;
@@ -15430,7 +15430,7 @@ impl MhnxEditor {
                                 // talisman to copy at all - the slot itself just
                                 // came back from first_free.
                                 self.message = String::from(
-                                    "作成できません（装備ボックスにコピー元のお守りがありません）",
+                                    "作成できません（装備ボックスにコピー元の護石がありません）",
                                 );
                             }
                         }
@@ -15837,13 +15837,13 @@ impl MhnxEditor {
         });
 
         ui.separator();
-        ui.heading("お守り");
+        ui.heading("護石");
         let charms = self
             .save
             .as_ref()
             .and_then(|s| s.charms(self.slot))
             .unwrap_or_default();
-        ui.label(format!("スロット {}: {} 個のお守り", self.slot + 1, charms.len()));
+        ui.label(format!("スロット {}: {} 個の護石", self.slot + 1, charms.len()));
         egui::ScrollArea::vertical()
             .id_salt("charms")
             .max_height(150.0)
@@ -15944,16 +15944,16 @@ impl MhnxEditor {
             }
         }
         if let Some(i) = drop_charm {
-            self.push_undo(format!("お守り {} の削除", i));
+            self.push_undo(format!("護石 {} の削除", i));
             if let Some(s) = &mut self.save {
                 if s.clear_charm(self.slot, i) {
                     self.dirty = true;
-                    self.message = format!("お守り {} を削除しました", i);
+                    self.message = format!("護石 {} を削除しました", i);
                 }
             }
         }
         if write_charm {
-            self.push_undo(format!("お守り {} の更新", self.charm_index));
+            self.push_undo(format!("護石 {} の更新", self.charm_index));
             let c = mhnx_core::charm::Charm {
                 index: self.charm_index,
                 slots: self.charm_slots,
@@ -15976,7 +15976,7 @@ impl MhnxEditor {
             if let Some(s) = &mut self.save {
                 if s.set_charm_with_kind(self.slot, &c, kind) {
                     self.dirty = true;
-                    self.message = format!("お守り {} を更新しました（{}）", c.index, kind_label);
+                    self.message = format!("護石 {} を更新しました（{}）", c.index, kind_label);
                 } else {
                     self.message =
                         String::from("書き込めません（武器・防具の枠は保護されています）");
@@ -25274,7 +25274,7 @@ mod tests {
     /// Japanese inside an English frame. They are catalogue keys now, so they
     /// follow the same chooser the buttons behind them do (AUDIT8 §4 N1).
     /// The アイテム BOX search opens from a pill and closes from one, in the
-    /// same way the お守り screen's does: the box says what it matches (it had no
+    /// same way the 護石 screen's does: the box says what it matches (it had no
     /// hint at all), the word in front of it is a button a mouse or a finger can
     /// press, and クリア puts the whole list back.
     #[test]
@@ -27229,10 +27229,10 @@ mod tests {
         assert_eq!(focus.record, Some(6));
         assert!(app.message.contains("装備ボックス"), "{}", app.message);
 
-        // お守り: the same bytes, named as the talisman row (護石).
+        // 護石: the same bytes, named as the talisman row (護石).
         app.tab = Tab::Charm;
         app.charm_index = 12;
-        let jump = app.detail_jump_for(Tab::Charm).expect("お守り has a detail");
+        let jump = app.detail_jump_for(Tab::Charm).expect("護石 has a detail");
         app.open_detail(jump);
         assert_eq!(app.savemap_selected, MhnxEditor::savemap_index_named("護石"));
         assert_eq!(app.detail_focus.and_then(|f| f.record), Some(12));

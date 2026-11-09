@@ -39,6 +39,11 @@ pub enum EquipError {
     /// is the 護石 grade, 1 兵士 .. 10 天 (charm::TALISMAN_KINDS). A record of
     /// type 6 carrying anything else is a record the game never writes.
     BadCharmKind,
+    /// The 装備BOX screen was asked to create a kind its list does not show.
+    ///
+    /// The box lists [equip::BOX_KINDS] and nothing else, so any other kind
+    /// would be created and then be invisible in the list it was created from.
+    NotBoxKind(u8),
 }
 
 impl EquipError {
@@ -70,7 +75,11 @@ impl EquipError {
                 equip::MAX_KIND
             ),
             EquipError::BadCharmKind => alloc::string::String::from(
-                "お守りにするときは護石の種類（1 兵士 〜 10 天）を選んでください",
+                "護石にするときは護石の種類（1 兵士 〜 10 天）を選んでください",
+            ),
+            EquipError::NotBoxKind(k) => format!(
+                "{} は装備BOXの一覧に出ません（護石は護石一覧で作ります）",
+                equip::type_name(*k)
             ),
         }
     }
@@ -236,6 +245,29 @@ pub fn create(
         return Err(EquipError::BadCharmKind);
     }
     Ok(index)
+}
+
+/// Write a new record the 装備BOX screen asked for.
+///
+/// The box lists [equip::BOX_KINDS] and nothing else, so a record of any other
+/// kind would be created and then not appear in the list it was created from -
+/// which is what the review found with a talisman: the box created one and the
+/// list (equip_rows) never showed it. The kind is refused here rather than in
+/// the screen, so the one create the box can run is one its list can show.
+///
+/// [create] stays the general writer: the CSV import and the talisman form both
+/// put records of their own kinds into the same box.
+pub fn create_in_box(
+    save: &mut Save,
+    slot: usize,
+    kind: u8,
+    id: u16,
+    level: u16,
+) -> Result<usize, EquipError> {
+    if !equip::box_holds_kind(kind) {
+        return Err(EquipError::NotBoxKind(kind));
+    }
+    create(save, slot, kind, id, level)
 }
 
 /// Refuse a type no record can carry before anything is written.

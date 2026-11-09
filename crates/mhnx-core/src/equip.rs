@@ -148,6 +148,25 @@ pub fn is_hunter_kind(kind: u8) -> bool {
     HUNTER_KINDS.contains(&kind)
 }
 
+/// The kinds the 装備BOX screen lists, in the order its pickers show them.
+///
+/// [HUNTER_KINDS] without the talisman (6). A talisman lives in the same box,
+/// but it has a screen and a form of its own (護石一覧 / 護石編集), and the
+/// equipment form's レベル / 着せ替え / 装飾品 rows mean nothing for one.
+///
+/// One table, because the four places that used to answer "which kinds does
+/// this box hold" separately disagreed: the list hid the talisman while the
+/// 種別 list, the arrow keys, the whole-box picker and the create path all let
+/// one through - so the box could create a talisman and then not show it.
+pub const BOX_KINDS: [u8; 19] = [
+    1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+];
+
+/// Does the 装備BOX screen list this kind? See [BOX_KINDS].
+pub fn box_holds_kind(kind: u8) -> bool {
+    BOX_KINDS.contains(&kind)
+}
+
 /// Rewrite the level field, keeping the type and the transmog level.
 ///
 /// The level is stored minus one in five bits, so it runs 1..=32. A level of

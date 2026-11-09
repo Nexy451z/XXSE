@@ -1044,7 +1044,7 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Options => "設定",
         Csv => "CSV 入出力",
         // 詳細: the bytes behind the screen 詳細 was pressed on.
-        SaveMap => "生データ（セーブマップ）",
+        SaveMap => "生データ",
         // 変更一覧: what the open save differs from the card in, one value a
         // line, each one restorable on its own.
         Review => "変更一覧",
@@ -1409,108 +1409,14 @@ fn key_from(buttons: u64) -> Option<Key> {
 }
 
 /// Apply a completed text input (from `swkbd` or the built-in OSK) to `Editor`.
-fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
-    // A name goes through the core checked writers. A control character the
-    // keyboard should never have produced is refused there: the save, the undo
-    // stack and the field stay exactly as they were, and the status row names
-    // the code point. A name that fits keeps every line break the player put in
-    // it, and the status row carries its length, its line count and the ragged
-    // break warnings. Nothing here clips by characters - the field counts the
-    // bytes it stores, so the core is the only place that may cut.
-    if let Some(target) = ed.text_request_name(idx) {
-        if let Err(e) = ed.apply_name_target(target, &s) {
-            ed.message = mhnx_core::hbedit::name_refusal_line(e);
-        }
-        return;
-    }
-    if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
-        ed.apply_item_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
-        ed.apply_skill_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {
-        ed.apply_quest_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_SAVE_NAME {
-        ed.apply_convert_name(s);
-    } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
-        // Through the editor: an empty answer clears the filter and says so.
-        ed.apply_equip_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
-        ed.apply_jewel_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_CHARM_FILTER {
-        // The talisman list's name filter: an empty answer is the whole box
-        // again, the same rule the equipment box's filter follows.
-        ed.apply_charm_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_ITEM_BOX_FILTER {
-        // The item box's name search: [ZR] (the one input this screen had
-        // left), and the inspector's pill sends the same key. An empty answer
-        // is the whole box.
-        ed.apply_item_box_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
-        // Through the editor: an empty answer is the whole list again, which is
-        // the same rule the item picker's filter follows.
-        ed.apply_equip_pick_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_EQUIP_ID {
-        // Hex or decimal, and the row re-spells what it took so a wrong
-        // reading is on screen before anything is written.
-        ed.apply_equip_id_text(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
-        // The parser in the core owns the format (and the message a bad one
-        // gets), so the layer only hands the text over.
-        ed.apply_arena_time(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_ITEM_COUNT {
-        // The four "type it instead of stepping it" rows. Each one clamps to
-        // the same ceiling its row prints and pushes its own undo step.
-        ed.apply_item_count_text(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_GUILD_HR {
-        ed.apply_guild_hr_text(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_GUILD_TIME {
-        ed.apply_guild_time_text(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_GUILD_QUEST_COUNT {
-        // The two guild card grids: one cell each, clamped to the u16 the save
-        // stores. The core owns the parse and the message, so the layer only
-        // hands the text over - the same rule the arena time follows.
-        ed.apply_guild_quest_count_text(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_GUILD_WEAPON_COUNT {
-        ed.apply_guild_weapon_count_text(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_SAVE_MAP_FILTER {
-        ed.apply_save_map_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_PROGRESS_FILTER {
-        // The progress screen's name search: the quest view lists 1,508 rows
-        // and the request view 380, and neither had a way to narrow.
-        ed.apply_progress_filter(s);
-    } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
-        ed.apply_hunt_count_text(&s);
-    } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB
-        || idx == mhnx_core::hbedit::TEXT_REWARD_COUNT
-    {
-        // The row's own field says which number is written; the sentinel only
-        // says that a reward row asked for one.
-        ed.apply_reward_text(&s);
-    } else {
-        ed.apply_text(idx, s);
-    }
-}
-
-/// The title the built-in keyboard shows for one of the six names.
 ///
-/// The capacity is the bytes the field stores - the same figure the status row
-/// prints - and the line-break key is named in the title as well as in the
-/// footer, because that key is the whole point of the multiline keyboard.
-fn name_header(target: mhnx_core::hbedit::NameTarget) -> String {
-    use mhnx_core::hbedit::NameTarget;
-    let spec = target.spec();
-    let unit = match spec.unit {
-        mhnx_core::save::NameUnit::Utf16 => format!(" = {} 文字", spec.capacity / 2),
-        mhnx_core::save::NameUnit::Bytes => String::new(),
-    };
-    match target {
-        NameTarget::Hunter => format!("ハンター名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
-        NameTarget::Palico(_) => format!("オトモ名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
-        NameTarget::ItemSet(_) => format!("アイテムセット名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
-        NameTarget::EquipSet(_) => format!("装備セット名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
-        NameTarget::CardName => format!("ギルドカード名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
-        NameTarget::CardComment => format!("ギルドカードのコメント（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
-    }
+/// One call, because the answer belongs to the request and the request is a row
+/// of the core's table (hbedit::TextSentinel): the id says which writer runs,
+/// and a sentinel added there cannot arrive here and be answered by nothing -
+/// which is what happened to the 報酬 / 支給品 search, whose id was in the queue
+/// and in neither of this function's two chains.
+fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
+    ed.apply_text_request(idx, &s);
 }
 
 /// Answer everything the editor asked for.
@@ -1708,121 +1614,25 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
 
     if let Some((idx, initial)) = ed.take_text_request() {
         force_redraw = true;
+        // The title and the field come from the request itself
+        // (hbedit::Editor::text_request_title / text_request_spec), which reads
+        // the core's sentinel table: this layer no longer keeps a second copy of
+        // the ids, the widths or the words, and a request added there arrives
+        // here titled and sized. It used to keep that copy, and the 報酬 /
+        // 支給品 search - added to the queue and to neither chain - opened a
+        // keyboard titled 「クエスト文章」.
+        let header = ed.text_request_title(idx);
+        let spec = ed.text_request_spec(idx);
         // A name always opens the built-in keyboard, even when the applet is
         // available: only the built-in one has a key for the line break the
         // field holds, and the applet is single line. What came back from an
         // old keyboard is filtered first, so a stray tab or NUL does not even
         // reach the input box.
-        if let Some(target) = ed.text_request_name(idx) {
-            let spec = target.spec();
-            let (initial, _) = spec.filter(&initial);
-            gui.open_osk(idx, &name_header(target), &initial, spec);
-            return force_redraw;
-        }
-        let (header, max_bytes) = if idx == mhnx_core::hbedit::TEXT_ITEM_FILTER {
-            // Which of the two searches the picker will run: the names when
-            // this build has them, the ids when it does not. The state machine
-            // answers the same question (item_pick_names_available), so the
-            // keyboard title and the list cannot promise different things.
-            if ed.item_pick_names_available() {
-                (
-                    "アイテム名で検索（部分一致・英数の大小は無視）",
-                    60usize,
-                )
-            } else {
-                ("アイテムIDで検索（名前が読めません 例: 975）", 60)
-            }
-        } else if idx == mhnx_core::hbedit::TEXT_SKILL_FILTER {
-            ("スキル名で検索", 60)
-        } else if idx == mhnx_core::hbedit::TEXT_QUEST_FILTER {
-            ("クエストIDかタイトルで検索", 60)
-        } else if idx == mhnx_core::hbedit::TEXT_SAVE_NAME {
-            ("書き出すファイル名（拡張子は自動）", 48)
-        } else if idx == mhnx_core::hbedit::TEXT_EQUIP_FILTER {
-            ("装備名か種類で検索", 60)
-        } else if idx == mhnx_core::hbedit::TEXT_JEWEL_FILTER {
-            ("装飾品名で検索", 60)
-        } else if idx == mhnx_core::hbedit::TEXT_CHARM_FILTER {
-            // A talisman has no name of its own, so the box says what it will
-            // match: the kind the game calls it and both skill names.
-            ("護石の種類かスキル名で検索", 60)
-        } else if idx == mhnx_core::hbedit::TEXT_ITEM_BOX_FILTER {
-            // Which of the two searches this build can run, the same rule the
-            // item picker follows: names when the table is compiled in, ids
-            // when it is not - and the keyboard title says which.
-            if ed.item_pick_names_available() {
-                ("アイテム名で検索（部分一致・英数の大小は無視）", 60)
-            } else {
-                ("アイテムIDで検索（名前が読めません 例: 975）", 60)
-            }
-        } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
-            // Which of the two searches the picker will run: the names when
-            // this build has them, the hex ids when it does not. The state
-            // machine answers the same question (equip_pick_names_available),
-            // so the keyboard title and the list cannot promise different
-            // things.
-            if ed.equip_pick_names_available() {
-                ("装備名で検索（部分一致 / 種別名でも可）", 60)
-            } else {
-                ("装備IDで検索（名前が読めません 16進 例: 28）", 60)
-            }
-        } else if idx == mhnx_core::hbedit::TEXT_PROGRESS_FILTER {
-            // What the three views can be searched by: the name the row prints
-            // (from the romfs dump or the bundled table) and the row's number.
-            ("進行状況を名前か番号で検索（空にすると解除）", 60)
-        } else if idx == mhnx_core::hbedit::TEXT_SAVE_MAP_FILTER {
-            // The list is about a hundred named stretches and three of them
-            // name the same box for the other two characters; the title says
-            // both of the things the filter matches.
-            ("領域名かオフセットで検索（空にすると解除）", 40)
-        } else if idx == mhnx_core::hbedit::TEXT_EQUIP_ID {
-            ("装備ID（16進 0x28 / 10進 40）", 8)
-        } else if idx == mhnx_core::hbedit::TEXT_ARENA_TIME {
-            // m:ss.cc is at most "10:55.35" (8 bytes); the keyboard still
-            // allows the raw hundredths form the parser accepts.
-            ("闘技大会のタイム (m:ss.cc 例 9:35.44 / 0:00.00 で消去)", 12)
-        } else if idx == mhnx_core::hbedit::TEXT_ITEM_COUNT {
-            ("アイテムの個数 (0〜99)", 4)
-        } else if idx == mhnx_core::hbedit::TEXT_GUILD_HR {
-            ("ハンターランク (0〜999)", 4)
-        } else if idx == mhnx_core::hbedit::TEXT_GUILD_TIME {
-            ("プレイ時間 (H:MM または秒)", 12)
-        } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
-            ("狩猟数 (0〜9999) / サイズ % (0〜300)", 6)
-        } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB {
-            ("報酬の確率 % (0〜100)", 4)
-        } else if idx == mhnx_core::hbedit::TEXT_GUILD_QUEST_COUNT {
-            // Seven u16 counters: at most five digits, and the parser clamps to
-            // 65,535 so a sixth digit cannot wrap the field.
-            ("クエスト回数 (0〜65535)", 6)
-        } else if idx == mhnx_core::hbedit::TEXT_GUILD_WEAPON_COUNT {
-            // Three venues of fifteen u16 each; the same ceiling.
-            ("武器使用数 (0〜65535)", 6)
-        } else if idx == mhnx_core::hbedit::TEXT_REWARD_COUNT {
-            ("報酬の個数 (0〜99)", 4)
+        let initial = if ed.text_request_name(idx).is_some() {
+            let (filtered, _) = spec.filter(&initial);
+            filtered
         } else {
-            let label = mhnx_core::quest::Gmd::LABELS
-                .get(idx)
-                .copied()
-                .unwrap_or("クエスト文章");
-            (label, 512)
-        };
-        // The 基本 tab's three text rows are .gmd strings, and a .gmd string is
-        // a paragraph: the game draws its U+000A as a line break, and the
-        // console used to edit one with the *system* keyboard, which is single
-        // line - so opening a two-line 依頼内容 and pressing 決定 wrote it back
-        // as one line and the break was gone. The field is multiline, so it
-        // takes the same built-in keyboard a name does (hbedit::keyboard_route
-        // sends every multiline field there, and that keyboard has [ZR] 改行).
-        // Every other request in this list really is one line.
-        // The .gmd rows are the only requests whose id is a plain index: every
-        // other request in this dispatch is a sentinel near usize::MAX
-        // (hbedit::TEXT_*), and the six names were answered above.
-        let is_quest_text = idx < mhnx_core::quest::Gmd::LABELS.len();
-        let spec = if is_quest_text {
-            mhnx_core::hbedit::NameSpec::name(max_bytes, mhnx_core::save::NameUnit::Bytes)
-        } else {
-            mhnx_core::hbedit::NameSpec::singleline(max_bytes)
+            initial
         };
         // Which keyboard to use, decided by one function so the screen, this
         // dispatch and the host tests cannot each have their own answer
@@ -1831,6 +1641,7 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
         //   * a name holds U+000A, which the system keyboard cannot type, so a
         //     name always uses the built-in one - the one real reason the
         //     built-in keyboard exists;
+        //   * a .gmd line is a paragraph for the same reason;
         //   * every other request is one line, so the system keyboard is
         //     preferred: it has the console's IME, flick input and the layout
         //     the player already knows;
@@ -1839,7 +1650,7 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
         //     keyboard is used and the modal says why.
         match mhnx_core::hbedit::keyboard_route(spec, crate::swkbd::is_available()) {
             mhnx_core::hbedit::KeyboardRoute::System => {
-                match crate::swkbd::input_text(header, &initial, max_bytes) {
+                match crate::swkbd::input_text(&header, &initial, spec.capacity) {
                     Some(s) => apply_text_result(ed, idx, s),
                     None => {
                         ed.message = String::from(
@@ -1854,7 +1665,7 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                 // on the modal, in the status row and nowhere silently.
                 gui.open_osk_with_note(
                     idx,
-                    header,
+                    &header,
                     &initial,
                     spec,
                     "システムキーボードが使えないため、内蔵キーボードで入力します",
@@ -1864,7 +1675,7 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                 );
             }
             mhnx_core::hbedit::KeyboardRoute::Builtin => {
-                gui.open_osk(idx, header, &initial, spec);
+                gui.open_osk(idx, &header, &initial, spec);
             }
         }
     }
@@ -1907,23 +1718,22 @@ pub fn run() -> i32 {
     // is the core's, so the frames it fires on are pinned by a host test.
     let mut held: u64 = 0;
     let mut key_repeat = mhnx_core::hbedit::KeyRepeat::new();
-    // The shoulders: the press is answered on the frame the key goes down.
+    // The shoulders: both taps are answered on the release.
     //
-    // L / R used to be answered on the release, because a tap had to be told
-    // from a hold first: the sub-tab therefore arrived after the finger came
-    // up, and two quick presses felt one press behind (the review called it
-    // もたつく). The tab now moves on the press. The holds keep their second
-    // job - L offers the whole-save undo, R opens 詳細 - and a hold never takes
-    // the tab move back: the tab has already been drawn, and undoing it on the
-    // way to the undo would be a second, invisible answer to one press.
-    // hbedit::ShoulderPress owns that ordering and its host test pins it; the
-    // undo still costs two holds, so a press that lingers cannot throw a save
-    // away (confirm::HoldConfirm).
-    let mut l_press = mhnx_core::hbedit::ShoulderPress::new();
-    // [R] is the one shoulder whose tap waits for the release: its hold opens
-    // 詳細, and answering the tap on the press meant a hold also moved the
-    // sub-tab (hbedit::ShoulderTap). The target is the screen state at press
-    // time, so the detail view opens on the screen the key went down on
+    // They were answered on the press for a while, because a tap that waits for
+    // the release felt one press behind (the review called it もたつく) - but
+    // the two keys of one band then answered on two different frames: [L] moved
+    // the sub-tab the moment it went down and [R] moved it when the finger came
+    // up, so the same gesture read as two different gestures depending on which
+    // shoulder was used. Both wait for the release now, and both holds keep
+    // their second job (L offers the whole-save undo, R opens 詳細) without ever
+    // also moving the tab: a hold that also taps is worse than a tap that is one
+    // frame late. hbedit::ShoulderTap owns that rule and its host test pins it;
+    // the undo still costs two holds, so a press that lingers cannot throw a
+    // save away (confirm::HoldConfirm).
+    let mut l_tap = mhnx_core::hbedit::ShoulderTap::new();
+    // [R]'s hold opens 詳細, so the target is the screen state at press time:
+    // the detail view opens on the screen the key went down on
     // (hbedit::DetailTarget).
     let mut r_tap = mhnx_core::hbedit::ShoulderTap::new();
     let mut r_target: Option<mhnx_core::hbedit::DetailTarget> = None;
@@ -2039,7 +1849,7 @@ pub fn run() -> i32 {
                 // L / R answer the keyboard here, not the list: forget the
                 // holds so a press that came up inside the keyboard cannot
                 // reach the screen behind it later.
-                l_press = mhnx_core::hbedit::ShoulderPress::new();
+                l_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_target = None;
                 l_repeat.tick(false);
@@ -2056,7 +1866,7 @@ pub fn run() -> i32 {
                     }
                 }
             } else if painter.gui.mib_picker.is_some() {
-                l_press = mhnx_core::hbedit::ShoulderPress::new();
+                l_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_target = None;
                 l_repeat.tick(false);
@@ -2080,7 +1890,7 @@ pub fn run() -> i32 {
                     }
                 }
             } else if ed.review_open() {
-                l_press = mhnx_core::hbedit::ShoulderPress::new();
+                l_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_target = None;
                 l_repeat.tick(false);
@@ -2229,14 +2039,24 @@ pub fn run() -> i32 {
                     need_draw = true;
                 }
 
-                // L / R, answered on the press. A tap is the sub-tab (or the ten
-                // row step on a pick list); a hold offers the second job without
-                // touching what the tap did.
-                if down & BTN_L != 0 && l_press.press() {
-                    // A key press takes the list back from a coasting flick.
+                // L / R, answered on the release. A tap is the sub-tab (or the
+                // ten row step on a pick list); a hold offers the second job and
+                // is not a tap at all. The two keys of the band answer on the
+                // same frame - they used to answer on two different ones, [L] on
+                // the press and [R] on the release.
+                //
+                // A pick list is the exception, exactly as it is for [R]: there
+                // the shoulder is the ten-row step and there is no hold job at
+                // all, so the press is answered at once and the auto-repeat
+                // follows it.
+                if down & BTN_L != 0 && l_tap.press() {
                     painter.gui.stop_fling();
-                    painter.gui.handle_pad_key(&mut ed, Key::L, cur);
-                    l_repeat.press();
+                    if crate::ui::shoulder_moves(&ed) {
+                        painter.gui.handle_pad_key(&mut ed, Key::L, cur);
+                        l_repeat.press();
+                        // The tap was this press: the release owes nothing.
+                        l_tap.spend();
+                    }
                     need_draw = true;
                 }
                 // [R]: the tap waits for the release, the hold is 詳細.
@@ -2289,7 +2109,7 @@ pub fn run() -> i32 {
                     // view rather than a destructive action, so the first hold
                     // opens it and the offer is taken back at once so holding
                     // longer cannot open it twice.
-                    match l_press.tick() {
+                    match l_tap.tick() {
                         mhnx_core::confirm::HoldAction::Arm => {
                             ed.message = alloc::format!(
                                 "もう一度 [L] を {} 秒長押しすると元に戻します（取り消す操作: {}）",
@@ -2329,9 +2149,16 @@ pub fn run() -> i32 {
                         mhnx_core::confirm::HoldAction::None => {}
                     }
                 }
-                // The keys came up: the holds restart from zero next time.
+                // The keys came up: the holds restart from zero next time, and
+                // a press that never reached the hold was a tap - its job runs
+                // now, on the screen that is showing (nothing else can change it
+                // while L is held).
                 if cur & BTN_L == 0 {
-                    l_press.release();
+                    if l_tap.release() {
+                        painter.gui.stop_fling();
+                        painter.gui.handle_pad_key(&mut ed, Key::L, cur);
+                        need_draw = true;
+                    }
                 }
                 if cur & BTN_R == 0 {
                     // A press that never reached the hold was a tap, and the
@@ -2357,7 +2184,7 @@ pub fn run() -> i32 {
                         // Some other key means the holds' offers are gone: they
                         // have to be asked for again rather than waiting for the
                         // next hold however long later.
-                        l_press.clear_arm();
+                        l_tap.cancel();
                         // The pending [R] tap is not owed any more: the user
                         // pressed something else while it was still down.
                         r_tap.cancel();

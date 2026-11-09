@@ -387,10 +387,14 @@ fn the_equipment_strip_keeps_the_warning_colour_for_warnings() {
     );
     // A warning is never pushed off by the explanation.
     assert!(body.contains("warnings.len().min(2) + notice.len().min(1)"), "{body}");
-    // The two screens that have a permanent note pass it as a notice.
+    // The equipment box passes warnings only: its permanent operating note was
+    // the third review's finding 10 (a strip that is always drawn costs the
+    // list a row), so the keys it named are the footer's job now.
     let equip = fn_body(src, "fn draw_equip");
-    assert!(equip.contains("notice.push"), "{equip}");
+    assert!(!equip.contains("notice.push"), "{equip}");
     assert!(equip.contains("warnings.push"), "{equip}");
+    // The new-record form still has something to say (the last [A] creates the
+    // record), and it says it as a notice, not as a warning.
     let edit = fn_body(src, "fn draw_equip_edit");
     assert!(edit.contains("&notice,"), "{edit}");
     assert!(edit.contains("&warnings,"), "{edit}");
@@ -576,13 +580,21 @@ fn a_quest_text_field_keeps_its_line_breaks() {
         "一行目\n二行目",
         "the break is the player's"
     );
-    // And the console asks for that keyboard (switch/src/editor.rs).
-    let src = editor_src();
+    // And the console asks for that keyboard. The field is the state machine's
+    // now (hbedit::Editor::text_request_spec, the third review's finding 1):
+    // a .gmd line is a paragraph there, and the console hands the answer to
+    // hbedit::keyboard_route without deciding anything itself.
+    let core = include_str!("../src/hbedit.rs");
     assert!(
-        src.contains("mhnx_core::hbedit::NameSpec::name(max_bytes, mhnx_core::save::NameUnit::Bytes)"),
+        core.contains("None => NameSpec::name(GMD_TEXT_MAX, crate::save::NameUnit::Bytes)"),
         "the .gmd rows must not use NameSpec::singleline"
     );
-    assert!(src.contains("let is_quest_text = idx < mhnx_core::quest::Gmd::LABELS.len();"), "{src}");
+    let src = editor_src();
+    assert!(src.contains("let spec = ed.text_request_spec(idx);"), "{src}");
+    assert!(
+        src.contains("hbedit::keyboard_route(spec, crate::swkbd::is_available())"),
+        "{src}"
+    );
 }
 
 // ---------------------------------------------------------------------------

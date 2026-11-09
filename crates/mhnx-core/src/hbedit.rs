@@ -344,6 +344,16 @@ pub const QUEST_TAB_SUPPLIES: usize = 3;
 /// The four tab labels, in tab order.
 pub const QUEST_TAB_LABELS: [&str; QUEST_TABS] = ["基本", "モンスター", "報酬", "支給品"];
 
+/// The three values [ZR] walks on the 報酬 tab, in the order it walks them.
+pub const QUEST_REWARD_COUNT: usize = 0;
+/// The chance column of a reward row.
+pub const QUEST_REWARD_CHANCE: usize = 1;
+/// The item-name search. A stop of its own, not a keypress: the cycle never
+/// opens the keyboard (see [Editor::quest_cycle_field]).
+pub const QUEST_REWARD_SEARCH: usize = 2;
+/// How many stops the 報酬 tab has.
+pub const QUEST_REWARD_FIELDS: usize = 3;
+
 /// Monster slots a .mib carries (13 bytes each, from offset 100).
 pub const QUEST_MON_SLOTS: usize = 5;
 /// How many values [◀/▶] steps on a monster row, in the order [ZR] walks them.
@@ -1791,6 +1801,34 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
     ]
 }
 
+/// The next skill id the form's own list allows, when a skill row is turned.
+///
+/// The ids are the picker's own table ([crate::charm::allowed_skill_ids] for
+/// the kind on the form and the row's slot), so [◀] / [▶] cannot reach a skill
+/// the list refuses - which is what they did: they walked the raw 0..=255 and
+/// stepped onto ids the game has no name for, on a form whose [A] opens a list
+/// that does not contain them. An id the table does not hold (a record from a
+/// save, or a kind that was just changed) starts the walk at its own end
+/// instead of jumping to a number nobody chose.
+fn step_skill_id(ids: &[u8], cur: u8, d: i64) -> u8 {
+    if ids.is_empty() {
+        return cur;
+    }
+    let n = ids.len() as i64;
+    match ids.iter().position(|id| *id == cur) {
+        Some(pos) => ids[((pos as i64 + d).rem_euclid(n)) as usize],
+        // Not in the list: the first press lands on its head (or its tail for
+        // [◀]), which is the nearest row the list can show.
+        None => {
+            if d > 0 {
+                ids[0]
+            } else {
+                ids[ids.len() - 1]
+            }
+        }
+    }
+}
+
 /// The next kind when the kind row is turned, skipping row 0 ("装備なし").
 fn step_kind(kind: u8, forward: bool) -> u8 {
     let top = crate::charm::TALISMAN_KIND_COUNT;
@@ -1932,6 +1970,21 @@ impl EquipEdit {
             EQUIP_NEW_ROWS - 1
         } else {
             0
+        }
+    }
+
+    /// The row that holds the item id: 1 on the new form, 8 on the editing one.
+    ///
+    /// The kind is one half of what names a record and the id the other, so a
+    /// pick that answers only the kind leaves the cursor here rather than on the
+    /// row whose [A] writes: jumping to レベル meant the next [A] created a
+    /// record with the id the form happened to hold (1) instead of asking which
+    /// item was meant.
+    pub fn id_row(&self) -> usize {
+        if self.new {
+            1
+        } else {
+            8
         }
     }
 
@@ -2747,14 +2800,6 @@ pub const WEAPON_KINDS: [u8; 14] = [7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19,
 pub const ARMOR_KINDS: [u8; 5] = [1, 2, 3, 4, 5];
 /// The talisman, the only kind of its family.
 pub const TALISMAN_KINDS: [u8; 1] = [6];
-/// Every kind the box holds, in the order the whole-box picker lists them.
-///
-/// The weapons first (they are 1,606 of the 8,041 rows), then the five armour
-/// parts, then the talisman: the same order [EquipScope::All] counts in.
-pub const ALL_KINDS: [u8; 20] = [
-    7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 1, 2, 3, 4, 5, 6,
-];
-
 /// Which half of the box a name pick is looking through.
 ///
 /// A scope, not a kind: the 1,606 weapons are one list whichever of the 14
@@ -2809,7 +2854,7 @@ impl EquipScope {
             EquipScope::Weapons => &WEAPON_KINDS,
             EquipScope::Armor => &ARMOR_KINDS,
             EquipScope::Talismans => &TALISMAN_KINDS,
-            EquipScope::All => &ALL_KINDS,
+            EquipScope::All => &crate::equip::BOX_KINDS,
         }
     }
 }
@@ -2932,12 +2977,15 @@ pub fn equip_names_available(scope: EquipScope) -> bool {
 /// The list is rebuilt per frame, so it carries no names - a row looks its name
 /// up when it is drawn (EquipChoice::name).
 pub fn equip_choices(scope: EquipScope) -> Vec<EquipChoice> {
-    // The whole box is the three lists one after the other, in the order
-    // [ALL_KINDS] names: one list, one cursor, one rule for the arrows.
+    // The whole box is the two lists the 装備BOX screen can hold, one after
+    // the other, in the order [crate::equip::BOX_KINDS] names: one list, one
+    // cursor, one rule for the arrows. The talismans are not in it - the box
+    // cannot create one (equipops::create_in_box) and its list does not show
+    // one (equip_rows), so offering them here would be a pick that writes a
+    // record the screen it returns to cannot see.
     if scope == EquipScope::All {
         let mut out = equip_choices(EquipScope::Weapons);
         out.extend(equip_choices(EquipScope::Armor));
-        out.extend(equip_choices(EquipScope::Talismans));
         return out;
     }
     let mut out = Vec::new();
@@ -3243,6 +3291,487 @@ pub const TEXT_SAVE_MAP_FILTER: usize = usize::MAX - 1_016;
 /// thousand rows. Its own id rather than a reuse: the console answers each
 /// sentinel with a different title and a different apply method.
 pub const TEXT_PROGRESS_FILTER: usize = usize::MAX - 1_017;
+
+// ---------------------------------------------------------------------------
+// The text-request table: one row per sentinel
+// ---------------------------------------------------------------------------
+//
+// A sentinel used to be written by hand in three places: the `request_*` method
+// that put the id on the queue, the title chain in the console's `service()`,
+// and the `if idx == TEXT_...` chain in its `apply_text_result`. Adding
+// [TEXT_QUEST_ITEM] to two of the three is exactly what the review found: the
+// 報酬 / 支給品 search opened a keyboard titled 「クエスト文章」 and pressing
+// 決定 wrote nothing, because the third place had never heard of the id.
+//
+// The table below is the one place. A `request_*` only queues an id, the
+// console asks [Editor::text_request_title] / [Editor::text_request_spec] for
+// the keyboard, and the answer goes through [Editor::apply_text_request], which
+// runs the row's own function. `every_text_sentinel_has_a_title_and_an_apply`
+// walks every constant and fails if one of them is missing here.
+
+/// One row of the text-request table.
+pub struct TextSentinel {
+    /// The first id this row answers.
+    pub first: usize,
+    /// How many ids the row answers: 1 for a one-off, `palico::SLOTS` for the
+    /// palico names and `myset::ITEM_SETS` for the item set names.
+    pub count: usize,
+    /// The title the keyboard shows.
+    ///
+    /// A function rather than a string because three of the titles name which
+    /// search this build can run (the item and equipment pickers search names
+    /// when their tables are compiled in and ids when they are not) and the six
+    /// names print the width of their own field.
+    pub title: fn(&Editor, usize) -> String,
+    /// The bytes a one-line field stores. Unused for a name: its width comes
+    /// from [NameTarget::spec], which is the field the writer checks.
+    pub max_bytes: usize,
+    /// What the answer does. The id travels with it because the two bands
+    /// (palico N, item set N) index by `id - first`.
+    pub apply: fn(&mut Editor, usize, &str),
+}
+
+impl TextSentinel {
+    /// Does this row answer `idx`?
+    ///
+    /// The offset is taken by subtraction rather than by adding `count` to
+    /// `first`: [TEXT_NAME] is `usize::MAX`, and `MAX + 1` saturates back to
+    /// `MAX`, which would leave the last id of the table unanswered.
+    pub fn holds(&self, idx: usize) -> bool {
+        match idx.checked_sub(self.first) {
+            Some(off) => off < self.count,
+            None => false,
+        }
+    }
+}
+
+/// The widest a .gmd line may be: the 基本 tab's three paragraphs.
+pub const GMD_TEXT_MAX: usize = 512;
+
+/// The row that answers `idx`, if any.
+///
+/// A .gmd line index (0..Gmd::LABELS.len()) is not a sentinel and answers None:
+/// those rows are the open quest's own strings, and the caller falls back to
+/// [Editor::apply_text].
+pub fn text_sentinel(idx: usize) -> Option<&'static TextSentinel> {
+    TEXT_SENTINELS.iter().find(|e| e.holds(idx))
+}
+
+/// Every text request the editor can make, one row each.
+pub const TEXT_SENTINELS: &[TextSentinel] = &[
+    // ---- the six names -------------------------------------------------
+    TextSentinel {
+        first: TEXT_NAME,
+        count: 1,
+        title: title_name,
+        max_bytes: 0,
+        apply: apply_name_text,
+    },
+    TextSentinel {
+        first: TEXT_PALICO_NAME,
+        count: crate::palico::SLOTS,
+        title: title_name,
+        max_bytes: 0,
+        apply: apply_name_text,
+    },
+    TextSentinel {
+        first: TEXT_ITEM_SET_NAME,
+        count: crate::myset::ITEM_SETS,
+        title: title_name,
+        max_bytes: 0,
+        apply: apply_name_text,
+    },
+    TextSentinel {
+        first: TEXT_SET_NAME,
+        count: 1,
+        title: title_name,
+        max_bytes: 0,
+        apply: apply_name_text,
+    },
+    TextSentinel {
+        first: TEXT_CARD_NAME,
+        count: 1,
+        title: title_name,
+        max_bytes: 0,
+        apply: apply_name_text,
+    },
+    TextSentinel {
+        first: TEXT_GUILD_COMMENT,
+        count: 1,
+        title: title_name,
+        max_bytes: 0,
+        apply: apply_name_text,
+    },
+    // ---- the searches --------------------------------------------------
+    TextSentinel {
+        first: TEXT_ITEM_FILTER,
+        count: 1,
+        title: title_item_filter,
+        max_bytes: 60,
+        apply: apply_item_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_SKILL_FILTER,
+        count: 1,
+        title: title_skill_filter,
+        max_bytes: 60,
+        apply: apply_skill_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_QUEST_FILTER,
+        count: 1,
+        title: title_quest_filter,
+        max_bytes: 60,
+        apply: apply_quest_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_EQUIP_FILTER,
+        count: 1,
+        title: title_equip_filter,
+        max_bytes: 60,
+        apply: apply_equip_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_JEWEL_FILTER,
+        count: 1,
+        title: title_jewel_filter,
+        max_bytes: 60,
+        apply: apply_jewel_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_CHARM_FILTER,
+        count: 1,
+        title: title_charm_filter,
+        max_bytes: 60,
+        apply: apply_charm_filter_text,
+    },
+    // The 報酬 / 支給品 search. It was missing here, which is the finding this
+    // table exists to make impossible: the keyboard was titled 「クエスト文章」
+    // and 決定 wrote nothing at all.
+    TextSentinel {
+        first: TEXT_QUEST_ITEM,
+        count: 1,
+        title: title_quest_item,
+        max_bytes: 60,
+        apply: apply_quest_item_text,
+    },
+    TextSentinel {
+        first: TEXT_ITEM_BOX_FILTER,
+        count: 1,
+        title: title_item_box_filter,
+        max_bytes: 60,
+        apply: apply_item_box_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_EQUIP_PICK_FILTER,
+        count: 1,
+        title: title_equip_pick_filter,
+        max_bytes: 60,
+        apply: apply_equip_pick_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_PROGRESS_FILTER,
+        count: 1,
+        title: title_progress_filter,
+        max_bytes: 60,
+        apply: apply_progress_filter_text,
+    },
+    TextSentinel {
+        first: TEXT_SAVE_MAP_FILTER,
+        count: 1,
+        title: title_save_map_filter,
+        max_bytes: 40,
+        apply: apply_save_map_filter_text,
+    },
+    // ---- the typed numbers ---------------------------------------------
+    TextSentinel {
+        first: TEXT_EQUIP_ID,
+        count: 1,
+        title: title_equip_id,
+        max_bytes: 8,
+        apply: apply_equip_id_text,
+    },
+    TextSentinel {
+        first: TEXT_ARENA_TIME,
+        count: 1,
+        title: title_arena_time,
+        max_bytes: 12,
+        apply: apply_arena_time_text,
+    },
+    TextSentinel {
+        first: TEXT_ITEM_COUNT,
+        count: 1,
+        title: title_item_count,
+        max_bytes: 4,
+        apply: apply_item_count_text,
+    },
+    TextSentinel {
+        first: TEXT_GUILD_HR,
+        count: 1,
+        title: title_guild_hr,
+        max_bytes: 4,
+        apply: apply_guild_hr_text,
+    },
+    TextSentinel {
+        first: TEXT_GUILD_TIME,
+        count: 1,
+        title: title_guild_time,
+        max_bytes: 12,
+        apply: apply_guild_time_text,
+    },
+    TextSentinel {
+        first: TEXT_HUNT_COUNT,
+        count: 1,
+        title: title_hunt_count,
+        max_bytes: 6,
+        apply: apply_hunt_count_text,
+    },
+    TextSentinel {
+        first: TEXT_REWARD_PROB,
+        count: 1,
+        title: title_reward_prob,
+        max_bytes: 4,
+        apply: apply_reward_text,
+    },
+    TextSentinel {
+        first: TEXT_REWARD_COUNT,
+        count: 1,
+        title: title_reward_count,
+        max_bytes: 4,
+        apply: apply_reward_text,
+    },
+    TextSentinel {
+        first: TEXT_GUILD_QUEST_COUNT,
+        count: 1,
+        title: title_guild_quest_count,
+        max_bytes: 6,
+        apply: apply_guild_quest_count_text,
+    },
+    TextSentinel {
+        first: TEXT_GUILD_WEAPON_COUNT,
+        count: 1,
+        title: title_guild_weapon_count,
+        max_bytes: 6,
+        apply: apply_guild_weapon_count_text,
+    },
+    // ---- the one file name ---------------------------------------------
+    TextSentinel {
+        first: TEXT_SAVE_NAME,
+        count: 1,
+        title: title_save_name,
+        max_bytes: 48,
+        apply: apply_convert_name_text,
+    },
+];
+
+// ---- the table's title functions ---------------------------------------
+
+/// A name's title: the field, its width and the line-break key.
+///
+/// The capacity is the bytes the field stores - the same figure the status row
+/// prints - and the line-break key is named in the title as well as in the
+/// footer, because that key is the whole point of the multiline keyboard.
+pub fn name_header(target: NameTarget) -> String {
+    let spec = target.spec();
+    let unit = match spec.unit {
+        crate::save::NameUnit::Utf16 => format!(" = {} 文字", spec.capacity / 2),
+        crate::save::NameUnit::Bytes => String::new(),
+    };
+    match target {
+        NameTarget::Hunter => format!("ハンター名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::Palico(_) => format!("オトモ名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::ItemSet(_) => format!("アイテムセット名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::EquipSet(_) => format!("装備セット名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::CardName => format!("ギルドカード名（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+        NameTarget::CardComment => format!("ギルドカードのコメント（最大 {} バイト{} / 改行は [ZR]）", spec.capacity, unit),
+    }
+}
+
+fn title_name(ed: &Editor, idx: usize) -> String {
+    match ed.text_request_name(idx) {
+        Some(t) => name_header(t),
+        None => String::new(),
+    }
+}
+
+/// Which of the two item searches this build can run.
+///
+/// The names when the table is compiled in, the ids when it is not: the state
+/// machine answers the same question (item_pick_names_available), so the
+/// keyboard title and the list cannot promise different things.
+fn item_search_title(ed: &Editor) -> &'static str {
+    if ed.item_pick_names_available() {
+        "アイテム名で検索（部分一致・英数の大小は無視）"
+    } else {
+        "アイテムIDで検索（名前が読めません 例: 975）"
+    }
+}
+
+fn title_item_filter(ed: &Editor, _idx: usize) -> String {
+    String::from(item_search_title(ed))
+}
+fn title_skill_filter(_ed: &Editor, _idx: usize) -> String {
+    String::from("スキル名で検索")
+}
+fn title_quest_filter(_ed: &Editor, _idx: usize) -> String {
+    String::from("クエストIDかタイトルで検索")
+}
+fn title_equip_filter(_ed: &Editor, _idx: usize) -> String {
+    String::from("装備名か種類で検索")
+}
+fn title_jewel_filter(_ed: &Editor, _idx: usize) -> String {
+    String::from("装飾品名で検索")
+}
+/// A talisman has no name of its own, so the box says what it will match: the
+/// kind the game calls it and both skill names.
+fn title_charm_filter(_ed: &Editor, _idx: usize) -> String {
+    String::from("護石の種類かスキル名で検索")
+}
+/// The 報酬 / 支給品 search: the item name, and an empty answer is the whole
+/// table again.
+fn title_quest_item(_ed: &Editor, _idx: usize) -> String {
+    String::from("報酬・支給品のアイテム名で検索（空にすると解除）")
+}
+fn title_item_box_filter(ed: &Editor, _idx: usize) -> String {
+    String::from(item_search_title(ed))
+}
+/// Which of the two equipment searches this build can run (see
+/// equip_pick_names_available).
+fn title_equip_pick_filter(ed: &Editor, _idx: usize) -> String {
+    if ed.equip_pick_names_available() {
+        String::from("装備名で検索（部分一致 / 種別名でも可）")
+    } else {
+        String::from("装備IDで検索（名前が読めません 16進 例: 28）")
+    }
+}
+/// What the three views can be searched by: the name the row prints (from the
+/// romfs dump or the bundled table) and the row's number.
+fn title_progress_filter(_ed: &Editor, _idx: usize) -> String {
+    String::from("進行状況を名前か番号で検索（空にすると解除）")
+}
+/// The list is about a hundred named stretches and three of them name the same
+/// box for the other two characters; the title says both of the things the
+/// filter matches.
+fn title_save_map_filter(_ed: &Editor, _idx: usize) -> String {
+    String::from("領域名かオフセットで検索（空にすると解除）")
+}
+fn title_equip_id(_ed: &Editor, _idx: usize) -> String {
+    String::from("装備ID（16進 0x28 / 10進 40）")
+}
+/// m:ss.cc is at most "10:55.35" (8 bytes); the keyboard still allows the raw
+/// hundredths form the parser accepts.
+fn title_arena_time(_ed: &Editor, _idx: usize) -> String {
+    String::from("闘技大会のタイム (m:ss.cc 例 9:35.44 / 0:00.00 で消去)")
+}
+fn title_item_count(_ed: &Editor, _idx: usize) -> String {
+    String::from("アイテムの個数 (0〜99)")
+}
+fn title_guild_hr(_ed: &Editor, _idx: usize) -> String {
+    String::from("ハンターランク (0〜999)")
+}
+fn title_guild_time(_ed: &Editor, _idx: usize) -> String {
+    String::from("プレイ時間 (H:MM または秒)")
+}
+fn title_hunt_count(_ed: &Editor, _idx: usize) -> String {
+    String::from("狩猟数 (0〜9999) / サイズ % (0〜300)")
+}
+fn title_reward_prob(_ed: &Editor, _idx: usize) -> String {
+    String::from("報酬の確率 % (0〜100)")
+}
+fn title_reward_count(_ed: &Editor, _idx: usize) -> String {
+    String::from("報酬の個数 (0〜99)")
+}
+/// Seven u16 counters: at most five digits, and the parser clamps to 65,535 so
+/// a sixth digit cannot wrap the field.
+fn title_guild_quest_count(_ed: &Editor, _idx: usize) -> String {
+    String::from("クエスト回数 (0〜65535)")
+}
+/// Three venues of fifteen u16 each; the same ceiling.
+fn title_guild_weapon_count(_ed: &Editor, _idx: usize) -> String {
+    String::from("武器使用数 (0〜65535)")
+}
+fn title_save_name(_ed: &Editor, _idx: usize) -> String {
+    String::from("書き出すファイル名（拡張子は自動）")
+}
+
+// ---- the table's apply functions ---------------------------------------
+//
+// Each one is the editor method the console used to call by hand. The name
+// rows share one writer, which is also the one place a refused name is
+// reported.
+
+fn apply_name_text(ed: &mut Editor, idx: usize, text: &str) {
+    let Some(target) = ed.text_request_name(idx) else {
+        return;
+    };
+    if let Err(e) = ed.apply_name_target(target, text) {
+        ed.message = name_refusal_line(e);
+    }
+}
+fn apply_item_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_item_filter(String::from(text));
+}
+fn apply_skill_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_skill_filter(String::from(text));
+}
+fn apply_quest_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_quest_filter(String::from(text));
+}
+fn apply_equip_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_equip_filter(String::from(text));
+}
+fn apply_jewel_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_jewel_filter(String::from(text));
+}
+fn apply_charm_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_charm_filter(String::from(text));
+}
+fn apply_quest_item_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_quest_item_filter(String::from(text));
+}
+fn apply_item_box_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_item_box_filter(String::from(text));
+}
+fn apply_equip_pick_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_equip_pick_filter(String::from(text));
+}
+fn apply_progress_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_progress_filter(String::from(text));
+}
+fn apply_save_map_filter_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_save_map_filter(String::from(text));
+}
+fn apply_equip_id_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_equip_id_text(text);
+}
+fn apply_arena_time_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_arena_time(text);
+}
+fn apply_item_count_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_item_count_text(text);
+}
+fn apply_guild_hr_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_guild_hr_text(text);
+}
+fn apply_guild_time_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_guild_time_text(text);
+}
+fn apply_hunt_count_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_hunt_count_text(text);
+}
+/// 報酬's two numbers: the row's own field says which one is written.
+fn apply_reward_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_reward_text(text);
+}
+fn apply_guild_quest_count_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_guild_quest_count_text(text);
+}
+fn apply_guild_weapon_count_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_guild_weapon_count_text(text);
+}
+fn apply_convert_name_text(ed: &mut Editor, _idx: usize, text: &str) {
+    ed.apply_convert_name(String::from(text));
+}
 
 // ---------------------------------------------------------------------------
 // Names: the six fields the screens edit, and what a text field accepts
@@ -3807,14 +4336,18 @@ fn clamp_u16(value: u16, step: i64) -> u16 {
     v.clamp(0, u16::MAX as i64) as u16
 }
 
-/// Step the equipment type through 1..=21, the range a record can hold.
+/// Step the equipment type through the kinds the 装備BOX screen lists.
 ///
-/// 12 is deliberately unused by the game (see `equip::type_name`), and it is
-/// still one of the reachable values: the field is five bits wide and an
-/// editor that silently skipped a number would be lying about the field.
+/// [crate::equip::BOX_KINDS] is the table, so the arrow keys cannot reach a
+/// kind the list would not show - which is what let the form create a talisman
+/// (kind 6) that equip_rows then hid. The unused 12 is not in that table
+/// either: the field is five bits wide, but the box screen is not the place to
+/// write a number no list names.
 fn cycle_equip_kind(kind: u8, d: i64) -> u8 {
-    let cur = if (1..=21).contains(&kind) { kind as i64 } else { 1 };
-    ((cur - 1 + d).rem_euclid(21) + 1) as u8
+    let kinds = &crate::equip::BOX_KINDS;
+    let pos = kinds.iter().position(|k| *k == kind).unwrap_or(0) as i64;
+    let n = kinds.len() as i64;
+    kinds[((pos + d).rem_euclid(n)) as usize]
 }
 
 /// Step a five bit level field, which is stored minus one: 1..=32 wraps.
@@ -5739,6 +6272,16 @@ pub struct Editor {
     pub charm_cursor: usize,
     /// The charm being edited, if the editor form is open.
     pub charm_edit: Option<CharmEdit>,
+    /// Which of the two talisman screens the section bar should light: 0
+    /// 護石一覧, 1 護石編集.
+    ///
+    /// A tab rather than a screen, because the two are not the same question:
+    /// pressing 護石編集 on an empty box leaves the list on screen (there is no
+    /// record to open) and the bar must still light the tab that was pressed -
+    /// the rule the quest bar follows with quest_bar_tab. The state machine owns
+    /// it because it is the one that knows the form could not open, and it is
+    /// put back to 0 wherever the form closes (every `charm_edit = None`).
+    pub charm_tab: usize,
     /// Cached quest titles: (quest id, title). Decoded once when the list
     /// opens, because inflating a .gmd for every visible row each frame is
     /// far too slow on the console.
@@ -5896,7 +6439,14 @@ pub struct Editor {
     ///
     /// The same two numbers a reward row carries, the same [-] switch the
     /// .rem screen has: 個数 and 確率.
-    pub quest_edit_chance: bool,
+    /// Which of the 報酬 tab's three stops [◀/▶] is on: 0 個数, 1 確率%,
+    /// 2 検索.
+    ///
+    /// Three stops, not a bool: the key used to walk 個数 → 確率% and then open
+    /// the keyboard on the next press, so the third press of [ZR] opened a
+    /// keyboard instead of coming back to 個数 - the cycle could not be walked
+    /// at all, and the search was a key nobody could press twice.
+    pub quest_reward_field: usize,
     /// Award names from the user's own romfs, 132 entries, or empty.
     ///
     /// The dump's own text wins over the bundled table ([crate::idmemo]): a
@@ -6082,6 +6632,18 @@ pub struct Editor {
     pub item_set_warnings: Vec<String>,
     /// Cursor inside the save's own quest list.
     pub save_quest_cursor: usize,
+    /// Which of the quest section's list tabs is showing: 0 セーブ内, 1 公式,
+    /// 2 没クエ.
+    ///
+    /// The tab lives here rather than in the console because two answers depend
+    /// on it and both were wrong while the console kept it: the guide under the
+    /// bar promised the save list's [-]-delete on the two bundle tabs (which
+    /// refuse it), and the extract button read the save's cursor on all three
+    /// tabs - so it wrote a quest the list was not showing.
+    pub quest_tab: usize,
+    /// Cursor inside each of the three list tabs. Tab 0's is
+    /// [Editor::save_quest_cursor]; the two bundle tabs keep their own here.
+    pub quest_cat_cursor: [usize; 3],
     /// Cursor inside the download Palico catalogue.
     pub palico_cursor: usize,
     /// 0 = Japanese, 1 = English.
@@ -6246,6 +6808,7 @@ impl Editor {
             findings: Vec::new(),
             charm_cursor: 0,
             charm_edit: None,
+            charm_tab: 0,
             quest_titles: Vec::new(),
             item_undo: Vec::new(),
             skill_pick_field: 1,
@@ -6277,7 +6840,7 @@ impl Editor {
             quest_edit_cursor: 0,
             quest_edit_field: 0,
             quest_item_filter: String::new(),
-            quest_edit_chance: false,
+            quest_reward_field: QUEST_REWARD_COUNT,
             romfs_awards: Vec::new(),
             romfs_requests: Vec::new(),
             romfs_records: Vec::new(),
@@ -6336,6 +6899,8 @@ impl Editor {
             item_set_armed: None,
             item_set_warnings: Vec::new(),
             save_quest_cursor: 0,
+            quest_tab: 0,
+            quest_cat_cursor: [0; 3],
             palico_cursor: 0,
             palico_lang: 0,
             palico_equip: None,
@@ -6427,6 +6992,54 @@ impl Editor {
                 self.dirty = true;
                 self.message = String::from("テキストを更新しました（X で .arc に書き込み）");
             }
+        }
+    }
+
+    /// The title the keyboard shows for a text request.
+    ///
+    /// The sentinel table's own row answers it; an id that is not a sentinel is
+    /// a .gmd line of the open quest, and its title is the line's label. This
+    /// is the one place the console asks, so a request that reaches the keyboard
+    /// always has a title and the table cannot fall behind the queue.
+    pub fn text_request_title(&self, idx: usize) -> String {
+        match text_sentinel(idx) {
+            Some(e) => (e.title)(self, idx),
+            None => alloc::string::ToString::to_string(
+                crate::quest::Gmd::LABELS
+                    .get(idx)
+                    .copied()
+                    .unwrap_or("クエスト文章"),
+            ),
+        }
+    }
+
+    /// The field a text request types into: its width and whether it holds a
+    /// line break.
+    ///
+    /// A name answers from [NameTarget::spec] (the field the writer checks); a
+    /// sentinel answers its own one-line width; a .gmd line is a paragraph, so
+    /// it is multiline and takes the built-in keyboard - the game draws its
+    /// U+000A as a line break, and the system keyboard is single line.
+    pub fn text_request_spec(&self, idx: usize) -> NameSpec {
+        if let Some(target) = self.text_request_name(idx) {
+            return target.spec();
+        }
+        match text_sentinel(idx) {
+            Some(e) => NameSpec::singleline(e.max_bytes),
+            None => NameSpec::name(GMD_TEXT_MAX, crate::save::NameUnit::Bytes),
+        }
+    }
+
+    /// Apply one answer from the keyboard to the request it belongs to.
+    ///
+    /// The table's row runs it; an id that is not a sentinel is a .gmd line and
+    /// goes through [Editor::apply_text]. Every request therefore has exactly
+    /// one writer, and a sentinel added to the table cannot be answered by
+    /// nothing.
+    pub fn apply_text_request(&mut self, idx: usize, text: &str) {
+        match text_sentinel(idx) {
+            Some(e) => (e.apply)(self, idx, text),
+            None => self.apply_text(idx, alloc::string::ToString::to_string(text)),
         }
     }
 
@@ -6855,6 +7468,7 @@ impl Editor {
         match self.screen {
             Screen::CharmEdit => {
                 self.charm_edit = None;
+                self.charm_tab = 0;
                 self.screen = Screen::Charms;
                 closed = true;
             }
@@ -6865,6 +7479,7 @@ impl Editor {
             }
             Screen::SkillPick => {
                 self.charm_edit = None;
+                self.charm_tab = 0;
                 self.screen = Screen::Charms;
                 closed = true;
             }
@@ -6884,6 +7499,7 @@ impl Editor {
             closed = true;
         }
         self.charm_edit = None;
+        self.charm_tab = 0;
         self.equip_edit = None;
         self.set_edit = None;
         self.set_clear_armed = None;
@@ -7274,9 +7890,11 @@ impl Editor {
                     "[▲/▼] 行  [◀/▶] 値  [ZR] 項目  [A] 選択  [Y] 刻み  [R長押し] ファイル"
                 } else {
                     // The two item tabs: [ZR] walks 個数 / 確率% / 検索 on 報酬
-                    // and opens the search on 支給品. [-] is the delete key and
+                    // (and opens the search on 支給品, which has one value), and
+                    // the search itself is [R] - the cycle no longer opens a
+                    // keyboard on the user's behalf. [-] is the delete key and
                     // nothing else, so it could not take the search.
-                    "[◀/▶] 値  [ZR] 項目/検索  [A] 選択  [Y] 刻み  [R長押し] ファイル"
+                    "[◀/▶] 値  [ZR] 項目  [R] 検索  [A] 選択  [Y] 刻み  [R長押し] ファイル"
                 }
             }
             // Conversion is the one screen whose keys are not the usual set:
@@ -7466,6 +8084,10 @@ impl Editor {
             // and the 詳細 row's [A], which is what gave the key back.
             Screen::QuestEdit => (&STEPS[..], "Y"),
             Screen::Items | Screen::Guild | Screen::Options => (&STEPS[..], ""),
+            // 護石編集 / 装備編集: [Y] opens the picker on the rows that have
+            // one (スキル / 装飾品 / 種別 / ID), so the pills name no key at
+            // all - the same honest answer the item box and the card give.
+            Screen::CharmEdit | Screen::EquipEdit => (&STEPS[..], ""),
             _ => (&STEPS[..], "Y"),
         }
     }
@@ -7684,7 +8306,7 @@ impl Editor {
             .quest_edit_cursor
             .min(self.quest_row_count().saturating_sub(1));
         self.quest_edit_field = self.quest_edit_field.min(QUEST_MON_FIELDS - 1);
-        self.quest_edit_chance = false;
+        self.quest_reward_field = QUEST_REWARD_COUNT;
         let heading = self.quest_heading();
         self.message = format!(
             "クエスト改造 — {}（[ファイル] ピル / [R長押し] でファイル単位の画面へ）",
@@ -8229,6 +8851,15 @@ impl Editor {
         }
     }
 
+    /// Is the 報酬 tab stepping the chance column rather than the count?
+    ///
+    /// The two stops that hold a number are 個数 and 確率%; the third (検索)
+    /// holds none, so [◀/▶] there says what the stop is for instead of writing
+    /// a number (see [Editor::quest_adjust]).
+    pub fn quest_edit_chance(&self) -> bool {
+        self.quest_reward_field == QUEST_REWARD_CHANCE
+    }
+
     /// Which of the eleven monster values [◀/▶] is on.
     pub fn quest_field_label(&self) -> &'static str {
         QUEST_MON_LABELS
@@ -8245,18 +8876,20 @@ impl Editor {
                 let label = self.quest_field_label();
                 self.message = format!("[◀/▶] で変更する項目: {}", label);
             }
-            // 個数 → 確率% → 検索. The third stop is the item-name search: the
-            // key is the screen's own value switch, and [-] could not take the
-            // search because it is the delete key everywhere (and audited to be
-            // nothing else).
+            // 個数 → 確率% → 検索 → 個数, and the keyboard opens on none of
+            // the three: a value switch that opens a keyboard every other press
+            // cannot be used to walk the values, and it left no way back to
+            // 個数 (the review's finding). The search itself is the 検索 pill
+            // (touch) and [R] here - the two explicit presses.
             QUEST_TAB_REWARDS => {
-                if self.quest_edit_chance {
-                    self.quest_edit_chance = false;
-                    self.request_quest_item_filter();
-                    return;
-                }
-                self.quest_edit_chance = true;
-                self.message = String::from("[◀/▶] で変更する項目: 確率%");
+                self.quest_reward_field = (self.quest_reward_field + 1) % QUEST_REWARD_FIELDS;
+                self.message = match self.quest_reward_field {
+                    QUEST_REWARD_CHANCE => String::from("[◀/▶] で変更する項目: 確率%"),
+                    QUEST_REWARD_SEARCH => String::from(
+                        "検索は [R] か右の [検索] ボタン（[ZR] でもう一度押すと 個数 に戻ります）",
+                    ),
+                    _ => String::from("[◀/▶] で変更する項目: 個数"),
+                };
             }
             // 支給品 has one value and nothing to switch, so the key is the
             // search itself here.
@@ -8327,6 +8960,15 @@ impl Editor {
                 }
             }
             QUEST_TAB_REWARDS => {
+                // The third stop is the search: it holds no number, so the
+                // arrows say what it is for rather than stepping a value the
+                // user cannot see they are on.
+                if self.quest_reward_field == QUEST_REWARD_SEARCH {
+                    self.message = String::from(
+                        "検索の段では [◀/▶] は値を変えません（[ZR] で 個数 に戻ります / [R] で検索）",
+                    );
+                    return false;
+                }
                 let rows = self.quest_rewards();
                 if rows.is_empty() {
                     self.message = String::from("このクエストに報酬テーブルがありません");
@@ -8336,7 +8978,7 @@ impl Editor {
                 let row = &rows[cur];
                 let entry = row.entry;
                 let index = row.row;
-                let chance = self.quest_edit_chance;
+                let chance = self.quest_edit_chance();
                 let cur_val = if chance { row.chance as i64 } else { row.count as i64 };
                 self.entry = entry;
                 self.entry_row_cursor = index;
@@ -8487,6 +9129,11 @@ impl Editor {
             // [ZR] switches which value [◀/▶] steps. [-] is the delete key and
             // a quest has nothing to delete, so the two must not share it.
             Key::Z => self.quest_cycle_field(),
+            // [R] is the item search on the two item tabs: the explicit press
+            // [ZR]'s cycle no longer makes on the user's behalf (it used to
+            // open the keyboard every other press). The other two tabs have
+            // nothing to search and the request says so.
+            Key::R => self.request_quest_item_filter(),
 
             Key::X => {
                 self.flush_quest_edit();
@@ -9170,9 +9817,16 @@ impl Editor {
     pub fn equip_filter_heading(&self) -> String {
         let needle = self.equip_filter.trim();
         if needle.is_empty() {
-            String::from("装備BOX")
+            // The one thing the heading has to say about the list itself: a
+            // talisman lives in the same box and is not a row here, and a user
+            // who went looking for one in this list had nothing on screen
+            // telling them where it went.
+            String::from("装備BOX（護石は護石一覧）")
         } else {
-            format!("装備BOX（検索: {}）[Y] で変更・空で解除", needle)
+            format!(
+                "装備BOX（検索: {}）[Y] で変更・空で解除／護石は護石一覧",
+                needle
+            )
         }
     }
 
@@ -9332,12 +9986,16 @@ impl Editor {
         self.set_guild_view(next);
     }
 
-    /// Ask the I/O layer to write the highlighted save quest out as a file.
+    /// Ask the I/O layer to write the highlighted quest out as a file.
+    ///
+    /// The row comes from the list tab that is showing ([Editor::quest_tab]),
+    /// not from the save's list: the button used to read `save_quest_cursor` on
+    /// all three tabs, so on 公式 / 没クエ it wrote whichever quest of the *save*
+    /// happened to sit on that row - a file for a quest the list was not
+    /// showing, and nothing at all when the save's list was short.
     pub fn request_extract_selected_quest(&mut self) {
-        let list = self.filtered_quests();
-        match list.get(self.save_quest_cursor) {
-            Some(q) => {
-                let qid = q.quest_id;
+        match self.quest_list_selected_id() {
+            Some(qid) => {
                 self.pending_request = Some(Request::ExtractQuests { ids: alloc::vec![qid] });
             }
             None => self.message = String::from("書き出すクエストがありません"),
@@ -9355,7 +10013,19 @@ impl Editor {
     }
 
     /// One press of [-] on the save's quest list: the two-press delete.
+    ///
+    /// The two catalogue tabs have nothing to delete - their rows are the
+    /// bundle, not the save - so the key says so instead of deleting a row of a
+    /// list that is not on screen. The guide under the bar says the same thing
+    /// ([Editor::screen_guide]).
     pub fn save_quest_delete_press(&mut self) {
+        if self.quest_tab != 0 {
+            self.save_quest_armed = None;
+            self.message = String::from(
+                "[-] 削除はこの一覧では使いません（「セーブ内」タブで削除、[A] で導入/解除）",
+            );
+            return;
+        }
         let list = self.filtered_quests();
         let Some(q) = list.get(self.save_quest_cursor) else {
             self.save_quest_armed = None;
@@ -10715,6 +11385,7 @@ impl Editor {
     pub fn open_charms(&mut self) {
         self.charm_cursor = 0;
         self.charm_edit = None;
+        self.charm_tab = 0;
         self.charm_delete_armed = None;
         self.screen = Screen::Charms;
         self.cursor = 0;
@@ -10801,6 +11472,7 @@ impl Editor {
         self.cursor = 0;
         self.charm_delete_armed = None;
         self.charm_edit = None;
+        self.charm_tab = 0;
         self.message = if cleared {
             String::from("検索を解除しました（全件表示）")
         } else {
@@ -10820,6 +11492,9 @@ impl Editor {
     /// tab opens the *form* now, on the record the list was on, and says so
     /// when there is nothing to open.
     pub fn open_charm_form_selected(&mut self) {
+        // The tab is lit before the list is asked: a press that finds nothing to
+        // open is still the press (see [Editor::charm_tab]).
+        self.charm_tab = 1;
         let list = self.charms();
         if list.is_empty() {
             // The two empty states need different words, the same rule the
@@ -10942,6 +11617,7 @@ impl Editor {
             // reach than to pass through on every visit.
             field: 3,
         });
+        self.charm_tab = 1;
         self.screen = Screen::CharmEdit;
         self.cursor = 0;
     }
@@ -11114,9 +11790,20 @@ impl Editor {
                         let max = e.grade.max_slots() as i64;
                         e.slots = ((e.slots as i64 + d).rem_euclid(max + 1)) as u8;
                     }
-                    3 => e.skill1 = ((e.skill1 as i64 + d).rem_euclid(256)) as u8,
+                    // The two skill rows walk the same table the picker lists
+                    // ([crate::charm::allowed_skill_ids]) instead of the raw
+                    // 0..=255: a skill the list refuses is a skill the game
+                    // never puts on this kind of talisman, and stepping onto
+                    // one wrote a record no other screen would offer.
+                    3 => {
+                        let ids = crate::charm::allowed_skill_ids(e.kind, false);
+                        e.skill1 = step_skill_id(&ids, e.skill1, d);
+                    }
                     4 => e.points1 = (e.points1 as i64 + d).clamp(-127, 127) as i8,
-                    5 => e.skill2 = ((e.skill2 as i64 + d).rem_euclid(256)) as u8,
+                    5 => {
+                        let ids = crate::charm::allowed_skill_ids(e.kind, true);
+                        e.skill2 = step_skill_id(&ids, e.skill2, d);
+                    }
                     6 => e.points2 = (e.points2 as i64 + d).clamp(-127, 127) as i8,
                     // The three decoration sockets: the same table the
                     // equipment form steps, so a socket never takes an id the
@@ -11208,9 +11895,19 @@ impl Editor {
                 if self.form_discard_press(self.charm_draft_dirty(), "護石編集") {
                     return;
                 }
+                // Back to the row the form was opened on, not the top: the
+                // equipment form has always left its list where it was, and
+                // editing the fortieth talisman cost forty presses to find
+                // again after one [B].
+                let index = e.index;
                 self.charm_edit = None;
+                self.charm_tab = 0;
                 self.screen = Screen::Charms;
-                self.cursor = 0;
+                self.cursor = self
+                    .charms()
+                    .iter()
+                    .position(|c| c.index == index)
+                    .unwrap_or(0);
                 return;
             }
             Key::Plus => {
@@ -11241,6 +11938,7 @@ impl Editor {
         // editing the fortieth talisman left the cursor on the first one and
         // the next visit cost forty presses.
         self.charm_edit = None;
+        self.charm_tab = 0;
         self.screen = Screen::Charms;
         self.cursor = written
             .and_then(|index| self.charms().iter().position(|c| c.index == index))
@@ -12062,6 +12760,7 @@ impl Editor {
         // replaced, so it is put away with the other forms.
         self.arena_edit = false;
         self.charm_edit = None;
+        self.charm_tab = 0;
         self.equip_edit = None;
         self.equip_delete_armed = None;
         self.set_edit = None;
@@ -13792,7 +14491,7 @@ impl Editor {
     pub fn equip_rows(&self) -> Vec<crate::equip::Equipment> {
         self.equipment()
             .into_iter()
-            .filter(|e| e.kind != crate::equip::TALISMAN_KIND)
+            .filter(|e| crate::equip::box_holds_kind(e.kind))
             .collect()
     }
 
@@ -15719,6 +16418,12 @@ impl Editor {
             // says so rather than leaving an empty list unexplained.
             Screen::SaveQuests if !Self::bundled_quests_available() => {
                 "DLC バンドル未生成: 公式・没クエは 0 件です（セーブ内は [A] で改造）。"
+            }
+            // The two catalogue tabs have nothing to delete: their rows are the
+            // bundle, not the save, and [-] there only ever answered with a
+            // refusal. The guide promised the delete on all three tabs.
+            Screen::SaveQuests if self.quest_tab != 0 => {
+                "クエストを選んで [A] で導入/解除（解除は2回）。[-] 削除はこの一覧では使いません。[L/R] で一覧切替。"
             }
             Screen::SaveQuests => {
                 "クエストを選んで [A] で改造、[-] で削除（2回）。書き出しは右のボタン。[L/R] で一覧切替。"
@@ -18217,9 +18922,10 @@ impl Editor {
                 }
                 // A talisman is not a row of this form: the 装備枠 row walks the
                 // same list the screen lists (equip_rows), or ◀ / ▶ would step
-                // onto a record the form has no fields for.
+                // onto a record the form has no fields for. One table answers
+                // both, so the two lists cannot disagree.
                 crate::equip::decode_record(*i, rec)
-                    .map(|eq| eq.kind != crate::equip::TALISMAN_KIND)
+                    .map(|eq| crate::equip::box_holds_kind(eq.kind))
                     .unwrap_or(false)
             })
             .collect()
@@ -18384,8 +19090,19 @@ impl Editor {
                     }
                     return;
                 } else if e.new {
-                    self.message =
-                        String::from("装飾品は作成後に選べます（[A] で作成してから編集）");
+                    // The new form has three rows and none of them has a list
+                    // behind it except 種別 / ID (answered above). The line
+                    // used to talk about 装飾品 - a row this form does not
+                    // have - so it said nothing about the row the cursor was
+                    // on. Say what that row does instead.
+                    self.message = match e.field {
+                        2 => String::from(
+                            "レベルは [◀/▶] で増減します（[Y] の一覧はありません / [A] でこの内容を作成）",
+                        ),
+                        _ => String::from(
+                            "この行に一覧はありません（種別・ID の行で [A] を押してください）",
+                        ),
+                    };
                 } else {
                     self.message = String::from(
                         "装備名は 種別・ID の行で [A] / 装飾品は装飾品の行で [A] を押してください",
@@ -18754,7 +19471,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
     /// The same table the form cycles ([crate::equip::HUNTER_KINDS]): one list
     /// of names, so the row, the picker and the box cannot disagree.
     pub fn equip_kind_choices() -> Vec<(u32, alloc::string::String)> {
-        crate::equip::HUNTER_KINDS
+        crate::equip::BOX_KINDS
             .iter()
             .map(|k| {
                 (
@@ -18774,23 +19491,28 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             self.message = String::from("装備の編集中に開いてください");
             return false;
         };
-        if !crate::equip::is_hunter_kind(kind) {
-            self.message = alloc::format!("種別 {} はハンターの箱に入りません", kind);
+        if !crate::equip::box_holds_kind(kind) {
+            // A talisman has a screen of its own, and the box's list would not
+            // show a record created here: say where it belongs instead of
+            // writing one that vanishes.
+            self.message = alloc::format!(
+                "{} は装備BOXの一覧に出ません（護石は護石一覧で作ります）",
+                crate::equip::type_name(kind)
+            );
             return false;
         }
         e.kind = kind;
-        // The row's own [A] writes, so the cursor goes to the row that writes -
-        // the same rule a pick from the item list follows.
-        e.field = e.write_row();
+        // The kind is one half of what names the record; the id is the other,
+        // and an id means a different item under every type (40 is 爆砕の大剣 as
+        // a 大剣 and something else as a 太刀). The cursor therefore stays on
+        // the ID row rather than jumping to the row whose [A] writes: it used
+        // to land on レベル, so the next [A] created a record with the id the
+        // form happened to hold (1) instead of asking which item was meant.
+        e.field = e.id_row();
         self.equip_edit = Some(e);
         self.message = alloc::format!(
-            "種別を {} にしました（[A] で{}）",
-            crate::equip::type_name(kind),
-            if self.equip_edit.map(|x| x.new).unwrap_or(false) {
-                "作成"
-            } else {
-                "書き込み"
-            }
+            "種別を {} にしました（[A] で ID を選ぶ / [R] で入力）",
+            crate::equip::type_name(kind)
         );
         true
     }
@@ -19000,7 +19722,9 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             self.message = String::from("先にセーブを開いてください");
             return;
         };
-        match equipops::create(save, slot, e.kind, e.id, e.level) {
+        // Through the box's own create: a kind the list does not show is
+        // refused here rather than written and hidden (equipops::create_in_box).
+        match equipops::create_in_box(save, slot, e.kind, e.id, e.level) {
             Ok(index) => {
                 self.dirty = true;
                 self.equip_delete_armed = None;
@@ -19542,15 +20266,123 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             .collect()
     }
 
+    // -------------------------------------------------------------------
+    // The quest section's three list tabs
+    // -------------------------------------------------------------------
+    //
+    // One tab, one list, one cursor, and one answer to "which quest is
+    // selected". The tab and the two bundle cursors used to live in the
+    // console, so the guide under the bar and the extract button each answered
+    // the question themselves - and both answered it for the save's list
+    // whatever tab was on screen.
+
+    /// The bundled quests one of the catalogue tabs lists, in list order.
+    ///
+    /// Tab 1 is the 189 official event quests and tab 2 the 40 没クエスト; the
+    /// same two tables the console draws, so the row the user sees and the row
+    /// this returns are the same row.
+    pub fn bundled_quests_for(
+        &self,
+        tab: usize,
+    ) -> Vec<&'static crate::dlc_bundle::OfficialQuestMeta> {
+        use crate::dlc_bundle::{DlcQuestCategory, OFFICIAL_QUESTS};
+        let needle = self.quest_filter.trim().to_lowercase();
+        let want = if tab == 2 {
+            DlcQuestCategory::Dead
+        } else {
+            DlcQuestCategory::Official
+        };
+        OFFICIAL_QUESTS
+            .iter()
+            .filter(|q| q.category == want)
+            .filter(|q| {
+                if needle.is_empty() {
+                    return true;
+                }
+                format!("{}", q.quest_id).contains(&needle)
+                    || q.title.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+
+    /// Show one of the three list tabs (0 セーブ内, 1 公式, 2 没クエ).
+    pub fn set_quest_tab(&mut self, tab: usize) {
+        self.quest_tab = tab.min(2);
+        self.save_quest_armed = None;
+    }
+
+    /// How many rows the list tab on screen holds.
+    pub fn quest_list_len(&self) -> usize {
+        if self.quest_tab == 0 {
+            self.filtered_quests().len()
+        } else {
+            self.bundled_quests_for(self.quest_tab).len()
+        }
+    }
+
+    /// The row the list tab on screen has selected.
+    pub fn quest_list_cursor(&self) -> usize {
+        if self.quest_tab == 0 {
+            self.save_quest_cursor
+        } else {
+            self.quest_cat_cursor[self.quest_tab]
+        }
+    }
+
+    /// Select one row of the list tab on screen, clamped to its length.
+    pub fn set_quest_list_cursor(&mut self, row: usize) {
+        let n = self.quest_list_len();
+        let row = row.min(n.saturating_sub(1));
+        if self.quest_tab == 0 {
+            self.save_quest_cursor = row;
+            self.cursor = row;
+        } else {
+            self.quest_cat_cursor[self.quest_tab] = row;
+        }
+    }
+
+    /// Move the list tab on screen by one row, wrapping.
+    pub fn quest_list_move(&mut self, delta: i32) {
+        let n = self.quest_list_len();
+        if n == 0 {
+            self.set_quest_list_cursor(0);
+            return;
+        }
+        let cur = self.quest_list_cursor() as i64;
+        let next = (cur + delta as i64).rem_euclid(n as i64) as usize;
+        self.set_quest_list_cursor(next);
+    }
+
+    /// The quest id the list tab on screen has selected.
+    ///
+    /// The one answer the extract button and the delete key read, so neither
+    /// can write or remove a quest the list is not showing.
+    pub fn quest_list_selected_id(&self) -> Option<i32> {
+        let cur = self.quest_list_cursor();
+        if self.quest_tab == 0 {
+            self.filtered_quests().get(cur).map(|q| q.quest_id)
+        } else {
+            self.bundled_quests_for(self.quest_tab)
+                .get(cur)
+                .map(|q| q.quest_id)
+        }
+    }
+
     /// The io layer answers a save-name request with this.
     pub fn apply_convert_name(&mut self, text: String) {
         self.convert_name = text;
     }
 
     /// The io layer answers a quest filter request with this.
+    ///
+    /// Every one of the three lists is narrowed by the same word, so all three
+    /// cursors go back to the top: a cursor left pointing at row 40 of a list
+    /// that now holds two rows is a row nobody selected.
     pub fn apply_quest_filter(&mut self, text: String) {
         self.quest_filter = text;
         self.save_quest_cursor = 0;
+        self.quest_cat_cursor = [0; 3];
+        self.save_quest_armed = None;
     }
 
     /// The io layer answers an equipment filter request with this.
@@ -19782,26 +20614,39 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
 
     fn input_save_quests(&mut self, key: Key) {
         let list = self.filtered_quests();
-        let n = list.len();
         // One delete key, two presses, and the offer belongs to the row it was
         // made on: anything but the confirmation drops it first.
         if key != Key::Minus {
             self.save_quest_armed = None;
         }
         match key {
-            Key::Up => {
-                self.save_quest_cursor = (self.save_quest_cursor + n.saturating_sub(1)) % n.max(1);
-                self.cursor = self.save_quest_cursor;
-            }
-            Key::Down => {
-                self.save_quest_cursor = (self.save_quest_cursor + 1) % n.max(1);
-                self.cursor = self.save_quest_cursor;
-            }
+            // One rule for the three lists: the tab on screen owns the cursor
+            // (Editor::quest_list_move), so a row cannot be selected in a list
+            // that is not showing.
+            Key::Up => self.quest_list_move(-1),
+            Key::Down => self.quest_list_move(1),
             // A opens the highlighted quest. It used to install all 189
             // bundled official quests when the list happened to be empty: a
             // press that wrote 189 records with nothing on screen to say so.
             // The bulk install lives on its own button now, and an empty list
             // says where that button is.
+            Key::A if self.quest_tab != 0 => {
+                // The two catalogue tabs install and release their own rows;
+                // the console runs that through UiAction::ToggleBundledQuest,
+                // and this is the same answer for a caller that presses the key
+                // on the state machine directly.
+                match self.quest_list_selected_id() {
+                    // The same two-press rule the deck's button follows: 導入
+                    // runs at once, 解除 asks (Editor::bundled_quest_press).
+                    Some(id) => {
+                        self.bundled_quest_press(id);
+                    }
+                    None => {
+                        self.save_quest_armed = None;
+                        self.message = String::from("クエストを選んでください");
+                    }
+                }
+            }
             Key::A => match list.get(self.save_quest_cursor) {
                 Some(q) => {
                     let id = q.quest_id;
@@ -19819,10 +20664,18 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             // extract that used to sit here moved to its own button
             // (Editor::request_extract_selected_quest).
             Key::Minus => self.save_quest_delete_press(),
-            // [R] writes every quest of the save out to the card. The console
-            // cannot send it - [R] is the sub-tab there - so the deck has a
-            // button that calls the same method.
-            Key::R => self.request_extract_all_quests(),
+            // [R] writes quests out to the card: the whole save's list on the
+            // セーブ内 tab, the highlighted row on the two catalogue tabs (whose
+            // rows are the bundle, so "all of them" would be 229 files nobody
+            // asked for). The console cannot send this key - [R] is the sub-tab
+            // there - so the deck has buttons that call the same two methods.
+            Key::R => {
+                if self.quest_tab == 0 {
+                    self.request_extract_all_quests();
+                } else {
+                    self.request_extract_selected_quest();
+                }
+            }
             // 175 quests at 16 rows a page needs a filter.
             Key::Y => {
                 self.pending_text = Some((TEXT_QUEST_FILTER, self.quest_filter.clone()));
@@ -22985,101 +23838,27 @@ impl KeyRepeat {
     }
 }
 
-/// A shoulder button's press, resolved on the frame the key goes down.
-///
-/// `L` / `R` used to be answered on the release, because a tap had to be told
-/// from a hold before either meaning could run: the sub-tab therefore arrived
-/// after the finger came up, and two quick presses felt one press behind. The
-/// tab is answered on the press now - `press()` says so - and the hold keeps
-/// its second job (`tick()`: L offers the whole-save undo, R offers 詳細).
-///
-/// A hold never takes the tab move back: the tab has already been drawn, and
-/// undoing it on the way to the undo would be a second, invisible answer to the
-/// same press. The two meanings are ordered, not cancelled:
-///
-///   * frame 1: `press()` -> true -> the sub-tab moves
-///   * frame 60: `tick()` -> Arm -> the screen says what a second hold runs
-///   * second hold: `tick()` -> Run -> the undo (or 詳細) runs
-///
-/// The state machine lives here so the ordering can be tested without a
-/// console (see `the_shoulder_moves_its_tab_on_the_press_not_the_release`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ShoulderPress {
-    down: bool,
-    hold: HoldConfirm,
-}
-
-impl ShoulderPress {
-    pub const fn new() -> Self {
-        ShoulderPress {
-            down: false,
-            hold: HoldConfirm::new(),
-        }
-    }
-
-    /// The key went down. True means "run the tap's job on this frame".
-    ///
-    /// A second report while the key is already down is not a press: the pad
-    /// reports an edge once, and a caller that feeds the held state back must
-    /// not move the tab a second time.
-    pub fn press(&mut self) -> bool {
-        if self.down {
-            return false;
-        }
-        self.down = true;
-        self.hold.press();
-        true
-    }
-
-    /// One frame with the key still down: the hold's own answer.
-    pub fn tick(&mut self) -> HoldAction {
-        if !self.down {
-            return HoldAction::None;
-        }
-        self.hold.tick()
-    }
-
-    /// The key came up. The hold's frame counter restarts; the arm it may have
-    /// left behind does not (`clear_arm` is the caller's "something else
-    /// happened" key).
-    pub fn release(&mut self) {
-        self.down = false;
-        let _ = self.hold.release();
-    }
-
-    /// Take the hold's offer back, because the press did something else.
-    pub fn clear_arm(&mut self) {
-        self.hold.clear_arm();
-    }
-
-    /// Is the hold's action offered, waiting for the second hold?
-    pub fn is_armed(&self) -> bool {
-        self.hold.is_armed()
-    }
-
-    /// Is the key still down?
-    pub fn is_down(&self) -> bool {
-        self.down
-    }
-}
 
 /// A shoulder press whose tap job waits for the release.
 ///
-/// [ShoulderPress] answers the tap on the frame the key goes down. That is right
-/// for [L], whose hold is the whole-save undo: the tab has already been drawn
-/// and a hold must not take it back. It is wrong for [R], whose hold opens
-/// 詳細: the review found that holding R to read the bytes behind a screen also
-/// moved the sub-tab, so the screen changed under the hold and the detail view
-/// opened on the wrong one.
+/// Both shoulders use this now. [L] and [R] are one band of two keys, and they
+/// answered on two different frames for a while: [L] moved the sub-tab the
+/// moment it went down and [R] moved it when the finger came up, so the same
+/// gesture read as two different gestures depending on which shoulder was
+/// pressed (the third review's finding). The tap waits for the release on both,
+/// and both holds keep their second job - L offers the whole-save undo, R opens
+/// 詳細 - without ever also moving the tab: a hold that also taps is worse than
+/// a tap that is one frame late, and a hold that opened 詳細 *and* moved the
+/// sub-tab opened it on the wrong screen.
 ///
 /// This keeps the tap in hand until the key comes up and then decides:
 ///
 ///   * released before the threshold -> the tap's job, now
 ///   * held past the threshold -> the hold's job only, no tap
 ///
-/// The cost is that [R]'s tap arrives on the release instead of the press. That
-/// is the trade the review asked for: a hold that also taps is worse than a tap
-/// that is one frame late.
+/// A pick list spends the shoulder on the ten-row step and has no hold job at
+/// all, so its press is answered at once and [ShoulderTap::spend] tells the
+/// release it owes nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShoulderTap {
     down: bool,
@@ -25553,42 +26332,6 @@ mod tests {
         assert_eq!(ed.screen, Screen::SkillPick, "{}", ed.message);
         let req = ed.take_text_request().expect("[Y] opens the search box");
         assert_eq!(req.0, TEXT_SKILL_FILTER);
-    }
-
-    #[test]
-    fn the_shoulder_moves_its_tab_on_the_press_not_the_release() {
-        let mut l = ShoulderPress::new();
-        // Frame 1: the press already answers the tap, which is the whole point
-        // - the sub-tab no longer waits for the finger to come up.
-        assert!(l.press(), "the first frame of the hold is the tap");
-        assert!(!l.press(), "a frame of the same hold is not a second press");
-        assert!(l.is_down());
-        // The hold's second job still needs the whole hold.
-        for _ in 0..(crate::confirm::HOLD_CONFIRM_FRAMES - 1) {
-            assert_eq!(l.tick(), HoldAction::None);
-        }
-        assert_eq!(l.tick(), HoldAction::Arm);
-        assert!(l.is_armed(), "the offer is shown, nothing has run");
-        l.release();
-        assert!(!l.is_down());
-        // The offer survives the release: the second hold runs it, and the tab
-        // has already moved - a hold never takes the tab move back.
-        assert!(l.press());
-        let mut last = HoldAction::None;
-        for _ in 0..crate::confirm::HOLD_CONFIRM_FRAMES {
-            last = l.tick();
-        }
-        assert_eq!(last, HoldAction::Run);
-        assert!(!l.is_armed());
-        l.release();
-        // Something else happening takes the offer away.
-        assert!(l.press());
-        for _ in 0..crate::confirm::HOLD_CONFIRM_FRAMES {
-            let _ = l.tick();
-        }
-        l.clear_arm();
-        l.release();
-        assert!(!l.is_armed());
     }
 
     #[test]

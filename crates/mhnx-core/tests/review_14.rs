@@ -764,7 +764,7 @@ fn the_quest_screens_step_key_is_y_again() {
     ed.quest_edit_tab = QUEST_TAB_REWARDS;
     ed.quest_edit_cursor = 0;
     ed.input(Key::Z);
-    assert!(ed.quest_edit_chance, "the chance is the value [◀/▶] steps");
+    assert!(ed.quest_edit_chance(), "the chance is the value [◀/▶] steps");
     assert_eq!(ed.quest_rewards()[0].chance, 50);
 
     // One press for the step, four for the value: 50% → 10%.

@@ -296,10 +296,20 @@ fn the_quest_row_survives_the_item_pick_and_the_item_tabs_can_be_searched() {
     assert_eq!(ed.quest_edit_cursor, 3, "the row is kept, not reset");
 
     // [ZR] on 報酬 walks 個数 -> 確率% -> 検索, and the search narrows the list.
+    // The cycle does not open the keyboard (the third review's finding 5): it
+    // used to, every other press, which left no way back to 個数.
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     ed.input(Key::Z);
-    assert!(ed.quest_edit_chance, "the first stop is the chance column");
+    assert!(ed.quest_edit_chance(), "the first stop is the chance column");
     ed.input(Key::Z);
+    assert_eq!(
+        ed.quest_reward_field,
+        mhnx_core::hbedit::QUEST_REWARD_SEARCH,
+        "the third stop is the item-name search"
+    );
+    assert_eq!(ed.take_text_request(), None, "the cycle opens no keyboard");
+    // The search is its own press: [R] on the same tab.
+    ed.input(Key::R);
     assert_eq!(
         ed.take_text_request(),
         Some((TEXT_QUEST_ITEM, String::new())),
@@ -686,7 +696,14 @@ fn every_quest_tab_numbers_its_rows_the_same_way() {
 #[test]
 fn the_kind_row_opens_the_kind_list() {
     let choices = Editor::equip_kind_choices();
-    assert_eq!(choices.len(), 20, "the twenty kinds a hunter's box holds");
+    // Nineteen: the twenty kinds a hunter's box holds, less the talisman, which
+    // has a screen of its own and is not a row of this box (the third review's
+    // finding 2).
+    assert_eq!(choices.len(), 19, "the kinds a hunter's box lists");
+    assert!(
+        !choices.iter().any(|(v, _)| *v == 6),
+        "護石 is not one of them"
+    );
     assert!(choices.iter().any(|(v, label)| *v == 7 && label.contains("大剣")));
 
     let mut ed = Editor::new();

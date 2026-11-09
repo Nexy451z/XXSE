@@ -377,7 +377,11 @@ fn the_equipment_filter_is_shown_and_can_be_cleared() {
     open_save(&mut ed);
     ed.screen = Screen::Equip; // the box is a section, not a key
     let all = ed.equipment().len();
-    assert_eq!(ed.equip_filter_heading(), "装備BOX");
+    // The heading names the box and says where the talismans are (the third
+    // review's finding 14): a talisman is in the same box and is not a row of
+    // this list, and nothing on screen used to say so.
+    assert!(ed.equip_filter_heading().starts_with("装備BOX"));
+    assert!(ed.equip_filter_heading().contains("護石一覧"));
 
     ed.apply_equip_filter(String::from("大剣"));
     assert!(ed.equip_filter_heading().contains("大剣"));
@@ -385,7 +389,8 @@ fn the_equipment_filter_is_shown_and_can_be_cleared() {
     assert!(ed.message.contains("解除"), "{}", ed.message);
 
     ed.apply_equip_filter(String::new());
-    assert_eq!(ed.equip_filter_heading(), "装備BOX");
+    assert!(ed.equip_filter_heading().starts_with("装備BOX"));
+    assert!(!ed.equip_filter_heading().contains("検索:"));
     assert_eq!(ed.equipment().len(), all);
     assert!(ed.message.contains("解除しました"));
 }
