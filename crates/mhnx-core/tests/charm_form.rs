@@ -100,6 +100,9 @@ fn every_row_says_what_a_really_does() {
     // The four things the owner asked for, row by row: 種類 switches, スロット
     // switches, the two skill rows pick, the two point rows raise. Row 0 names
     // the box slot the form would go into, so it is the one row that writes.
+    // The three decoration rows are the talisman's own sockets (+0x06 /
+    // +0x08 / +0x0A): they used to be edited on the equipment form, which
+    // stopped opening on a talisman.
     let expected = [
         (0usize, CharmAction::WriteToBox, "BOXへ反映"),
         (1, CharmAction::CycleKind, "種類を切替"),
@@ -108,6 +111,9 @@ fn every_row_says_what_a_really_does() {
         (4, CharmAction::RaisePoints, "数値を増やす"),
         (5, CharmAction::PickSkill, "スキルを選ぶ"),
         (6, CharmAction::RaisePoints, "数値を増やす"),
+        (7, CharmAction::PickDecoration, "装飾品を選ぶ"),
+        (8, CharmAction::PickDecoration, "装飾品を選ぶ"),
+        (9, CharmAction::PickDecoration, "装飾品を選ぶ"),
     ];
     assert_eq!(
         expected.len(),
@@ -156,7 +162,7 @@ fn every_row_says_what_a_really_does() {
     let mut past = CharmEdit::default();
     past.field = 99;
     assert_eq!(past.row(), CHARM_EDIT_ROWS - 1);
-    assert_eq!(past.a_action(), CharmAction::RaisePoints);
+    assert_eq!(past.a_action(), CharmAction::PickDecoration);
 }
 
 // ---------------------------------------------------------------------------

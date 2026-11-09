@@ -485,9 +485,16 @@ fn the_quest_basic_button_follows_the_row() {
     // The .mib time limit: there is no text to edit and [A] says so.
     ed.quest_edit_cursor = ed.quest_value_rows() - 1;
     assert_eq!(ed.quest_basic_a_label(), "増減は [◀/▶]");
-    // The 詳細 row of every tab.
+    // There is no 詳細 row any more: every tab is its values, and the file
+    // screens are the [ファイル] pill / [R] held (the second review's 13). A
+    // cursor past the end clamps to the last value row, which is the time limit.
     ed.quest_edit_cursor = ed.quest_value_rows();
-    assert_eq!(ed.quest_basic_a_label(), "ファイル画面へ");
+    assert_eq!(ed.quest_row_count(), ed.quest_value_rows());
+    assert_eq!(
+        ed.quest_basic_a_label(),
+        "増減は [◀/▶]",
+        "the last row is the time limit, not a button"
+    );
     // The footer says which row the [◀/▶] pair is for.
     ed.quest_edit_cursor = 0;
     let hint = ed.footer_hint();
@@ -606,7 +613,7 @@ fn minus_is_the_delete_key_and_nothing_else() {
     // a second job.
     ed.screen = Screen::Charms;
     ed.input(Key::Minus);
-    assert!(ed.message.contains("削除するお守り"), "{}", ed.message);
+    assert!(ed.message.contains("削除する護石"), "{}", ed.message);
     assert_eq!(ed.screen, Screen::Charms, "[-] never leaves the screen");
 
     // The screens that used to give it a second job answer [ZR] for that job
@@ -658,9 +665,17 @@ fn the_guide_line_is_the_row_font() {
     assert!(src.contains("const CONTENT_Y: i32 = GUIDE_Y + GUIDE_H; // 120"));
     let body = fn_body(src, "fn draw_guide");
     assert!(
-        body.contains("ed.screen_guide(),\n            t.text_secondary,\n            FontSize::Medium,"),
-        "{body}"
+        body.contains("FontSize::Medium"),
+        "the guide is the row font: {body}"
     );
-    // The cost is stated where the constant is: the lists lose a row.
-    assert!(src.contains("nine rows to eight"), "the trade is written down");
+    // The six pixels the strip took are given back by the list's own padding:
+    // nine rows again when no warning strip is drawn (the second review's 15).
+    assert!(
+        src.contains("nine rows"),
+        "the trade is written down where the constant is"
+    );
+    assert!(
+        body.contains("guide_tail"),
+        "a long guide keeps its last items: {body}"
+    );
 }

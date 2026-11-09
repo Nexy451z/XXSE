@@ -118,6 +118,10 @@ pub fn set_kind(rec: &mut [u8], kind: u8) -> bool {
     true
 }
 
+/// The talisman's type number: the one kind the hunter's box holds that has a
+/// screen and a form of its own (see [crate::hbedit::Editor::equip_rows]).
+pub const TALISMAN_KIND: u8 = 6;
+
 /// The highest type number the table in [type_name] names.
 ///
 /// 24 is オトモ防具(胴). The field is five bits wide, so 31 can be written, but

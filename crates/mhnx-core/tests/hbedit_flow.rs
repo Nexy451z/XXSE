@@ -562,7 +562,7 @@ fn charm_screen_creates_and_deletes() {
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::CharmEdit);
     let lines = ed.lines();
-    assert!(lines[0].text.contains("お守りの編集"));
+    assert!(lines[0].text.contains("護石の編集"));
     // The form shows each field on its own row. Find the skill row by label
     // rather than by a fixed line number, so the grade row that sits above it
     // does not shift the assertion.
@@ -685,7 +685,11 @@ fn extracting_one_quest_asks_for_exactly_that_id() {
     }
     // The I/O layer reports back through apply_extracted.
     ed.apply_extracted(1, "/switch/mhnxeditor/mhxx/quest/arc");
-    assert!(ed.message.contains("1 quest file"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("1 件のクエスト"),
+        "message was {}",
+        ed.message
+    );
 }
 
 #[test]
@@ -730,7 +734,11 @@ fn minus_is_only_swallowed_on_the_quest_entry_screen() {
 fn a_missing_save_reports_that_nothing_was_written() {
     let mut ed = Editor::new();
     ed.apply_extracted(0, "/switch/mhnxeditor/mhxx/quest/arc");
-    assert!(ed.message.contains("nothing written"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("何も書き出していません"),
+        "message was {}",
+        ed.message
+    );
 }
 // ---------------------------------------------------------------------------
 // The save -> quest editor loop on the console side.
@@ -771,7 +779,10 @@ fn opening_a_quest_from_the_save_fills_the_editor() {
 
     let want = ed.save_quests()[0].quest_id;
     ed.input(Key::A);
-    assert_eq!(ed.screen, Screen::ArcEntries, "A must open the quest");
+    // The quest is opened to be edited, so the screen it lands on is the one
+    // that edits it: 構成(.arc) - the file list - is one press away through the
+    // [ファイル] pill / [R] held (the second review's finding 4).
+    assert_eq!(ed.screen, Screen::QuestEdit, "A must open the quest");
     assert!(ed.message.contains(&want.to_string()), "message was {}", ed.message);
     // The .mib of that quest is now in the field editor's buffer.
     let mib_len = ed.arc.as_ref().and_then(|a| a.by_ext("mib")).expect("a .mib").data.len();
@@ -794,7 +805,7 @@ fn editing_a_quest_from_the_save_writes_back_to_the_same_slot() {
     ed.input(Key::X);
     let target = ed.save_quests()[0].clone();
     ed.input(Key::A);
-    assert_eq!(ed.screen, Screen::ArcEntries);
+    assert_eq!(ed.screen, Screen::QuestEdit);
 
     // The entry cursor must point at the .mib, so A opens the field editor
     // instead of re-loading entry 0 and wiping the buffer.
@@ -804,6 +815,10 @@ fn editing_a_quest_from_the_save_writes_back_to_the_same_slot() {
         ed.cursor,
         ed.entry
     );
+    // The .mib editor is behind the file list, which the [ファイル] pill opens
+    // (the quest screen lands on the editor itself now).
+    ed.screen = Screen::ArcEntries;
+    ed.cursor = ed.entry;
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Mib, "A must open the .mib of the chosen entry");
 
@@ -869,7 +884,11 @@ fn a_quest_id_that_is_not_in_the_save_is_refused() {
     open_save(&mut ed);
     ed.open_quest_from_save(9999999);
     assert_ne!(ed.screen, Screen::ArcEntries);
-    assert!(ed.message.contains("not in this save"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("このセーブにありません"),
+        "message was {}",
+        ed.message
+    );
 }
 
 #[test]
@@ -1190,10 +1209,27 @@ fn y_off_a_skill_row_says_so_instead_of_opening() {
     open_save(&mut ed);
     ed.input(Key::L);
     ed.input(Key::L);
-    ed.input(Key::Up); // skill 1 -> deco slots
+    ed.input(Key::Up); // skill 1 -> the slot count row
     ed.input(Key::Y);
+    // A row that is neither a skill nor a socket says which rows do have a
+    // list, and opens nothing.
     assert_eq!(ed.screen, Screen::CharmEdit);
-    assert!(ed.message.contains("スキルの行"), "message was {}", ed.message);
+    assert!(
+        ed.message.contains("スキル・装飾品の行"),
+        "message was {}",
+        ed.message
+    );
+
+    // The three decoration sockets are rows of this form now (the equipment
+    // form stopped opening on a talisman), and [Y] on one opens the same
+    // decoration list the equipment form opens, with the search box up.
+    while ed.charm_edit.map(|e| e.field) != Some(9) {
+        ed.input(Key::Up);
+    }
+    ed.input(Key::Y);
+    assert_eq!(ed.screen, Screen::JewelPick);
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::CharmEdit);
 }
 
 #[test]
@@ -4321,16 +4357,17 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
     let points0 = seed.points1;
     let grade = seed.grade;
 
-    // The form has seven rows and opens on the first skill: 0 index, 1 grade,
-    // 2 slots, 3 skill1, 4 points1, 5 skill2, 6 points2. Down walks all of
-    // them and wraps, which is what "seven rows" means here.
+    // The form has ten rows and opens on the first skill: 0 box slot, 1 kind,
+    // 2 slots, 3 skill1, 4 points1, 5 skill2, 6 points2, 7..9 the three
+    // decoration sockets. Down walks all of them and wraps, which is what "ten
+    // rows" means here.
     assert_eq!(seed.field, 3, "the form lands on the first skill");
-    for want in [4usize, 5, 6, 0, 1, 2, 3] {
+    for want in [4usize, 5, 6, 7, 8, 9, 0, 1, 2, 3] {
         ed.input(Key::Down);
         assert_eq!(
             ed.charm_edit.expect("open").field,
             want,
-            "the form must have seven rows"
+            "the form must have ten rows"
         );
     }
 
@@ -4551,7 +4588,10 @@ fn audit_a_quest_inside_the_save_can_be_edited_and_written_back() {
     );
 
     ed.input(Key::A);
-    assert_eq!(ed.screen, Screen::ArcEntries);
+    assert_eq!(ed.screen, Screen::QuestEdit);
+    // The .mib editor is behind the file list, which the [ファイル] pill opens.
+    ed.screen = Screen::ArcEntries;
+    ed.cursor = ed.entry;
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Mib);
     goto_mib_field(&mut ed, "quest_level");

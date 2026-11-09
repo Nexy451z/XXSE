@@ -238,9 +238,13 @@ fn y_picks_by_name_on_the_id_rows_and_by_name_on_the_sockets() {
     open_picker(&mut ed);
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::EquipEdit, "B goes back to the form");
-    ed.equip_edit.as_mut().unwrap().field = 7; // 種別
-    open_picker(&mut ed);
-    ed.input(Key::B);
+    // 種別 has a list of its own now (the twenty kinds), not the item table:
+    // the row asks for it and the console opens it (the second review's 18).
+    ed.equip_edit.as_mut().unwrap().field = 7;
+    ed.input(Key::Y);
+    assert!(ed.equip_kind_pick_pending, "種別 asks for the kind list");
+    assert_eq!(ed.screen, Screen::EquipEdit, "the console owns that modal");
+    ed.equip_kind_pick_pending = false;
     // A socket row still opens the decoration picker.
     ed.equip_edit.as_mut().unwrap().field = 4;
     ed.input(Key::Y);
@@ -343,8 +347,11 @@ fn a_wanted_weapon_is_created_from_its_name_alone() {
     presses += 1;
     assert_eq!(ed.screen, Screen::EquipEdit);
     assert_eq!(ed.equip_edit.map(|e| e.new), Some(true));
-    // [A] on 種別 opens the whole box: the form starts on kind 1 (armour), and
-    // a pick carries both halves, so no type walk is needed first.
+    // The ID row's [A] opens the whole box: the form starts on kind 1 (armour),
+    // and a pick carries both halves, so no type walk is needed first. (The
+    // 種別 row above it has the kind list, which is a different question.)
+    ed.input(Key::Down);
+    presses += 1;
     ed.input(Key::A);
     presses += 1;
     assert_eq!(ed.screen, Screen::EquipPick);
@@ -373,7 +380,7 @@ fn a_wanted_weapon_is_created_from_its_name_alone() {
     // Five presses and one typed word, against the nineteen the review
     // measured: six on the 種別 row, the walk to the list, fourteen on the
     // type filter, and the pick.
-    assert_eq!(presses, 5, "the route is five presses now");
+    assert_eq!(presses, 6, "the route is six presses now");
 }
 
 #[test]

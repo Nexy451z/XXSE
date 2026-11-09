@@ -11,10 +11,9 @@
 
 use mhnx_core::arc::{Arc, ArcEntry, ARC_VERSION};
 use mhnx_core::hbedit::{
-    item_name_or_none, monster_name_of, Editor, Key, QuestMonRow, QuestPick, Screen,
-    QUEST_MON_AREA,
-    QUEST_MON_HP, QUEST_MON_SLOTS, QUEST_TAB_BASIC, QUEST_TAB_MONSTERS, QUEST_TAB_REWARDS,
-    QUEST_TAB_SUPPLIES,
+    item_name_or_none, monster_name_of, Editor, Key, QuestPick, Screen, QUEST_MON_AREA,
+    QUEST_MON_HP, QUEST_MON_SEM_X, QUEST_MON_SLOTS, QUEST_TAB_BASIC, QUEST_TAB_MONSTERS,
+    QUEST_TAB_REWARDS, QUEST_TAB_SUPPLIES,
 };
 use mhnx_core::quest::{Gmd, GMD_TAG, GMD_VERSION, MIB_SIZE};
 
@@ -273,17 +272,17 @@ fn one_screen_reads_every_file_of_the_quest_by_itself() {
     assert_eq!(supplies[0].file, "supp_1010165");
     assert_eq!(supplies[0].label, item_label(0x6B4));
 
-    // The tabs are what L / R walks, and each tab counts its own rows plus
-    // the 詳細 row every tab ends with.
+    // The tabs are what L / R walks, and each tab counts its own rows: no tab
+    // ends with a 詳細 row any more (the [ファイル] pill is the one door).
     assert_eq!(ed.quest_edit_tab, QUEST_TAB_BASIC);
     assert_eq!(ed.quest_value_rows(), Gmd::LABELS.len() + 1);
-    assert_eq!(ed.quest_row_count(), Gmd::LABELS.len() + 2);
+    assert_eq!(ed.quest_row_count(), Gmd::LABELS.len() + 1);
     ed.quest_set_tab(QUEST_TAB_MONSTERS);
-    assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS + 1);
+    assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS);
     ed.quest_set_tab(QUEST_TAB_REWARDS);
-    assert_eq!(ed.quest_row_count(), 4);
+    assert_eq!(ed.quest_row_count(), 3);
     ed.quest_set_tab(QUEST_TAB_SUPPLIES);
-    assert_eq!(ed.quest_row_count(), 4);
+    assert_eq!(ed.quest_row_count(), 3);
 }
 
 #[test]
@@ -360,50 +359,45 @@ fn the_monster_tab_steps_the_value_it_is_on_and_no_other_byte() {
 }
 
 #[test]
-fn the_detail_rows_open_under_their_slot_and_step_the_placement() {
+fn the_placement_values_are_stepped_on_the_slot_row() {
     let mut ed = open_quest(1_010_165, 50);
     ed.quest_set_tab(QUEST_TAB_MONSTERS);
-    assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS + 1);
+    // Five slots, and no row is spent on the placement: opening a detail used
+    // to add five rows under the slot and push slots 4 and 5 off the list.
+    assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS);
+    assert_eq!(ed.quest_mon_rows(), vec![0, 1, 2, 3, 4]);
 
-    ed.quest_edit_cursor = 0;
-    // The deck's pill runs this. [Y] is the step size now: the reward chance
-    // could only be walked one point at a time while the key was spent here.
-    ed.quest_toggle_detail();
-    assert!(ed.quest_edit_open[0], "the pill opens the ▸詳細 rows");
-    let rows = ed.quest_mon_rows();
-    assert_eq!(rows.len(), QUEST_MON_SLOTS + 5);
-    assert_eq!(rows[1], QuestMonRow::Detail(0, 1));
-
-    // The five rows are the five numbers of the .sem, in the .sem screen order.
+    // The five numbers of the .sem are the row's own line, in the .sem screen
+    // order, and they are on screen without a row being spent on them.
     assert_eq!(ed.quest_monster_detail(0, 1).0, "X座標");
-    assert_eq!(ed.quest_monster_detail(0, 1).1, "180.0");
-    assert_eq!(ed.quest_monster_detail(0, 2).1, "23.0");
-    assert_eq!(ed.quest_monster_detail(0, 3).1, "-150.0");
-    assert_eq!(ed.quest_monster_detail(0, 4).1, "90.0°");
-    assert_eq!(ed.quest_monster_detail(0, 5).1, "Wave 0");
+    let line = ed.quest_sem_line(0).expect("slot 0 has a .sem");
+    assert!(line.contains("X 180.0"), "{line}");
+    assert!(line.contains("Y 23.0"), "{line}");
+    assert!(line.contains("Z -150.0"), "{line}");
+    assert!(line.contains("W 90°"), "{line}");
+    assert!(line.contains("Wv0"), "{line}");
+    assert!(ed.quest_mon_meta(0).contains("X 180.0"), "{}", ed.quest_mon_meta(0));
 
-    // Stepping a detail row writes that coordinate and only that one.
-    ed.quest_edit_cursor = 1;
+    // [ZR] walks all eleven values; the five .sem ones are the last five.
+    ed.quest_edit_cursor = 0;
+    ed.quest_edit_field = QUEST_MON_SEM_X;
+    assert_eq!(ed.quest_field_label(), "X座標");
     assert!(ed.quest_adjust(10));
     assert_eq!(ed.quest_monster_detail(0, 1).1, "190.0");
     assert_eq!(ed.quest_monster_detail(0, 2).1, "23.0");
     let sem = entry_bytes(&ed, "b_m15em010_00");
     assert_eq!(&sem[0x10..0x14], &190.0f32.to_le_bytes());
 
-    // The last detail row is 出現ウェーブ, the .sem byte at +0x08.
-    ed.quest_edit_cursor = 5;
+    // The last of them is 出現ウェーブ, the .sem byte at +0x08.
+    ed.quest_edit_field = QUEST_MON_SEM_X + 4;
+    assert_eq!(ed.quest_field_label(), "出現ウェーブ");
     assert!(ed.quest_adjust(1));
     assert_eq!(ed.quest_monster_detail(0, 5).1, "Wave 1");
     let sem = entry_bytes(&ed, "b_m15em010_00");
     assert_eq!(&sem[0x08..0x0C], &1u32.to_le_bytes());
 
-    // Closing it puts the list back the way it was.
-    ed.quest_edit_cursor = 0;
-    ed.quest_toggle_detail();
-    assert!(!ed.quest_edit_open[0]);
-    assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS + 1);
-
     // A slot with no .sem says so instead of inventing a zero coordinate.
+    assert!(ed.quest_sem_line(4).is_none());
     assert_eq!(ed.quest_monster_detail(4, 1).1, "—");
     assert!(!ed.adjust_sem_placement(4, 0, 1));
     assert!(ed.message.contains(".sem がありません"), "{}", ed.message);
@@ -494,10 +488,15 @@ fn a_supply_row_has_only_a_count_to_step() {
     assert!(ed.quest_adjust(1));
     assert_eq!(ed.quest_supplies()[0].count, 4);
     assert_eq!(entry_bytes(&ed, "supp_1010165")[8 + 2], 4);
-    // [-] cannot switch to a chance column a .sup does not have.
+    // [ZR] cannot switch to a chance column a .sup does not have: the key is
+    // the item-name search on this tab instead.
     ed.quest_cycle_field();
     assert!(!ed.quest_edit_chance);
-    assert!(ed.message.contains("確率はありません"), "{}", ed.message);
+    assert_eq!(
+        ed.take_text_request(),
+        Some((mhnx_core::hbedit::TEXT_QUEST_ITEM, String::new())),
+        "ZR is the search on 支給品, which has one value and nothing to switch"
+    );
     assert!(ed.quest_adjust(-1));
     assert_eq!(ed.quest_supplies()[0].count, 3);
 }
@@ -557,39 +556,40 @@ fn leaving_for_the_file_screens_keeps_the_edit_and_the_detail_stays_one_press() 
 }
 
 #[test]
-fn the_last_row_of_every_tab_is_the_detail_button() {
+fn no_tab_ends_with_a_detail_row() {
+    // Every tab used to end with a 詳細 row that opened the file-by-file
+    // screens, so the screen had three doors to one place (the row, the
+    // [ファイル] pill and [R] held). The row is gone; the pill is the door.
     let mut ed = open_quest(1_010_165, 50);
-    // 基本: every Gmd::LABELS line and the time limit, then 詳細.
     assert_eq!(ed.quest_value_rows(), Gmd::LABELS.len() + 1);
-    assert!(!ed.quest_on_detail_row());
-    ed.quest_edit_cursor = ed.quest_value_rows();
-    assert!(ed.quest_on_detail_row());
-    assert_eq!(ed.quest_activate(), QuestPick::Detail);
-    // Nothing on it takes a step, and the screen says which key it does take.
-    assert!(!ed.quest_adjust(1));
-    assert!(ed.message.contains("詳細行"), "{}", ed.message);
+    assert_eq!(
+        ed.quest_row_count(),
+        ed.quest_value_rows(),
+        "the 基本 tab is its values and nothing else"
+    );
 
-    // The same last row on the tabs that hold a list.
-    for tab in [QUEST_TAB_MONSTERS, QUEST_TAB_REWARDS, QUEST_TAB_SUPPLIES] {
+    for tab in [
+        QUEST_TAB_BASIC,
+        QUEST_TAB_MONSTERS,
+        QUEST_TAB_REWARDS,
+        QUEST_TAB_SUPPLIES,
+    ] {
         ed.quest_set_tab(tab);
-        let last = ed.quest_row_count() - 1;
-        assert_eq!(last, ed.quest_value_rows(), "tab {}", tab);
-        ed.quest_edit_cursor = last;
-        assert!(ed.quest_on_detail_row(), "tab {}", tab);
-        assert_eq!(ed.quest_activate(), QuestPick::Detail, "tab {}", tab);
+        assert_eq!(
+            ed.quest_row_count(),
+            ed.quest_value_rows(),
+            "tab {} has no extra row",
+            tab
+        );
     }
 
-    // On the monster tab it is still not a monster row: [Y] cannot open it.
-    ed.quest_set_tab(QUEST_TAB_MONSTERS);
-    ed.quest_edit_cursor = ed.quest_row_count() - 1;
-    ed.quest_toggle_detail();
-    assert!(ed.message.contains("詳細行"), "{}", ed.message);
-    assert!(!ed.quest_edit_open.iter().any(|o| *o));
-
-    // The console fallback prints it as its last line, so the ASCII route has
-    // the same button the canvas draws.
+    // The console fallback prints the same rows the canvas draws.
     ed.quest_set_tab(QUEST_TAB_BASIC);
     let rows = ed.quest_console_rows();
     assert_eq!(rows.len(), ed.quest_row_count());
-    assert!(rows.last().unwrap().contains("詳細"), "{:?}", rows);
+    assert!(
+        !rows.iter().any(|r| r.contains("詳細")),
+        "no row opens the file screens any more: {:?}",
+        rows
+    );
 }

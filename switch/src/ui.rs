@@ -36,7 +36,7 @@
 //!     can land on the other.
 //!   - 装備フォームの `[A]` は行ごとの操作（装備名/装飾品を選ぶ・値・書き込み）で、
 //!     行そのものに「▸ 選ぶ / ▸ 書き込み」と出る（`hbedit::EquipFormAction`）。
-//!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `お守り反映`).
+//!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `護石反映`).
 //!   - `Y`: The list key. On every screen whose list can be narrowed it is
 //!     that screen's 検索 (equipment box, talisman list, talisman form, the
 //!     quest list and the three pickers) or `空きも表示` on the item box; on a
@@ -85,8 +85,8 @@ use mhnx_core::hbedit::{
     // The scroll model: see mhnx_core::hbedit for the arithmetic and its tests.
     list_end, page_move, scroll_track, ScrollBar,
     // クエスト改造: the aggregate screen, its tabs and its row model.
-    QuestMonRow, QuestPick, QUEST_MON_AREA, QUEST_TAB_BASIC, QUEST_TAB_LABELS,
-    QUEST_TAB_MONSTERS, QUEST_TAB_REWARDS, QUEST_TABS,
+    quest_row_badge, QuestPick, QUEST_MON_AREA, QUEST_TAB_BASIC, QUEST_TAB_LABELS,
+    QUEST_TAB_MONSTERS, QUEST_TAB_REWARDS, QUEST_TAB_SUPPLIES, QUEST_TABS,
 };
 use mhnx_core::questfields;
 use mhnx_core::save::{Options, SaveKind};
@@ -228,10 +228,10 @@ const SUB_TAB_H: i32 = 44;
 /// smaller than the row values it explains. The review asked for the row size
 /// and this is it.
 ///
-/// The cost is the six pixels CONTENT_Y moves down, which is the row every list
-/// loses (nine rows to eight). It is a real cost and it is the reason the 22px
-/// upgrade was deferred once before; it is taken now because a guide nobody can
-/// read is not a guide.
+/// The cost was the six pixels CONTENT_Y moved down, which took a row from every
+/// list (nine rows to eight). The row is back: the list panel's own top padding
+/// is 4px now instead of 10, so nine rows fit again when no warning strip is
+/// drawn and eight when one is (hbedit::list_window_rows).
 const GUIDE_Y: i32 = SUB_TAB_Y + SUB_TAB_H; // 92
 const GUIDE_H: i32 = 28;
 const CONTENT_Y: i32 = GUIDE_Y + GUIDE_H; // 120
@@ -389,12 +389,6 @@ pub enum UiAction {
     /// the button on card 2 opened card 1's character. The slot travels with the
     /// action now, and an empty slot pushes no button at all.
     OpenSlot(usize),
-    /// The ▸詳細 rows of one monster slot: open / close them.
-    ///
-    /// [Y] ran this until the step size took the key back; the pad reaches the
-    /// same numbers through the 詳細 row's [A] (the file screens) and a finger
-    /// through the pill this answers.
-    QuestMonDetail,
     /// ポーチへ on the item set form: copy the set into the pouch.
     ///
     /// It was [-]'s job, and [-] is the delete key now. The form's [ZR] is
@@ -474,6 +468,13 @@ pub enum UiAction {
     /// pill in the inspector. One word for it, the same one the talisman and
     /// equipment screens use: 検索.
     FilterItems,
+    /// 進行状況's 既読 write: the second bit of the quest view.
+    ///
+    /// [Y] used to run it there and move the tab on the other two views. The
+    /// key is the tab key on all three now, so the write is this pill.
+    ProgressSeen,
+    /// 報酬 / 支給品's item-name search.
+    FilterQuestItems,
     /// 進行状況's name search.
     ///
     /// The quest view lists 1,508 rows and the request view 380, and the screen
@@ -654,12 +655,25 @@ pub struct GuiState {
     /// The snapshot button was pressed; the I/O layer owns the folder.
     pub wants_restore_snapshot: bool,
     pub quest_tab: usize,
+    /// Which tab of the クエスト section bar is lit.
+    ///
+    /// The bar used to derive it from the screen (SaveQuests -> 1 + quest_tab),
+    /// so pressing クエスト改造 with no .arc open - which lands on the save's own
+    /// list - lit セーブ内 instead of the tab that was pressed. The tab the user
+    /// chose is the tab that stays lit.
+    pub quest_bar_tab: usize,
     pub quest_cat_cursor: [usize; 4],
     pub mib_picker: Option<MibPickerState>,
     /// The monster slot whose エリア番号 chooser is open, if it is the one
     /// the shared picker modal is showing. The picker is the same modal the
     /// .mib screen uses; this says which writer its [A] lands in.
     pub quest_area_slot: Option<usize>,
+    /// The shared picker modal is showing the equipment form's 種別 list.
+    ///
+    /// The form's [A] on 種別 asks for a list the state machine cannot open
+    /// (hbedit::Editor::equip_kind_pick_pending); this says which writer the
+    /// modal's pick lands in.
+    pub equip_kind_picker: bool,
     pub mib_mob_sub: usize,
     pub osk: Option<OskState>,
     pub osk_result: Option<(usize, String)>,
@@ -717,9 +731,11 @@ impl GuiState {
             wants_install_arc_idx: None,
             wants_restore_snapshot: false,
             quest_tab: 0,
+            quest_bar_tab: 0,
             quest_cat_cursor: [0; 4],
             mib_picker: None,
             quest_area_slot: None,
+            equip_kind_picker: false,
             mib_mob_sub: 0,
             osk: None,
             osk_result: None,
@@ -997,6 +1013,9 @@ impl GuiState {
                 ed.roster_cursor = 0;
             }
             MainSection::Quest => {
+                // Entering the section lands on its first tab, and the bar says
+                // so: it used to land on the save's list with セーブ内 lit.
+                self.quest_bar_tab = 0;
                 if ed.save.is_some() {
                     ed.refresh_quest_titles();
                     ed.screen = Screen::SaveQuests;
@@ -1025,20 +1044,29 @@ impl GuiState {
     // -----------------------------------------------------------------------
     // L / R: Sub-Tab System Inside the Current Section!
     // -----------------------------------------------------------------------
-    fn sub_tabs_for(&self, ed: &Editor) -> (&'static [&'static str], usize) {
+    /// The bar labels as owned strings.
+    ///
+    /// Most sections name their tabs with literals; the クエスト bar counts what
+    /// its two bundles really carry, so the labels are built at run time and the
+    /// whole row is one type.
+    fn statics(labels: &'static [&'static str]) -> Vec<String> {
+        labels.iter().map(|s| String::from(*s)).collect()
+    }
+
+    fn sub_tabs_for(&self, ed: &Editor) -> (Vec<String>, usize) {
         // The progress screen carries the three views itself: one screen with
         // three tabs, the same shape the quest entries have, so the bar names
         // them and L / R walk them. B goes back to the card.
         if ed.screen == Screen::Progress {
             let labels: &'static [&'static str] = &["勲章", "依頼", "クエスト"];
-            return (labels, ed.progress_view().min(2));
+            return (Self::statics(labels), ed.progress_view().min(2));
         }
         // クエスト改造 carries the four questions the game asks about a quest,
         // so the bar names them and L / R walks them - the same shape the
         // progress screen uses for its three views.
         if ed.screen == Screen::QuestEdit {
             let labels: &'static [&'static str] = &["基本", "モンスター", "報酬", "支給品"];
-            return (labels, ed.quest_edit_tab.min(3));
+            return (Self::statics(labels), ed.quest_edit_tab.min(3));
         }
         if is_quest_inner(ed.screen) {
             let labels: &'static [&'static str] = &[
@@ -1065,7 +1093,7 @@ impl GuiState {
                 Screen::Check => 4,
                 _ => 0,
             };
-            return (labels, active);
+            return (Self::statics(labels), active);
         }
 
         match section_of(ed.screen) {
@@ -1079,7 +1107,7 @@ impl GuiState {
                     Screen::Convert => 1,
                     _ => 0,
                 };
-                (labels, active)
+                (Self::statics(labels), active)
             }
             MainSection::Hunter => {
                 let labels: &'static [&'static str] = &[
@@ -1093,7 +1121,7 @@ impl GuiState {
                     Screen::Slots => 2,
                     _ => 0,
                 };
-                (labels, active)
+                (Self::statics(labels), active)
             }
             MainSection::Items => {
                 let labels: &'static [&'static str] = &[
@@ -1114,7 +1142,7 @@ impl GuiState {
                 } else {
                     4
                 };
-                (labels, active)
+                (Self::statics(labels), active)
             }
             MainSection::Gear => {
                 let labels: &'static [&'static str] = &[
@@ -1131,7 +1159,7 @@ impl GuiState {
                     Screen::Sets => 3,
                     _ => 0,
                 };
-                (labels, active)
+                (Self::statics(labels), active)
             }
             MainSection::PalicoRecord => {
                 // The guild card carries two views of its own - the card and
@@ -1158,22 +1186,25 @@ impl GuiState {
                     // tabs, so this arm is only reached when it is not showing.
                     _ => 5,
                 };
-                (labels, active)
+                (Self::statics(labels), active)
             }
             MainSection::Quest => {
                 // クエスト改造 is the section's first tab, because it is the
                 // screen the work is done on: the four list tabs beside it are
                 // where a quest is found, and [A] on one lands on this tab.
-                let labels: &'static [&'static str] = &[
-                    "クエスト改造",
-                    "セーブ内",
-                    "公式(189)",
-                    "没クエ(34)",
-                    "SD(.arc)",
-                    "固定装備",
-                ];
+                //
+                // The two bundle tabs count what the bundle really carries
+                // (hbedit::Editor::quest_section_tab_labels): they printed 189
+                // and 34 as literals, and a checkout without the generated
+                // bundle has zero of each - a tab promising 189 quests over an
+                // empty list.
+                let labels = mhnx_core::hbedit::Editor::quest_section_tab_labels();
                 let active = match ed.screen {
-                    Screen::SaveQuests => 1 + self.quest_tab.min(2),
+                    // The tab the user pressed is the tab that stays lit. The
+                    // クエスト改造 tab opens the save's own list when no .arc is
+                    // loaded, and this used to light セーブ内 instead - a press
+                    // that moved the highlight to a tab nobody pressed.
+                    Screen::SaveQuests => self.quest_bar_tab.min(3),
                     Screen::ArcList => 4,
                     Screen::QuestEquip => 5,
                     // QuestEdit has its own four tabs (基本/モンスター/…), so
@@ -1199,7 +1230,7 @@ impl GuiState {
                     Screen::Options => 3,
                     _ => 0,
                 };
-                (labels, active)
+                (Self::statics(labels), active)
             }
         }
     }
@@ -1409,14 +1440,12 @@ impl GuiState {
             }
             MainSection::Gear => match idx {
                 0 => ed.open_charms(),
-                // 護石編集: the list the talisman form is opened from. The tab
-                // press is spent on the tab itself - this arm used to forward
-                // [Y] (the search key) into the screen it had just opened, so
-                // choosing the tab popped the keyboard, and on an empty box it
-                // forwarded [L] and created a record nobody asked for. [A] on a
-                // row opens the form and [Y] is the search once the list is up,
-                // exactly as on 護石一覧.
-                1 => ed.open_charms(),
+                // 護石編集: the tab opens the *form*, not the list. It used to
+                // call open_charms() - the same call the tab beside it makes -
+                // so pressing 護石編集 put the list back on screen, lit 護石一覧
+                // and left the form one more [A] away. The form opens on the
+                // record the list was on, and says so when there is none.
+                1 => ed.open_charm_form_selected(),
                 2 => {
                     ed.screen = Screen::Equip;
                     ed.equip_edit = None;
@@ -1465,6 +1494,8 @@ impl GuiState {
                 // .arc loaded the tab goes to the list a quest is opened from
                 // and says so, rather than offering a screen with no quest.
                 0 => {
+                    // The pressed tab stays lit, whatever screen it lands on.
+                    self.quest_bar_tab = 0;
                     if ed.arc.is_some() {
                         // The tab is pressed from the list the quest came from,
                         // so that list is where [B] goes back to.
@@ -1488,10 +1519,12 @@ impl GuiState {
                         return;
                     }
                     self.quest_tab = idx - 1;
+                    self.quest_bar_tab = idx;
                     ed.refresh_quest_titles();
                     ed.screen = Screen::SaveQuests;
                 }
                 4 => {
+                    self.quest_bar_tab = 4;
                     ed.screen = Screen::ArcList;
                     ed.cursor = 0;
                 }
@@ -1500,6 +1533,7 @@ impl GuiState {
                         ed.message = String::from("先にセーブデータを開いてください");
                         return;
                     }
+                    self.quest_bar_tab = 5;
                     ed.screen = Screen::QuestEquip;
                     ed.qe_open = false;
                     ed.cursor = 0;
@@ -1860,6 +1894,34 @@ impl GuiState {
         true
     }
 
+    /// Open the equipment form's 種別 list: the twenty kinds a box holds.
+    ///
+    /// The row used to step one kind per press, so reaching 弓 from 頭 cost
+    /// fourteen presses; the list is one press and the same modal the .mib and
+    /// エリア choosers use.
+    fn open_equip_kind_picker(&mut self, ed: &mut Editor) -> bool {
+        let Some(e) = ed.equip_edit else {
+            return false;
+        };
+        let items = mhnx_core::hbedit::Editor::equip_kind_choices();
+        if items.is_empty() {
+            return false;
+        }
+        let cursor = items
+            .iter()
+            .position(|(v, _)| *v == e.kind as u32)
+            .unwrap_or(0);
+        self.quest_area_slot = None;
+        self.equip_kind_picker = true;
+        self.mib_picker = Some(MibPickerState {
+            field_idx: usize::MAX,
+            title: String::from("種別を選ぶ（ハンターの箱に入る 20 種）"),
+            items,
+            cursor,
+        });
+        true
+    }
+
     /// Open the エリア番号 chooser for one monster slot.
     ///
     /// The area is the number a custom quest most often gets wrong, so the
@@ -1973,11 +2035,17 @@ impl GuiState {
             }
             Key::A => {
                 if let Some((raw_val, label)) = picker.items.get(picker.cursor).cloned() {
-                    // The area chooser is the same modal with a different
-                    // writer: the pick lands in the .sem, through the one
-                    // method that writes that byte. Both routes (this press and
-                    // a tap on a row) go through the same entry point, so they
-                    // cannot write to different places.
+                    // Three lists share this modal and each has its own writer:
+                    // the equipment form's 種別 (the kind list), the エリア番号
+                    // chooser (the .sem byte) and the .mib field (the monster /
+                    // part / item table). Both routes - this press and a tap on
+                    // a row - come through here, so they cannot write to
+                    // different places.
+                    if self.equip_kind_picker {
+                        self.equip_kind_picker = false;
+                        ed.apply_equip_kind(raw_val as u8);
+                        return true;
+                    }
                     let target = match self.quest_area_slot.take() {
                         Some(slot) => MibPickTarget::Area(slot),
                         None => MibPickTarget::Field(picker.field_idx),
@@ -1987,6 +2055,7 @@ impl GuiState {
             }
             Key::B | Key::Minus => {
                 self.quest_area_slot = None;
+                self.equip_kind_picker = false;
             }
             _ => {
                 self.mib_picker = Some(picker);
@@ -2490,13 +2559,15 @@ impl GuiState {
                     ed.input(other);
                     // Opening a quest from the save is the same promise the
                     // card's quest list makes: クエスト改造, not the file list.
+                    // The state machine lands there itself now
+                    // (Editor::open_quest_from_save); this only pins the return
+                    // target, so [B] comes back to the list the quest was
+                    // opened from.
                     if self.quest_tab == 0
                         && matches!(other, Key::A)
-                        && ed.screen == Screen::ArcEntries
+                        && ed.screen == Screen::QuestEdit
                         && ed.arc.is_some()
                     {
-                        // A quest opened from the save's own list comes back
-                        // there on [B], not to the .arc list.
                         ed.enter_quest_edit_from(Screen::SaveQuests);
                     }
                 }
@@ -2559,7 +2630,6 @@ impl GuiState {
                         QuestPick::Area(slot) => {
                             self.open_quest_area_picker(ed, slot);
                         }
-                        QuestPick::Detail => self.open_quest_detail(ed),
                         QuestPick::None => {}
                     }
                     // A reward / supply row opens the item chooser, and the
@@ -2571,6 +2641,17 @@ impl GuiState {
                 // the [ファイル] pill on the bar and [R 長押し].
                 other => ed.input(other),
             },
+            // The equipment form: [A] on the 種別 row asks for the kind list,
+            // which the state machine cannot open. The flag it sets is read on
+            // the frame the press lands, so the row's own action is still the
+            // one thing that decides what [A] means.
+            Screen::EquipEdit => {
+                ed.input(key);
+                if ed.equip_kind_pick_pending {
+                    ed.equip_kind_pick_pending = false;
+                    self.open_equip_kind_picker(ed);
+                }
+            }
             Screen::Mib => {
                 let is_mob = questfields::MIB_FIELDS
                     .get(ed.mib_cursor)
@@ -2899,6 +2980,12 @@ impl GuiState {
             UiAction::FilterProgress => {
                 ed.request_progress_filter();
             }
+            // The quest view's second bit: [Y] is the tab key on all three
+            // views now, so the write is this button.
+            UiAction::ProgressSeen => ed.progress_seen_press(),
+            // 報酬 / 支給品: the item-name search. [ZR]'s third stop runs the
+            // same request, and [-] could not take it (the delete key).
+            UiAction::FilterQuestItems => ed.request_quest_item_filter(),
             UiAction::SlotBadge(s) => {
                 if s < 3 && s != ed.slot {
                     if self.slot_press.press() {
@@ -2942,9 +3029,6 @@ impl GuiState {
                 }
             }
             UiAction::ItemSetToPouch => ed.item_set_to_pouch(),
-            // The ▸詳細 rows of the monster under the cursor: the deck's half of
-            // a key the pad gave back to the step size.
-            UiAction::QuestMonDetail => ed.quest_toggle_detail(),
             UiAction::GotoSection(sec) => self.goto_section(ed, sec),
             UiAction::SelectSubTab(idx) => self.select_sub_tab(ed, idx),
             UiAction::CycleSection(fwd) => self.cycle_sidebar_tab(ed, fwd),
@@ -3161,6 +3245,13 @@ impl GuiState {
             UiAction::MibPickerSelect(idx) => {
                 if let Some(mut picker) = self.mib_picker.take() {
                     if picker.cursor == idx {
+                        if self.equip_kind_picker {
+                            self.equip_kind_picker = false;
+                            if let Some((raw_val, _)) = picker.items.get(idx).cloned() {
+                                ed.apply_equip_kind(raw_val as u8);
+                            }
+                            return;
+                        }
                         if let Some((raw_val, label)) = picker.items.get(idx).cloned() {
                             // The area chooser is the same modal with a
                             // different writer. The tap used to go through the
@@ -3508,7 +3599,7 @@ fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
         Screen::Charms => ed.charms().len(),
         Screen::CharmEdit => CHARM_EDIT_ROWS,
         Screen::SkillPick => ed.skill_pick_matches().len(),
-        Screen::Equip => ed.equipment().len(),
+        Screen::Equip => ed.equip_rows().len(),
         // The form has two shapes: 9 rows for an existing record and 3 for a
         // new one. The count comes from the form itself so the cursor and the
         // renderer can never disagree about it.
@@ -4240,14 +4331,42 @@ impl GuiState {
             right -= nw + 16;
         }
         let room = (right - (MAIN_X + 4)).max(120);
-        c.text_clipped(
-            MAIN_X + 4,
-            GUIDE_Y + 3,
-            room,
-            ed.screen_guide(),
-            t.text_secondary,
-            FontSize::Medium,
-        );
+        // While the update banner is up the strip is narrower than the guide,
+        // and a clipped guide loses its *end* - which is where the way out
+        // ([B] / [＋]) is named. The tail is drawn instead, prefixed with an
+        // ellipsis, so the last item survives the banner.
+        let guide = ed.screen_guide();
+        let mut width = |s: &str| c.text_width_sized(s, FontSize::Medium);
+        let tail = mhnx_core::hbedit::guide_tail(guide, room, &mut width);
+        if tail.len() == guide.len() {
+            c.text_clipped(
+                MAIN_X + 4,
+                GUIDE_Y + 3,
+                room,
+                guide,
+                t.text_secondary,
+                FontSize::Medium,
+            );
+        } else if !tail.is_empty() {
+            let marker = "…";
+            let marker_w = c.text_width_sized(marker, FontSize::Medium);
+            c.text_clipped(
+                MAIN_X + 4,
+                GUIDE_Y + 3,
+                room,
+                marker,
+                t.text_muted,
+                FontSize::Medium,
+            );
+            c.text_clipped(
+                MAIN_X + 4 + marker_w,
+                GUIDE_Y + 3,
+                (room - marker_w).max(0),
+                tail,
+                t.text_secondary,
+                FontSize::Medium,
+            );
+        }
     }
 
     fn draw_top_nav(&mut self, c: &mut Canvas, ed: &Editor) {
@@ -4387,9 +4506,9 @@ impl GuiState {
 
         let (subs, active_sub) = self.sub_tabs_for(ed);
         let mut sub_x = 60i32;
-        for (idx, &label) in subs.iter().enumerate() {
+        for (idx, label) in subs.iter().enumerate() {
             let is_active = idx == active_sub;
-            let tw = c.text_width_sized(label, FontSize::Small) + 24;
+            let tw = c.text_width_sized(label.as_str(), FontSize::Small) + 24;
             let w = tw.clamp(84, 156);
             // 800 rather than 880: the [R] button and the [詳細] pill share the
             // right end of this bar now, and a label that reached under them
@@ -4403,7 +4522,7 @@ impl GuiState {
             if is_active {
                 c.rect(sub_x + 8, sy + sh - 3, w - 16, 3, t.accent_secondary);
             }
-            btn_text(c, sub_x, sy, w, sh, label, fg, FontSize::Small);
+            btn_text(c, sub_x, sy, w, sh, label.as_str(), fg, FontSize::Small);
             self.add_hit(sub_x, sy, w, sh, UiAction::SelectSubTab(idx));
             sub_x += w + 6;
         }
@@ -4515,21 +4634,19 @@ impl GuiState {
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &chip, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
-                // The ▸詳細 rows of a monster slot: [Y] is the step key now, so
-                // a finger opens them here and the pad reaches the same numbers
-                // through the 詳細 row's [A] (the file screens they live on).
-                // The second pill used to be a third entry point to the file
-                // screens ("[詳細] ファイル単位") beside the [ファイル] pill on
-                // the tab bar and the row the list ends with; one screen with
-                // three doors named two different things was the review's find,
-                // so this pill is the row toggle, not a fourth door.
-                if ed.quest_edit_tab == QUEST_TAB_MONSTERS {
-                    let open = ed.quest_detail_open();
-                    let lbl = if open { "▸詳細 閉じる" } else { "▸詳細 開く" };
+                // The two item tabs' search is [ZR]'s third stop (個数 →
+                // 確率% → 検索) and the pill is the touch route to the same
+                // request. [-] is the delete key and nothing else.
+                if matches!(ed.quest_edit_tab, QUEST_TAB_REWARDS | QUEST_TAB_SUPPLIES) {
+                    let lbl = if ed.quest_item_filter.trim().is_empty() {
+                        String::from("検索")
+                    } else {
+                        format!("検索: {}", ed.quest_item_filter.trim())
+                    };
                     c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                    btn_text(c, 1108, sy, 158, sh, lbl, t.text_primary, FontSize::Small);
-                    self.add_hit(1108, sy, 158, sh, UiAction::QuestMonDetail);
+                    btn_text(c, 1108, sy, 158, sh, &lbl, t.text_primary, FontSize::Small);
+                    self.add_hit(1108, sy, 158, sh, UiAction::FilterQuestItems);
                 }
             }
             // The item set form's name has no row of its own (the thirty-two
@@ -4588,15 +4705,30 @@ impl GuiState {
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
             }
             Screen::Roster => {
-                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
-                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[ZR] 装備", t.accent_secondary, FontSize::Small);
-                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
+                // [Y] walks the three numbers the list edits (Lv / なつき /
+                // EXP) and was on neither the footer nor the deck: a touch-only
+                // player could not change the column at all.
+                let col = match ed.roster_field {
+                    0 => "Lv",
+                    1 => "なつき",
+                    _ => "EXP",
+                };
+                // Three pills in the 302px the deck has: 96 + 6 + 96 + 6 + 98.
+                let y_lbl = format!("[Y] 列: {}", col);
+                c.round_rect(964, sy, 96, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 96, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 96, sh, &y_lbl, t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 96, sh, UiAction::Key(Key::Y));
 
-                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
-                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[+] スキル", t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Plus));
+                c.round_rect(1066, sy, 96, sh, 5, t.bg_btn);
+                c.round_rect_border(1066, sy, 96, sh, 5, 1, t.border_subtle);
+                btn_text(c, 1066, sy, 96, sh, "[ZR] 装備", t.text_primary, FontSize::Small);
+                self.add_hit(1066, sy, 96, sh, UiAction::Key(Key::Z));
+
+                c.round_rect(1168, sy, 98, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1168, sy, 98, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1168, sy, 98, sh, "[+] スキル", t.text_primary, FontSize::Small);
+                self.add_hit(1168, sy, 98, sh, UiAction::Key(Key::Plus));
             }
             Screen::Palico => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
@@ -4722,11 +4854,15 @@ impl GuiState {
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &label, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::FilterProgress);
+                // 既読 is the quest view's second bit. [Y] moves the tab on all
+                // three views now, so the write is this pill and nothing else:
+                // a key that wrote the save on one view and moved the tab on
+                // the other two was the review's finding.
                 if ed.progress_view() == PROGRESS_QUESTS {
                     c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                    btn_text(c, 1108, sy, 158, sh, "[Y] 既読", t.text_primary, FontSize::Small);
-                    self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
+                    btn_text(c, 1108, sy, 158, sh, "既読にする", t.text_primary, FontSize::Small);
+                    self.add_hit(1108, sy, 158, sh, UiAction::ProgressSeen);
                 }
             }
             // 環境設定: [Y] puts the newest snapshot back. It is the only
@@ -5864,8 +6000,8 @@ impl GuiState {
         // Geometry first. The header now repeats facts that come off the window
         // (how many rows fit, and therefore whether there is a page to turn),
         // so it cannot be laid out before the window is known.
-        let body_y = CONTENT_Y + 30; // 132
-        let body_h = FOOTER_Y - body_y - 10; // 526
+        let body_y = CONTENT_Y + 30; // 150
+        let body_h = FOOTER_Y - body_y - 10; // 508
 
         // The strip needs one or two lines under the list, so the list gives up
         // a row rather than drawing text over the last entry. Warnings are
@@ -5873,11 +6009,6 @@ impl GuiState {
         // lines.
         let warn_lh = c.line_height_sized(FontSize::Small).max(16);
         let strip_lines = (warnings.len().min(2) + notice.len().min(1)).min(2) as i32;
-        let warn_reserve = if strip_lines == 0 {
-            0
-        } else {
-            strip_lines * warn_lh + 16
-        };
         let row_h = LIST_ROW_H;
         // The scrollbar's own geometry decides where a row's text and its tap
         // area may end: the bar answers a finger 40px from the panel edge now,
@@ -5887,9 +6018,11 @@ impl GuiState {
         // drawn from (scroll_track), so the two cannot drift apart.
         let track = scroll_track(MAIN_X, V1_LIST_W);
         let row_hit_w = track.row_right - (MAIN_X + 8);
-        let rows_that_fit = ((body_h - 10 - warn_reserve).max(row_h)) / row_h;
-        let vis = (rows_that_fit.max(1) as usize).min(9);
-        let vis = if strip_lines == 0 { vis } else { vis.min(8) };
+        // Nine rows when there is no strip, eight when there is one: the
+        // arithmetic lives in hbedit so a host test can pin it (the old copy
+        // here said the same thing in a comment and then could not deliver it -
+        // the list was eight rows with or without a strip).
+        let vis = mhnx_core::hbedit::list_window_rows(body_h, row_h, strip_lines, warn_lh);
         let cur_pos = rows
             .iter()
             .position(|r| r.0 == active_row_idx)
@@ -5989,7 +6122,7 @@ impl GuiState {
                 break;
             };
             let row_idx = *r_idx;
-            let ry = body_y + 10 + (i as i32) * row_h;
+            let ry = body_y + mhnx_core::hbedit::LIST_PAD_TOP + (i as i32) * row_h;
             let is_sel = row_idx == active_row_idx;
 
             if is_sel {
@@ -6083,7 +6216,7 @@ impl GuiState {
             ed,
             MAIN_X,
             V1_LIST_W,
-            body_y + 10,
+            body_y + mhnx_core::hbedit::LIST_PAD_TOP,
             (vis as i32) * row_h,
             ScrollBar::new(total, vis, start),
             &ids,
@@ -6112,7 +6245,8 @@ impl GuiState {
                 }
             }
             let drawn = total.min(vis);
-            let rows_bottom = body_y + 10 + drawn as i32 * row_h;
+            let rows_bottom =
+                body_y + mhnx_core::hbedit::LIST_PAD_TOP + drawn as i32 * row_h;
             let limit = body_y + body_h - 4;
             let mut strip_h = lines.len() as i32 * warn_lh;
             let mut top = (limit - strip_h).max(rows_bottom + 12);
@@ -6730,13 +6864,13 @@ impl GuiState {
             // at all. The form itself has no deck: its [A] is the row's own
             // action, which the inspector button and the footer name.
             Screen::Charms => {
-                c.text_sized(ix + 20, cur_y, "お守りの操作", t.text_muted, FontSize::Small);
+                c.text_sized(ix + 20, cur_y, "護石の操作", t.text_muted, FontSize::Small);
                 cur_y += 24;
                 let armed = ed.charm_delete_armed.is_some();
                 let del_label = if armed {
                     "もう一度タップで削除"
                 } else {
-                    "[-] 選択中のお守りを削除（2回）"
+                    "[-] 選択中の護石を削除（2回）"
                 };
                 self.draw_tool_button(
                     c,
@@ -6816,7 +6950,7 @@ impl GuiState {
                 c.text_sized(ix + 20, cur_y, "装備の操作", t.text_muted, FontSize::Small);
                 cur_y += 24;
                 let armed_index = ed.equip_delete_pending().map(|(index, _, _)| index);
-                let cursor_index = ed.equipment().get(ed.equip_cursor).map(|e| e.index);
+                let cursor_index = ed.equip_rows().get(ed.equip_cursor).map(|e| e.index);
                 let armed = armed_index.is_some() && armed_index == cursor_index;
                 let del_label = if armed {
                     "削除する? もう一度タップ"
@@ -8127,7 +8261,10 @@ impl GuiState {
     }
 
     fn draw_equip(&mut self, c: &mut Canvas, ed: &Editor) {
-        let all = ed.equipment();
+        // The box as this screen lists it: weapons and armour. A talisman is
+        // type 6 and has a screen and a form of its own (護石一覧 / 護石編集),
+        // so it is not a row here (hbedit::Editor::equip_rows).
+        let all = ed.equip_rows();
         let mut rows = Vec::with_capacity(all.len());
         for (i, eq) in all.iter().enumerate() {
             let tname = mhnx_core::equip::type_name(eq.kind);
@@ -9936,7 +10073,7 @@ impl GuiState {
         match tab {
             QUEST_TAB_BASIC => {
                 let basic = ed.quest_basic_rows();
-                let mut rows: Vec<(usize, String, String, String, String)> = basic
+                let rows: Vec<(usize, String, String, String, String)> = basic
                     .iter()
                     .enumerate()
                     .map(|(i, r)| {
@@ -9949,73 +10086,55 @@ impl GuiState {
                             String::from(r.label),
                             meta,
                             r.value.clone(),
-                            format!("#{:02}", i + 1),
+                            quest_row_badge(i),
                         )
                     })
                     .collect();
-                rows.push(detail_row(rows.len()));
                 let cur = ed.quest_edit_cursor.min(rows.len().saturating_sub(1));
                 // The button's word follows the row: three of the four rows are
-                // .gmd text ([A] opens the keyboard), the fourth is the .mib
-                // 制限時間 (which steps with [◀/▶] and has no text at all), and
-                // the last row of every tab is 詳細.
+                // .gmd text ([A] opens the keyboard) and the fourth is the .mib
+                // 制限時間 (which steps with [◀/▶] and has no text at all).
                 let a_label = ed.quest_basic_a_label();
                 self.draw_adaptive_rows(c, ed, "クエスト改造", &sub, &rows, cur, false, a_label);
             }
             QUEST_TAB_MONSTERS => {
                 let monsters = ed.quest_monsters();
                 let mut rows: Vec<(usize, String, String, String, String)> = Vec::new();
-                for row in ed.quest_mon_rows() {
-                    match row {
-                        QuestMonRow::Slot(slot) => {
-                            let Some(m) = monsters.get(slot) else { continue };
-                            // The name first, the hex id small beside it, then the
-                            // five numbers, so the row carries what the tab
-                            // promises. The area is the value column: it is the
-                            // number a custom quest gets wrong.
-                            let title = format!(
-                                "{}  HP:{} 攻:{} 防:{} 寸:{}% 数:{}",
-                                m.label, m.hp, m.atk, m.def, m.size, m.count
-                            );
-                            let value = match m.area {
-                                Some(a) if a > 0 => format!("エリア {}", a),
-                                Some(_) => String::from("エリア 0 (未使用)"),
-                                None => String::from("エリア -"),
-                            };
-                            let open = if ed.quest_edit_open.get(slot).copied().unwrap_or(false) {
-                                "▾"
-                            } else {
-                                "▸"
-                            };
-                            let meta = format!("{}詳細[Y]  変更中: {}", open, ed.quest_field_label());
-                            // The row id is the row's position, which is what
-                            // the cursor counts (the detail rows shift it).
-                            let idx = rows.len();
-                            rows.push((idx, title, meta, value, format!("S{}", slot + 1)));
-                        }
-                        QuestMonRow::Detail(slot, k) => {
-                            let name = monsters
-                                .get(slot)
-                                .map(|m| m.label.clone())
-                                .unwrap_or_default();
-                            let (label, value) = ed.quest_monster_detail(slot, k);
-                            let idx = rows.len();
-                            rows.push((
-                                idx,
-                                format!("　└ {}", label),
-                                format!("{} の初期配置 (.sem)", name),
-                                value,
-                                format!("S{}", slot + 1),
-                            ));
-                        }
-                    }
+                // The five slots, and nothing else: the ▸詳細 rows that used to
+                // appear under an opened slot pushed slots 4 and 5 out of the
+                // window. The numbers they held are values of the row now -
+                // [ZR] walks all eleven, the .sem five included - and the
+                // placement is printed on the inspector's second line.
+                for slot in ed.quest_mon_rows() {
+                    let Some(m) = monsters.get(slot) else { continue };
+                    // The name first, the hex id small beside it, then the five
+                    // numbers, so the row carries what the tab promises. The
+                    // area is the value column: it is the number a custom quest
+                    // gets wrong.
+                    let title = format!(
+                        "{}  HP:{} 攻:{} 防:{} 寸:{}% 数:{}",
+                        m.label, m.hp, m.atk, m.def, m.size, m.count
+                    );
+                    let value = match m.area {
+                        Some(a) if a > 0 => format!("エリア {}", a),
+                        Some(_) => String::from("エリア 0 (未使用)"),
+                        None => String::from("エリア -"),
+                    };
+                    // The meta names the value [ZR] is on and the slot's .sem
+                    // placement. It does not name [Y]: that key is the step
+                    // size here and has opened nothing since the ▸詳細 rows
+                    // moved onto the row.
+                    let meta = format!("スロット{}  {}", slot + 1, ed.quest_mon_meta(slot));
+                    let idx = rows.len();
+                    rows.push((idx, title, meta, value, quest_row_badge(idx)));
                 }
                 let a_label = if ed.quest_edit_field == QUEST_MON_AREA {
                     "エリア選択"
+                } else if ed.quest_edit_field >= mhnx_core::hbedit::QUEST_MON_SEM_X {
+                    "増減は [◀/▶]"
                 } else {
                     "モンスター選択"
                 };
-                rows.push(detail_row(rows.len()));
                 let cur = ed.quest_edit_cursor.min(rows.len().saturating_sub(1));
                 self.draw_adaptive_rows(c, ed, "クエスト改造", &sub, &rows, cur, true, a_label);
             }
@@ -10024,6 +10143,11 @@ impl GuiState {
                 let mut rows: Vec<(usize, String, String, String, String)> = Vec::new();
                 for (i, r) in rewards.iter().enumerate() {
                     let value = format!("×{}  {}%", r.count, r.chance);
+                    // The file and the group are in the meta; the badge is the
+                    // row's place in the tab, the same on all four tabs. It
+                    // used to be "G1" - the group - which repeated itself
+                    // across files, so two rows of rem_000000 and rem_000001
+                    // carried the same badge.
                     let meta = format!(
                         "{}  G{} 合計{}% / {}枠{}",
                         r.file,
@@ -10032,7 +10156,7 @@ impl GuiState {
                         r.group_len,
                         if r.dummy { "  ダミー(未読込)" } else { "" }
                     );
-                    rows.push((i, r.label.clone(), meta, value, format!("G{}", r.group + 1)));
+                    rows.push((i, r.label.clone(), meta, value, quest_row_badge(i)));
                 }
                 // A group that does not add up to 100 is reported, never
                 // corrected - the rule the .rem screen already follows.
@@ -10050,12 +10174,12 @@ impl GuiState {
                         r.group_total
                     ));
                 }
-                rows.push(detail_row(rows.len()));
                 let cur = ed.quest_edit_cursor.min(rows.len().saturating_sub(1));
+                let heading = ed.quest_item_heading();
                 self.draw_adaptive_rows_warn(
                     c,
                     ed,
-                    "クエスト改造",
+                    &heading,
                     &sub,
                     &rows,
                     cur,
@@ -10067,7 +10191,7 @@ impl GuiState {
             }
             _ => {
                 let supplies = ed.quest_supplies();
-                let mut rows: Vec<(usize, String, String, String, String)> = supplies
+                let rows: Vec<(usize, String, String, String, String)> = supplies
                     .iter()
                     .enumerate()
                     .map(|(i, r)| {
@@ -10076,13 +10200,13 @@ impl GuiState {
                             r.label.clone(),
                             format!("{}  {} 行目（確率なし）", r.file, r.row + 1),
                             format!("×{}", r.count),
-                            format!("#{:02}", i + 1),
+                            quest_row_badge(i),
                         )
                     })
                     .collect();
-                rows.push(detail_row(rows.len()));
                 let cur = ed.quest_edit_cursor.min(rows.len().saturating_sub(1));
-                self.draw_adaptive_rows(c, ed, "クエスト改造", &sub, &rows, cur, true, "アイテム選択");
+                let heading = ed.quest_item_heading();
+                self.draw_adaptive_rows(c, ed, &heading, &sub, &rows, cur, true, "アイテム選択");
             }
         }
     }
@@ -10977,21 +11101,6 @@ fn bundled_quests_for_tab(
             format!("{}", q.quest_id).contains(&needle) || q.title.to_lowercase().contains(&needle)
         })
         .collect()
-}
-
-/// The ファイル row every クエスト改造 tab ends with.
-///
-/// It is a row, not only a chip, so the pad can reach the file-by-file
-/// screens: the chip on the bar is a one-tap shortcut to the same action,
-/// and [A] anywhere on this row runs it.
-fn detail_row(idx: usize) -> (usize, String, String, String, String) {
-    (
-        idx,
-        String::from("▸ ファイル（.mib / .gmd / .rem / .sup / .sem）"),
-        String::from("ファイル単位の画面を開きます（[ファイル] と同じ）"),
-        String::from("開く"),
-        String::from("ファイル"),
-    )
 }
 
 fn monster_name_for_mint(v: u32) -> &'static str {

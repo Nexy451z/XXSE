@@ -781,17 +781,33 @@ fn the_quest_screens_step_key_is_y_again() {
         ed.message
     );
 
-    // The ▸詳細 rows are still reachable: the deck's pill and the 詳細 row's
-    // [A] (the file screens) are the two routes.
+    // The .sem numbers the ▸詳細 rows used to hold are values of the row now:
+    // the monster tab is five slots, and [ZR] walks the eleven values - the
+    // five .mib ones, the area and the five .sem ones. The rows themselves are
+    // gone, so opening a detail can no longer push slots 4 and 5 off the list
+    // (the second review's finding 19), and the file screens have one door
+    // (the [ファイル] pill / [R] held, finding 13).
     ed.quest_edit_tab = QUEST_TAB_MONSTERS;
     ed.quest_edit_cursor = 0;
-    assert!(!ed.quest_detail_open());
-    ed.quest_toggle_detail();
-    assert!(ed.quest_detail_open(), "the deck's pill still opens the rows");
-    // The 詳細 row is the last row of every tab: [A] on it opens the file
-    // screens, which is the pad's route to the same numbers.
-    ed.quest_edit_cursor = ed.quest_value_rows();
-    assert_eq!(ed.quest_activate(), mhnx_core::hbedit::QuestPick::Detail);
+    assert_eq!(
+        ed.quest_row_count(),
+        mhnx_core::hbedit::QUEST_MON_SLOTS,
+        "the monster tab is the five slots and nothing else"
+    );
+    ed.quest_edit_field = 0;
+    for _ in 0..mhnx_core::hbedit::QUEST_MON_FIELDS {
+        ed.input(Key::Z);
+    }
+    assert_eq!(ed.quest_edit_field, 0, "[ZR] wraps after all eleven values");
+    for _ in 0..mhnx_core::hbedit::QUEST_MON_SEM_X {
+        ed.input(Key::Z);
+    }
+    assert_eq!(
+        ed.quest_field_label(),
+        "X座標",
+        "the .sem placement is one of the row's values: {}",
+        ed.message
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -373,9 +373,17 @@ fn the_save_quest_guide_names_the_delete_key() {
     let mut ed = Editor::new();
     ed.screen = Screen::SaveQuests;
     let guide = ed.screen_guide();
-    assert!(guide.contains("[-] で削除（2回）"), "{guide}");
-    assert!(!guide.contains("[-] で書き出し"), "{guide}");
-    assert!(guide.contains("書き出しは右のボタン"), "{guide}");
+    if mhnx_core::hbedit::Editor::bundled_quests_available() {
+        assert!(guide.contains("[-] で削除（2回）"), "{guide}");
+        assert!(!guide.contains("[-] で書き出し"), "{guide}");
+        assert!(guide.contains("書き出しは右のボタン"), "{guide}");
+    } else {
+        // A checkout without the generated bundle has no 公式 / 没クエ rows at
+        // all, so the guide says why the two tabs are empty instead of
+        // describing a list that is not there (the second review's finding 20).
+        assert!(guide.contains("DLC バンドル未生成"), "{guide}");
+        assert!(guide.contains("0 件"), "{guide}");
+    }
 
     // The export really is another key's job: [R] asks the I/O layer for it,
     // and [-] on this list is the delete (see the state machine's arm).

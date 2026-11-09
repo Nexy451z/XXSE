@@ -63,7 +63,7 @@ pub enum Screen {
     Gmd,
     /// Quest checker results.
     Check,
-    /// Charm box (お守り).
+    /// Charm box (護石).
     Charms,
     /// Charm editor form.
     CharmEdit,
@@ -346,8 +346,15 @@ pub const QUEST_TAB_LABELS: [&str; QUEST_TABS] = ["基本", "モンスター", "
 
 /// Monster slots a .mib carries (13 bytes each, from offset 100).
 pub const QUEST_MON_SLOTS: usize = 5;
-/// How many values [◀/▶] steps on a monster row, in the order [-] walks them.
-pub const QUEST_MON_FIELDS: usize = 6;
+/// How many values [◀/▶] steps on a monster row, in the order [ZR] walks them.
+///
+/// Eleven, not six: the five .mib numbers, the .sem area, and the five .sem
+/// placement numbers (X / Y / Z / 向き / ウェーブ). The last five used to be
+/// five extra rows under the slot, and opening them pushed slots 4 and 5 off
+/// the bottom of the list - the review's finding. They are values of the row
+/// now, stepped in place, so the list is always the five slots and nothing an
+/// edit does can hide another slot.
+pub const QUEST_MON_FIELDS: usize = 11;
 /// 体力.
 pub const QUEST_MON_HP: usize = 0;
 /// 攻撃力.
@@ -360,10 +367,13 @@ pub const QUEST_MON_SIZE: usize = 3;
 pub const QUEST_MON_COUNT: usize = 4;
 /// エリア番号: the .sem placement of the same slot.
 pub const QUEST_MON_AREA: usize = 5;
-/// The labels of the six values, in the order [-] walks them.
+/// The first of the five .sem placement values (X座標).
+pub const QUEST_MON_SEM_X: usize = 6;
+/// The labels of the eleven values, in the order [ZR] walks them.
 ///
-/// The area is last here and first on the row, because it is the number the
-/// console's quest menu shows and the one a custom quest most often gets wrong.
+/// The area is first among the .sem half because it is the number the console's
+/// quest menu shows and the one a custom quest most often gets wrong; the five
+/// placement numbers follow in the .sem's own order.
 pub const QUEST_MON_LABELS: [&str; QUEST_MON_FIELDS] = [
     "体力",
     "攻撃力",
@@ -371,6 +381,11 @@ pub const QUEST_MON_LABELS: [&str; QUEST_MON_FIELDS] = [
     "サイズ%",
     "出現数",
     "エリア番号",
+    "X座標",
+    "Y座標(高さ)",
+    "Z座標",
+    "向き角度(W)",
+    "出現ウェーブ",
 ];
 /// The eight values the .mib screen steps on a monster slot, in its order.
 ///
@@ -388,10 +403,13 @@ pub const MIB_MOB_VALUE_LABELS: [&str; 8] = [
     "獰猛/特殊",
 ];
 
-/// How many rows ▸詳細 adds under one monster slot (X/Y/Z/向き/ウェーブ).
+/// How many .sem placement values one monster slot carries (X/Y/Z/向き/ウェーブ).
+///
+/// They are the five values at the end of [QUEST_MON_LABELS], stepped on the
+/// slot's own row: they used to be five extra rows under it.
 pub const QUEST_MON_DETAIL_ROWS: usize = 5;
 
-/// The labels of the five detail rows, in file order.
+/// The labels of the five .sem placement values, in file order.
 pub const QUEST_MON_DETAIL_LABELS: [&str; QUEST_MON_DETAIL_ROWS] = [
     "X座標",
     "Y座標(高さ)",
@@ -438,19 +456,6 @@ pub struct QuestMonster {
     pub area: Option<u32>,
     /// 出現ウェーブ from the same .sem.
     pub wave: Option<u32>,
-}
-
-/// Which row the モンスター tab lists.
-///
-/// The five slots, and - under an opened one - its five ▸詳細 rows. A flat
-/// list of row ids rather than two parallel arrays, because the cursor, the
-/// touch targets and the renderer all count the same rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuestMonRow {
-    /// The slot itself.
-    Slot(usize),
-    /// One detail row (1..=QUEST_MON_DETAIL_ROWS) of a slot.
-    Detail(usize, usize),
 }
 
 /// One reward record of the 報酬 tab.
@@ -511,8 +516,38 @@ pub enum QuestPick {
     Monster(usize),
     /// Open the area chooser for this monster slot (the .sem area number).
     Area(usize),
-    /// The 詳細 row: the file-by-file screens behind this one.
-    Detail,
+}
+
+/// Does one reward / supply row answer the item filter?
+///
+/// The row prints the item's name and its hex id, so both answer: a user who
+/// knows the id can type it, and the name is what the tab is searched by. The
+/// needle is already lowercased and trimmed ([Editor::quest_item_filter]).
+fn quest_item_hit(label: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if label.to_lowercase().contains(needle) {
+        return true;
+    }
+    // "0x1A2" and "1a2" both find the id the row prints.
+    let hex = label
+        .rsplit("0x")
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    hex.contains(needle)
+}
+
+/// The badge one row of a クエスト改造 tab carries: its number inside the tab.
+///
+/// All four tabs number their rows the same way now. They used to carry four
+/// different schemes - #01 on 基本, S1 on モンスター, G1 on 報酬, #01 on 支給品 -
+/// and the reward one repeated itself across files: two rows of rem_000000 and
+/// rem_000001 were both "G1". The file name is in the row's meta line, where it
+/// has room, and the badge is the row's place in the list it is on.
+pub fn quest_row_badge(row: usize) -> String {
+    alloc::format!("#{:02}", row + 1)
 }
 
 /// What a pick from the .mib / エリア list writes.
@@ -1402,6 +1437,14 @@ pub struct CharmEdit {
     pub skill2: u8,
     /// Second skill points.
     pub points2: i8,
+    /// Decoration ids in the talisman's own three sockets (+0x06, +0x08, +0x0A).
+    ///
+    /// A talisman carries the same three decoration sockets a weapon or a piece
+    /// of armour does, and they are the one part of the record the equipment
+    /// form used to edit that this form did not. The equipment box no longer
+    /// opens on a talisman at all (see [Editor::equip_rows]), so the rows moved
+    /// here rather than being lost.
+    pub decorations: [u16; 3],
     /// Which row the cursor is on.
     pub field: usize,
 }
@@ -1417,6 +1460,7 @@ impl Default for CharmEdit {
             points1: 0,
             skill2: 0,
             points2: 0,
+            decorations: [0; 3],
             field: 0,
         }
     }
@@ -1424,10 +1468,14 @@ impl Default for CharmEdit {
 
 /// Rows on the talisman form.
 ///
-/// Seven, and the state machine (Up / Down wrap with 7), the console's list
-/// geometry and the host tests all read this number, so the highlight and the
-/// row the form edits cannot drift apart.
-pub const CHARM_EDIT_ROWS: usize = 7;
+/// Ten: the box slot, the kind, the slot count, the two skills and their
+/// points, and the three decoration sockets (+0x06 / +0x08 / +0x0A) the record
+/// carries. The last three used to be edited on the equipment form, which meant
+/// the same talisman had two forms - and the equipment one also offered レベル
+/// and 着せ替え, which mean nothing for a talisman. The state machine (Up / Down
+/// wrap with this number), the console's list geometry and the host tests all
+/// read it, so the highlight and the row the form edits cannot drift apart.
+pub const CHARM_EDIT_ROWS: usize = 10;
 
 /// What `[A]` does on one row of the talisman form.
 ///
@@ -1450,6 +1498,8 @@ pub enum CharmAction {
     PickSkill,
     /// 第1スキル値 / 第2スキル値: raise the value by one step.
     RaisePoints,
+    /// 装飾品1..3: open the decoration list on that socket.
+    PickDecoration,
 }
 
 impl CharmAction {
@@ -1464,6 +1514,7 @@ impl CharmAction {
             2 => CharmAction::CycleSlots,
             3 | 5 => CharmAction::PickSkill,
             4 | 6 => CharmAction::RaisePoints,
+            7..=9 => CharmAction::PickDecoration,
             _ => CharmAction::WriteToBox,
         }
     }
@@ -1476,6 +1527,7 @@ impl CharmAction {
             CharmAction::CycleSlots => "スロットを切替",
             CharmAction::PickSkill => "スキルを選ぶ",
             CharmAction::RaisePoints => "数値を増やす",
+            CharmAction::PickDecoration => "装飾品を選ぶ",
         }
     }
 
@@ -1496,7 +1548,7 @@ impl CharmAction {
     pub fn row_hint(self) -> &'static str {
         match self {
             CharmAction::WriteToBox => "▸ 書き込み",
-            CharmAction::PickSkill => "▸ 選ぶ",
+            CharmAction::PickSkill | CharmAction::PickDecoration => "▸ 選ぶ",
             // The three that step a field use the arrow key the footer names.
             CharmAction::CycleKind | CharmAction::CycleSlots | CharmAction::RaisePoints => "▸ +1",
         }
@@ -1628,6 +1680,28 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
     let hint = |field: usize, name: &str| -> String {
         format!("{}  {}", name, CharmAction::of_row(field).row_hint())
     };
+    // One decoration socket: the id, its name, and what the arrow keys do. Only
+    // the sockets the slot count makes usable are offered; the rest say so
+    // rather than pretending to hold something.
+    let deco = |sock: usize| -> CharmFormRow {
+        let id = e.decorations[sock];
+        let usable = (sock as u8) < e.slots;
+        CharmFormRow {
+            field: 7 + sock,
+            title: hint(7 + sock, &format!("装飾品{}", sock + 1)),
+            meta: if usable {
+                format!("◀ ▶ で切替 / [A] で一覧 / ID {}", id)
+            } else {
+                String::from("スロット数が足りません")
+            },
+            value: if id == 0 {
+                String::from("なし")
+            } else {
+                String::from(decoration_name_of(id))
+            },
+            badge: format!("#{:02}", 8 + sock),
+        }
+    };
     [
         CharmFormRow {
             field: 0,
@@ -1708,6 +1782,12 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
             },
             badge: String::from("#07"),
         },
+        // The talisman's own three decoration sockets. They were edited on the
+        // equipment form until that form stopped opening on a talisman; the
+        // bytes are the same three u16 at +0x06 / +0x08 / +0x0A.
+        deco(0),
+        deco(1),
+        deco(2),
     ]
 }
 
@@ -1828,6 +1908,19 @@ impl EquipEdit {
         }
     }
 
+    /// Is this row the 種別 one? It has a list of its own.
+    ///
+    /// The twenty kinds are a list, not a number to walk: the row used to step
+    /// one kind per press, so reaching 弓 from 頭 cost fourteen presses on a row
+    /// whose own [A] opened the *item* list. [A] opens the kinds now.
+    pub fn is_kind_row(&self, field: usize) -> bool {
+        if self.new {
+            field == 0
+        } else {
+            field == 7
+        }
+    }
+
     /// The row whose `[A]` writes: 装備枠 on the editing form, レベル on the
     /// new one.
     ///
@@ -1851,6 +1944,9 @@ impl EquipEdit {
     /// `[A]` on アイテムID cannot mean "write" while the row says "pick".
     pub fn a_action(&self) -> EquipFormAction {
         let field = self.field.min(self.rows().saturating_sub(1));
+        if self.is_kind_row(field) {
+            return EquipFormAction::PickKind;
+        }
         if self.is_identity_row(field) {
             return EquipFormAction::PickEquip;
         }
@@ -1892,6 +1988,8 @@ pub enum EquipFormAction {
     PickDecoration,
     /// 種別 / アイテムID: open the equipment name picker.
     PickEquip,
+    /// 種別: open the list of the twenty kinds the box holds.
+    PickKind,
 }
 
 impl EquipFormAction {
@@ -1903,6 +2001,7 @@ impl EquipFormAction {
             EquipFormAction::StepValue => "値を増やす",
             EquipFormAction::PickDecoration => "装飾品を選ぶ",
             EquipFormAction::PickEquip => "装備名を選ぶ",
+            EquipFormAction::PickKind => "種別を選ぶ",
         }
     }
 
@@ -1915,12 +2014,16 @@ impl EquipFormAction {
             EquipFormAction::StepValue => "▸ +1",
             EquipFormAction::PickDecoration => "▸ 選ぶ",
             EquipFormAction::PickEquip => "▸ 選ぶ",
+            EquipFormAction::PickKind => "▸ 選ぶ",
         }
     }
 
-    /// Is this action one of the two that open a list?
+    /// Is this action one of the three that open a list?
     pub fn opens_picker(self) -> bool {
-        matches!(self, EquipFormAction::PickDecoration | EquipFormAction::PickEquip)
+        matches!(
+            self,
+            EquipFormAction::PickDecoration | EquipFormAction::PickEquip | EquipFormAction::PickKind
+        )
     }
 }
 
@@ -2963,6 +3066,56 @@ pub fn pick_needle(text: &str) -> String {
     }
 }
 
+/// Pixels between the top of a list panel and its first row.
+///
+/// Four, not ten: the panel is 508px tall and a row is 56, so ten pixels of
+/// padding is what made nine rows impossible and left every list at eight even
+/// when no warning strip was drawn. Four is the whole of the difference.
+pub const LIST_PAD_TOP: i32 = 4;
+
+/// The most rows one list window shows.
+pub const LIST_MAX_ROWS: usize = 9;
+
+/// How many rows of a list fit: the window arithmetic every list screen uses.
+///
+/// strip_lines is the warning / notice strip under the list (0, 1 or 2 lines),
+/// and it is what the list gives up a row for - the rule the old code stated in
+/// a comment and then made unreachable, because the strip's reserve was already
+/// subtracted from the fit and the min(8) on top of it could never bite.
+pub fn list_window_rows(body_h: i32, row_h: i32, strip_lines: i32, line_h: i32) -> usize {
+    let strip = if strip_lines <= 0 {
+        0
+    } else {
+        strip_lines * line_h + 16
+    };
+    let usable = (body_h - LIST_PAD_TOP - strip).max(row_h);
+    ((usable / row_h).max(1) as usize).min(LIST_MAX_ROWS)
+}
+
+/// The tail of a guide line that fits in room, measured by width.
+///
+/// The guide strip is one line high and the update banner takes its right end,
+/// so a long guide is cut - and text_clipped cuts the *end*, which is where
+/// the way out ([B] / [＋]) is named. This returns the longest suffix that
+/// fits, so what is lost is the beginning of the sentence and never its last
+/// item. An empty answer means nothing fits.
+pub fn guide_tail<'a>(guide: &'a str, room: i32, width: &mut dyn FnMut(&str) -> i32) -> &'a str {
+    if room <= 0 {
+        return "";
+    }
+    if width(guide) <= room {
+        return guide;
+    }
+    let chars: alloc::vec::Vec<(usize, char)> = guide.char_indices().collect();
+    for start in 0..chars.len() {
+        let tail = &guide[chars[start].0..];
+        if width(tail) <= room {
+            return tail;
+        }
+    }
+    ""
+}
+
 /// "1,606": a count with the thousands grouped.
 ///
 /// The lists this picker shows are four digits long, and 6435 with no break in
@@ -3007,6 +3160,12 @@ pub const TEXT_JEWEL_FILTER: usize = usize::MAX - 6;
 /// a cursor. [Y] was a second copy of [A] there (both opened the form), so the
 /// key moved to the search the equipment box already has.
 pub const TEXT_CHARM_FILTER: usize = usize::MAX - 7;
+/// Sentinel id for "ask for an item name to filter the 報酬 / 支給品 tabs by".
+///
+/// [-] is the delete key everywhere, and those two tabs have nothing to
+/// delete: a reward row's item is changed with [A], never removed. That is the
+/// free key the search takes.
+pub const TEXT_QUEST_ITEM: usize = usize::MAX - 8;
 /// Sentinel id for "ask for the name of the equipment set being edited".
 ///
 /// It has to stay **below** `TEXT_PALICO_NAME`, because the console layer
@@ -5724,10 +5883,15 @@ pub struct Editor {
     pub quest_edit_tab: usize,
     /// The row the cursor is on inside that tab.
     pub quest_edit_cursor: usize,
-    /// Which of the six monster values [◀/▶] steps (QUEST_MON_*).
+    /// Which of the eleven monster values [◀/▶] steps (QUEST_MON_*).
     pub quest_edit_field: usize,
-    /// Which monster slots have their ▸詳細 rows open.
-    pub quest_edit_open: [bool; QUEST_MON_SLOTS],
+    /// Item name filter for the 報酬 / 支給品 tabs.
+    ///
+    /// A quest's reward tables run to a few hundred rows across several .rem
+    /// files and the tab had no way to find one item in them: the two tabs are
+    /// the only lists in the editor with no search at all. Empty means every
+    /// row, and an empty answer clears it - the rule every other list follows.
+    pub quest_item_filter: String,
     /// Does [◀/▶] move the chance column on the 報酬 tab?
     ///
     /// The same two numbers a reward row carries, the same [-] switch the
@@ -5767,6 +5931,12 @@ pub struct Editor {
     pub equip_cursor: usize,
     /// The equipment record being edited, if the form is open.
     pub equip_edit: Option<EquipEdit>,
+    /// The 種別 row's [A] asked for the kind list, which the console owns.
+    ///
+    /// The state machine cannot open a modal, so the request is a flag: the
+    /// console reads it on the frame the press lands, opens the list and clears
+    /// it. One flag, one reader - a press cannot open two lists.
+    pub equip_kind_pick_pending: bool,
     /// Box index of a record whose delete is waiting for its second press.
     ///
     /// A delete is never one press: the first press only says what would go
@@ -5778,6 +5948,13 @@ pub struct Editor {
     pub jewel_pick_filter: String,
     /// Cursor inside the filtered decoration list.
     pub jewel_pick_cursor: usize,
+    /// The talisman socket the decoration list was opened on, if it was.
+    ///
+    /// The list is one screen with two writers: the equipment form's socket
+    /// (the default, [EquipEdit::decoration_socket]) and the talisman form's
+    /// (this). A pick writes the socket the list was opened from and returns to
+    /// the form that opened it.
+    pub jewel_pick_charm_socket: Option<usize>,
     /// Name filter used by the equipment picker.
     pub equip_pick_filter: String,
     /// The half of the box the equipment picker is listing.
@@ -6099,7 +6276,7 @@ impl Editor {
             quest_edit_tab: 0,
             quest_edit_cursor: 0,
             quest_edit_field: 0,
-            quest_edit_open: [false; QUEST_MON_SLOTS],
+            quest_item_filter: String::new(),
             quest_edit_chance: false,
             romfs_awards: Vec::new(),
             romfs_requests: Vec::new(),
@@ -6117,9 +6294,11 @@ impl Editor {
             equip_filter: String::new(),
             equip_cursor: 0,
             equip_edit: None,
+            equip_kind_pick_pending: false,
             equip_delete_armed: None,
             jewel_pick_filter: String::new(),
             jewel_pick_cursor: 0,
+            jewel_pick_charm_socket: None,
             equip_pick_filter: String::new(),
             equip_pick_scope: EquipScope::Weapons,
             equip_pick_kind: 0,
@@ -6625,10 +6804,10 @@ impl Editor {
     /// Feed raw save bytes.
     pub fn open_save_bytes(&mut self, path: &str, bytes: &[u8]) {
         match Save::from_bytes(bytes) {
-            Err(e) => self.message = format!("not a MHXX save: {}", e),
+            Err(e) => self.message = format!("MHXX のセーブではありません: {}", e),
             Ok(s) => {
                 self.slot = (0..3).find(|i| s.slot_used(*i)).unwrap_or(0);
-                self.message = format!("loaded {} bytes from {}", bytes.len(), path);
+                self.message = format!("{} バイトを読み込みました: {}", bytes.len(), path);
                 self.save = Some(s);
                 self.save_path = Some(path.to_string());
                 self.dirty = false;
@@ -6876,8 +7055,11 @@ impl Editor {
                     )
                 }
             }
+            // [B] goes to the slot cards, which is the one thing this line was
+            // missing: the card view is the only screen in the section whose
+            // way out was named nowhere - not in the footer, not on the deck.
             Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => format!(
-                "[◀/▶] 増減  [R] 数値  [Y] 回数/武器  [A] {}  [ZR] 進行状況  [X] 保存",
+                "[R] 数値  [Y] 回数/武器  [A] {}  [ZR] 進行状況  [X] 保存  [B] 枠選択",
                 self.guild_a_label()
             ),
             _ => String::from(self.static_footer()),
@@ -7009,17 +7191,20 @@ impl Editor {
             Screen::Roster if self.palico_skill_open() => {
                 "[▲/▼] 枠  [◀/▶] 候補  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
             }
+            // [Y] walks the three numbers the list can edit (Lv / なつき /
+            // EXP) and was named nowhere: not in this line, not on the deck.
             Screen::Roster => {
-                "[◀/▶] 増減  [A] 名前  [ZR] 装備  [＋] スキル  [X] 保存  [B] 戻る"
+                "[Y] 列  [A] 名前  [ZR] 装備  [＋] スキル  [X] 保存  [B] 戻る"
             }
             // Built in footer_hint: the word after [A] follows the row.
             Screen::Palico => "",
             Screen::Hunts => {
                 "[◀/▶] 増減  [Y] 列  [A] 刻み  [ZR] 表示  [R] 数値  [X] 保存  [B] 戻る"
             }
-            Screen::Progress if self.progress_view() == PROGRESS_QUESTS => {
-                "[A] クリア  [Y] 既読  [◀/▶] ±50  [ZR] 検索  [X] 保存  [B] 戻る"
-            }
+            // [Y] is the tab key on all three views now. On the quest view it
+            // used to write the 既読 bit - a save write on a key that moved the
+            // tab on the other two views, which is the review's finding. The
+            // write is the deck's 既読 pill ([UiAction::ProgressSeen]).
             Screen::Progress => {
                 "[A] ビット  [Y] タブ  [◀/▶] ±50  [ZR] 検索  [X] 保存  [B] 戻る"
             }
@@ -7083,8 +7268,15 @@ impl Editor {
                     // The step pills name [Y] (step_table), and this line is the
                     // longest of the four: it does not repeat the key.
                     "[▲/▼] 行  [A] 文字編集  [◀/▶] 制限時間  [L/R] タブ  [R長押し] ファイル"
-                } else {
+                } else if self.quest_edit_tab == QUEST_TAB_MONSTERS {
+                    // The eleven values of a monster row are [ZR]'s, the five
+                    // .sem ones included: they are stepped on the row itself.
                     "[▲/▼] 行  [◀/▶] 値  [ZR] 項目  [A] 選択  [Y] 刻み  [R長押し] ファイル"
+                } else {
+                    // The two item tabs: [ZR] walks 個数 / 確率% / 検索 on 報酬
+                    // and opens the search on 支給品. [-] is the delete key and
+                    // nothing else, so it could not take the search.
+                    "[◀/▶] 値  [ZR] 項目/検索  [A] 選択  [Y] 刻み  [R長押し] ファイル"
                 }
             }
             // Conversion is the one screen whose keys are not the usual set:
@@ -7483,12 +7675,21 @@ impl Editor {
         self.load_quest_files();
         self.screen = Screen::QuestEdit;
         self.quest_edit_tab = self.quest_edit_tab.min(QUEST_TABS - 1);
-        self.quest_edit_cursor = 0;
-        self.quest_edit_field = 0;
-        self.quest_edit_open = [false; QUEST_MON_SLOTS];
+        // The row is kept, not reset. The item picker behind a reward row comes
+        // back through here, and a pick used to land the cursor on row 1 of the
+        // tab - so choosing the item for row 40 put the list back at the top and
+        // the next row cost forty presses to find again. A clamped row is the
+        // same row whenever the tab still has it.
+        self.quest_edit_cursor = self
+            .quest_edit_cursor
+            .min(self.quest_row_count().saturating_sub(1));
+        self.quest_edit_field = self.quest_edit_field.min(QUEST_MON_FIELDS - 1);
         self.quest_edit_chance = false;
         let heading = self.quest_heading();
-        self.message = format!("クエスト改造 — {}（[ファイル] でファイル単位の画面へ）", heading);
+        self.message = format!(
+            "クエスト改造 — {}（[ファイル] ピル / [R長押し] でファイル単位の画面へ）",
+            heading
+        );
     }
 
     /// Read the .mib and the .gmd of the open archive into the working copies.
@@ -7742,21 +7943,45 @@ impl Editor {
         })
     }
 
-    /// The rows of the モンスター tab: five slots, plus the ▸詳細 of an open one.
-    pub fn quest_mon_rows(&self) -> Vec<QuestMonRow> {
-        let mut out = Vec::with_capacity(QUEST_MON_SLOTS + QUEST_MON_DETAIL_ROWS);
-        for slot in 0..QUEST_MON_SLOTS {
-            out.push(QuestMonRow::Slot(slot));
-            if self.quest_edit_open.get(slot).copied().unwrap_or(false) {
-                for k in 1..=QUEST_MON_DETAIL_ROWS {
-                    out.push(QuestMonRow::Detail(slot, k));
-                }
-            }
-        }
-        out
+    /// The rows of the モンスター tab: the five slots, and nothing else.
+    ///
+    /// It used to grow five ▸詳細 rows under a slot that was opened, which
+    /// pushed slots 4 and 5 out of the window: the list is a fixed five rows
+    /// now, and the .sem numbers are values of the slot's own row (see
+    /// [QUEST_MON_SEM_X] and [Editor::quest_sem_line]).
+    pub fn quest_mon_rows(&self) -> Vec<usize> {
+        (0..QUEST_MON_SLOTS).collect()
     }
 
-    /// One ▸詳細 row of a monster slot: (label, value).
+    /// The .sem placement of one slot as one line: "X 12.3 Y 4.5 Z 6.7 W 90° Wv1".
+    ///
+    /// The inspector's second line for the row, so the numbers the ▸詳細 rows
+    /// used to hold are on screen without a row being spent on them. None when
+    /// the slot has no .sem placement to read.
+    pub fn quest_sem_line(&self, slot: usize) -> Option<String> {
+        let sem = self.sem_of_slot(slot).and_then(|i| self.sem_placement(i))?;
+        Some(alloc::format!(
+            "X {:.1} Y {:.1} Z {:.1} W {:.0}° Wv{}",
+            sem.x,
+            sem.y,
+            sem.z,
+            sem.w,
+            sem.wave
+        ))
+    }
+
+    /// The inspector's second line for one monster row: what [◀/▶] steps and
+    /// where the slot is placed.
+    pub fn quest_mon_meta(&self, slot: usize) -> String {
+        let mut line = alloc::format!("変更中: {}", self.quest_field_label());
+        if let Some(sem) = self.quest_sem_line(slot) {
+            line.push_str(" / ");
+            line.push_str(&sem);
+        }
+        line
+    }
+
+    /// One .sem placement value of a monster slot: (label, value).
     pub fn quest_monster_detail(&self, slot: usize, k: usize) -> (&'static str, String) {
         let label = QUEST_MON_DETAIL_LABELS
             .get(k.saturating_sub(1))
@@ -7776,8 +8001,13 @@ impl Editor {
     }
 
     /// Every reward record of the quest, table by table and group by group.
+    ///
+    /// Narrowed by [Editor::quest_item_filter]: a quest's reward tables run to
+    /// a few hundred rows over several .rem files, and the tab had no way to
+    /// find one item in them.
     pub fn quest_rewards(&self) -> Vec<QuestRewardRow> {
         let Some(a) = &self.arc else { return Vec::new() };
+        let needle = self.quest_item_filter.trim().to_lowercase();
         let mut out = Vec::new();
         for (idx, e) in a.entries.iter().enumerate() {
             if extension_for(e.type_hash) != Some("rem") {
@@ -7801,12 +8031,16 @@ impl Editor {
             for (i, rec) in table.records.iter().enumerate() {
                 let gi = group_of.get(i).copied().unwrap_or(0);
                 let g = groups.get(gi);
+                let label = named_hex(item_name_or_none(rec.item).as_deref(), rec.item as u32);
+                if !quest_item_hit(&label, &needle) {
+                    continue;
+                }
                 out.push(QuestRewardRow {
                     entry: idx,
                     file: file.clone(),
                     row: i,
                     item: rec.item,
-                    label: named_hex(item_name_or_none(rec.item).as_deref(), rec.item as u32),
+                    label,
                     count: rec.count,
                     chance: rec.slot,
                     group: gi,
@@ -7819,9 +8053,10 @@ impl Editor {
         out
     }
 
-    /// Every supply record of the quest.
+    /// Every supply record of the quest, narrowed by the same item filter.
     pub fn quest_supplies(&self) -> Vec<QuestSupplyRow> {
         let Some(a) = &self.arc else { return Vec::new() };
+        let needle = self.quest_item_filter.trim().to_lowercase();
         let mut out = Vec::new();
         for (idx, e) in a.entries.iter().enumerate() {
             if extension_for(e.type_hash) != Some("sup") {
@@ -7832,12 +8067,16 @@ impl Editor {
             };
             let file = file_name_of_entry(&e.name);
             for (i, rec) in table.records.iter().enumerate() {
+                let label = named_hex(item_name_or_none(rec.item).as_deref(), rec.item as u32);
+                if !quest_item_hit(&label, &needle) {
+                    continue;
+                }
                 out.push(QuestSupplyRow {
                     entry: idx,
                     file: file.clone(),
                     row: i,
                     item: rec.item,
-                    label: named_hex(item_name_or_none(rec.item).as_deref(), rec.item as u32),
+                    label,
                     count: rec.count,
                 });
             }
@@ -7845,7 +8084,13 @@ impl Editor {
         out
     }
 
-    /// How many rows of the tab hold a value (everything but 詳細).
+    /// How many rows the current tab lists.
+    ///
+    /// The values, and nothing else: every tab used to end with a 詳細 row that
+    /// opened the file-by-file screens, and that made three doors to one screen
+    /// (the row, the [ファイル] pill on the bar and [R] held down). The row is
+    /// gone and the pill is the one door - the pad's route to it is [R] held,
+    /// which the guide names.
     pub fn quest_value_rows(&self) -> usize {
         match self.quest_edit_tab {
             QUEST_TAB_BASIC => self.quest_basic_rows().len(),
@@ -7855,9 +8100,9 @@ impl Editor {
         }
     }
 
-    /// Is the cursor on the 詳細 row (the last row of every tab)?
-    pub fn quest_on_detail_row(&self) -> bool {
-        self.quest_edit_cursor >= self.quest_value_rows()
+    /// How many rows the current tab lists (the values; there is no extra row).
+    pub fn quest_row_count(&self) -> usize {
+        self.quest_value_rows()
     }
 
     /// What [A] does on the row the cursor is on, as the deck's button says it.
@@ -7869,25 +8114,12 @@ impl Editor {
     /// The label follows the row now, the same way the equipment form's
     /// (hbedit::EquipFormAction) does.
     pub fn quest_basic_a_label(&self) -> &'static str {
-        if self.quest_on_detail_row() {
-            return "ファイル画面へ";
-        }
         let rows = self.quest_basic_rows();
         match rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1))) {
             Some(row) if row.text_index.is_some() => "テキスト編集",
             Some(_) => "増減は [◀/▶]",
             None => "行の操作",
         }
-    }
-
-    /// How many rows the current tab lists.
-    ///
-    /// One more than the values: the last row of every tab is 詳細, so the pad
-    /// can reach the file-by-file screens without a key that belongs to
-    /// something else (ZR is the sidebar's). The button on the bar runs the
-    /// same action.
-    pub fn quest_row_count(&self) -> usize {
-        self.quest_value_rows() + 1
     }
 
     /// Move the cursor inside the current tab.
@@ -7911,7 +8143,93 @@ impl Editor {
         self.message = format!("タブ: {}", QUEST_TAB_LABELS[self.quest_edit_tab]);
     }
 
-    /// Which of the six monster values [◀/▶] is on.
+    /// The 報酬 / 支給品 tabs' item search: ask the I/O layer for a name.
+    ///
+    /// The key is [ZR], the screen's own value switch: on 報酬 it walks 個数 →
+    /// 確率% → 検索, and on 支給品 - which has one value and nothing to switch -
+    /// it opens the search directly. [-] is the delete key and nothing else
+    /// (tests/key_hints.rs audits every [-] in this file), so it could not take
+    /// the search even though these two tabs have nothing to delete.
+    pub fn request_quest_item_filter(&mut self) {
+        if !matches!(self.quest_edit_tab, QUEST_TAB_REWARDS | QUEST_TAB_SUPPLIES) {
+            self.message = String::from(
+                "検索は 報酬 / 支給品 タブで使います（この tab は [A] で編集）",
+            );
+            return;
+        }
+        self.pending_text = Some((TEXT_QUEST_ITEM, self.quest_item_filter.clone()));
+    }
+
+    /// The I/O layer answers the [−] request with this.
+    ///
+    /// An empty answer clears the filter, the same rule the talisman box, the
+    /// equipment box and the item box follow.
+    pub fn apply_quest_item_filter(&mut self, text: String) {
+        let cleared = text.trim().is_empty();
+        self.quest_item_filter = text;
+        self.quest_edit_cursor = 0;
+        self.cursor = 0;
+        let n = self.quest_value_rows();
+        self.message = if cleared {
+            String::from("検索を解除しました（全件表示）")
+        } else {
+            alloc::format!(
+                "検索「{}」— {} 件。[ZR] で変更、空にすると解除",
+                self.quest_item_filter.trim(),
+                n
+            )
+        };
+    }
+
+    /// The 報酬 / 支給品 tab's header, with the item filter on it.
+    pub fn quest_item_heading(&self) -> String {
+        let base = QUEST_TAB_LABELS[self.quest_edit_tab.min(QUEST_TABS - 1)];
+        let needle = self.quest_item_filter.trim();
+        if needle.is_empty() {
+            alloc::format!("クエスト改造 {}", base)
+        } else {
+            alloc::format!("クエスト改造 {}（検索: {}）[ZR] で変更", base, needle)
+        }
+    }
+
+    /// The six tabs of the クエスト section bar.
+    ///
+    /// The two bundle tabs count what the bundle really carries
+    /// ([crate::dlc::bundled_quest_counts]) instead of printing 189 / 34 as
+    /// literals: a checkout without the generated bundle has zero of each, and
+    /// a tab that promised 189 quests over an empty list was the review's
+    /// finding. The guide says why the list is empty when it is.
+    pub fn quest_section_tab_labels() -> Vec<String> {
+        let (official, dead) = Self::bundle_counts();
+        alloc::vec![
+            String::from("クエスト改造"),
+            String::from("セーブ内"),
+            alloc::format!("公式({})", official),
+            alloc::format!("没クエ({})", dead),
+            String::from("SD(.arc)"),
+            String::from("固定装備"),
+        ]
+    }
+
+    /// Does this build carry a bundled quest catalogue at all?
+    pub fn bundled_quests_available() -> bool {
+        let (official, dead) = Self::bundle_counts();
+        official > 0 || dead > 0
+    }
+
+    /// The two bundle sizes, or (0, 0) in a build without the game data.
+    fn bundle_counts() -> (usize, usize) {
+        #[cfg(feature = "gamedata")]
+        {
+            crate::dlc::bundled_quest_counts()
+        }
+        #[cfg(not(feature = "gamedata"))]
+        {
+            (0, 0)
+        }
+    }
+
+    /// Which of the eleven monster values [◀/▶] is on.
     pub fn quest_field_label(&self) -> &'static str {
         QUEST_MON_LABELS
             .get(self.quest_edit_field.min(QUEST_MON_FIELDS - 1))
@@ -7927,72 +8245,27 @@ impl Editor {
                 let label = self.quest_field_label();
                 self.message = format!("[◀/▶] で変更する項目: {}", label);
             }
+            // 個数 → 確率% → 検索. The third stop is the item-name search: the
+            // key is the screen's own value switch, and [-] could not take the
+            // search because it is the delete key everywhere (and audited to be
+            // nothing else).
             QUEST_TAB_REWARDS => {
-                self.quest_edit_chance = !self.quest_edit_chance;
-                self.message = if self.quest_edit_chance {
-                    String::from("[◀/▶] で変更する項目: 確率%")
-                } else {
-                    String::from("[◀/▶] で変更する項目: 個数")
-                };
+                if self.quest_edit_chance {
+                    self.quest_edit_chance = false;
+                    self.request_quest_item_filter();
+                    return;
+                }
+                self.quest_edit_chance = true;
+                self.message = String::from("[◀/▶] で変更する項目: 確率%");
             }
+            // 支給品 has one value and nothing to switch, so the key is the
+            // search itself here.
             QUEST_TAB_SUPPLIES => {
-                self.message = String::from("支給品は個数だけです（確率はありません）");
+                self.request_quest_item_filter();
             }
             _ => {
                 self.message = String::from("このタブは [◀/▶] では変わりません（[A] で編集）");
             }
-        }
-    }
-
-    /// Open / close the ▸詳細 rows of the monster under the cursor.
-    ///
-    /// The deck's button on the モンスター tab runs it. It used to be [Y], and
-    /// [Y] is the step key now: the reward chance could only be walked one
-    /// point at a time because the key that changes the step had been given
-    /// away to a row toggle. The numbers behind the rows are still on the pad's
-    /// route - the 詳細 row's [A] opens the file screens they live on.
-    pub fn quest_toggle_detail(&mut self) {
-        if self.quest_edit_tab != QUEST_TAB_MONSTERS {
-            self.message = String::from("このタブに詳細行はありません（[A] で編集）");
-            return;
-        }
-        if self.quest_on_detail_row() {
-            self.message = String::from("詳細行です（[A] でファイル単位の画面へ）");
-            return;
-        }
-        let rows = self.quest_mon_rows();
-        let Some(row) = rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1))) else {
-            return;
-        };
-        let QuestMonRow::Slot(slot) = *row else {
-            self.message = String::from("詳細行です（[◀/▶] で座標・向き・ウェーブを変更）");
-            return;
-        };
-        if let Some(open) = self.quest_edit_open.get_mut(slot) {
-            *open = !*open;
-            let now = *open;
-            self.message = if now {
-                format!("スロット{} の詳細を開きました（X/Y/Z/向き/ウェーブ）", slot + 1)
-            } else {
-                format!("スロット{} の詳細を閉じました", slot + 1)
-            };
-        }
-    }
-
-    /// Is the ▸詳細 of the monster under the cursor open?
-    ///
-    /// The deck's pill draws its word from this, so the button cannot say 開く
-    /// about rows that are already showing.
-    pub fn quest_detail_open(&self) -> bool {
-        if self.quest_edit_tab != QUEST_TAB_MONSTERS {
-            return false;
-        }
-        let rows = self.quest_mon_rows();
-        match rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1))) {
-            Some(QuestMonRow::Slot(slot)) | Some(QuestMonRow::Detail(slot, _)) => {
-                self.quest_edit_open.get(*slot).copied().unwrap_or(false)
-            }
-            None => false,
         }
     }
 
@@ -8005,10 +8278,6 @@ impl Editor {
     /// same .rem / .sup table writer (store_entry_number).
     pub fn quest_adjust(&mut self, delta: i64) -> bool {
         if delta == 0 {
-            return false;
-        }
-        if self.quest_on_detail_row() {
-            self.message = String::from("詳細行です（[A] でファイル単位の画面へ）");
             return false;
         }
         let step = delta as i32;
@@ -8039,19 +8308,22 @@ impl Editor {
                 if rows.is_empty() {
                     return false;
                 }
-                let cur = self.quest_edit_cursor.min(rows.len() - 1);
-                match rows[cur] {
-                    QuestMonRow::Slot(slot) => match self.quest_edit_field {
-                        QUEST_MON_AREA => self.adjust_sem_placement(slot, 0, step),
-                        field => {
-                            let Some(idx) = mob_slot_field_index(slot) else {
-                                return false;
-                            };
-                            self.adjust_mib_mob(idx, field, step);
-                            true
-                        }
-                    },
-                    QuestMonRow::Detail(slot, k) => self.adjust_sem_placement(slot, k, step),
+                let slot = self.quest_edit_cursor.min(rows.len() - 1);
+                match self.quest_edit_field {
+                    // The .sem half of the row: the area byte, then the five
+                    // placement numbers, all through the one writer the .sem
+                    // screen uses.
+                    QUEST_MON_AREA => self.adjust_sem_placement(slot, 0, step),
+                    field if field >= QUEST_MON_SEM_X => {
+                        self.adjust_sem_placement(slot, field - QUEST_MON_SEM_X + 1, step)
+                    }
+                    field => {
+                        let Some(idx) = mob_slot_field_index(slot) else {
+                            return false;
+                        };
+                        self.adjust_mib_mob(idx, field, step);
+                        true
+                    }
                 }
             }
             QUEST_TAB_REWARDS => {
@@ -8095,9 +8367,6 @@ impl Editor {
     /// The two choices the console owns - the monster list and the area list -
     /// come back as a [QuestPick].
     pub fn quest_activate(&mut self) -> QuestPick {
-        if self.quest_on_detail_row() {
-            return QuestPick::Detail;
-        }
         match self.quest_edit_tab {
             QUEST_TAB_BASIC => {
                 let rows = self.quest_basic_rows();
@@ -8123,20 +8392,23 @@ impl Editor {
                 if rows.is_empty() {
                     return QuestPick::None;
                 }
-                let cur = self.quest_edit_cursor.min(rows.len() - 1);
-                match rows[cur] {
-                    QuestMonRow::Slot(slot) => {
-                        if self.quest_edit_field == QUEST_MON_AREA {
-                            QuestPick::Area(slot)
-                        } else if let Some(idx) = mob_slot_field_index(slot) {
-                            QuestPick::Monster(idx)
-                        } else {
-                            self.message = String::from("このクエストにモンスタースロットがありません");
-                            QuestPick::None
-                        }
-                    }
-                    QuestMonRow::Detail(_, _) => {
-                        self.message = String::from("この行は [◀/▶] で変更します");
+                let slot = self.quest_edit_cursor.min(rows.len() - 1);
+                if self.quest_edit_field == QUEST_MON_AREA {
+                    return QuestPick::Area(slot);
+                }
+                if self.quest_edit_field >= QUEST_MON_SEM_X {
+                    // The .sem numbers are stepped, not chosen: there is no list
+                    // of coordinates to pick from.
+                    self.message = alloc::format!(
+                        "{} は [◀/▶] で変更します（[ZR] で項目を切り替え）",
+                        self.quest_field_label()
+                    );
+                    return QuestPick::None;
+                }
+                match mob_slot_field_index(slot) {
+                    Some(idx) => QuestPick::Monster(idx),
+                    None => {
+                        self.message = String::from("このクエストにモンスタースロットがありません");
                         QuestPick::None
                     }
                 }
@@ -8215,6 +8487,7 @@ impl Editor {
             // [ZR] switches which value [◀/▶] steps. [-] is the delete key and
             // a quest has nothing to delete, so the two must not share it.
             Key::Z => self.quest_cycle_field(),
+
             Key::X => {
                 self.flush_quest_edit();
                 self.request_write_arc();
@@ -8661,9 +8934,10 @@ impl Editor {
     /// rows here are the same rows the canvas screen draws, in the same order,
     /// so the two fallbacks cannot show different quests.
     pub fn quest_console_rows(&self) -> Vec<String> {
-        let mut out = self.quest_console_value_rows();
-        out.push(String::from("  > 詳細（ファイル単位の画面へ）"));
-        out
+        // The values, and nothing else: the 詳細 row the list used to end with
+        // is gone (the [ファイル] pill is the one door), so the ASCII route
+        // prints exactly the rows the canvas draws.
+        self.quest_console_value_rows()
     }
 
     /// The value rows of the current tab, without the 詳細 row.
@@ -8677,30 +8951,27 @@ impl Editor {
             QUEST_TAB_MONSTERS => {
                 let monsters = self.quest_monsters();
                 let mut out = Vec::new();
-                for row in self.quest_mon_rows() {
-                    match row {
-                        QuestMonRow::Slot(slot) => {
-                            let Some(m) = monsters.get(slot) else { continue };
-                            let area = match m.area {
-                                Some(a) => format!("エリア {}", a),
-                                None => String::from("エリア -"),
-                            };
-                            out.push(format!(
-                                "{} {}  HP:{} 攻:{} 防:{} 寸:{}% 数:{}  {}",
-                                slot + 1,
-                                m.label,
-                                m.hp,
-                                m.atk,
-                                m.def,
-                                m.size,
-                                m.count,
-                                area
-                            ));
-                        }
-                        QuestMonRow::Detail(slot, k) => {
-                            let (label, value) = self.quest_monster_detail(slot, k);
-                            out.push(format!("    ・{}: {}", label, value));
-                        }
+                for slot in self.quest_mon_rows() {
+                    let Some(m) = monsters.get(slot) else { continue };
+                    let area = match m.area {
+                        Some(a) => format!("エリア {}", a),
+                        None => String::from("エリア -"),
+                    };
+                    out.push(format!(
+                        "{} {}  HP:{} 攻:{} 防:{} 寸:{}% 数:{}  {}",
+                        slot + 1,
+                        m.label,
+                        m.hp,
+                        m.atk,
+                        m.def,
+                        m.size,
+                        m.count,
+                        area
+                    ));
+                    // The .sem numbers the row's [ZR] walks, on the row's own
+                    // line: they are not rows of their own any more.
+                    if let Some(sem) = self.quest_sem_line(slot) {
+                        out.push(format!("    ・{}", sem));
                     }
                 }
                 out
@@ -9107,16 +9378,16 @@ impl Editor {
     /// The I/O layer answers an ExtractQuests request with this.
     pub fn apply_extracted(&mut self, written: usize, dir: &str) {
         self.message = if written == 0 {
-            format!("nothing written to {} - no matching quest in this save", dir)
+            format!("{} には何も書き出していません（このセーブに該当クエストがありません）", dir)
         } else {
-            format!("wrote {} quest file(s) to {}", written, dir)
+            format!("{} 件のクエストを {} に書き出しました", written, dir)
         };
     }
 
     /// Feed raw archive bytes.
     pub fn open_arc_bytes(&mut self, path: &str, bytes: &[u8]) {
         match Arc::parse(bytes) {
-            Err(e) => self.message = format!("not an .arc: {}", e),
+            Err(e) => self.message = format!(".arc ではありません: {}", e),
             Ok(a) => {
                 let idx = a
                     .entries
@@ -9522,6 +9793,7 @@ impl Editor {
             || rec[0x0D] != e.skill2
             || rec[0x0F] as i8 != e.points2
             || charm::kind_of_record(rec) != Some(e.kind)
+            || crate::equip::Equipment::decorations(e.index, rec) != e.decorations
     }
 
     /// Does the equipment form hold an edit the box does not have yet?
@@ -9963,12 +10235,12 @@ impl Editor {
         let list = self.charms();
         let n = list.len();
         let Some(c) = list.get(self.cursor).copied() else {
-            self.message = String::from("削除するお守りを選んでください");
+            self.message = String::from("削除する護石を選んでください");
             return false;
         };
         let idx = c.index;
         let slot = self.slot;
-        self.push_undo("お守りの削除");
+        self.push_undo("護石の削除");
         let ok = match &mut self.save {
             Some(s) => s.clear_charm(slot, idx),
             None => false,
@@ -9978,7 +10250,7 @@ impl Editor {
             if self.cursor > 0 && self.cursor >= n - 1 {
                 self.cursor = n.saturating_sub(2);
             }
-            self.message = alloc::format!("お守り (枠 #{:04}) を削除しました", idx);
+            self.message = alloc::format!("護石 (枠 #{:04}) を削除しました", idx);
         } else {
             self.message = alloc::format!(
                 "枠 #{:04} は削除できません（護石ではない記録です）",
@@ -10454,10 +10726,10 @@ impl Editor {
                 // cannot be [-]: it is [＋] now, and the line names it so the
                 // empty box cannot send the user at the key that removes one.
                 self.message =
-                    String::from("お守りがありません（[＋] で作成 / [A] でも作成できます）");
+                    String::from("護石がありません（[＋] で作成 / [A] でも作成できます）");
             } else {
                 self.message = alloc::format!(
-                    "検索「{}」に一致するお守りがありません（[Y] で変える・空で解除）",
+                    "検索「{}」に一致する護石がありません（[Y] で変える・空で解除）",
                     self.charm_filter.trim()
                 );
             }
@@ -10540,6 +10812,35 @@ impl Editor {
         };
     }
 
+    /// 護石編集: open the form on the talisman the list has selected.
+    ///
+    /// The section's second tab used to call [Editor::open_charms] - the same
+    /// call the first tab makes - so pressing 護石編集 put the list back on
+    /// screen and the tab lit 護石一覧 instead of the one that was pressed. The
+    /// tab opens the *form* now, on the record the list was on, and says so
+    /// when there is nothing to open.
+    pub fn open_charm_form_selected(&mut self) {
+        let list = self.charms();
+        if list.is_empty() {
+            // The two empty states need different words, the same rule the
+            // list's own [A] follows: a filtered box is not an empty one.
+            self.message = if self.charm_filter.trim().is_empty() {
+                String::from("護石を選んでください（一覧に護石がありません・[＋] で新規）")
+            } else {
+                alloc::format!(
+                    "護石を選んでください（検索「{}」に一致する護石がありません）",
+                    self.charm_filter.trim()
+                )
+            };
+            self.screen = Screen::Charms;
+            self.cursor = 0;
+            return;
+        }
+        let pos = self.cursor.min(list.len() - 1);
+        self.cursor = pos;
+        self.open_charm_editor(false);
+    }
+
     /// Open the charm form, either on the selected charm or on a free slot.
     fn open_charm_editor(&mut self, fresh: bool) {
         let list = self.charms();
@@ -10613,6 +10914,20 @@ impl Editor {
             .unwrap_or_else(|| {
                 crate::charm::canonical_kind(grade.rarity()).unwrap_or(10)
             });
+        // The three decoration sockets come off the record the form is seeded
+        // from, the same way the skills and the kind do: a talisman that holds
+        // something in a socket must show it, and a fresh one must not invent
+        // one (charm::template_from_box already prefers a clean record).
+        let decorations = self
+            .save
+            .as_ref()
+            .and_then(|s| s.equipment_box(self.slot))
+            .and_then(|b| {
+                let o = seed.index * crate::charm::CHARM_RECORD;
+                b.get(o..o + crate::charm::CHARM_RECORD)
+                    .map(|rec| crate::equip::Equipment::decorations(seed.index, rec))
+            })
+            .unwrap_or([0; 3]);
         self.charm_edit = Some(CharmEdit {
             index: seed.index,
             kind,
@@ -10622,6 +10937,7 @@ impl Editor {
             points1: seed.points1,
             skill2: seed.skill2,
             points2: seed.points2,
+            decorations,
             // Land on the first skill: the grade and slot rows are quicker to
             // reach than to pass through on every visit.
             field: 3,
@@ -10649,7 +10965,7 @@ impl Editor {
             // would write a record the user never asked for, on a list whose
             // heading says the search found nothing.
             self.message = alloc::format!(
-                "検索「{}」に一致するお守りがありません（[Y] で変える・空で解除 / 新規は [＋]）",
+                "検索「{}」に一致する護石がありません（[Y] で変える・空で解除 / 新規は [＋]）",
                 self.charm_filter.trim()
             );
             return;
@@ -10703,13 +11019,13 @@ impl Editor {
                     (Some(i), _) => {
                         self.charm_delete_armed = Some(i);
                         self.message = alloc::format!(
-                            "お守りの枠 #{:04} を削除しますか？ もう一度 [-] で削除（2回）",
+                            "護石の枠 #{:04} を削除しますか？ もう一度 [-] で削除（2回）",
                             i
                         );
                     }
                     (None, _) => {
                         self.charm_delete_armed = None;
-                        self.message = String::from("削除するお守りを選んでください");
+                        self.message = String::from("削除する護石を選んでください");
                     }
                 }
             }
@@ -10734,8 +11050,11 @@ impl Editor {
             return;
         };
         match key {
-            Key::Up => e.field = (e.field + 6) % 7,
-            Key::Down => e.field = (e.field + 1) % 7,
+            // The row count is the form's own (CHARM_EDIT_ROWS): the two arms
+            // used to wrap with a literal 7, which is what left the three
+            // decoration rows unreachable from the pad.
+            Key::Up => e.field = (e.field + CHARM_EDIT_ROWS - 1) % CHARM_EDIT_ROWS,
+            Key::Down => e.field = (e.field + 1) % CHARM_EDIT_ROWS,
             Key::Left | Key::Right => {
                 let d: i64 = if key == Key::Right { 1 } else { -1 } * STEPS[self.step].min(10).max(1);
                 match e.field {
@@ -10799,6 +11118,29 @@ impl Editor {
                     4 => e.points1 = (e.points1 as i64 + d).clamp(-127, 127) as i8,
                     5 => e.skill2 = ((e.skill2 as i64 + d).rem_euclid(256)) as u8,
                     6 => e.points2 = (e.points2 as i64 + d).clamp(-127, 127) as i8,
+                    // The three decoration sockets: the same table the
+                    // equipment form steps, so a socket never takes an id the
+                    // game has no decoration for. A socket the slot count does
+                    // not cover says so rather than taking the id silently.
+                    7..=9 => {
+                        let sock = e.field - 7;
+                        if (sock as u8) >= e.slots {
+                            self.message = String::from(
+                                "スロット数が足りません（スロット数の行で増やせます）",
+                            );
+                        } else {
+                            let ids = decoration_ids();
+                            if !ids.is_empty() {
+                                let pos = ids
+                                    .iter()
+                                    .position(|i| *i == e.decorations[sock])
+                                    .unwrap_or(0);
+                                let n = ids.len() as i64;
+                                let next = ((pos as i64 + d).rem_euclid(n)) as usize;
+                                e.decorations[sock] = ids[next];
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -10811,8 +11153,13 @@ impl Editor {
                     self.charm_open_skill_pick(true);
                     return;
                 }
+                if (7..=9).contains(&e.field) {
+                    self.charm_edit = Some(e);
+                    self.charm_open_jewel_pick(true);
+                    return;
+                }
                 self.message =
-                    String::from("スキルの行で [A] 一覧から選択 / [Y] 名前で検索");
+                    String::from("スキル・装飾品の行で [A] 一覧から選択 / [Y] 名前で検索");
             }
             Key::X => self.step = (self.step + 1) % STEPS.len(),
             // [A] is the row's own action (hbedit::CharmAction). The skill rows
@@ -10832,6 +11179,11 @@ impl Editor {
                     | CharmAction::RaisePoints => {
                         self.charm_edit = Some(e);
                         self.input(Key::Right);
+                        return;
+                    }
+                    CharmAction::PickDecoration => {
+                        self.charm_edit = Some(e);
+                        self.charm_open_jewel_pick(false);
                         return;
                     }
                     // The box-slot row is the one row that writes.
@@ -10880,13 +11232,19 @@ impl Editor {
     /// talisman says why and returns false; the caller must not then pretend
     /// the draft is in the save.
     pub fn commit_charm_draft(&mut self) -> bool {
+        let written = self.charm_edit.map(|e| e.index);
         if !self.write_charm_draft() {
             return false;
         }
-        // [A] wrote the record, so the list is where the next thing happens.
+        // [A] wrote the record, so the list is where the next thing happens -
+        // on the row that was just written. It used to go back to the top, so
+        // editing the fortieth talisman left the cursor on the first one and
+        // the next visit cost forty presses.
         self.charm_edit = None;
         self.screen = Screen::Charms;
-        self.cursor = 0;
+        self.cursor = written
+            .and_then(|index| self.charms().iter().position(|c| c.index == index))
+            .unwrap_or(0);
         true
     }
 
@@ -10918,7 +11276,7 @@ impl Editor {
             skill2: e.skill2,
             points2: e.points2,
         };
-        self.push_undo("お守りの書き込み");
+        self.push_undo("護石の書き込み");
         let kind_name = crate::charm::kind_name(e.kind).unwrap_or("?");
         let written = match &mut self.save {
             // The kind is written with the skills, and its rarity comes along:
@@ -10926,6 +11284,24 @@ impl Editor {
             Some(s) => s.set_charm_with_kind(self.slot, &c, e.kind),
             None => false,
         };
+        // The three decoration sockets are the record's own (+0x06 / +0x08 /
+        // +0x0A), and set_charm_with_kind leaves them alone: they are written
+        // here, on the same record, so the form's three rows are not a promise
+        // the write does not keep.
+        if written {
+            let slot = self.slot;
+            let index = e.index;
+            if let Some(save) = &mut self.save {
+                if let Some(box_) = save.equipment_box_mut(slot) {
+                    let o = index * crate::charm::CHARM_RECORD;
+                    if let Some(rec) = box_.get_mut(o..o + crate::charm::CHARM_RECORD) {
+                        for (sock, id) in e.decorations.iter().enumerate() {
+                            crate::equip::set_decoration(rec, sock, *id);
+                        }
+                    }
+                }
+            }
+        }
         if !written {
             self.message = String::from(
                 "could not write here - the slot is a weapon or the box has no talisman to copy",
@@ -10933,12 +11309,51 @@ impl Editor {
             return false;
         }
         self.dirty = true;
-        self.message = format!("お守り {} を書き込みました（{}）", e.index, kind_name);
+        self.message = format!("護石 {} を書き込みました（{}）", e.index, kind_name);
         // The values stay in the form: they are the record's now, so the draft
         // is clean. Where the screen goes is the caller's half of the answer
         // ([Editor::commit_charm_draft] leaves, [..._here] stays).
         self.charm_edit = Some(e);
         true
+    }
+
+    /// [A] / [Y] on 装飾品1..3: open the decoration list on that socket.
+    ///
+    /// The same list the equipment form opens, with the same filter and the
+    /// same rows - only the writer differs, and that is what
+    /// [Editor::jewel_pick_charm_socket] says.
+    fn charm_open_jewel_pick(&mut self, search: bool) {
+        let Some(e) = self.charm_edit else {
+            return;
+        };
+        let Some(sock) = e.field.checked_sub(7).filter(|s| *s < 3) else {
+            self.message = String::from("装飾品の行で [A] を押してください");
+            return;
+        };
+        if (sock as u8) >= e.slots {
+            self.message = String::from(
+                "スロット数が足りません（スロット数の行で増やしてから選んでください）",
+            );
+            return;
+        }
+        self.jewel_pick_filter.clear();
+        // The cursor starts on the decoration the socket holds, so opening the
+        // list twice does not lose the entry.
+        let held = e.decorations[sock];
+        self.jewel_pick_cursor = self
+            .jewel_pick_matches()
+            .iter()
+            .position(|id| *id == held)
+            .unwrap_or(0);
+        self.jewel_pick_charm_socket = Some(sock);
+        self.screen = Screen::JewelPick;
+        if search {
+            self.message =
+                String::from("装飾品名で検索します（空にすると一覧が戻ります）");
+            self.pending_text = Some((TEXT_JEWEL_FILTER, self.jewel_pick_filter.clone()));
+        } else {
+            self.message = self.pick_key_hint();
+        }
     }
 
     /// Open the skill name picker on the row the form is on.
@@ -11672,7 +12087,7 @@ impl Editor {
         self.item_undo.clear();
         let charms = self.charms().len();
         self.charm_cursor = self.charm_cursor.min(charms.saturating_sub(1));
-        let equip = self.equipment().len();
+        let equip = self.equip_rows().len();
         self.equip_cursor = self.equip_cursor.min(equip.saturating_sub(1));
         let palicos = self.palicos().len();
         self.roster_cursor = self.roster_cursor.min(palicos.saturating_sub(1));
@@ -11770,7 +12185,7 @@ impl Editor {
     /// The same request, without losing the line the caller just set.
     ///
     /// The quest screen and the two form screens say what they just wrote
-    /// (枠 3 に上書きしました / お守り 4 を書き込みました) and then have to ask
+    /// (枠 3 に上書きしました / 護石 4 を書き込みました) and then have to ask
     /// for the write. The plain request replaces that sentence with 書き込み中,
     /// so the one press that changed the card would read as one that had not.
     fn request_write_save_keeping_message(&mut self) {
@@ -13364,6 +13779,21 @@ impl Editor {
             bytes,
         });
         self.message = alloc::format!("{}で書き出しました: {}", what, path);
+    }
+
+    /// The equipment box as the 装備BOX screen lists it: every record but the
+    /// talismans.
+    ///
+    /// A talisman is type 6 and lives in the same box, but it has a screen and
+    /// a form of its own (護石一覧 / 護石編集) - two screens editing one record
+    /// is how the two forms came to disagree about what a talisman has. The
+    /// equipment form's レベル / 着せ替え / 装飾品 rows mean nothing for a
+    /// talisman either, and this is what keeps it from ever opening on one.
+    pub fn equip_rows(&self) -> Vec<crate::equip::Equipment> {
+        self.equipment()
+            .into_iter()
+            .filter(|e| e.kind != crate::equip::TALISMAN_KIND)
+            .collect()
     }
 
     /// Equipment of the current slot, after the filter.
@@ -15261,7 +15691,7 @@ impl Editor {
             Screen::Char => "行を選んで [◀/▶] で変更、[A] 2回で最大。[生データ] でこの画面のバイト。",
             Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[Y] で空き枠も表示。",
             Screen::ItemPick => "名前で検索して [A] で決定。[B] で元の画面へ。",
-            Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[Y] で種類やスキル名を検索できます。",
+            Screen::Charms => "護石を選んで [A] で編集、[＋] で新規。[Y] で種類やスキル名を検索できます。",
             Screen::CharmEdit => "行ごとに [A] で操作（スキルは一覧）、[◀/▶] で値。[B] で一覧へ。",
             Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を検索できます。",
             Screen::Equip => "装備を選んで [A] で編集、[Y] で名前を検索、[＋] で新規。[生データ] で装備BOXのバイト。",
@@ -15284,6 +15714,12 @@ impl Editor {
             // back to the sub-tab. The line named the wrong key for the wrong
             // job, and the only way to check it was to read
             // `input_save_quests` beside it.
+            // The two bundle tabs count what the build really carries, and a
+            // checkout without the generated bundle carries none: the guide
+            // says so rather than leaving an empty list unexplained.
+            Screen::SaveQuests if !Self::bundled_quests_available() => {
+                "DLC バンドル未生成: 公式・没クエは 0 件です（セーブ内は [A] で改造）。"
+            }
             Screen::SaveQuests => {
                 "クエストを選んで [A] で改造、[-] で削除（2回）。書き出しは右のボタン。[L/R] で一覧切替。"
             }
@@ -15509,16 +15945,14 @@ impl Editor {
             Key::R => {
                 self.progress_tab = (self.progress_view() + 1) % PROGRESS_TABS;
             }
-            // Y is the second bit of the quest view (seen). The other two views
-            // have no second bit to give - an award or a request flag is one
-            // bit - so there it cycles the view instead. The chips on screen
-            // name whichever it is on the view in front of the user.
+            // [Y] walks the three views on all three of them. On the quest view
+            // it used to write the 既読 bit instead - a save write on the key
+            // that moves the tab on the other two views, which is the review's
+            // finding: one key, two meanings, and the destructive one on the
+            // view where a user expects the tab to move. The write is the
+            // deck's 既読 pill now ([Editor::progress_seen_press]).
             Key::Y => {
-                if self.progress_view() == PROGRESS_QUESTS {
-                    self.progress_quest_seen();
-                } else {
-                    self.progress_tab = (self.progress_view() + 1) % PROGRESS_TABS;
-                }
+                self.progress_tab = (self.progress_view() + 1) % PROGRESS_TABS;
             }
             // The four directions walk the list that is on screen, not the
             // whole table: with a search on, the rows between two matches are
@@ -15635,6 +16069,21 @@ impl Editor {
 
     /// Y on the quest view: the seen bit, which the core refuses to clear while
     /// the quest is still cleared.
+    /// The deck's 既読 pill: the write [Y] used to make on the quest view.
+    ///
+    /// [Y] moves the tab on all three views now, so the one view whose rows
+    /// carry a second bit needs a button of its own. It says where it works on
+    /// the other two rather than doing nothing.
+    pub fn progress_seen_press(&mut self) {
+        if self.progress_view() != PROGRESS_QUESTS {
+            self.message = String::from(
+                "既読は クエスト ビューで使います（勲章・依頼は 1 ビットだけです）",
+            );
+            return;
+        }
+        self.progress_quest_seen();
+    }
+
     fn progress_quest_seen(&mut self) {
         let slot = self.slot;
         // The same rule [A] follows: an empty list has no row to write.
@@ -17570,7 +18019,7 @@ impl Editor {
     }
 
     fn input_equip(&mut self, key: Key) {
-        let n = self.equipment().len();
+        let n = self.equip_rows().len();
         // Anything other than the confirmation itself means the user is no
         // longer looking at the record that was armed, so the pending delete
         // is dropped before the key does its own work.
@@ -17622,7 +18071,7 @@ impl Editor {
     /// The second half is the same key again with `equip_delete_armed` set to
     /// the record under the cursor.
     fn delete_equip_under_cursor(&mut self) {
-        let list = self.equipment();
+        let list = self.equip_rows();
         let Some(eq) = list.get(self.equip_cursor).copied() else {
             self.equip_delete_armed = None;
             self.message = String::from("削除する装備がありません");
@@ -17667,7 +18116,7 @@ impl Editor {
             Ok(()) => {
                 self.dirty = true;
                 self.equip_delete_armed = None;
-                let list = self.equipment();
+                let list = self.equip_rows();
                 let pos = list.iter().position(|q| q.index == index);
                 self.equip_cursor =
                     pos.unwrap_or_else(|| self.equip_cursor.min(list.len().saturating_sub(1)));
@@ -17760,8 +18209,17 @@ impl Editor {
         (0..crate::equip::EQUIP_COUNT)
             .filter(|i| {
                 let o = i * crate::equip::EQUIP_RECORD;
-                box_.get(o..o + crate::equip::EQUIP_RECORD)
-                    .map(|rec| !crate::equip::record_is_blank(rec))
+                let Some(rec) = box_.get(o..o + crate::equip::EQUIP_RECORD) else {
+                    return false;
+                };
+                if crate::equip::record_is_blank(rec) {
+                    return false;
+                }
+                // A talisman is not a row of this form: the 装備枠 row walks the
+                // same list the screen lists (equip_rows), or ◀ / ▶ would step
+                // onto a record the form has no fields for.
+                crate::equip::decode_record(*i, rec)
+                    .map(|eq| eq.kind != crate::equip::TALISMAN_KIND)
                     .unwrap_or(false)
             })
             .collect()
@@ -17814,7 +18272,7 @@ impl Editor {
 
     /// Open the equipment form on the record under the list cursor.
     fn open_equip_editor(&mut self) {
-        let list = self.equipment();
+        let list = self.equip_rows();
         let Some(eq) = list.get(self.equip_cursor).copied() else {
             self.message = String::from("編集できる装備がありません");
             return;
@@ -17913,6 +18371,12 @@ impl Editor {
                 if e.decoration_socket(e.field).is_some() {
                     self.equip_edit = Some(e);
                     self.equip_form_open_jewel(true);
+                } else if e.is_kind_row(e.field) {
+                    // The kind row's list is the kind list, not the item one.
+                    self.equip_edit = Some(e);
+                    self.equip_kind_pick_pending = true;
+                    self.message = String::from("種別を一覧から選んでください（20 種）");
+                    return;
                 } else if e.is_identity_row(e.field) {
                     self.equip_edit = Some(e);
                     if self.open_equip_picker() {
@@ -17954,6 +18418,16 @@ impl Editor {
             // have to be read out of the footer first.
             Key::A => {
                 match e.a_action() {
+                    // The kind row opens the kind list; the console owns that
+                    // modal, so the request travels as a flag it reads on the
+                    // frame the press lands (the same shape the .mib picker
+                    // uses). One source of truth: the row's own action.
+                    EquipFormAction::PickKind => {
+                        self.equip_edit = Some(e);
+                        self.equip_kind_pick_pending = true;
+                        self.message = String::from("種別を一覧から選んでください（20 種）");
+                        return;
+                    }
                     EquipFormAction::PickEquip => {
                         self.equip_edit = Some(e);
                         self.open_equip_picker();
@@ -18046,7 +18520,33 @@ impl Editor {
         }
     }
 
-    /// The rows the picker offers, after its type and word filters.
+    /// Where the equipment picker's cursor starts.
+///
+/// A record that exists starts on its own row, so opening the list twice does
+/// not lose the entry the user came back for. A record being *created* has no
+/// row: the form's default type is a piece of armour, and the whole-box list
+/// starts with the 1,606 weapons - so the old rule (find the form's own
+/// (kind, id) pair) put the new-record picker on row 1,608, the head of the
+/// armour block, with every weapon above it. A create starts at the head of
+/// the list instead, and a record whose id the table does not carry starts at
+/// the head of its own type's block.
+pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -> usize {
+    if choices.is_empty() {
+        return 0;
+    }
+    if new {
+        return 0;
+    }
+    if let Some(pos) = choices.iter().position(|c| c.kind == kind && c.id == id) {
+        return pos;
+    }
+    choices
+        .iter()
+        .position(|c| c.kind == kind)
+        .unwrap_or(0)
+}
+
+/// The rows the picker offers, after its type and word filters.
     ///
     /// Rebuilt every frame the picker is open, the way the item picker is, so
     /// the list cannot fall behind the form it writes into.
@@ -18148,10 +18648,7 @@ impl Editor {
         };
         self.equip_pick_filter.clear();
         let choices = self.equip_pick_choices();
-        self.equip_pick_cursor = choices
-            .iter()
-            .position(|c| c.kind == e.kind && c.id == e.id)
-            .unwrap_or(0);
+        self.equip_pick_cursor = Self::equip_pick_start(&choices, e.kind, e.id, e.new);
         self.screen = Screen::EquipPick;
         self.message = self.equip_pick_search_line(choices.len());
         true
@@ -18250,6 +18747,52 @@ impl Editor {
             }
             _ => {}
         }
+    }
+
+    /// The twenty kinds a hunter's box holds, as the 種別 list shows them.
+    ///
+    /// The same table the form cycles ([crate::equip::HUNTER_KINDS]): one list
+    /// of names, so the row, the picker and the box cannot disagree.
+    pub fn equip_kind_choices() -> Vec<(u32, alloc::string::String)> {
+        crate::equip::HUNTER_KINDS
+            .iter()
+            .map(|k| {
+                (
+                    *k as u32,
+                    alloc::format!("{} {}", k, crate::equip::type_name(*k)),
+                )
+            })
+            .collect()
+    }
+
+    /// Write a type picked from that list into the open form.
+    ///
+    /// The id is left alone: the type is the half the list answers, and a pick
+    /// from the item list is what changes both.
+    pub fn apply_equip_kind(&mut self, kind: u8) -> bool {
+        let Some(mut e) = self.equip_edit else {
+            self.message = String::from("装備の編集中に開いてください");
+            return false;
+        };
+        if !crate::equip::is_hunter_kind(kind) {
+            self.message = alloc::format!("種別 {} はハンターの箱に入りません", kind);
+            return false;
+        }
+        e.kind = kind;
+        // The row's own [A] writes, so the cursor goes to the row that writes -
+        // the same rule a pick from the item list follows.
+        e.field = e.write_row();
+        self.equip_edit = Some(e);
+        self.message = alloc::format!(
+            "種別を {} にしました（[A] で{}）",
+            crate::equip::type_name(kind),
+            if self.equip_edit.map(|x| x.new).unwrap_or(false) {
+                "作成"
+            } else {
+                "書き込み"
+            }
+        );
+        true
     }
 
     /// [R] on 種別 / ID: type the id instead of paging to it.
@@ -18379,7 +18922,7 @@ impl Editor {
                 crate::equip::set_transmog(rec, e.transmog_id, e.transmog_level);
             }
             self.dirty = true;
-            let pos = self.equipment().iter().position(|q| q.index == idx).unwrap_or(0);
+            let pos = self.equip_rows().iter().position(|q| q.index == idx).unwrap_or(0);
             self.equip_cursor = pos;
             // What the record is now: a type change keeps every byte, so the
             // lines worth saying are the ones about bytes that no longer mean
@@ -18432,7 +18975,7 @@ impl Editor {
         }
         if written {
             self.dirty = true;
-            let pos = self.equipment().iter().position(|q| q.index == idx).unwrap_or(0);
+            let pos = self.equip_rows().iter().position(|q| q.index == idx).unwrap_or(0);
             self.equip_cursor = pos;
             self.message = alloc::format!(
                 "{} 枠 #{} を書き込みました（Lv{}）",
@@ -18463,7 +19006,7 @@ impl Editor {
                 self.equip_delete_armed = None;
                 // Select the row that was just written, so the list shows what
                 // create() produced instead of leaving the cursor behind.
-                let list = self.equipment();
+                let list = self.equip_rows();
                 let pos = list.iter().position(|q| q.index == index);
                 self.equip_cursor = pos.unwrap_or_else(|| self.equip_cursor.min(list.len().saturating_sub(1)));
                 if leave {
@@ -18589,8 +19132,13 @@ impl Editor {
             }
             Key::A => {
                 let matches = self.jewel_pick_matches();
+                let charm_socket = self.jewel_pick_charm_socket.take();
                 if let Some(&id) = matches.get(self.jewel_pick_cursor) {
-                    if let Some(e) = &mut self.equip_edit {
+                    if let Some(sock) = charm_socket {
+                        if let Some(e) = &mut self.charm_edit {
+                            e.decorations[sock] = id;
+                        }
+                    } else if let Some(e) = &mut self.equip_edit {
                         if let Some(socket) = e.decoration_socket(e.field) {
                             e.decorations[socket] = id;
                         }
@@ -18600,9 +19148,21 @@ impl Editor {
                         decoration_name_of(id)
                     );
                 }
-                self.screen = Screen::EquipEdit;
+                // Back to the form that opened the list, not always to the
+                // equipment one.
+                self.screen = if charm_socket.is_some() {
+                    Screen::CharmEdit
+                } else {
+                    Screen::EquipEdit
+                };
             }
-            Key::B => self.screen = Screen::EquipEdit,
+            Key::B => {
+                self.screen = if self.jewel_pick_charm_socket.take().is_some() {
+                    Screen::CharmEdit
+                } else {
+                    Screen::EquipEdit
+                };
+            }
             Key::Plus => {
                 self.press_quit();
             }
@@ -18809,7 +19369,12 @@ impl Editor {
                                 self.dirty = true;
                             }
                             let name = item_name_of(id);
-                            self.message = format!("box #{} -> {} ({})", box_i + 1, name, id);
+                            self.message = format!(
+                                "枠 #{:04} を {}（ID {}）にしました",
+                                box_i + 1,
+                                name,
+                                id
+                            );
                         }
                     }
                     self.screen = Screen::Items;
@@ -19006,7 +19571,7 @@ impl Editor {
             format!(
                 "検索「{}」— {} 件。[Y] で変更、空にすると解除",
                 self.equip_filter.trim(),
-                self.equipment().len()
+                self.equip_rows().len()
             )
         };
     }
@@ -19167,11 +19732,15 @@ impl Editor {
     /// same slot.
     pub fn open_quest_from_save(&mut self, quest_id: i32) {
         let Some(q) = self.save_quests().into_iter().find(|q| q.quest_id == quest_id) else {
-            self.message = format!("quest {} is not in this save", quest_id);
+            self.message = alloc::format!("クエスト {} はこのセーブにありません", quest_id);
             return;
         };
         if q.data.is_empty() {
-            self.message = format!("quest {} has no payload (size {})", quest_id, q.size);
+            self.message = alloc::format!(
+                "クエスト {} の中身が空です（サイズ {}）",
+                quest_id,
+                q.size
+            );
             return;
         }
         match Arc::parse(&q.data) {
@@ -19194,10 +19763,20 @@ impl Editor {
                 // and throw the .mib buffer away.
                 self.cursor = idx;
                 self.load_entry();
-                self.screen = Screen::ArcEntries;
-                self.message = format!("opened quest {} from the save ({} B)", quest_id, q.data.len());
+                // The quest is opened to be *edited*, so the screen it opens is
+                // the one that edits it. It used to land on 構成(.arc) - the
+                // file list - and [B] there was the way "on" to the editor,
+                // which read as a screen that refused to open. The file list is
+                // one press away now ([ファイル] pill / [R] held).
+                self.quest_return = Screen::SaveQuests;
+                self.enter_quest_edit_keeping_return();
+                self.message = alloc::format!(
+                    "セーブ内のクエスト {} を開きました（{} B・[B] で一覧へ）",
+                    quest_id,
+                    q.data.len()
+                );
             }
-            Err(e) => self.message = format!("quest {} is not an .arc: {}", quest_id, e),
+            Err(e) => self.message = alloc::format!("クエスト {} は .arc ではありません: {}", quest_id, e),
         }
     }
 
@@ -21138,7 +21717,7 @@ impl Editor {
                 );
             }
             Screen::Equip => {
-                let all = self.equipment();
+                let all = self.equip_rows();
                 push(
                     &mut out,
                     alloc::format!(
@@ -21477,7 +22056,7 @@ impl Editor {
                 );
             }
             Screen::CharmEdit => {
-                push(&mut out, String::from("お守りの編集"), false, false);
+                push(&mut out, String::from("護石の編集"), false, false);
                 let e = self.charm_edit.unwrap_or_default();
                 // Seven rows, matching the state machine and the console's
                 // drawn form. This text view was left at six when the grade
@@ -23453,9 +24032,13 @@ mod tests {
         assert_eq!(ed.progress_quest_page(), (2, 31));
         assert_eq!(ed.progress_quest_index(), 51);
 
-        // Y on this view is the seen bit, not the view key.
+        // Y walks the views on all three of them now; the seen bit of this
+        // view is the deck's 既読 pill (Editor::progress_seen_press).
         ed.input(Key::Y);
-        assert_eq!(ed.progress_view(), PROGRESS_QUESTS, "Y is not the tab here");
+        assert_eq!(ed.progress_view(), PROGRESS_AWARDS, "Y is the tab key here");
+        ed.input(Key::L);
+        assert_eq!(ed.progress_view(), PROGRESS_QUESTS);
+        ed.progress_seen_press();
         assert_eq!(ed.progress_quest_state(50), (false, true, false));
 
         // L back to the award view: the cursor is where it was left.
@@ -23710,9 +24293,10 @@ mod tests {
         assert_eq!(questprogress::get(save, 0, Progress::Seen, 1), Some(true));
         assert_eq!(ed.progress_quest_counts(), (1, 1, 0));
 
-        // Y cannot take the seen bit off while the quest is still cleared: the
-        // core refuses and the screen says why instead of doing nothing.
-        ed.input(Key::Y);
+        // The 既読 pill cannot take the seen bit off while the quest is still
+        // cleared: the core refuses and the screen says why instead of doing
+        // nothing. ([Y] is the tab key on this view now.)
+        ed.progress_seen_press();
         assert_eq!(ed.progress_quest_state(0), (true, true, false));
         assert!(ed.message.contains("クリア済み"), "{}", ed.message);
 
@@ -23946,7 +24530,7 @@ mod tests {
         ed.input(Key::L);
         ed.charm_edit.as_mut().expect("the talisman form").field = 0;
         ed.input(Key::A);
-        assert_eq!(ed.undo_label(), Some("お守りの書き込み"), "{}", ed.message);
+        assert_eq!(ed.undo_label(), Some("護石の書き込み"), "{}", ed.message);
 
         // DLC
         ed.install_dlc_category(true, false, "公式");
@@ -24805,9 +25389,13 @@ mod tests {
         // who never looks at the footer can still find the write.
         assert_eq!(rows[0].action, EquipFormAction::WriteForm);
         assert!(rows[0].title.contains("▸ 書き込み"), "{}", rows[0].title);
-        // The two rows that name the record open the picker, and say so.
+        // The two rows that name the record open a list, and say so. 種別 has a
+        // list of its own (the twenty kinds): it used to step one kind per
+        // press, so reaching 弓 from 頭 cost fourteen presses.
+        assert_eq!(rows[7].action, EquipFormAction::PickKind);
+        assert!(rows[7].title.contains("▸ 選ぶ"), "{}", rows[7].title);
+        assert_eq!(rows[8].action, EquipFormAction::PickEquip);
         for i in [7usize, 8] {
-            assert_eq!(rows[i].action, EquipFormAction::PickEquip);
             assert!(rows[i].title.contains("▸ 選ぶ"), "{}", rows[i].title);
             assert!(rows[i].meta.contains("[A]"), "{}", rows[i].meta);
         }
@@ -24820,12 +25408,13 @@ mod tests {
         for i in 1..=3 {
             assert_eq!(rows[i].action, EquipFormAction::StepValue);
         }
-        // A new record: the two identity rows pick, the level row creates.
+        // A new record: 種別 has the kind list, ID the item list, and the level
+        // row creates.
         let mut fresh = e;
         fresh.new = true;
         let rows = equip_form_rows(&fresh, "");
         assert_eq!(rows.len(), EQUIP_NEW_ROWS);
-        assert_eq!(rows[0].action, EquipFormAction::PickEquip);
+        assert_eq!(rows[0].action, EquipFormAction::PickKind);
         assert_eq!(rows[1].action, EquipFormAction::PickEquip);
         assert_eq!(rows[2].action, EquipFormAction::CreateRecord);
         assert!(rows[2].title.contains("▸ 作成"), "{}", rows[2].title);

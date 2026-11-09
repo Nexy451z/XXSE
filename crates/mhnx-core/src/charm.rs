@@ -1,4 +1,4 @@
-//! Talismans (お守り) inside the equipment box.
+//! Talismans (護石) inside the equipment box.
 //!
 //! slot + 0x62EE is NOT a charm-only box: it is the character's whole
 //! equipment box, 2000 records of 36 bytes, holding weapons, armour and

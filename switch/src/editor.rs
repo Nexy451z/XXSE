@@ -1019,8 +1019,8 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
         Char => "キャラクター編集",
         Items => "アイテムボックス",
         ItemPick => "アイテムを選ぶ",
-        Charms => "お守り",
-        CharmEdit => "お守り編集",
+        Charms => "護石",
+        CharmEdit => "護石編集",
         SkillPick => "スキルを選ぶ",
         Equip => "装備",
         EquipEdit => "装備編集",
@@ -1580,7 +1580,7 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                     } else {
                         match read_file(&p) {
                             Some(b) => ed.open_save_bytes(&p, &b),
-                            None => ed.message = format!("cannot read {}", p),
+                            None => ed.message = format!("{} を読めません", p),
                         }
                     }
                 }
@@ -1606,7 +1606,7 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                                 ed.enter_quest_edit_from(mhnx_core::hbedit::Screen::ArcList);
                             }
                         }
-                        None => ed.message = format!("cannot read {}", p),
+                        None => ed.message = format!("{} を読めません", p),
                     }
                 }
             }
@@ -1614,14 +1614,14 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                 let written = match &ed.save {
                     Some(s) => extract_quests(s, &ids),
                     None => {
-                        ed.message = String::from("open a save first");
+                        ed.message = String::from("先にセーブデータを開いてください");
                         0
                     }
                 };
                 let failed = LAST_EXTRACT_FAILED.load(core::sync::atomic::Ordering::Relaxed);
                 ed.apply_extracted(written, OUT_QUEST_DIR);
                 if failed > 0 {
-                    ed.message = format!("{} - {} write(s) FAILED (folder missing?)", ed.message, failed);
+                    ed.message = format!("{} - {} 件を書き出せませんでした（フォルダがありません）", ed.message, failed);
                 }
                 // The folder is new, so refresh the quest list for the next scan.
                 ed.set_arc_files(scan_quests());

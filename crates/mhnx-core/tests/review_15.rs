@@ -241,7 +241,7 @@ fn a_charm_search_with_no_matches_does_not_create_a_record() {
     assert_eq!(ed.screen, Screen::Charms, "the list stays where it is");
     assert!(ed.charm_edit.is_none(), "no form may open");
     assert!(
-        ed.message.contains("一致するお守りがありません"),
+        ed.message.contains("一致する護石がありません"),
         "{}",
         ed.message
     );
