@@ -4082,6 +4082,10 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::SkillPick);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::CharmEdit);
+    // The new talisman is a draft until [A] writes it, so leaving the form
+    // asks first: the first [B] only offers, the second one leaves.
+    press!(Key::B);
+    assert_eq!(ed.screen, Screen::CharmEdit, "the first [B] only asks");
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Charms);
     press!(Key::B);

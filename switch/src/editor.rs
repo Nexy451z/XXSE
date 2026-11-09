@@ -1070,17 +1070,20 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("+", "終了"),
         ],
         Convert => &[("A", "変換して保存"), ("Y", "名前"), ("B", "戻る")],
+        // [Y] is the bulk MAX on this build (the console answers it before the
+        // state machine sees it), and it asks for a second press now. The quest
+        // files are the クエスト section's first tab, one ZR away.
         Slots => &[
             ("A", "キャラ"),
             ("X", "アイテム"),
             ("-", "装備"),
             ("L", "お守り"),
             ("R", "オトモ"),
-            ("Y", "クエスト"),
+            ("Y", "一括MAX(2回)"),
             ("B", "戻る"),
         ],
         Char => &[
-            ("A", "最大/編集"),
+            ("A", "最大(2回)/編集"),
             ("</>", "値を変更"),
             ("Y", "刻み"),
             ("-", "狩猟記録"),
@@ -1188,14 +1191,20 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         // The whole-save SD write is the deck's button, because [R] (its old
         // key) is the sub-tab on this build.
         SaveQuests => &[
-            ("A", "編集/導入"),
+            ("A", "編集/導入(解除は2回)"),
             ("-", "削除(2回)"),
             ("Y", "検索"),
             ("L/R", "サブタブ"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
-        ArcList => &[("A", "開く"), ("Z", "クエスト追加"), ("X", "セーブ内"), ("Y", "セーブ編集"), ("+", "終了")],
+        ArcList => &[
+            ("A", "開く"),
+            ("Z", "クエスト追加"),
+            ("X", "セーブ内"),
+            ("Y", "セーブへ導入(2回)"),
+            ("+", "終了"),
+        ],
         // クエスト改造: one row pair moves, the other steps, [A] opens the
         // row's chooser, [Y] the ▸詳細 rows, [ZR] the file-by-file screens.
         QuestEdit => &[
@@ -1250,6 +1259,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "ビット切替"),
             ("Y", "タブ/既読"),
             ("</>", "±50行"),
+            ("検索", "名前で絞る"),
             ("L/R", "タブ"),
             ("X", "保存"),
             ("B", "戻る"),
@@ -1281,7 +1291,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         ],
         Palico => &[
             ("A", "追加/削除"),
-            ("Y", "全導入"),
+            ("Y", "全導入(2回)"),
             ("L", "言語"),
             ("R", "言語"),
             ("-", "装備/解除(2回)"),
@@ -1426,6 +1436,10 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         ed.apply_guild_weapon_count_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_SAVE_MAP_FILTER {
         ed.apply_save_map_filter(s);
+    } else if idx == mhnx_core::hbedit::TEXT_PROGRESS_FILTER {
+        // The progress screen's name search: the quest view lists 1,508 rows
+        // and the request view 380, and neither had a way to narrow.
+        ed.apply_progress_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_HUNT_COUNT {
         ed.apply_hunt_count_text(&s);
     } else if idx == mhnx_core::hbedit::TEXT_REWARD_PROB
@@ -1707,6 +1721,10 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
             } else {
                 ("装備IDで検索（名前が読めません 16進 例: 28）", 60)
             }
+        } else if idx == mhnx_core::hbedit::TEXT_PROGRESS_FILTER {
+            // What the three views can be searched by: the name the row prints
+            // (from the romfs dump or the bundled table) and the row's number.
+            ("進行状況を名前か番号で検索（空にすると解除）", 60)
         } else if idx == mhnx_core::hbedit::TEXT_SAVE_MAP_FILTER {
             // The list is about a hundred named stretches and three of them
             // name the same box for the other two characters; the title says
@@ -2001,6 +2019,16 @@ pub fn run() -> i32 {
                 // else is heard. The UI drops taps on anything but its two
                 // buttons for the same reason - a tap must not reach the list
                 // under the dialog.
+                // The right stick turns a page of the body, the same way it
+                // does on every list: the dialog's body is longer than the
+                // panel, and the stick is the one input the dialog has free.
+                if down & BTN_RSTICK_UP != 0 {
+                    painter.gui.scroll_review(&ed, -10);
+                    need_draw = true;
+                } else if down & BTN_RSTICK_DOWN != 0 {
+                    painter.gui.scroll_review(&ed, 10);
+                    need_draw = true;
+                }
                 if let Some(k) = key {
                     match k {
                         Key::A => {
@@ -2013,6 +2041,25 @@ pub fn run() -> i32 {
                             // it kept a copy of is still what the console
                             // holds, so there is nothing else to undo.
                             painter.gui.pending_snapshot = None;
+                            need_draw = true;
+                        }
+                        // The body scrolls: one line on ▲ / ▼, ten on ◀ / ▶.
+                        // The two buttons in the dialog's footer send the same
+                        // two steps, so a finger and the pad cannot disagree.
+                        Key::Up => {
+                            painter.gui.scroll_review(&ed, -1);
+                            need_draw = true;
+                        }
+                        Key::Down => {
+                            painter.gui.scroll_review(&ed, 1);
+                            need_draw = true;
+                        }
+                        Key::Left => {
+                            painter.gui.scroll_review(&ed, -10);
+                            need_draw = true;
+                        }
+                        Key::Right => {
+                            painter.gui.scroll_review(&ed, 10);
                             need_draw = true;
                         }
                         _ => {}

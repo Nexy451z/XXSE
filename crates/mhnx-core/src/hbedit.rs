@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 
 use crate::arc::{extension_for, Arc};
 use crate::awards;
-use crate::confirm::{HoldAction, HoldConfirm};
+use crate::confirm::{ArmedAction, HoldAction, HoldConfirm};
 use crate::check::{self, Finding, Severity};
 use crate::diffvalues::{diff_values, ValueChange};
 use crate::charm::{self, Charm, CHARM_COUNT};
@@ -1478,7 +1478,7 @@ impl CharmEdit {
         // other screen uses for "choose"), so [Y] is the search shortcut rather
         // than the only way in.
         format!(
-            "[A] {}  [▲/▼] 行  [◀/▶] 値  [Y] スキルを検索  [X] 保存  [B] 戻る",
+            "[A] {}  [▲/▼] 行  [◀/▶] 値  [Y] スキルを検索  [X] 保存  [B] 戻る（下書きは2回）",
             self.a_label()
         )
     }
@@ -2980,6 +2980,13 @@ pub const TEXT_ITEM_SET_NAME: usize = usize::MAX - 1_100;
 /// the map. Its own id rather than a reuse: the console answers each sentinel
 /// with a different title and a different apply method.
 pub const TEXT_SAVE_MAP_FILTER: usize = usize::MAX - 1_016;
+/// Sentinel id for "type a name to narrow the 進行状況 list".
+///
+/// The quest view lists 1,508 rows and the request view 380, and neither had a
+/// search at all: a user who knows the quest is called 天彗龍 had to walk a
+/// thousand rows. Its own id rather than a reuse: the console answers each
+/// sentinel with a different title and a different apply method.
+pub const TEXT_PROGRESS_FILTER: usize = usize::MAX - 1_017;
 
 // ---------------------------------------------------------------------------
 // Names: the six fields the screens edit, and what a text field accepts
@@ -5008,6 +5015,14 @@ pub struct SaveReview {
     pub path: String,
 }
 
+/// Rows of the review dialog's body that fit on the panel at once.
+///
+/// Geometry, not a guess: the panel is 612 tall, its body starts 64 below the
+/// top and ends 20 above the rule over the buttons, and a row is 23px (an empty
+/// spacer row is 10). The console draws the window [SaveReview::scroll_to]
+/// names, so this number is the one the dialog and the tests share.
+pub const REVIEW_DIALOG_ROWS: usize = 20;
+
 impl SaveReview {
     /// The one line above the body: what changes and how big the file is.
     pub fn headline(&self) -> String {
@@ -5015,6 +5030,31 @@ impl SaveReview {
             "変更 {} バイト（{} バイト → {} バイト）",
             self.changed, self.old_len, self.new_len
         )
+    }
+
+    /// How many lines the body has.
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Is there nothing to read?
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Does the body need the scroll the dialog offers?
+    ///
+    /// The panel holds [REVIEW_DIALOG_ROWS] rows, and a save-wide edit produces
+    /// more than that: the dialog used to stop at the edge and say "ほか N 行"
+    /// with no way to see them, so the values the user is asked to agree to
+    /// were the part they could not read.
+    pub fn needs_scroll(&self) -> bool {
+        self.lines.len() > REVIEW_DIALOG_ROWS
+    }
+
+    /// A scroll offset clamped so the last line can be reached.
+    pub fn scroll_to(&self, start: usize) -> usize {
+        start.min(self.lines.len().saturating_sub(1))
     }
 }
 
@@ -5380,6 +5420,27 @@ pub fn build_review_list(
     }
 }
 
+/// One of the bulk buttons that rewrite more than the row under the cursor.
+///
+/// Every one of these used to run on a single press: the whole character's
+/// money and rank, the whole roster's levels, a quest installed from the card
+/// into the save, and a bundled quest removed from it. The first press now
+/// only names what the second would touch - [ArmedAction] carries which one was
+/// offered, so two different bulk buttons cannot confirm each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BulkAction {
+    /// [Y] on the slot screen: 所持金・HR・全ポイント of one character.
+    CharMaxAll,
+    /// [A] on one row of the character screen: that field to its ceiling.
+    CharRowMax(usize),
+    /// [Y] on 配信オトモ: every downloadable palico of the language.
+    PalicoInstallAll,
+    /// [Y] on the .arc list: install that file into the open save.
+    ArcInstall(usize),
+    /// [A] on a bundled quest that is already in the save: remove it.
+    QuestRemove(i32),
+}
+
 /// The editor.
 pub struct Editor {
     /// Current screen.
@@ -5501,6 +5562,27 @@ pub struct Editor {
     /// A row, not an index: row 0 is quest progress index 1, because index 0
     /// lines up with the dummy quest and is never used.
     pub quest_cursor: usize,
+    /// 進行状況's name search, applied by [Editor::progress_rows].
+    ///
+    /// The quest view lists 1,508 rows and the request view 380, and neither
+    /// had a way to narrow: the quest names come from the bundled table
+    /// ([crate::idmemo]), so the same substring rule the other lists use works
+    /// here. Empty means every row, and an empty answer clears it - the rule
+    /// the talisman box, the equipment box and the item box all follow.
+    pub progress_filter: String,
+    /// The bulk button whose second press has not arrived yet.
+    ///
+    /// One value for all five bulk actions (see [BulkAction]): the identity is
+    /// what keeps two of them from confirming each other, so a single field is
+    /// enough and a press can never be spent on a button it was not offered to.
+    bulk: ArmedAction<BulkAction>,
+    /// The form whose [B] has been pressed once on unsaved edits.
+    ///
+    /// The three forms (talisman, equipment, both my-sets) keep their draft
+    /// apart from the save: [A] is what writes it. [B] used to throw that draft
+    /// away on one press with nothing on screen saying so, so the first [B] on
+    /// a dirty form only asks, and any other key takes the offer back.
+    form_discard_armed: bool,
     // ---------------------------------------------- クエスト改造 (QuestEdit)
 
     /// Which tab of [Screen::QuestEdit] is showing.
@@ -5876,6 +5958,9 @@ impl Editor {
             award_cursor: 0,
             request_cursor: 0,
             quest_cursor: 0,
+            progress_filter: String::new(),
+            bulk: ArmedAction::new(),
+            form_discard_armed: false,
             quest_edit_tab: 0,
             quest_edit_cursor: 0,
             quest_edit_field: 0,
@@ -6561,7 +6646,7 @@ impl Editor {
             // The form's [A] is the row's own action, so the form writes the
             // line (CharmEdit::footer).
             Screen::CharmEdit => self.charm_edit.map(|c| c.footer()).unwrap_or_else(|| {
-                String::from("[A] 行ごとの操作  [▲/▼] 行  [◀/▶] 値  [X] 保存  [B] 戻る")
+                String::from("[A] 行ごとの操作  [▲/▼] 行  [◀/▶] 値  [X] 保存  [B] 戻る（下書きは2回）")
             }),
             // [A] installs on a row that is not in the save and releases on one
             // that is: the same key, two words, and the footer says which one
@@ -6569,7 +6654,7 @@ impl Editor {
             Screen::Palico => {
                 let id = dlcats::all_ids().get(self.palico_cursor).copied().unwrap_or(0);
                 format!(
-                    "[A] {}  [Y] 全導入  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
+                    "[A] {}  [Y] 全導入（2回）  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
                     self.palico_row_action(id)
                 )
             }
@@ -6612,10 +6697,10 @@ impl Editor {
             // the character and not a bare 決定: the card's button says the same
             // words (ui.rs draw_slots) and a touch and a pad press must not read
             // as two different promises.
-            Screen::Slots => "[◀/▶] 枠選択  [A] このキャラを編集  [Y] 一括MAX  [L/R] サブタブ",
+            Screen::Slots => "[◀/▶] 枠選択  [A] このキャラを編集  [Y] 一括MAX（2回）  [L/R] サブタブ",
             // Row 0 is the name: ◀ / ▶ opens the keyboard, and the name may hold
             // a line break, which the footer says because no key hints at it.
-            Screen::Char => "[◀/▶] 増減（0行目=名前・改行可）  [A] 最大/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
+            Screen::Char => "[◀/▶] 増減（0行目=名前・改行可）  [A] 最大（2回）/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
             Screen::Items if self.item_menu_open => {
                 "[▲/▼] 選択  [A] 実行（2回）  [-] 閉じる  [B] 戻る  [X] 保存"
             }
@@ -6653,7 +6738,7 @@ impl Editor {
             // form's レベル creates. [Y] is the search shortcut into the same
             // two lists.
             Screen::EquipEdit => {
-                "[A] 行の操作  [▲/▼] 行  [◀/▶] 10件/値  [Y] 名前で検索  [R] ID入力  [X] 保存"
+                "[A] 行の操作  [▲/▼] 行  [◀/▶] 10件/値  [Y] 名前で検索  [R] ID入力  [X] 保存  [B] 戻る（下書きは2回）"
             }
             Screen::JewelPick => {
                 "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [X] クリア  [B] 戻る"
@@ -6668,10 +6753,10 @@ impl Editor {
                 "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [-] 種別  [X] クリア  [B] 戻る"
             }
             Screen::Sets if self.set_edit.is_some() => {
-                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 解除（2回）  [Y] 警告  [X] 保存  [B] 一覧"
+                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 解除（2回）  [Y] 警告  [X] 保存  [B] 一覧（下書きは2回）"
             }
             Screen::Sets if self.item_set_edit.is_some() => {
-                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込（2回）  [-] ポーチへ（2回）  [B] 一覧"
+                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込（2回）  [-] ポーチへ（2回）  [B] 一覧（下書きは2回）"
             }
             Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
             Screen::Csv if self.csv_armed.is_some() => {
@@ -6696,22 +6781,22 @@ impl Editor {
                 "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [-] 表示切替  [R] 数値入力  [L/R] サブタブ  [X] 保存"
             }
             Screen::Progress if self.progress_view() == PROGRESS_QUESTS => {
-                "[A] クリア  [Y] 既読  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
+                "[A] クリア  [Y] 既読  [▲/▼] 行  [◀/▶] ±50  [検索] 名前  [L/R] タブ  [X] 保存  [B] 戻る"
             }
             Screen::Progress => {
-                "[A] ビット切替  [Y] タブ  [▲/▼] 行  [◀/▶] ±50  [L/R] タブ  [X] 保存  [B] 戻る"
+                "[A] ビット切替  [Y] タブ  [▲/▼] 行  [◀/▶] ±50  [検索] 名前  [L/R] タブ  [X] 保存  [B] 戻る"
             }
             // No [R] in this line: the console answers [R] with the sub-tab,
             // so the SD write every quest needs is the deck's button
             // (Editor::request_extract_all_quests) rather than a promise this
             // key cannot keep.
             Screen::SaveQuests => {
-                "[A] 編集/導入  [Y] 検索  [-] 削除（2回）  [L/R] サブタブ  [X] 保存"
+                "[A] 編集/導入（解除は2回）  [Y] 検索  [-] 削除（2回）  [L/R] サブタブ  [X] 保存"
             }
             // Screen-specific because every key here does something the other
             // screens do not have: Y installs the file into the open save and
             // Minus writes the bundled quests out.
-            Screen::ArcList => "[A] 開く  [Y] セーブへ導入  [-] SDへ展開  [B] 戻る",
+            Screen::ArcList => "[A] 開く  [Y] セーブへ導入（2回）  [-] SDへ展開  [B] 戻る",
             Screen::ArcEntries => "[A] 開く  [Y] 検査  [L/R] サブタブ  [X] 保存  [B] 戻る",
             Screen::Mib => {
                 "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存"
@@ -8776,6 +8861,308 @@ impl Editor {
         cnt
     }
 
+    // ------------------------------------------------- the bulk buttons, twice
+    //
+    // Five buttons rewrite more than the row under the cursor: the whole
+    // character's money and rank, the whole roster's levels, a quest installed
+    // from the card, and a bundled quest removed from the save. Every one of
+    // them ran on a single press, which is what the review found. They all ask
+    // through [Editor::bulk_press] now, so the pad, the deck's button and the
+    // host tests share one rule: the first press names what would change, the
+    // second one runs it, and any other bulk button takes the offer back.
+
+    /// Is one of the bulk buttons waiting for its second press?
+    pub fn bulk_armed(&self) -> Option<BulkAction> {
+        self.bulk.armed()
+    }
+
+    /// Take a bulk offer back (something else happened).
+    pub fn clear_bulk_press(&mut self) {
+        self.bulk.clear();
+    }
+
+    /// One press of a bulk button: true means "run it now".
+    fn bulk_press(&mut self, action: BulkAction) -> bool {
+        self.bulk.press(action)
+    }
+
+    /// [Y] on the slot screen: 所持金・HR・全ポイント of the selected character.
+    ///
+    /// One press used to write all eleven fields with nothing on screen saying
+    /// so. The first press now says which character and what would move, and
+    /// the second one runs [Editor::maximize_character] - one undo step, as
+    /// before.
+    pub fn char_max_all_press(&mut self) -> bool {
+        if self.character().is_none() {
+            self.bulk.clear();
+            self.message = String::from("この枠にキャラクターがいません（別の枠を選んでください）");
+            return false;
+        }
+        if self.bulk_press(BulkAction::CharMaxAll) {
+            return self.maximize_character();
+        }
+        let name = self
+            .character()
+            .map(|c| c.name)
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| alloc::format!("Slot {}", self.slot + 1));
+        self.message = alloc::format!(
+            "「{}」の所持金・HR・全ポイントを最大にします。もう一度 [Y]（画面下のボタン）で実行（1回で戻せます）",
+            crate::hbedit::name_preview(&name)
+        );
+        false
+    }
+
+    /// [A] on one row of the character screen: that field to its ceiling.
+    ///
+    /// The row's [A] was the one key on that screen that wrote without asking,
+    /// and it wrote the ceiling of whatever row the cursor happened to be on -
+    /// 所持金 on one press, HR on the next. It asks once now, and the row is
+    /// part of the offer, so moving the cursor takes it back.
+    pub fn char_row_max_press(&mut self, field: usize) -> bool {
+        if field == 0 || field == 13 {
+            // The name opens the keyboard and the gender toggles: neither is a
+            // write at all, so neither asks - and neither writes (see
+            // [Editor::char_row_max]).
+            return self.char_row_max(field);
+        }
+        if self.bulk_press(BulkAction::CharRowMax(field)) {
+            return self.char_row_max(field);
+        }
+        let label = CHAR_FIELDS.get(field).map(|f| f.1).unwrap_or("-");
+        self.message = alloc::format!(
+            "「{}」をこの行の最大値にします。もう一度 [A]（または [MAX]）で実行（1回で戻せます）",
+            label
+        );
+        false
+    }
+
+    /// [Y] on 配信オトモ: every downloadable palico of the current language.
+    ///
+    /// The same key on the roster beside it walks the editable column, so the
+    /// two screens gave one key two meanings and one of them wrote the whole
+    /// roster. It asks first now, and says how many it would install.
+    pub fn install_all_palicoes_press(&mut self) -> bool {
+        if self.save.is_none() {
+            self.bulk.clear();
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        if self.bulk_press(BulkAction::PalicoInstallAll) {
+            self.install_all_dlc_palicoes();
+            return true;
+        }
+        let lang = if self.palico_lang == 0 {
+            Lang::Jp
+        } else {
+            Lang::En
+        };
+        let n = match lang {
+            Lang::Jp => dlcats::JP_IDS.len(),
+            Lang::En => dlcats::EN_IDS.len(),
+        };
+        self.message = alloc::format!(
+            "配信オトモ {} 匹を空き枠へ一括導入します（{}）。もう一度 [Y]（画面下のボタン）で実行（1回で戻せます）",
+            n,
+            if self.palico_lang == 0 { "日本語" } else { "English" }
+        );
+        false
+    }
+
+    /// [Y] on the .arc list: install the highlighted file into the open save.
+    ///
+    /// The install writes a quest record into the save (and overwrites one when
+    /// the id is already there), so it is a write like the save key's: the
+    /// first press names the file and the slot it would land in.
+    pub fn arc_install_press(&mut self, idx: usize) -> bool {
+        if self.save.is_none() {
+            self.bulk.clear();
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let Some(path) = self.arc_files.get(idx).cloned() else {
+            self.bulk.clear();
+            self.message = String::from("クエストファイルが選択されていません");
+            return false;
+        };
+        if self.bulk_press(BulkAction::ArcInstall(idx)) {
+            return true;
+        }
+        let name = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
+        self.message = alloc::format!(
+            "「{}」をセーブへ導入します（同じIDがあれば上書き）。もう一度 [Y]（画面下のボタン）で実行",
+            name
+        );
+        false
+    }
+
+    /// [A] on a bundled quest: install it, or remove it on the second press.
+    ///
+    /// Installing is additive - it writes the quest into a free slot - so it
+    /// stays one press. Removing deletes a record from the save, which is the
+    /// destructive half of the same key, so that half asks.
+    pub fn bundled_quest_press(&mut self, quest_id: i32) -> bool {
+        let installed = self
+            .save_quests()
+            .iter()
+            .any(|q| q.quest_id == quest_id);
+        if !installed {
+            self.bulk.clear();
+            self.toggle_bundled_quest(quest_id);
+            return true;
+        }
+        if self.bulk_press(BulkAction::QuestRemove(quest_id)) {
+            self.toggle_bundled_quest(quest_id);
+            return true;
+        }
+        let title = crate::dlc_bundle::official_quest_title(quest_id).unwrap_or("");
+        self.message = alloc::format!(
+            "クエスト {} 「{}」はセーブに入っています。もう一度 [A]（行のタップ）でセーブから削除します（1回で戻せます）",
+            quest_id,
+            title
+        );
+        false
+    }
+
+    // ------------------------------------------- the forms' unsaved drafts
+    //
+    // Three forms keep their edit apart from the save: the talisman form, the
+    // equipment form and the two my-set forms. [A] is what writes a draft, so
+    // [B] is what throws it away - and it did that on one press with nothing on
+    // screen saying so. Each form now answers "is there a draft the box does
+    // not have", and [B] asks once when the answer is yes.
+
+    /// Does the talisman form hold an edit the box does not have yet?
+    ///
+    /// Compared field by field against the record at the form's own index: a
+    /// record that is not a talisman has nothing to compare with, so any value
+    /// at all in the form counts (writing it would create the record).
+    pub fn charm_draft_dirty(&self) -> bool {
+        let Some(e) = self.charm_edit else {
+            return false;
+        };
+        let Some(save) = self.save.as_ref() else {
+            return false;
+        };
+        let Some(box_bytes) = save.equipment_box(self.slot) else {
+            return false;
+        };
+        let o = e.index * charm::CHARM_RECORD;
+        let Some(rec) = box_bytes.get(o..o + charm::CHARM_RECORD) else {
+            return false;
+        };
+        if !charm::is_talisman(rec) {
+            return e.slots != 0
+                || e.skill1 != 0
+                || e.points1 != 0
+                || e.skill2 != 0
+                || e.points2 != 0;
+        }
+        rec[0x10] != e.slots
+            || rec[0x0C] != e.skill1
+            || rec[0x0E] as i8 != e.points1
+            || rec[0x0D] != e.skill2
+            || rec[0x0F] as i8 != e.points2
+            || charm::kind_of_record(rec) != Some(e.kind)
+    }
+
+    /// Does the equipment form hold an edit the box does not have yet?
+    ///
+    /// A new form is compared with the values [Editor::open_equip_creator]
+    /// starts it on, so opening the creator and leaving it again loses nothing
+    /// and does not ask.
+    pub fn equip_draft_dirty(&self) -> bool {
+        let Some(e) = self.equip_edit else {
+            return false;
+        };
+        if e.new {
+            return e.kind != 1
+                || e.id != 1
+                || e.level != 1
+                || e.transmog_id != 0
+                || e.transmog_level != 1
+                || e.decorations != [0; 3];
+        }
+        let Some(save) = self.save.as_ref() else {
+            return false;
+        };
+        let Some(box_bytes) = save.equipment_box(self.slot) else {
+            return false;
+        };
+        let o = e.index * crate::equip::EQUIP_RECORD;
+        let Some(rec) = box_bytes.get(o..o + crate::equip::EQUIP_RECORD) else {
+            return false;
+        };
+        let Some(eq) = crate::equip::decode_record(e.index, rec) else {
+            return false;
+        };
+        eq.kind != e.kind
+            || eq.id != e.id
+            || eq.level != e.level
+            || eq.transmog != e.transmog_id
+            || eq.transmog_level != e.transmog_level
+            || crate::equip::Equipment::decorations(e.index, rec) != e.decorations
+    }
+
+    /// Does the equipment-set form hold parts the record does not have yet?
+    pub fn set_draft_dirty(&self) -> bool {
+        let Some(e) = self.set_edit else {
+            return false;
+        };
+        let Some(rec) = self.equip_sets().into_iter().nth(e.set) else {
+            return false;
+        };
+        rec.parts != e.pick
+    }
+
+    /// Does the item-set form hold entries the record does not have yet?
+    pub fn item_set_draft_dirty(&self) -> bool {
+        let Some(e) = self.item_set_edit else {
+            return false;
+        };
+        let Some(rec) = self.item_sets().into_iter().nth(e.set) else {
+            return false;
+        };
+        for (i, pick) in e.pick.iter().enumerate() {
+            let held = rec
+                .items
+                .get(i)
+                .copied()
+                .unwrap_or(crate::myset::SetItem { id: 0, count: 0 });
+            if held.id != pick.id || held.count != pick.count {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Is one of the three forms waiting for a second [B] to drop its draft?
+    pub fn form_discard_armed(&self) -> bool {
+        self.form_discard_armed
+    }
+
+    /// [B] on a form: ask once when there is a draft, close on the next press.
+    ///
+    /// Returns true when the press was spent on the question, so the caller
+    /// keeps the form open and returns. A form whose draft is already in the
+    /// save closes at once - asking there would be a dialog about nothing.
+    fn form_discard_press(&mut self, dirty: bool, what: &str) -> bool {
+        if !dirty {
+            self.form_discard_armed = false;
+            return false;
+        }
+        if self.form_discard_armed {
+            self.form_discard_armed = false;
+            return false;
+        }
+        self.form_discard_armed = true;
+        self.message = alloc::format!(
+            "{}の下書きがまだ書き込まれていません（[A] で書き込み）。もう一度 [B] で破棄して戻ります",
+            what
+        );
+        true
+    }
+
     // ------------------------------------------------------- [MAX] ceilings
     //
     // [MAX] on the inspector is one answer per row, and every screen that draws
@@ -9033,6 +9420,13 @@ impl Editor {
             0 => {
                 self.message =
                     String::from("名前は [A] でテキスト入力してください（上限 31 バイト）");
+                return false;
+            }
+            // The gender is a 0 / 1 toggle, not a slider: the row's [A] swaps
+            // it. A "maximum" here wrote CHAR_LOOK_MAX (3) into the byte, which
+            // is a value the game has no gender for.
+            13 => {
+                self.message = String::from("性別は [A] で切り替えます（最大値はありません）");
                 return false;
             }
             1 => CHAR_FUNDS_MAX,
@@ -9432,6 +9826,12 @@ impl Editor {
         }
         if key != Key::Plus {
             self.quit_armed = false;
+        }
+        // A form's "throw the draft away" offer belongs to the press that made
+        // it: any other key takes it back, the same rule the [＋] quit and the
+        // two-press deletes follow.
+        if key != Key::B {
+            self.form_discard_armed = false;
         }
         match self.screen {
             Screen::SaveList => self.input_save_list(key),
@@ -9928,8 +10328,14 @@ impl Editor {
                 self.screen = Screen::Charms;
                 self.cursor = 0;
             }
+            // [B] leaves the form. The draft is [A]'s to write, so leaving it
+            // with one still in hand asks first: it used to be dropped by the
+            // same press that closed the screen, with nothing saying so.
             Key::B => {
                 self.charm_edit = Some(e);
+                if self.form_discard_press(self.charm_draft_dirty(), "護石編集") {
+                    return;
+                }
                 self.screen = Screen::Charms;
             }
             Key::Plus => {
@@ -10033,7 +10439,12 @@ impl Editor {
                 }
             }
             Key::X => self.request_write_save(),
-            Key::Y => self.install_all_dlc_palicoes(),
+            // The bulk install asks first: it writes every downloadable palico
+            // of the language into the save, and the same key on the roster
+            // beside it only walks the editable column.
+            Key::Y => {
+                self.install_all_palicoes_press();
+            }
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = 0;
@@ -10558,6 +10969,23 @@ impl Editor {
     /// "3/4" - the count alone, for the top bar.
     pub fn undo_count_text(&self) -> String {
         format!("{}/{}", self.undo.len(), UNDO_STEPS)
+    }
+
+    /// The label on the footer's undo pill.
+    ///
+    /// Two routes reach the whole-save undo: a tap on the pill (twice) and
+    /// holding [L] (twice). The second one is not there on the four pick lists,
+    /// where a held [L] is the ten-row step of the list - and the pill named it
+    /// anyway, so the one line that describes the control promised a key that
+    /// moved the cursor instead. The label is the state machine's because
+    /// [Editor::shoulder_job] is what decides which of the two it is.
+    pub fn undo_pill_label(&self) -> String {
+        let count = self.undo_count_text();
+        if self.shoulder_job(Key::L) == Shoulder::Move {
+            format!("[タップ2回] 元に戻す（{}）", count)
+        } else {
+            format!("[タップ2回 / L 2回長押し] 元に戻す（{}）", count)
+        }
     }
 
     /// Put the whole save, and the slot it belonged to, back the way it was.
@@ -12155,6 +12583,43 @@ impl Editor {
         self.skill_pick_cursor = 0;
     }
 
+    /// Where [A] on the conversion screen would write, or None when it cannot.
+    ///
+    /// The one place that builds the path: the screen prints it and
+    /// [Editor::convert_now] writes it, so the name on screen and the file on
+    /// the card cannot disagree. It used to print the *source* path in the
+    /// brackets beside the output name, which read as if the conversion wrote
+    /// back over the save it had just read.
+    pub fn convert_output_path(&self) -> Option<String> {
+        let save = self.save.as_ref()?;
+        if save.kind() == crate::save::SaveKind::Mhgu {
+            return None;
+        }
+        let base = self.save_path.as_deref()?;
+        // The console save lives on a mounted save area, and that area holds
+        // exactly the files the game made. A converted copy does not belong
+        // next to it: "nand:/system" used to produce "nand:/system.3ds", which
+        // then went straight back through the console writer and left the save
+        // as a hybrid of a 3DS body and the old tail.
+        let dir = if crate::hbedit::is_console_save_path(base) {
+            alloc::string::String::from("/switch/mhnxeditor/")
+        } else {
+            split_dir(base)
+        };
+        let stem = if self.convert_name.trim().is_empty() {
+            alloc::string::String::from("system")
+        } else {
+            // Keep it to one path segment: a stray slash would write elsewhere.
+            self.convert_name.trim().replace('/', "_").replace('\\', "_")
+        };
+        let ext = if save.kind() == crate::save::SaveKind::ThreeDs {
+            "switch"
+        } else {
+            "3ds"
+        };
+        Some(alloc::format!("{}{}.{}", dir, stem, ext))
+    }
+
     /// Build the converted save and hand the bytes to the io layer.
     fn convert_now(&mut self) {
         let Some(save) = &self.save else {
@@ -12165,27 +12630,15 @@ impl Editor {
             self.message = String::from("MHGU はここでは変換できません");
             return;
         }
-        let Some(base) = self.save_path.clone() else {
+        if self.save_path.is_none() {
             self.message = String::from("このセーブにはパスがありません");
             return;
+        }
+        let Some(path) = self.convert_output_path() else {
+            self.message = String::from("出力先を決められません");
+            return;
         };
-        // The console save lives on a mounted save area, and that area holds
-        // exactly the files the game made. A converted copy does not belong
-        // next to it: "nand:/system" used to produce "nand:/system.3ds", which
-        // then went straight back through the console writer and left the save
-        // as a hybrid of a 3DS body and the old tail.
-        let dir = if crate::hbedit::is_console_save_path(&base) {
-            alloc::string::String::from("/switch/mhnxeditor/")
-        } else {
-            split_dir(&base)
-        };
-        let stem = if self.convert_name.trim().is_empty() {
-            alloc::string::String::from("system")
-        } else {
-            // Keep it to one path segment: a stray slash would write elsewhere.
-            self.convert_name.trim().replace('/', "_").replace('\\', "_")
-        };
-        let (path, bytes, what) = match save.kind() {
+        let (bytes, what) = match save.kind() {
             crate::save::SaveKind::ThreeDs => {
                 let name = if save.header().iter().any(|b| *b != 0) {
                     "system"
@@ -12193,22 +12646,14 @@ impl Editor {
                     "system"
                 };
                 match crate::save::Save::from_3ds_body(save.body(), name) {
-                    Ok(sw) => (
-                        alloc::format!("{}{}.switch", dir, stem),
-                        sw.to_bytes(),
-                        "Switch (36 byte header synthesised)",
-                    ),
+                    Ok(sw) => (sw.to_bytes(), "Switch (36 byte header synthesised)"),
                     Err(_) => {
                         self.message = String::from("Switch 形式を作れません");
                         return;
                     }
                 }
             }
-            _ => (
-                alloc::format!("{}{}.3ds", dir, stem),
-                save.to_3ds_bytes(),
-                "3DS (header stripped)",
-            ),
+            _ => (save.to_3ds_bytes(), "3DS (header stripped)"),
         };
         self.pending_write = Some(Write::File {
             path: path.clone(),
@@ -13022,7 +13467,17 @@ impl Editor {
             PROGRESS_REQUESTS => self.request_cursor,
             _ => self.quest_cursor,
         };
-        cur.min(last)
+        let cur = cur.min(last);
+        // With a search on, the cursor has to name a row the list is showing:
+        // [A] toggles the bit under the cursor, and a press that edits a row
+        // the user cannot see is exactly what the search exists to prevent.
+        let needle = self.progress_needle();
+        if needle.is_empty() || self.progress_row_matches_needle(cur, &needle) {
+            return cur;
+        }
+        (0..self.progress_len())
+            .find(|row| self.progress_row_matches_needle(*row, &needle))
+            .unwrap_or(cur)
     }
 
     /// Put the cursor on a row, clipped to the showing view.
@@ -13034,6 +13489,154 @@ impl Editor {
             PROGRESS_REQUESTS => self.request_cursor = row,
             _ => self.quest_cursor = row,
         }
+    }
+
+    // ------------------------------------------------- 進行状況's name search
+    //
+    // The quest view lists 1,508 rows and the request view 380, and neither had
+    // a way to narrow: a user who knows the quest is called 天彗龍 had to walk a
+    // thousand rows to find it. The names come from the bundled tables
+    // ([crate::idmemo], the romfs dump when the user supplied one), so the same
+    // substring rule the other lists use works here - and the row's number is
+    // matched too, the pair the save's quest list searches.
+
+    /// The needle the search compares with: trimmed, lowercased, without '#'.
+    fn progress_needle(&self) -> String {
+        filter_needle(&self.progress_filter)
+    }
+
+    /// Does one row of the showing view answer the search?
+    pub fn progress_row_matches(&self, row: usize) -> bool {
+        let needle = self.progress_needle();
+        if needle.is_empty() {
+            return true;
+        }
+        self.progress_row_matches_needle(row, &needle)
+    }
+
+    fn progress_row_matches_needle(&self, row: usize, needle: &str) -> bool {
+        match self.progress_view() {
+            PROGRESS_AWARDS => {
+                name_matches(self.award_name(row), needle) || id_digits_contain(row + 1, needle)
+            }
+            PROGRESS_REQUESTS => {
+                let Some(flag) = self.request_flag_at(row) else {
+                    return false;
+                };
+                name_matches(&self.request_flag_label(flag), needle)
+                    || id_digits_contain(flag, needle)
+            }
+            _ => {
+                name_matches(self.progress_quest_name(row), needle)
+                    || id_digits_contain(row + 1, needle)
+            }
+        }
+    }
+
+    /// The rows of the showing view after the search, in row order.
+    ///
+    /// The ids are the view's own row numbers, not positions in this list: the
+    /// cursor, the bit a press toggles and the name a row prints all address
+    /// the underlying row, so a filter can only ever hide rows, never renumber
+    /// them.
+    pub fn progress_rows(&self) -> Vec<usize> {
+        let len = self.progress_len();
+        let needle = self.progress_needle();
+        if needle.is_empty() {
+            return (0..len).collect();
+        }
+        (0..len)
+            .filter(|row| self.progress_row_matches_needle(*row, &needle))
+            .collect()
+    }
+
+    /// How many rows the search left.
+    pub fn progress_visible_len(&self) -> usize {
+        let needle = self.progress_needle();
+        if needle.is_empty() {
+            return self.progress_len();
+        }
+        (0..self.progress_len())
+            .filter(|row| self.progress_row_matches_needle(*row, &needle))
+            .count()
+    }
+
+    /// The search state as one line for the heading, or "" when it is off.
+    pub fn progress_search_line(&self) -> String {
+        let needle = self.progress_filter.trim();
+        if needle.is_empty() {
+            String::new()
+        } else {
+            alloc::format!(
+                "検索: {}（{} / {} 件）",
+                needle,
+                self.progress_visible_len(),
+                self.progress_len()
+            )
+        }
+    }
+
+    /// [Y] on the progress screen: ask the I/O layer for a name to narrow by.
+    pub fn request_progress_filter(&mut self) {
+        self.pending_text = Some((TEXT_PROGRESS_FILTER, self.progress_filter.clone()));
+    }
+
+    /// The I/O layer answers a progress search with this.
+    ///
+    /// An empty answer clears it. Clearing also puts the cursor back on the
+    /// first row that is shown, so a search can never leave the cursor on a row
+    /// the list has hidden.
+    pub fn apply_progress_filter(&mut self, text: String) {
+        let cleared = text.trim().is_empty();
+        self.progress_filter = text;
+        // One needle for the whole walk: the filter is applied once and the
+        // list is 1,508 rows, so a lowercased copy per row would be 1,508
+        // allocations for one press.
+        let needle = self.progress_needle();
+        let len = self.progress_len();
+        let mut shown = 0usize;
+        let mut first = 0usize;
+        let mut have_first = false;
+        for row in 0..len {
+            if self.progress_row_matches_needle(row, &needle) {
+                shown += 1;
+                if !have_first {
+                    first = row;
+                    have_first = true;
+                }
+            }
+        }
+        self.set_progress_cursor(first);
+        self.message = if cleared {
+            String::from("検索を解除しました（全件表示）")
+        } else if shown == 0 {
+            alloc::format!(
+                "検索「{}」に一致する行がありません（空にすると解除）",
+                self.progress_filter.trim()
+            )
+        } else {
+            alloc::format!(
+                "検索「{}」— {} 件。[検索] でもう一度変えられます（空で解除）",
+                self.progress_filter.trim(),
+                shown
+            )
+        };
+    }
+
+    /// Move the cursor by `delta` rows of the list that is on screen.
+    ///
+    /// With a search on, the list on screen is the filtered one, so one press
+    /// of [▼] has to land on the next row that is *shown*: stepping to a hidden
+    /// row would look like a press that did nothing.
+    pub fn progress_step(&mut self, delta: i32) {
+        let rows = self.progress_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let cur = self.progress_cursor();
+        let pos = rows.iter().position(|row| *row == cur).unwrap_or(0) as i64;
+        let next = (pos + delta as i64).clamp(0, rows.len() as i64 - 1) as usize;
+        self.set_progress_cursor(rows[next]);
     }
 
     // -----------------------------------------------------------------------
@@ -13852,8 +14455,8 @@ impl Editor {
             // The card's [A] button and this line say the same words: the
             // highlighted slot is the one the edit opens, so the guide names
             // the character rather than a bare 編集.
-            Screen::Slots => "キャラを選んで [A] でこのキャラを編集。[◀/▶] で枠、[Y] で一括MAX。",
-            Screen::Char => "行を選んで [◀/▶] で変更、[A] で最大。[生データ] でこの画面のバイト。",
+            Screen::Slots => "キャラを選んで [A] でこのキャラを編集。[◀/▶] で枠、[Y] 2回で一括MAX。",
+            Screen::Char => "行を選んで [◀/▶] で変更、[A] 2回で最大。[生データ] でこの画面のバイト。",
             Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[Y] で空き枠も表示。",
             Screen::ItemPick => "名前で検索して [A] で決定。[B] で元の画面へ。",
             Screen::Charms => "お守りを選んで [A] で編集、[＋] で新規。[Y] で種類やスキル名を検索できます。",
@@ -13866,9 +14469,9 @@ impl Editor {
             Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
             Screen::Hunts => "狩猟記録の行を選んで [◀/▶] で増減。[Y] で項目切替。",
             Screen::Guild => "ギルドカードの行を [◀/▶] で変更、[-] で進行状況。[生データ] でこの画面のバイト。",
-            Screen::Progress => "[A] でビットを切替、[L/R] でビット列を切替。[生データ] でこの画面のバイト。",
+            Screen::Progress => "[A] でビットを切替、[L/R] でビット列を切替、[検索] で名前を絞り込み。",
             Screen::Roster => "オトモを選んで [A] で名前、[-] で装備、[＋] でスキル。",
-            Screen::Palico => "配信オトモを選んで [A] で導入/解除、[Y] で全導入。",
+            Screen::Palico => "配信オトモを選んで [A] で導入/解除、[Y] 2回で全導入。",
             // Only three keys answer here, so the line names those three and
             // nothing else: [X] saves the open save, not the converted file.
             Screen::Convert => "3DS と Switch の形式を変換します。[A] で変換出力、[Y] で出力名、[B] で戻る。",
@@ -13884,7 +14487,7 @@ impl Editor {
             }
             Screen::QuestEquip => "固定装備の枠を [A] で開いて編集します。",
             Screen::QuestEdit => "4つのタブでクエストを作ります。[ファイル] でファイル単位の画面へ。",
-            Screen::ArcList => ".arc を選んで [A] で開きます。[Y] でセーブへ導入、[-] で書き出し。",
+            Screen::ArcList => ".arc を選んで [A] で開きます。[Y] 2回でセーブへ導入、[-] で書き出し。",
             Screen::ArcEntries => "クエストの構成ファイルです。[A] で中身、[L/R] でタブ切替。",
             Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み。",
             Screen::Mib => "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。",
@@ -14115,22 +14718,17 @@ impl Editor {
                     self.progress_tab = (self.progress_view() + 1) % PROGRESS_TABS;
                 }
             }
-            Key::Up => {
-                let row = self.progress_cursor();
-                self.set_progress_cursor(row.saturating_sub(1));
-            }
-            Key::Down => {
-                let row = self.progress_cursor();
-                self.set_progress_cursor(row.saturating_add(1));
-            }
-            Key::Left => {
-                let row = self.progress_cursor();
-                self.set_progress_cursor(row.saturating_sub(PROGRESS_JUMP));
-            }
-            Key::Right => {
-                let row = self.progress_cursor();
-                self.set_progress_cursor(row.saturating_add(PROGRESS_JUMP));
-            }
+            // The four directions walk the list that is on screen, not the
+            // whole table: with a search on, the rows between two matches are
+            // hidden, and stepping onto one would look like a dead key.
+            Key::Up => self.progress_step(-1),
+            Key::Down => self.progress_step(1),
+            Key::Left => self.progress_step(-(PROGRESS_JUMP as i32)),
+            Key::Right => self.progress_step(PROGRESS_JUMP as i32),
+            // The search has no key of its own - [A] toggles, [Y] is the second
+            // bit, the four directions move and L / R are the tabs - so it is
+            // the deck's button, and this arm is what that button sends.
+            Key::Z => self.request_progress_filter(),
             Key::A => self.progress_toggle(),
             Key::B => {
                 self.screen = Screen::Guild;
@@ -14281,11 +14879,12 @@ impl Editor {
                     self.roster_cursor = (self.roster_cursor + 1).min(n - 1);
                 }
             }
-            // R walks the editable fields of the highlighted palico. X used to
-            // do the same, but on the pad X is the save key and never reached
-            // this screen; keeping it as a second field key meant the chips had
-            // to advertise X as something it did not do.
-            Key::R => self.roster_field = (self.roster_field + 1) % 3,
+            // [Y] and [R] walk the editable fields of the highlighted palico.
+            // [Y] is the one the console's footer and the deck's button name
+            // (項目切替); [R] stays for the host build and the pad's own habit.
+            // X used to do the same, but on the pad X is the save key and never
+            // reached this screen.
+            Key::Y | Key::R => self.roster_field = (self.roster_field + 1) % 3,
             Key::X => self.request_write_save(),
             Key::L => self.roster_field = (self.roster_field + 2) % 3,
             Key::Left | Key::Right => {
@@ -15512,8 +16111,14 @@ impl Editor {
                 };
                 return;
             }
+            // The pending parts are the draft, so [B] asks before it drops
+            // them: only [A] writes a part, and a form left without a word
+            // looked like one that had been saved.
             Key::B => {
                 self.set_edit = Some(e);
+                if self.form_discard_press(self.set_draft_dirty(), "マイセット編集") {
+                    return;
+                }
                 self.close_set_editor();
                 return;
             }
@@ -16108,6 +16713,9 @@ impl Editor {
             }
             Key::B => {
                 self.item_set_edit = Some(e);
+                if self.form_discard_press(self.item_set_draft_dirty(), "アイテムセット編集") {
+                    return;
+                }
                 self.close_item_set_editor();
                 return;
             }
@@ -16533,7 +17141,13 @@ impl Editor {
             }
             Key::B => {
                 // The working copy is dropped: only A writes. The type-change
-                // ask belongs to that copy, so it goes with it.
+                // ask belongs to that copy, so it goes with it. A copy that
+                // really holds an edit asks before it goes - the press used to
+                // throw the whole form away with nothing on screen saying so.
+                if self.form_discard_press(self.equip_draft_dirty(), "装備編集") {
+                    self.equip_edit = Some(e);
+                    return;
+                }
                 self.equip_edit = None;
                 self.equip_kind_armed = None;
                 self.screen = Screen::Equip;
@@ -17341,8 +17955,13 @@ impl Editor {
                 self.message = String::from("セーブ編集");
             }
             // Z installs the highlighted archive into the save: the one action
-            // the console could not do at all before.
-            Key::Z => self.install_selected_arc(),
+            // the console could not do at all before. It writes a quest record
+            // into the save, so it asks first like the console's [Y] does.
+            Key::Z => {
+                if self.arc_install_press(self.cursor) {
+                    self.install_selected_arc();
+                }
+            }
             Key::Plus => {
                 self.press_quit();
             }
@@ -22446,7 +23065,12 @@ mod tests {
         let depth = ed.undo_depth();
         ed.input(Key::A);
         assert!(ed.equip_kind_pending().is_some());
-        // [B] leaves the form: the working copy is dropped with the arm.
+        // [B] leaves the form: the working copy is dropped with the arm. The
+        // copy holds an edit, so the first [B] only asks - the second one is
+        // the press that drops it.
+        ed.input(Key::B);
+        assert_eq!(ed.screen, Screen::EquipEdit, "the first [B] only asks");
+        assert!(ed.form_discard_armed());
         ed.input(Key::B);
         assert_eq!(ed.screen, Screen::Equip);
         assert!(ed.equip_kind_pending().is_none());

@@ -45,6 +45,54 @@ impl ConfirmPress {
     }
 }
 
+/// A destructive action that runs on the second identical press.
+///
+/// [ConfirmPress] answers "is this the second press" but not "the second press
+/// of *what*": with one flag for several buttons, offering a bulk MAX and then
+/// pressing a single row's MAX ran the row on its first press, which is the
+/// shape of bug this exists to stop. This carries the identity of the action
+/// that was offered, so a different action can never spend an offer it did not
+/// make - and two different bulk buttons cannot confirm each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArmedAction<T: Copy + PartialEq> {
+    armed: Option<T>,
+}
+
+impl<T: Copy + PartialEq> Default for ArmedAction<T> {
+    fn default() -> Self {
+        ArmedAction { armed: None }
+    }
+}
+
+impl<T: Copy + PartialEq> ArmedAction<T> {
+    pub const fn new() -> Self {
+        ArmedAction { armed: None }
+    }
+
+    /// Which action is waiting for its second press, if any.
+    pub fn armed(&self) -> Option<T> {
+        self.armed
+    }
+
+    /// Take the offer away without running anything.
+    pub fn clear(&mut self) {
+        self.armed = None;
+    }
+
+    /// One press of `action`. True means "run it now", false means "this press
+    /// only asked" - the same contract [ConfirmPress::press] has, with the
+    /// action's identity added.
+    pub fn press(&mut self, action: T) -> bool {
+        if self.armed == Some(action) {
+            self.armed = None;
+            true
+        } else {
+            self.armed = Some(action);
+            false
+        }
+    }
+}
+
 /// What a held key did on the frame it crossed the threshold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HoldAction {
