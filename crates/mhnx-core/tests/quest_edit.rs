@@ -366,8 +366,10 @@ fn the_detail_rows_open_under_their_slot_and_step_the_placement() {
     assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS + 1);
 
     ed.quest_edit_cursor = 0;
-    ed.input(Key::Y);
-    assert!(ed.quest_edit_open[0], "[Y] opens the ▸詳細 rows");
+    // The deck's pill runs this. [Y] is the step size now: the reward chance
+    // could only be walked one point at a time while the key was spent here.
+    ed.quest_toggle_detail();
+    assert!(ed.quest_edit_open[0], "the pill opens the ▸詳細 rows");
     let rows = ed.quest_mon_rows();
     assert_eq!(rows.len(), QUEST_MON_SLOTS + 5);
     assert_eq!(rows[1], QuestMonRow::Detail(0, 1));
@@ -397,7 +399,7 @@ fn the_detail_rows_open_under_their_slot_and_step_the_placement() {
 
     // Closing it puts the list back the way it was.
     ed.quest_edit_cursor = 0;
-    ed.input(Key::Y);
+    ed.quest_toggle_detail();
     assert!(!ed.quest_edit_open[0]);
     assert_eq!(ed.quest_row_count(), QUEST_MON_SLOTS + 1);
 

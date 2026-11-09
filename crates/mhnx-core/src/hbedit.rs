@@ -495,6 +495,22 @@ pub enum QuestPick {
     Detail,
 }
 
+/// What a pick from the .mib / エリア list writes.
+///
+/// The two lists are the same modal on the console, and the writers are not the
+/// same: a field of the .mib lives in the working copy, the エリア番号 lives in
+/// the .sem entry of the archive. The pick carries the answer so the tap path
+/// and the pad path cannot write to different places - the tap path used to
+/// call the .mib writer with a field index that names nothing (the chooser is
+/// not a field), so a tapped area wrote nothing while the pad's [A] wrote it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MibPickTarget {
+    /// One field of the .mib, by its index in questfields::MIB_FIELDS.
+    Field(usize),
+    /// The エリア番号 of one monster slot: the .sem, not the .mib.
+    Area(usize),
+}
+
 /// One .sem placement, decoded.
 ///
 /// The six numbers are the six rows the .sem screen draws: エリア番号 (+0x0C),
@@ -2608,6 +2624,13 @@ pub const WEAPON_KINDS: [u8; 14] = [7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19,
 pub const ARMOR_KINDS: [u8; 5] = [1, 2, 3, 4, 5];
 /// The talisman, the only kind of its family.
 pub const TALISMAN_KINDS: [u8; 1] = [6];
+/// Every kind the box holds, in the order the whole-box picker lists them.
+///
+/// The weapons first (they are 1,606 of the 8,041 rows), then the five armour
+/// parts, then the talisman: the same order [EquipScope::All] counts in.
+pub const ALL_KINDS: [u8; 20] = [
+    7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21, 1, 2, 3, 4, 5, 6,
+];
 
 /// Which half of the box a name pick is looking through.
 ///
@@ -2622,6 +2645,15 @@ pub enum EquipScope {
     Armor,
     /// The talisman list.
     Talismans,
+    /// The whole box: the new-record form's picker.
+    ///
+    /// A new record starts on kind 1 (a piece of armour), so a list scoped by
+    /// the form's own kind could only ever offer armour: creating a weapon
+    /// meant walking the 種別 row to a weapon kind first - up to fourteen
+    /// presses - and only then opening the list. A pick carries both halves
+    /// ([EquipChoice]), so the new form opens the whole box and one pick is
+    /// the type and the id together.
+    All,
 }
 
 impl EquipScope {
@@ -2644,6 +2676,7 @@ impl EquipScope {
             EquipScope::Weapons => "武器",
             EquipScope::Armor => "防具",
             EquipScope::Talismans => "護石",
+            EquipScope::All => "全種",
         }
     }
 
@@ -2653,6 +2686,7 @@ impl EquipScope {
             EquipScope::Weapons => &WEAPON_KINDS,
             EquipScope::Armor => &ARMOR_KINDS,
             EquipScope::Talismans => &TALISMAN_KINDS,
+            EquipScope::All => &ALL_KINDS,
         }
     }
 }
@@ -2755,6 +2789,12 @@ pub fn equip_names_available(scope: EquipScope) -> bool {
                 false
             }
         }
+        // The whole box names its rows when any of its three halves can.
+        EquipScope::All => {
+            equip_names_available(EquipScope::Weapons)
+                || equip_names_available(EquipScope::Armor)
+                || equip_names_available(EquipScope::Talismans)
+        }
     }
 }
 
@@ -2769,6 +2809,14 @@ pub fn equip_names_available(scope: EquipScope) -> bool {
 /// The list is rebuilt per frame, so it carries no names - a row looks its name
 /// up when it is drawn (EquipChoice::name).
 pub fn equip_choices(scope: EquipScope) -> Vec<EquipChoice> {
+    // The whole box is the three lists one after the other, in the order
+    // [ALL_KINDS] names: one list, one cursor, one rule for the arrows.
+    if scope == EquipScope::All {
+        let mut out = equip_choices(EquipScope::Weapons);
+        out.extend(equip_choices(EquipScope::Armor));
+        out.extend(equip_choices(EquipScope::Talismans));
+        return out;
+    }
     let mut out = Vec::new();
     match scope {
         EquipScope::Weapons => {
@@ -2814,6 +2862,9 @@ pub fn equip_choices(scope: EquipScope) -> Vec<EquipChoice> {
                 }
             }
         }
+        // Answered by the three lists above, before the match: the whole box is
+        // not a fourth table, it is the three of them one after the other.
+        EquipScope::All => {}
     }
     out
 }
@@ -5835,6 +5886,9 @@ pub struct Editor {
     /// The screen [B] returns to from 生データ, i.e. the screen 詳細 was
     /// pressed on.
     pub map_return: Screen,
+    /// Where [B] on クエスト改造 goes back to: [Screen::SaveQuests] for a quest
+    /// opened out of the save, [Screen::ArcList] for one opened from the card.
+    pub quest_return: Screen,
     /// 生データ's byte editor while [A] has it open, `None` while the screen
     /// is the read-only view it used to be.
     ///
@@ -6064,6 +6118,7 @@ impl Editor {
             option_cursor: 0,
             map_cursor: 0,
             map_return: Screen::SaveList,
+            quest_return: Screen::ArcList,
             map_edit: None,
             rev_list: None,
             rev_cursor: 0,
@@ -6843,8 +6898,13 @@ impl Editor {
             Screen::ItemPick | Screen::SkillPick => {
                 "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 検索  [X] クリア  [B] 戻る"
             }
-            // One delete key on every screen: [-] twice.
-            Screen::Charms => "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る",
+            // One delete key on every screen: [-] twice. [B] is not "back":
+            // this list is a section of its own, so the way out of it is the
+            // character select, and the guide has to say which screen it goes
+            // to rather than 戻る (which read as "the screen you came from").
+            Screen::Charms => {
+                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 枠選択"
+            }
             // Built by the form, not here: see footer_hint.
             Screen::CharmEdit => "",
             Screen::Equip => "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る",
@@ -6942,17 +7002,20 @@ impl Editor {
             Screen::QuestEquip => "[A] 開く  [◀/▶] 個数  [X] 保存  [B] 戻る",
             // The aggregate quest screen: one row pair moves the cursor, the
             // other steps whatever value the tab is on, [ZR] picks which value
-            // that is, [Y] opens the ▸詳細 rows, [A] opens the row's own
-            // chooser or keyboard, and 詳細 is a bar button on the console.
+            // that is, [Y] is the step size, [A] opens the row's own chooser or
+            // keyboard (and the 詳細 row's file screens), and 詳細 is a bar
+            // button on the console.
             Screen::QuestEdit => {
                 // The file screens are reached by the [ファイル] pill on the
                 // touched route and by [R 長押し] on the pad. ZR is the
                 // screen's own second action here (the value switch), so it
                 // cannot be the pad's way in.
                 if self.quest_edit_tab == QUEST_TAB_BASIC {
+                    // The step pills name [Y] (step_table), and this line is the
+                    // longest of the four: it does not repeat the key.
                     "[▲/▼] 行  [A] 文字編集  [◀/▶] 制限時間  [L/R] タブ  [R長押し] ファイル"
                 } else {
-                    "[▲/▼] 行  [◀/▶] 値  [ZR] 項目  [A] 選択  [Y] 詳細  [R長押し] ファイル"
+                    "[▲/▼] 行  [◀/▶] 値  [ZR] 項目  [A] 選択  [Y] 刻み  [R長押し] ファイル"
                 }
             }
             // Conversion is the one screen whose keys are not the usual set:
@@ -7124,16 +7187,19 @@ impl Editor {
     /// The hunt screen steps by [HUNT_STEPS] (its fifth entry is a direction
     /// flip, not a size) and spends [Y] on the column; 環境設定 spends [Y] on
     /// the snapshot restore; the item box spends it on 空きも表示; the card
-    /// walks its four views with it; クエスト改造 opens its ▸詳細 rows. On all
-    /// of those the pills named a key the screen had already given away, so an
-    /// empty key is the honest answer: the five pills are the only route there
-    /// and the label names no key at all.
+    /// walks its four views with it. On all of those the pills named a key the
+    /// screen had already given away, so an empty key is the honest answer: the
+    /// five pills are the only route there and the label names no key at all.
+    /// クエスト改造 was on that list while [Y] opened its ▸詳細 rows; the rows
+    /// moved to the deck and the 詳細 row's [A], so the key is back and the
+    /// pills name it again.
     pub fn step_table(&self) -> (&'static [i64], &'static str) {
         match self.screen {
             Screen::Hunts => (&HUNT_STEPS[..], "A"),
-            Screen::Items | Screen::Guild | Screen::QuestEdit | Screen::Options => {
-                (&STEPS[..], "")
-            }
+            // クエスト改造 answers [Y] again: the ▸詳細 rows moved to the deck
+            // and the 詳細 row's [A], which is what gave the key back.
+            Screen::QuestEdit => (&STEPS[..], "Y"),
+            Screen::Items | Screen::Guild | Screen::Options => (&STEPS[..], ""),
             _ => (&STEPS[..], "Y"),
         }
     }
@@ -7312,6 +7378,26 @@ impl Editor {
     /// rows are read straight out of the archive on every frame, so an edit made
     /// on one tab is visible on the next without a second source of truth.
     pub fn enter_quest_edit(&mut self) {
+        self.enter_quest_edit_keeping_return();
+    }
+
+    /// The same, from a known list: [B] comes back to it.
+    ///
+    /// The two lists a quest can be opened from are different screens - the
+    /// save's own quest list and the .arc list on the card - and [B] used to go
+    /// to the .arc list whatever the quest was opened from.
+    pub fn enter_quest_edit_from(&mut self, from: Screen) {
+        if matches!(from, Screen::SaveQuests | Screen::ArcList) {
+            self.quest_return = from;
+        }
+        self.enter_quest_edit_keeping_return();
+    }
+
+    /// Open the aggregate screen without touching the remembered return.
+    ///
+    /// The item picker behind a reward row comes back here, and that is not a
+    /// new visit: the list the quest was opened from is still the answer.
+    fn enter_quest_edit_keeping_return(&mut self) {
         if self.arc.is_none() {
             self.message = String::from("先にクエスト (.arc) を開いてください");
             return;
@@ -7785,6 +7871,12 @@ impl Editor {
     }
 
     /// Open / close the ▸詳細 rows of the monster under the cursor.
+    ///
+    /// The deck's button on the モンスター tab runs it. It used to be [Y], and
+    /// [Y] is the step key now: the reward chance could only be walked one
+    /// point at a time because the key that changes the step had been given
+    /// away to a row toggle. The numbers behind the rows are still on the pad's
+    /// route - the 詳細 row's [A] opens the file screens they live on.
     pub fn quest_toggle_detail(&mut self) {
         if self.quest_edit_tab != QUEST_TAB_MONSTERS {
             self.message = String::from("このタブに詳細行はありません（[A] で編集）");
@@ -7810,6 +7902,23 @@ impl Editor {
             } else {
                 format!("スロット{} の詳細を閉じました", slot + 1)
             };
+        }
+    }
+
+    /// Is the ▸詳細 of the monster under the cursor open?
+    ///
+    /// The deck's pill draws its word from this, so the button cannot say 開く
+    /// about rows that are already showing.
+    pub fn quest_detail_open(&self) -> bool {
+        if self.quest_edit_tab != QUEST_TAB_MONSTERS {
+            return false;
+        }
+        let rows = self.quest_mon_rows();
+        match rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1))) {
+            Some(QuestMonRow::Slot(slot)) | Some(QuestMonRow::Detail(slot, _)) => {
+                self.quest_edit_open.get(*slot).copied().unwrap_or(false)
+            }
+            None => false,
         }
     }
 
@@ -8014,7 +8123,17 @@ impl Editor {
             Key::A => {
                 let _ = self.quest_activate();
             }
-            Key::Y => self.quest_toggle_detail(),
+            // [Y] is the step key, the same key it is on the .mib screen, the
+            // reward rows and every other screen that has one. This screen had
+            // given it away to the ▸詳細 rows, so the reward chance could only
+            // be walked one point at a time: 10% → 50% was forty presses.
+            // The ▸詳細 rows are the deck's button (touch) and the numbers
+            // behind them are the 詳細 row's [A] (the file screens), which is
+            // where a pad reaches them.
+            Key::Y => {
+                self.step = (self.step + 1) % STEPS.len();
+                self.message = format!("刻みを ±{} に切り替えました", STEPS[self.step]);
+            }
             // [ZR] switches which value [◀/▶] steps. [-] is the delete key and
             // a quest has nothing to delete, so the two must not share it.
             Key::Z => self.quest_cycle_field(),
@@ -8022,12 +8141,26 @@ impl Editor {
                 self.flush_quest_edit();
                 self.request_write_arc();
             }
+            // [B] goes back to the list the quest was opened from: the save's
+            // own list (セーブ内) or the .arc list on the card. It used to go to
+            // the .arc list every time, so a quest opened from the save came
+            // back to a list that did not hold it and the same quest cost a
+            // walk through two lists to reach again.
             Key::B => {
                 self.flush_quest_edit();
                 self.gmd = None;
-                self.screen = Screen::ArcList;
-                self.cursor = 0;
-                self.message = String::from("クエスト一覧へ戻りました（[X] を押すまでファイルは変わりません）");
+                self.screen = self.quest_return;
+                if self.quest_return == Screen::SaveQuests {
+                    self.cursor = self.save_quest_cursor;
+                    self.message = String::from(
+                        "セーブ内のクエスト一覧へ戻りました（[X] を押すまでファイルは変わりません）",
+                    );
+                } else {
+                    self.cursor = 0;
+                    self.message = String::from(
+                        "クエスト一覧へ戻りました（[X] を押すまでファイルは変わりません）",
+                    );
+                }
             }
             Key::Plus => {
                 self.press_quit();
@@ -8388,6 +8521,59 @@ impl Editor {
         self.dirty = true;
         self.message = format!("配置{} ({}) の初期エリア番号を {} にしました", sem_k + 1, name, next);
         true
+    }
+
+    /// Write one .mib field from a pick in the list.
+    ///
+    /// Public because the console's two routes to the same list - the pad's
+    /// [A] and a tap on a row - have to write the same bytes. Returns whether
+    /// anything was written: a field index that names no row writes nothing,
+    /// which is what the tap path used to do for the エリア chooser.
+    pub fn apply_mib_choice(&mut self, field_idx: usize, raw_val: u32, label: &str) -> bool {
+        let Some(f) = questfields::MIB_FIELDS.get(field_idx).copied() else {
+            return false;
+        };
+        if f.key.starts_with("mob_slot[") {
+            if f.offset + 13 > self.mib_bytes.len() {
+                return false;
+            }
+            let mid = raw_val as u16;
+            self.mib_bytes[f.offset..f.offset + 2].copy_from_slice(&mid.to_le_bytes());
+            if mid > 0 && self.mib_bytes[f.offset + 4] == 0 {
+                self.mib_bytes[f.offset + 4] = 1;
+                self.mib_bytes[f.offset + 5] = 50;
+                self.mib_bytes[f.offset + 6] = 50;
+                self.mib_bytes[f.offset + 7] = 50;
+                self.mib_bytes[f.offset + 9..f.offset + 11].copy_from_slice(&100u16.to_le_bytes());
+                self.mib_bytes[f.offset + 12] = 1;
+            } else if mid == 0 {
+                self.mib_bytes[f.offset..f.offset + 13].fill(0);
+            }
+            self.dirty = true;
+            self.message = format!("{}: {}", f.ja, label);
+            return true;
+        }
+        if questfields::write_u32(&mut self.mib_bytes, f.offset, f.kind, raw_val) {
+            self.dirty = true;
+            self.message = format!("{}: {}", f.ja, label);
+            return true;
+        }
+        false
+    }
+
+    /// One pick from the .mib / エリア list, whichever list opened it.
+    ///
+    /// The two lists are the same modal, so the pick has to say which writer it
+    /// belongs to. The console's tap path used to call the .mib writer for both
+    /// - with a field index that names nothing, because the エリア chooser is
+    /// not a field - so a tapped area wrote nothing at all while the pad's [A]
+    /// wrote the .sem. One entry point now, and a pick that writes nothing
+    /// returns false instead of leaving the caller to believe it did.
+    pub fn apply_mib_pick(&mut self, target: MibPickTarget, value: u32, label: &str) -> bool {
+        match target {
+            MibPickTarget::Area(slot) => self.set_sem_area(slot, value),
+            MibPickTarget::Field(idx) => self.apply_mib_choice(idx, value, label),
+        }
     }
 
     /// The current tab as plain lines, for the ASCII console fallback.
@@ -9311,6 +9497,52 @@ impl Editor {
             }
         }
         false
+    }
+
+    /// Which form holds a draft the save does not have, if any.
+    ///
+    /// The four forms that keep their edit apart from the save: the talisman
+    /// form, the equipment form and the two my-set forms. The name is the one
+    /// the status line uses, so a jump and a [B] cannot word the same question
+    /// two different ways.
+    pub fn draft_form_name(&self) -> Option<&'static str> {
+        if self.charm_draft_dirty() {
+            Some("護石編集")
+        } else if self.equip_draft_dirty() {
+            Some("装備編集")
+        } else if self.set_draft_dirty() {
+            Some("マイセット編集")
+        } else if self.item_set_draft_dirty() {
+            Some("アイテムセット編集")
+        } else {
+            None
+        }
+    }
+
+    /// A jump that would leave a form: ask once, exactly as [B] does.
+    ///
+    /// The sub-tab and the section bar change `screen` without going through
+    /// the form's own keys, so a draft used to be dropped by a shoulder press
+    /// with nothing on screen saying so - the same loss [B] asks about, through
+    /// a key nobody expected to be destructive. Returns true when the press was
+    /// spent on the question, so the caller keeps the screen and returns; the
+    /// second press is the one that goes through, and the jump itself drops the
+    /// form (that is what closing it means).
+    pub fn form_leave_press(&mut self) -> bool {
+        let Some(what) = self.draft_form_name() else {
+            self.form_discard_armed = false;
+            return false;
+        };
+        if self.form_discard_armed {
+            self.form_discard_armed = false;
+            return false;
+        }
+        self.form_discard_armed = true;
+        self.message = format!(
+            "{}の下書きがまだ書き込まれていません（[A] で書き込み）。もう一度押すと破棄して移動します",
+            what
+        );
+        true
     }
 
     /// Is one of the three forms waiting for a second [B] to drop its draft?
@@ -10478,32 +10710,9 @@ impl Editor {
                     // The box-slot row is the one row that writes.
                     CharmAction::WriteToBox => {}
                 }
-                let c = Charm {
-                    index: e.index,
-                    slots: e.slots,
-                    skill1: e.skill1,
-                    points1: e.points1,
-                    skill2: e.skill2,
-                    points2: e.points2,
-                };
-                self.push_undo("お守りの書き込み");
-                let kind_name = crate::charm::kind_name(e.kind).unwrap_or("?");
-                if let Some(s) = &mut self.save {
-                    // The kind is written with the skills, and its rarity comes
-                    // along: the pair (+0x02, +0x12/+0x13) cannot disagree.
-                    if s.set_charm_with_kind(self.slot, &c, e.kind) {
-                        self.dirty = true;
-                        self.message =
-                            format!("お守り {} を書き込みました（{}）", e.index, kind_name);
-                    } else {
-                        self.message = String::from(
-                            "could not write here - the slot is a weapon or the box has no talisman to copy",
-                        );
-                    }
-                }
                 self.charm_edit = Some(e);
-                self.screen = Screen::Charms;
-                self.cursor = 0;
+                self.commit_charm_draft();
+                return;
             }
             // [B] leaves the form. The draft is [A]'s to write, so leaving it
             // with one still in hand asks first: it used to be dropped by the
@@ -10521,6 +10730,57 @@ impl Editor {
             _ => {}
         }
         self.charm_edit = Some(e);
+    }
+
+    /// Write the talisman form into the box: the one commit the form has.
+    ///
+    /// [A] on the box-slot row runs it, and [X] runs it before it saves. The
+    /// save key cannot press [A] for the form - on a skill row that [A] opens
+    /// the skill list - so it calls this instead, and the two cannot disagree
+    /// about what "write the form" means.
+    ///
+    /// Returns whether the record was written. A slot that cannot hold a
+    /// talisman says why and returns false; the caller must not then pretend
+    /// the draft is in the save.
+    pub fn commit_charm_draft(&mut self) -> bool {
+        let Some(e) = self.charm_edit else {
+            return false;
+        };
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        let c = Charm {
+            index: e.index,
+            slots: e.slots,
+            skill1: e.skill1,
+            points1: e.points1,
+            skill2: e.skill2,
+            points2: e.points2,
+        };
+        self.push_undo("お守りの書き込み");
+        let kind_name = crate::charm::kind_name(e.kind).unwrap_or("?");
+        let written = match &mut self.save {
+            // The kind is written with the skills, and its rarity comes along:
+            // the pair (+0x02, +0x12/+0x13) cannot disagree.
+            Some(s) => s.set_charm_with_kind(self.slot, &c, e.kind),
+            None => false,
+        };
+        if !written {
+            self.message = String::from(
+                "could not write here - the slot is a weapon or the box has no talisman to copy",
+            );
+            return false;
+        }
+        self.dirty = true;
+        self.message = format!("お守り {} を書き込みました（{}）", e.index, kind_name);
+        // The values stay in the form (they are the record's now, so the draft
+        // is clean) and the screen goes back to the list, exactly as the row's
+        // [A] did.
+        self.charm_edit = Some(e);
+        self.screen = Screen::Charms;
+        self.cursor = 0;
+        true
     }
 
     /// Open the skill name picker on the row the form is on.
@@ -10675,9 +10935,9 @@ impl Editor {
             Key::Down => self.option_cursor = (self.option_cursor + 1) % 4,
             Key::Left | Key::Right => {
                 let d: i64 = if key == Key::Right { 1 } else { -1 };
-                self.push_undo("設定");
-                let Some(s) = &mut self.save else { return };
-                let mut o = s.options();
+                let Some(s) = &self.save else { return };
+                let before = s.options();
+                let mut o = before;
                 match self.option_cursor {
                     // Real saves hold values well above 31, so only bound
                     // the byte. Clamping tighter silently rewrote the field.
@@ -10687,6 +10947,15 @@ impl Editor {
                     3 => o.circle_pad_pro = ((o.circle_pad_pro as i64 + d).rem_euclid(2)) as u8,
                     _ => {}
                 }
+                // The brightness is the one row that clamps, so the one row a
+                // press can leave unchanged: it used to push an undo step and
+                // mark the save dirty for a byte that did not move.
+                if o == before {
+                    self.message = String::from("これ以上は変わりません（端まで来ています）");
+                    return;
+                }
+                self.push_undo("設定");
+                let Some(s) = &mut self.save else { return };
                 s.set_options(&o);
                 self.dirty = true;
             }
@@ -11327,6 +11596,22 @@ impl Editor {
         }
     }
 
+    /// The same request, without losing the line the caller just set.
+    ///
+    /// The quest screen and the two form screens say what they just wrote
+    /// (枠 3 に上書きしました / お守り 4 を書き込みました) and then have to ask
+    /// for the write. The plain request replaces that sentence with 書き込み中,
+    /// so the one press that changed the card would read as one that had not.
+    fn request_write_save_keeping_message(&mut self) {
+        let said = core::mem::take(&mut self.message);
+        self.request_write_save();
+        if self.pending_write.is_none() {
+            self.message = said;
+        } else if !said.is_empty() {
+            self.message = format!("{} / {}", said, self.message);
+        }
+    }
+
     /// The [X] key on every screen: save, and nothing else.
     ///
     /// Moved here from the Switch layer (it was `ui::trigger_quick_save`) for
@@ -11335,8 +11620,12 @@ impl Editor {
     /// skill row and wrote the form into the box on the box-slot row; on 装備編集
     /// it opened the equipment / decoration picker or replaced the record. A
     /// save key that edits is a save key nobody can trust, so on those two
-    /// screens it now only asks for the write: the form's own [A] is the one
-    /// commit, and a form that was never committed is simply not in the save.
+    /// screens it runs the form's *commit* - [Editor::commit_charm_draft] /
+    /// [Editor::commit_equip_draft], the same write the form's [A] runs on the
+    /// row that writes - and nothing else. A draft that cannot be committed
+    /// (a type change waiting for its second [A], a slot that refuses the
+    /// record) stops the save and says 下書きが残っています, because a file
+    /// written without it would be a lie about the screen.
     ///
     /// The quest screens keep their flush: their working copies (`.mib` bytes,
     /// `.gmd` strings) are the edit, so [X] has to put them into the archive
@@ -11350,8 +11639,39 @@ impl Editor {
             return;
         }
         match self.screen {
-            // 護石編集 / 装備編集: save only. See the doc above.
-            Screen::CharmEdit | Screen::EquipEdit => self.request_write_save(),
+            // 護石編集 / 装備編集: the draft first, then the write.
+            //
+            // [X] still does not press the form's [A] - on a skill row that [A]
+            // opens the skill list - but it does call the form's one commit,
+            // which is the write [A] runs on the row that writes. Before this
+            // the line said 保存しました about a save that did not hold the
+            // record on screen: the draft was still in the form when the bytes
+            // went out, and leaving the screen threw it away.
+            Screen::CharmEdit => {
+                if self.charm_draft_dirty() {
+                    self.commit_charm_draft();
+                }
+                if self.charm_draft_dirty() {
+                    self.message = String::from(
+                        "下書きが残っています（この枠には書き込めません）。保存はしていません",
+                    );
+                    return;
+                }
+                self.request_write_save_keeping_message();
+            }
+            Screen::EquipEdit => {
+                if self.equip_draft_dirty() {
+                    self.commit_equip_draft();
+                }
+                if self.equip_draft_dirty() {
+                    // A type change waits for its second [A], and a record that
+                    // refused the write is still only in the form: saving the
+                    // file now would write a save that lacks what is on screen.
+                    self.message = format!("{}（下書きが残っています）", self.message);
+                    return;
+                }
+                self.request_write_save_keeping_message();
+            }
             // クエスト改造 edits the same .arc the file screens do: [X] flushes
             // the two working copies and writes the file, or installs the quest
             // into the open save when it came out of the save and has no path.
@@ -11361,6 +11681,11 @@ impl Editor {
                     self.input(Key::X);
                 } else if self.save.is_some() {
                     self.install_into_save();
+                    // The install only moves bytes inside the open save. The
+                    // file screens below ask for the write as well, and one [X]
+                    // has to mean the same thing on both: without this the line
+                    // said 上書きしました and the card was untouched.
+                    self.request_write_save_keeping_message();
                     self.screen = Screen::QuestEdit;
                 } else {
                     self.message =
@@ -13027,29 +13352,55 @@ impl Editor {
             Key::Left | Key::Right => {
                 let up = key == Key::Right;
                 let slot = self.slot;
+                let step = STEPS[self.step].max(1) as u32;
+                // The new value is worked out before anything is written. The
+                // press used to push an undo step and mark the save dirty
+                // whatever row it landed on: on the comment and the name rows
+                // it changed nothing at all, and on a counter already at its
+                // end it wrote back the value it already held. An undo step for
+                // a press that changed nothing is a step the user cannot tell
+                // from one that did.
+                let change = match self.save.as_ref() {
+                    Some(save) => match self.guild_field {
+                        0 => {
+                            let cur = crate::guildcard::hunter_rank(save, slot).unwrap_or(0);
+                            let v = if up {
+                                (cur + 1).min(999)
+                            } else {
+                                cur.saturating_sub(1)
+                            };
+                            (v != cur).then_some(v as u32)
+                        }
+                        1 => {
+                            let cur = crate::guildcard::play_time(save, slot).unwrap_or(0);
+                            let v = if up {
+                                cur.saturating_add(step)
+                            } else {
+                                cur.saturating_sub(step)
+                            };
+                            (v != cur).then_some(v)
+                        }
+                        _ => None,
+                    },
+                    None => None,
+                };
+                let Some(v) = change else {
+                    self.message = if self.save.is_none() {
+                        String::from("先にセーブを開いてください")
+                    } else if self.guild_field > 1 {
+                        String::from(
+                            "[◀/▶] は ランク / プレイ時間 の行で効きます（この行は [A] / [R]）",
+                        )
+                    } else {
+                        String::from("これ以上は変わりません（端まで来ています）")
+                    };
+                    return;
+                };
                 self.push_undo("ギルドカード");
                 let Some(save) = &mut self.save else { return };
                 let ok = match self.guild_field {
-                    0 => {
-                        let cur = crate::guildcard::hunter_rank(save, slot).unwrap_or(0);
-                        let v = if up {
-                            (cur + 1).min(999)
-                        } else {
-                            cur.saturating_sub(1)
-                        };
-                        crate::guildcard::set_hunter_rank(save, slot, v)
-                    }
-                    1 => {
-                        let cur = crate::guildcard::play_time(save, slot).unwrap_or(0);
-                        let step = STEPS[self.step].max(1) as u32;
-                        let v = if up {
-                            cur.saturating_add(step)
-                        } else {
-                            cur.saturating_sub(step)
-                        };
-                        crate::guildcard::set_play_time(save, slot, v)
-                    }
-                    _ => false,
+                    0 => crate::guildcard::set_hunter_rank(save, slot, v as u16),
+                    _ => crate::guildcard::set_play_time(save, slot, v),
                 };
                 if ok {
                     self.dirty = true;
@@ -17469,12 +17820,28 @@ impl Editor {
             self.message = String::from("種別・ID の行で [A] を押してください");
             return false;
         }
-        let scope = EquipScope::of_kind(e.kind);
+        // The new-record form opens the whole box: its kind starts on 1 (a
+        // piece of armour), and a pick writes the type with the id, so scoping
+        // the list to the form's own kind made creating a weapon a walk through
+        // the 種別 row before the list could even show one.
+        let scope = if e.new {
+            EquipScope::All
+        } else {
+            EquipScope::of_kind(e.kind)
+        };
         self.equip_pick_scope = scope;
         // A type outside the scope (the unused 12, or one of the palico kinds a
         // corrupt record can hold) is no filter at all rather than a filter
-        // that matches nothing.
-        self.equip_pick_kind = if scope.kinds().contains(&e.kind) { e.kind } else { 0 };
+        // that matches nothing. The whole box starts unfiltered for the same
+        // reason the form's kind cannot narrow it: the kind is what the pick is
+        // there to choose.
+        self.equip_pick_kind = if e.new {
+            0
+        } else if scope.kinds().contains(&e.kind) {
+            e.kind
+        } else {
+            0
+        };
         self.equip_pick_filter.clear();
         let choices = self.equip_pick_choices();
         self.equip_pick_cursor = choices
@@ -17801,6 +18168,25 @@ impl Editor {
             }
             Err(err) => self.message = err.text(),
         }
+    }
+
+    /// Write the equipment form into the box: the one commit the form has.
+    ///
+    /// [A] runs it on the row whose word says 書き込み / 作成; [X] runs it
+    /// before it saves, so the file cannot be written without the record the
+    /// form is showing. A type change still asks for its second [A] (see
+    /// [Editor::write_equip_edit]), so this can return with the draft still in
+    /// hand - the caller asks [Editor::equip_draft_dirty] whether it did.
+    pub fn commit_equip_draft(&mut self) -> bool {
+        let Some(e) = self.equip_edit else {
+            return false;
+        };
+        if e.new {
+            self.write_new_equip(&e);
+        } else {
+            self.write_equip_edit(&e);
+        }
+        !self.equip_draft_dirty()
     }
 
     /// Decoration ids whose name matches the current filter.

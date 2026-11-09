@@ -176,15 +176,26 @@ fn the_save_key_on_the_equipment_form_only_saves() {
 
     ed.quick_save();
 
-    assert_eq!(
+    // The save key still never opens the picker (that was the finding). It does
+    // commit the form now, which is the fourth review's fix: a form whose draft
+    // is not in the save must not be saved as if it were.
+    assert_ne!(
         ed.screen,
-        Screen::EquipEdit,
+        Screen::EquipPick,
         "the save key must not open the equipment picker"
     );
-    assert!(ed.equip_edit.is_some());
+    assert!(
+        ed.take_text_request().is_none(),
+        "and it must not open a keyboard"
+    );
     assert!(
         ed.take_write().is_some(),
         "the save request is the one thing [X] does"
+    );
+    assert!(
+        !ed.equip_draft_dirty(),
+        "the draft the form was holding is in the save: {}",
+        ed.message
     );
 }
 
@@ -373,8 +384,10 @@ fn the_options_panel_names_the_keys_it_really_has() {
     ed.screen = Screen::Guild;
     ed.set_guild_view(GUILD_TAB_CARD);
     assert_eq!(ed.step_table().1, "");
+    // クエスト改造 had no step key while [Y] opened its ▸詳細 rows; the rows
+    // moved to the deck and the 詳細 row's [A], so the key is back.
     ed.screen = Screen::QuestEdit;
-    assert_eq!(ed.step_table().1, "");
+    assert_eq!(ed.step_table().1, "Y");
 
     let body = fn_body(ui_src(), "fn draw_options");
     assert!(

@@ -434,7 +434,9 @@ fn the_item_box_search_is_a_key_and_both_footers_name_the_way_back() {
     assert!(hint.contains("[B] 戻る"), "{hint}");
 
     // The talisman list already answered [Y]; what it did not do was name the
-    // way back.
+    // way back. It names it now, and by the screen it goes to: the fourth
+    // review found that [B] here is the character select, not the screen the
+    // user came from.
     ed.screen = Screen::Charms;
     ed.input(Key::Y);
     assert_eq!(
@@ -444,7 +446,9 @@ fn the_item_box_search_is_a_key_and_both_footers_name_the_way_back() {
     );
     let hint = ed.footer_hint();
     assert!(hint.contains("[Y] 検索"), "{hint}");
-    assert!(hint.contains("[B] 戻る"), "{hint}");
+    assert!(hint.contains("[B] 枠選択"), "{hint}");
+    ed.input(Key::B);
+    assert_eq!(ed.screen, Screen::Slots, "and the word is true");
 }
 
 // ---------------------------------------------------------------------------

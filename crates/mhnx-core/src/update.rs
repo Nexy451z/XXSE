@@ -524,9 +524,16 @@ impl Settings {
 // What the screen says
 // ---------------------------------------------------------------------------
 
-/// The banner's one line: 新しいバージョン v0.3.2 があります [A] 詳細
+/// The banner's one line: 新しいバージョン v0.3.2 があります
+///
+/// It names no key. It used to end with "[A] 詳細", and [A] only opens the
+/// dialog on the start screen: on the other twenty the same [A] is the screen's
+/// own key (開く / 編集), so the banner promised a press that did something else
+/// - or nothing. The pill is a tap target on every screen, so the console adds
+/// the pad's route where the pad really has one
+/// (switch/src/ui.rs draw_update_banner).
 pub fn banner_text(version: &Version) -> String {
-    format!("{} v{} があります  [A] 詳細", BANNER_PREFIX, version)
+    format!("{} v{} があります", BANNER_PREFIX, version)
 }
 
 /// The dialog's title.

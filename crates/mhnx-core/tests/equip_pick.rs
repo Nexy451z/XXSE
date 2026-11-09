@@ -81,10 +81,12 @@ fn the_picker_lists_every_named_row_of_the_box() {
 
 #[test]
 fn a_type_name_finds_that_type() {
-    let mut ed = form_on(7, 1, 1, true);
+    // Editing a record: the picker opens narrowed to the type the form is on,
+    // so the first screen is the 大剣 list rather than all 1,606 weapons. (The
+    // new-record form opens the whole box instead: its kind starts on armour,
+    // and a pick carries the type, so narrowing there hid every weapon.)
+    let mut ed = form_on(7, 1, 8, false);
     open_picker(&mut ed);
-    // The picker opens narrowed to the type the form is on, so the first screen
-    // is the 大剣 list rather than all 1,606 weapons.
     assert_eq!(ed.equip_pick_kind, 7);
     assert_eq!(ed.equip_pick_choices().len(), 137);
     assert_eq!(ed.equip_pick_search_line(137), "検索: 大剣（137件）");
@@ -115,7 +117,7 @@ fn a_type_name_finds_that_type() {
 
 #[test]
 fn a_partial_name_finds_the_row_and_the_header_names_the_search() {
-    let mut ed = form_on(7, 1, 1, true);
+    let mut ed = form_on(7, 1, 8, false);
     open_picker(&mut ed);
     ed.input(Key::Minus); // widen to every weapon type
     for _ in 0..(hbedit::WEAPON_KINDS.len() - 1) {
@@ -149,13 +151,12 @@ fn a_partial_name_finds_the_row_and_the_header_names_the_search() {
 #[test]
 fn a_picked_row_writes_the_type_and_the_id_back_into_the_form() {
     // Creating: 種別 and ID come from create(), and the picker answers both -
-    // id 40 is 爆砕の大剣 as a 大剣 and another weapon as a 太刀.
+    // id 40 is 爆砕の大剣 as a 大剣 and another weapon as a 太刀. The new form
+    // opens the whole box, so the search is the only narrowing it needs.
     let mut ed = form_on(7, 1, 1, true);
     open_picker(&mut ed);
-    ed.input(Key::Minus);
-    for _ in 0..(hbedit::WEAPON_KINDS.len() - 1) {
-        ed.input(Key::Minus);
-    }
+    assert_eq!(ed.equip_pick_scope, EquipScope::All);
+    assert_eq!(ed.equip_pick_kind, 0, "the whole box starts unfiltered");
     ed.apply_equip_pick_filter(String::from("爆砕の大剣"));
     let choices = ed.equip_pick_choices();
     assert_eq!(choices, vec![EquipChoice { kind: 7, id: 40 }]);
@@ -259,10 +260,6 @@ fn the_picker_leads_with_the_name_and_prints_the_id_in_hex() {
     // equipment id one way.
     let mut ed = form_on(7, 1, 1, true);
     open_picker(&mut ed);
-    ed.input(Key::Minus);
-    for _ in 0..(hbedit::WEAPON_KINDS.len() - 1) {
-        ed.input(Key::Minus);
-    }
     ed.apply_equip_pick_filter(String::from("爆砕の大剣"));
     let all = ed
         .lines()
@@ -284,7 +281,7 @@ fn the_picker_leads_with_the_name_and_prints_the_id_in_hex() {
 
 #[test]
 fn the_picker_moves_one_row_ten_rows_and_answers_y_and_x() {
-    let mut ed = form_on(7, 1, 1, true);
+    let mut ed = form_on(7, 1, 8, false);
     open_picker(&mut ed);
     assert_eq!(ed.equip_pick_choices().len(), 137);
     // The cursor starts on the id the form already holds (id 1 is row 1), so
@@ -332,37 +329,38 @@ fn the_picker_moves_one_row_ten_rows_and_answers_y_and_x() {
 
 #[test]
 fn a_wanted_weapon_is_created_from_its_name_alone() {
-    // The whole report, end to end: a new record, the type picked on the form,
-    // the name searched for, and the box holding the weapon - with no id typed
-    // and no arrow key walked through 1,606 rows.
+    // The whole report, end to end: a new record, the name searched for, and
+    // the box holding the weapon - with no id typed, no arrow key walked
+    // through 1,606 rows, and no walk through the 種別 row either. The new
+    // form opens the whole box, so the type arrives with the pick.
     let mut empty = save::empty_switch_save();
     empty.set_slot_used(0, true);
     let mut ed = Editor::new();
     ed.save = Some(empty);
     ed.screen = Screen::Equip;
+    let mut presses = 0;
     ed.input(Key::Plus);
+    presses += 1;
     assert_eq!(ed.screen, Screen::EquipEdit);
     assert_eq!(ed.equip_edit.map(|e| e.new), Some(true));
-    // 種別: 頭 (1) -> 大剣 (7).
-    for _ in 0..6 {
-        ed.input(Key::Right);
-    }
-    assert_eq!(ed.equip_edit.expect("form").kind, 7);
-    ed.input(Key::Down);
-    assert_eq!(ed.equip_edit.expect("form").field, 1, "the ID row");
-    ed.input(Key::Y);
+    // [A] on 種別 opens the whole box: the form starts on kind 1 (armour), and
+    // a pick carries both halves, so no type walk is needed first.
+    ed.input(Key::A);
+    presses += 1;
     assert_eq!(ed.screen, Screen::EquipPick);
-    ed.input(Key::Minus);
-    for _ in 0..(hbedit::WEAPON_KINDS.len() - 1) {
-        ed.input(Key::Minus);
-    }
+    assert_eq!(ed.equip_pick_scope, EquipScope::All);
+    // [Y] is the search box; the word itself is the I/O layer's answer.
+    ed.input(Key::Y);
+    presses += 1;
     ed.apply_equip_pick_filter(String::from("爆砕の大剣"));
     ed.input(Key::A);
+    presses += 1;
     let form = ed.equip_edit.expect("form");
-    assert_eq!((form.kind, form.id), (7, 40));
+    assert_eq!((form.kind, form.id), (7, 40), "the pick carries the type");
 
     // [A] writes the record: the box now holds 爆砕の大剣.
     ed.input(Key::A);
+    presses += 1;
     assert_eq!(ed.screen, Screen::Equip);
     assert!(ed.dirty);
     assert!(ed.message.contains("新規作成"), "{}", ed.message);
@@ -372,6 +370,10 @@ fn a_wanted_weapon_is_created_from_its_name_alone() {
         .find(|e| e.kind == 7 && e.id == 40)
         .expect("the box holds the weapon that was chosen by name");
     assert_eq!(equip::name(&written), "爆砕の大剣");
+    // Five presses and one typed word, against the nineteen the review
+    // measured: six on the 種別 row, the walk to the list, fourteen on the
+    // type filter, and the pick.
+    assert_eq!(presses, 5, "the route is five presses now");
 }
 
 #[test]

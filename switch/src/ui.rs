@@ -74,7 +74,8 @@ use mhnx_core::entries::{Esl, ItemTable, Qdp, QuestLink};
 use mhnx_core::hbedit::{
     arena_clock, arena_name, arena_part_name, arena_rank_name, charm_form_rows, deck_stack,
     decoration_name_of, footer_guide_right, footer_quit_x, item_name_of, monster_name,
-    palico_part_name, palico_skill_tab_name, Editor, ItemSetOp, Key, PalicoEquipRow,
+    palico_part_name, palico_skill_tab_name, Editor, ItemSetOp, Key, MibPickTarget,
+    PalicoEquipRow,
     PalicoSkillRow, Screen, Shoulder, ARENA_COLUMNS, ARENA_PARTS, ARENA_ROWS, CHAR_FIELDS,
     CHARM_EDIT_ROWS, CONSOLE_SAVE, CSV_DIR, GUILD_TAB_ARENA, GUILD_TAB_CARD, GUILD_TAB_COUNTS,
     GUILD_TAB_WEAPONS, GUILD_VENUES, GUILD_WEAPON_ROWS, HUNT_STEPS, ITEM_OP_ADD, ITEM_OP_CLAMP,
@@ -388,6 +389,12 @@ pub enum UiAction {
     /// the button on card 2 opened card 1's character. The slot travels with the
     /// action now, and an empty slot pushes no button at all.
     OpenSlot(usize),
+    /// The ▸詳細 rows of one monster slot: open / close them.
+    ///
+    /// [Y] ran this until the step size took the key back; the pad reaches the
+    /// same numbers through the 詳細 row's [A] (the file screens) and a finger
+    /// through the pill this answers.
+    QuestMonDetail,
     /// ポーチへ on the item set form: copy the set into the pouch.
     ///
     /// It was [-]'s job, and [-] is the delete key now. The form's [ZR] is
@@ -551,6 +558,13 @@ pub struct OskState {
     /// built-in keyboard: the modal then says so instead of leaving the user to
     /// wonder why the system keyboard never appeared.
     pub note: String,
+    /// The two-press rule for [X] 全消去.
+    ///
+    /// [X] used to empty the field on one press, next to [B] which removes one
+    /// character: the two keys sit side by side on the pad and a name typed
+    /// over a minute was gone with no way back. The first press only offers it
+    /// (mhnx_core::confirm::ConfirmPress); any other key takes the offer back.
+    pub clear: mhnx_core::confirm::ConfirmPress,
 }
 
 #[derive(Clone, Copy)]
@@ -768,6 +782,7 @@ impl GuiState {
             col: 0,
             refused,
             note: String::from(note),
+            clear: mhnx_core::confirm::ConfirmPress::new(),
         });
     }
 
@@ -775,6 +790,11 @@ impl GuiState {
         let Some(mut osk) = self.osk.take() else {
             return false;
         };
+        // The 全消去 offer belongs to the press that made it, the same rule the
+        // two-press deletes follow: anything but [X] takes it back.
+        if key != Key::X {
+            osk.clear.clear();
+        }
         match key {
             Key::Up => {
                 osk.row = (osk.row + 4) % 5;
@@ -810,8 +830,18 @@ impl GuiState {
                 let _ = osk.buffer.pop();
                 self.osk = Some(osk);
             }
+            // [X] is 全消去, and it asks: the first press names what it would
+            // take, the second one takes it. It used to empty the field on one
+            // press, one key away from [B] (which removes a character).
             Key::X => {
-                osk.buffer.clear();
+                if osk.buffer.is_empty() {
+                    osk.clear.clear();
+                    self.osk = Some(osk);
+                    return true;
+                }
+                if osk.clear.press() {
+                    osk.buffer.clear();
+                }
                 self.osk = Some(osk);
             }
             Key::Y => {
@@ -926,6 +956,12 @@ impl GuiState {
     }
 
     fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
+        // The same question the sub-tab asks: ZL / ZR changes the screen
+        // without going through the form's own keys, and the two calls below
+        // throw the draft away.
+        if ed.form_leave_press() {
+            return;
+        }
         self.close_set_form(ed);
         self.close_palico_panel(ed);
         // The item bulk menu is a mode of the item box. A section jump changes
@@ -1188,6 +1224,13 @@ impl GuiState {
     }
 
     pub fn select_sub_tab(&mut self, ed: &mut Editor, idx: usize) {
+        // A tab press that would leave a form asks first, exactly as [B] does:
+        // the jump below closes the form, and a draft dropped by a shoulder
+        // press is the same loss [B] asks about through a key nobody expects to
+        // be destructive. The second press goes through.
+        if ed.form_leave_press() {
+            return;
+        }
         // The マイセット tab means the list, so a tab press also closes the
         // set editor; leaving the screen any other way does too.
         self.close_set_form(ed);
@@ -1428,7 +1471,10 @@ impl GuiState {
                 // and says so, rather than offering a screen with no quest.
                 0 => {
                     if ed.arc.is_some() {
-                        ed.enter_quest_edit();
+                        // The tab is pressed from the list the quest came from,
+                        // so that list is where [B] goes back to.
+                        let from = ed.screen;
+                        ed.enter_quest_edit_from(from);
                     } else if ed.save.is_some() {
                         self.quest_tab = 0;
                         ed.refresh_quest_titles();
@@ -1797,6 +1843,10 @@ impl GuiState {
     }
 
     pub fn open_mib_picker(&mut self, ed: &mut Editor, field_idx: usize) -> bool {
+        // Whatever the last chooser was for, this one is a .mib field: the
+        // area slot is disarmed before the list is built, so a pick can only
+        // ever write the field the list is showing.
+        self.quest_area_slot = None;
         let Some((title, items, cur_val)) = mib_field_choices(ed.mib_bytes(), field_idx) else {
             return false;
         };
@@ -1930,13 +1980,14 @@ impl GuiState {
                 if let Some((raw_val, label)) = picker.items.get(picker.cursor).cloned() {
                     // The area chooser is the same modal with a different
                     // writer: the pick lands in the .sem, through the one
-                    // method that writes that byte.
-                    match self.quest_area_slot.take() {
-                        Some(slot) => {
-                            ed.set_sem_area(slot, raw_val);
-                        }
-                        None => apply_mib_choice(ed, picker.field_idx, raw_val, &label),
-                    }
+                    // method that writes that byte. Both routes (this press and
+                    // a tap on a row) go through the same entry point, so they
+                    // cannot write to different places.
+                    let target = match self.quest_area_slot.take() {
+                        Some(slot) => MibPickTarget::Area(slot),
+                        None => MibPickTarget::Field(picker.field_idx),
+                    };
+                    ed.apply_mib_pick(target, raw_val, &label);
                 }
             }
             Key::B | Key::Minus => {
@@ -2437,7 +2488,9 @@ impl GuiState {
                         && ed.screen == Screen::ArcEntries
                         && ed.arc.is_some()
                     {
-                        ed.enter_quest_edit();
+                        // A quest opened from the save's own list comes back
+                        // there on [B], not to the .arc list.
+                        ed.enter_quest_edit_from(Screen::SaveQuests);
                     }
                 }
             },
@@ -2884,6 +2937,9 @@ impl GuiState {
                 }
             }
             UiAction::ItemSetToPouch => ed.item_set_to_pouch(),
+            // The ▸詳細 rows of the monster under the cursor: the deck's half of
+            // a key the pad gave back to the step size.
+            UiAction::QuestMonDetail => ed.quest_toggle_detail(),
             UiAction::GotoSection(sec) => self.goto_section(ed, sec),
             UiAction::SelectSubTab(idx) => self.select_sub_tab(ed, idx),
             UiAction::CycleSection(fwd) => self.cycle_sidebar_tab(ed, fwd),
@@ -3082,9 +3138,11 @@ impl GuiState {
             UiAction::OpenBundledQuest(qid) => {
                 ed.open_bundled_quest(qid);
                 // A quest that was picked is a quest to edit: the aggregate
-                // screen is where it opens, not the file list.
+                // screen is where it opens, not the file list. The list it was
+                // picked from is the save's own (the bundled tabs are on that
+                // screen), so [B] comes back there.
                 if ed.arc.is_some() {
-                    ed.enter_quest_edit();
+                    ed.enter_quest_edit_from(Screen::SaveQuests);
                 }
             }
 
@@ -3099,7 +3157,17 @@ impl GuiState {
                 if let Some(mut picker) = self.mib_picker.take() {
                     if picker.cursor == idx {
                         if let Some((raw_val, label)) = picker.items.get(idx).cloned() {
-                            apply_mib_choice(ed, picker.field_idx, raw_val, &label);
+                            // The area chooser is the same modal with a
+                            // different writer. The tap used to go through the
+                            // .mib field writer with the "no field" index, so it
+                            // wrote nothing at all while the pad's [A] wrote the
+                            // .sem - and the slot stayed armed, so the next
+                            // monster pick wrote the area instead of the monster.
+                            let target = match self.quest_area_slot.take() {
+                                Some(slot) => mhnx_core::hbedit::MibPickTarget::Area(slot),
+                                None => mhnx_core::hbedit::MibPickTarget::Field(picker.field_idx),
+                            };
+                            ed.apply_mib_pick(target, raw_val, &label);
                         }
                     } else {
                         picker.cursor = idx.min(picker.items.len().saturating_sub(1));
@@ -3108,7 +3176,12 @@ impl GuiState {
                 }
             }
             UiAction::MibPickerScroll(delta) => self.scroll_mib_picker(delta),
-            UiAction::MibPickerClose => self.mib_picker = None,
+            // Closing the chooser disarms it: an area slot left behind is what
+            // made the next monster pick write the .sem.
+            UiAction::MibPickerClose => {
+                self.mib_picker = None;
+                self.quest_area_slot = None;
+            }
             // Both presets rewrite every monster / spawn of the record at
             // once, so they ask for a second press and say how many they would
             // touch (hbedit::Editor::mib_preset_label / sem_preset_label).
@@ -3163,9 +3236,15 @@ impl GuiState {
                     let _ = osk.buffer.pop();
                 }
             }
+            // The same two presses the pad's [X] takes: a finger and a key must
+            // not cost a different number of presses for the same delete.
             UiAction::OskClear => {
                 if let Some(osk) = &mut self.osk {
-                    osk.buffer.clear();
+                    if osk.buffer.is_empty() {
+                        osk.clear.clear();
+                    } else if osk.clear.press() {
+                        osk.buffer.clear();
+                    }
                 }
             }
             UiAction::OskModify => {
@@ -4134,7 +4213,12 @@ impl GuiState {
         // is shown, which is the right trade: the note is a hint about a key,
         // the banner is new information.
         if self.update.banner_visible() {
-            right = self.draw_update_banner(c, right);
+            // [A] opens the dialog on the start screen and nowhere else (every
+            // other screen's [A] is its own key), so the banner only names the
+            // key where the key is true. The pill itself is a tap target on
+            // every screen, which is why the line can be drawn anywhere.
+            let a_opens_it = ed.screen == Screen::SaveList;
+            right = self.draw_update_banner(c, right, a_opens_it);
         }
         // Not on 生データ itself: the note would advertise the screen that is
         // already showing. It names the pill by the word the pill itself
@@ -4405,12 +4489,33 @@ impl GuiState {
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &chip, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
+                // The ▸詳細 rows of a monster slot: [Y] is the step key now, so
+                // a finger opens them here and the pad reaches the same numbers
+                // through the 詳細 row's [A] (the file screens they live on).
                 // The second pill used to be a third entry point to the file
                 // screens ("[詳細] ファイル単位") beside the [ファイル] pill on
-                // the tab bar and the row the list ends with. One screen with
-                // three doors named two different things is what the review
-                // found; the door that stays is the pill on the bar, because it
-                // is on every tab and every screen already carries it.
+                // the tab bar and the row the list ends with; one screen with
+                // three doors named two different things was the review's find,
+                // so this pill is the row toggle, not a fourth door.
+                if ed.quest_edit_tab == QUEST_TAB_MONSTERS {
+                    let open = ed.quest_detail_open();
+                    let lbl = if open { "▸詳細 閉じる" } else { "▸詳細 開く" };
+                    c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
+                    c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                    btn_text(c, 1108, sy, 158, sh, lbl, t.text_primary, FontSize::Small);
+                    self.add_hit(1108, sy, 158, sh, UiAction::QuestMonDetail);
+                }
+            }
+            // The item set form's name has no row of its own (the thirty-two
+            // rows are the entries), so the keyboard lives on [ZR] and the deck
+            // gives a finger the same key. The pad already reaches it: the
+            // state machine answers ZrJob::Screen on this form, and this pill
+            // is the touch half of the same answer.
+            Screen::Sets if ed.item_set_edit.is_some() => {
+                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 136, sh, "[ZR] セット名", t.text_primary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
             }
             Screen::Charms => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
@@ -10567,9 +10672,9 @@ impl GuiState {
         // The key legend names the line-break key, because a player who is not
         // told about it will never find it. A one-line field says so instead.
         let legend = if osk.spec.multiline {
-            "[A] 入力  [B] 削除  [ZR] 改行  [L/R] 文字種  [+] 確定"
+            "[A] 入力  [B] 削除  [X] 全消去（2回）  [ZR] 改行  [L/R] 文字種  [+] 確定"
         } else {
-            "[A] 入力  [B] 削除  [L/R] 文字種  [+] 確定（改行不可）"
+            "[A] 入力  [B] 削除  [X] 全消去（2回）  [L/R] 文字種  [+] 確定（改行不可）"
         };
         c.text_right(mx + mw - 24, my + 20, legend, t.text_secondary, FontSize::Small);
 
@@ -10697,7 +10802,13 @@ impl GuiState {
         };
         let actions: &[(&str, i32, Color, Color, UiAction)] = &[
             ("[B] 1字削除", 128, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
-            ("[X] クリア", 116, t.bg_danger, t.accent_danger, UiAction::OskClear),
+            (
+                "[X] クリア（2回）",
+                150,
+                t.bg_danger,
+                t.accent_danger,
+                UiAction::OskClear,
+            ),
             ("[Y] 濁点/小字", 148, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
             (
                 if osk.spec.multiline { "[ZR] 改行" } else { "改行不可" },
@@ -10706,7 +10817,7 @@ impl GuiState {
                 t.accent_primary,
                 UiAction::OskNewline,
             ),
-            ("空白", 96, t.bg_btn, t.border_subtle, UiAction::OskSpace),
+            ("空白", 84, t.bg_btn, t.border_subtle, UiAction::OskSpace),
             ("[-] 取消", 128, t.bg_btn, t.border_subtle, UiAction::OskCancel),
             ("[+] 確定", 180, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
         ];
@@ -10983,35 +11094,6 @@ fn mib_field_choices(mib: &[u8], field_idx: usize) -> Option<(String, Vec<(u32, 
     }
 }
 
-fn apply_mib_choice(ed: &mut Editor, field_idx: usize, raw_val: u32, label: &str) {
-    let Some(f) = questfields::MIB_FIELDS.get(field_idx) else {
-        return;
-    };
-    if f.key.starts_with("mob_slot[") {
-        if f.offset + 13 <= ed.mib_bytes.len() {
-            let mid = raw_val as u16;
-            ed.mib_bytes[f.offset..f.offset + 2].copy_from_slice(&mid.to_le_bytes());
-            if mid > 0 && ed.mib_bytes[f.offset + 4] == 0 {
-                ed.mib_bytes[f.offset + 4] = 1;
-                ed.mib_bytes[f.offset + 5] = 50;
-                ed.mib_bytes[f.offset + 6] = 50;
-                ed.mib_bytes[f.offset + 7] = 50;
-                ed.mib_bytes[f.offset + 9..f.offset + 11].copy_from_slice(&100u16.to_le_bytes());
-                ed.mib_bytes[f.offset + 12] = 1;
-            } else if mid == 0 {
-                ed.mib_bytes[f.offset..f.offset + 13].fill(0);
-            }
-            ed.dirty = true;
-            ed.message = format!("{}: {}", f.ja, label);
-        }
-        return;
-    }
-    if questfields::write_u32(&mut ed.mib_bytes, f.offset, f.kind, raw_val) {
-        ed.dirty = true;
-        ed.message = format!("{}: {}", f.ja, label);
-    }
-}
-
 /// The value column of one .mib row that carries no enum table.
 ///
 /// For a com* row the number is named in the space its 種類 byte names: a
@@ -11238,9 +11320,13 @@ impl GuiState {
     /// The pill is the tap target; the pad route to the same dialog is [A] on
     /// the start screen (and [R] held there at any time). Its width is capped so
     /// that a long version string cannot eat the guide line it sits beside.
-    fn draw_update_banner(&mut self, c: &mut Canvas, right: i32) -> i32 {
+    fn draw_update_banner(&mut self, c: &mut Canvas, right: i32, a_opens_it: bool) -> i32 {
         let t = theme();
-        let text = self.update.banner.clone();
+        let text = if a_opens_it {
+            format!("{}  [A] 詳細", self.update.banner)
+        } else {
+            format!("{}  タップで詳細", self.update.banner)
+        };
         let w = (c.text_width_sized(&text, FontSize::Small) + 24).clamp(200, 640);
         let x = (right - w).max(MAIN_X);
         let h = GUIDE_H - 4;

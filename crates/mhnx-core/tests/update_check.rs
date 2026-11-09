@@ -472,7 +472,13 @@ fn the_start_up_check_can_be_turned_off_and_the_file_is_forgiving() {
 #[test]
 fn the_banner_is_one_quiet_line() {
     let v = Version::parse("v0.3.2").unwrap();
-    assert_eq!(banner_text(&v), "新しいバージョン v0.3.2 があります  [A] 詳細");
+    assert_eq!(banner_text(&v), "新しいバージョン v0.3.2 があります");
+    // No key in the line: [A] opens the dialog on the start screen only, and a
+    // banner that names it lies on the other twenty screens.
+    assert!(
+        !banner_text(&v).contains("[A]"),
+        "the banner must not name a key it cannot keep on every screen"
+    );
     // One line: the guide strip draws exactly one.
     assert!(!banner_text(&v).contains('\n'));
 }

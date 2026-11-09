@@ -2095,6 +2095,14 @@ pub fn run() -> i32 {
                     if ed.press_quit() {
                         break;
                     }
+                    // The press is spent. Every screen's own Key::Plus arm calls
+                    // press_quit as well, so handing the same press to the state
+                    // machine below answered the offer it had just made: one
+                    // [＋] on a dirty save armed the quit and then took it, and
+                    // the session ended with the edit still in memory.
+                    if key == Some(Key::Plus) {
+                        key = None;
+                    }
                     need_draw = true;
                 }
 
