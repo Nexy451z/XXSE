@@ -172,6 +172,31 @@ pub enum Screen {
     Review,
 }
 
+/// What a shoulder press means on the screen that is showing.
+///
+/// [L] / [R] are the sub-tab keys by default, and that default is the whole
+/// navigation rule: a shoulder tap moves the tab strip and nothing else. A few
+/// screens take the key back, and each one is named here rather than left to a
+/// negative list at the call site - the negative list is how [R] came to
+/// swallow the numeric input the item box and the hunt record print in their
+/// own footers ("[R] 数値入力"), so choosing a BOX tab moved the tab instead of
+/// opening the keyboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shoulder {
+    /// Previous / next sub-tab: the default on every screen.
+    SubTab,
+    /// The ten-row jump of a pick list: the shoulder is turned into [◀] / [▶].
+    Move,
+    /// The screen's own key: the console hands the press to that screen's
+    /// handler. Not necessarily the state machine's [L] / [R] - the item box's
+    /// [R] opens the count keyboard, which the console owns - so the press must
+    /// not be forwarded blindly.
+    Screen,
+    /// Nobody: a modal form owns the screen and neither reads the shoulder nor
+    /// lets the tab strip under it move.
+    Swallow,
+}
+
 /// The three views of [Screen::Progress], in the order L / R walks them.
 pub const PROGRESS_AWARDS: usize = 0;
 /// The request / event flag view.
@@ -3655,7 +3680,11 @@ pub const CHAR_FIELDS: &[(&str, &str)] = &[
 pub const STEPS: [i64; 5] = [1, 10, 100, 1_000, 10_000];
 
 /// Steps the hunt screen cycles through: counts are small, so 10000 is useless.
-const HUNT_STEPS: [i64; 5] = [1, 10, 100, 1000, -1];
+///
+/// Public because the console prints the same table it steps by: the inspector
+/// pill, the footer and the key all read the fifth entry as "reversed", so a
+/// copy of this array in the Switch layer was a second answer to one question.
+pub const HUNT_STEPS: [i64; 5] = [1, 10, 100, 1000, -1];
 
 // ---------------------------------------------------------------------------
 // The ceilings every [MAX] jumps to
@@ -6397,6 +6426,97 @@ impl Editor {
         }
     }
 
+    /// Switch the hunter whose save every screen is editing.
+    ///
+    /// Three characters live in one file, so a slot change re-points every
+    /// record the editor reads. Nothing that was open *on* a record may stay
+    /// open across it: the talisman form, the equipment form, the two set
+    /// forms, the two palico panels, the item bulk menu and the four pick lists
+    /// all name a record of the slot that is going away (or a box position in
+    /// it), and a form left open over a switch wrote the other character's same
+    /// frame on its next [A]. That is the bug this method exists to make
+    /// impossible: the console only calls it, so a slot card, the header badge
+    /// and the deck's slot button cannot disagree about what a switch closes.
+    ///
+    /// The forms go back to the list they are a mode of (護石 → 護石一覧,
+    /// 装備 → 装備BOX); a pick list that was open came from one of those forms,
+    /// so it lands on the list rather than on a form it no longer has.
+    ///
+    /// Returns whether the slot changed. The same slot, or a slot that does not
+    /// exist, changes nothing and says nothing.
+    pub fn switch_slot(&mut self, slot: usize) -> bool {
+        if slot >= 3 || slot == self.slot {
+            return false;
+        }
+        // A form is a mode of its screen: the screen goes back to the list and
+        // the record it held is dropped, not carried to another character.
+        let mut closed = false;
+        match self.screen {
+            Screen::CharmEdit => {
+                self.charm_edit = None;
+                self.screen = Screen::Charms;
+                closed = true;
+            }
+            Screen::EquipEdit => {
+                self.equip_edit = None;
+                self.screen = Screen::Equip;
+                closed = true;
+            }
+            Screen::SkillPick => {
+                self.charm_edit = None;
+                self.screen = Screen::Charms;
+                closed = true;
+            }
+            Screen::JewelPick | Screen::EquipPick => {
+                self.equip_edit = None;
+                self.screen = Screen::Equip;
+                closed = true;
+            }
+            Screen::ItemPick => {
+                self.screen = Screen::Items;
+                closed = true;
+            }
+            _ => {}
+        }
+        // The modes that sit on top of a screen rather than being one.
+        if self.set_edit.is_some() || self.item_set_edit.is_some() || self.item_menu_open {
+            closed = true;
+        }
+        self.charm_edit = None;
+        self.equip_edit = None;
+        self.set_edit = None;
+        self.set_clear_armed = None;
+        self.set_warnings.clear();
+        self.item_set_edit = None;
+        self.item_set_armed = None;
+        self.item_set_warnings.clear();
+        self.palico_equip = None;
+        self.palico_skill = None;
+        self.dismiss_item_menu();
+        // A half-answered two-press offer names a record of the old slot.
+        self.charm_delete_armed = None;
+        self.equip_kind_armed = None;
+        self.slot = slot;
+        // The lists are rebuilt from the new slot, so their cursors start at
+        // the top rather than at an index that may not exist.
+        self.charm_cursor = 0;
+        self.equip_cursor = 0;
+        self.hunt_cursor = 0;
+        if self.screen == Screen::Slots {
+            self.cursor = slot;
+        }
+        self.message = alloc::format!(
+            "ハンター枠 Slot {} に切り替えました{}",
+            slot + 1,
+            if closed {
+                "（開いていたフォームは閉じました）"
+            } else {
+                ""
+            }
+        );
+        true
+    }
+
     /// Does a Minus press on this screen refresh the card listing?
     ///
     /// One press does one thing. The rescan is what Minus means on the save
@@ -6659,6 +6779,132 @@ impl Editor {
             Screen::SaveMap => "[▲/▼] 行  [◀/▶] 10行  [A] 編集  [Y] 検索  [B] 戻る"
         };
         base
+    }
+
+    // -------------------------------------------------------------------
+    // What a key means, and the labels the console draws from it
+    // -------------------------------------------------------------------
+    //
+    // Every question on this shelf used to be answered twice: once here and
+    // once in the Switch layer, and each copy drifted on its own. That is what
+    // the A items of the review found - a shoulder that took a promised
+    // keyboard, a pill drawn on a row that refused it, a pill lit on the
+    // screen it opens, a panel naming a key the screen spends elsewhere. The
+    // console asks now, so the answer a test pins is the answer on the glass.
+
+    /// What a shoulder press means on the screen that is showing.
+    ///
+    /// See [Shoulder]: the sub-tab is the default, the pick lists move ten
+    /// rows, and the screens whose footer promises "[R] 数値入力" get the key
+    /// before the tab strip does.
+    pub fn shoulder_job(&self, key: Key) -> Shoulder {
+        // The forms that own their screen keep the shoulders too: a tab move
+        // under them would leave a form open on a screen that no longer shows
+        // it. (The set form's own keys are directions, so a shoulder is nobody's
+        // there; the palico skill panel steps its candidate list with them.)
+        if self.screen == Screen::Sets && self.set_edit.is_some() {
+            return Shoulder::Swallow;
+        }
+        if self.palico_equip_open() {
+            return Shoulder::Swallow;
+        }
+        if self.palico_skill_open() {
+            return Shoulder::Screen;
+        }
+        let right = key == Key::R;
+        match self.screen {
+            // The four pick lists move ten rows with the shoulders.
+            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick => {
+                Shoulder::Move
+            }
+            // [R] types the count of the selected slot, and both footers say so
+            // ("[R] 数値入力"): the tab strip must not answer first.
+            Screen::Items | Screen::Hunts if right => Shoulder::Screen,
+            // A reward / supply row holds numbers too.
+            Screen::EntryView if right && self.entry_has_numbers() => Shoulder::Screen,
+            // The equipment form's two identity rows take [R] as the ID entry
+            // key (the number a user knows and cannot reach by stepping).
+            Screen::EquipEdit if right => Shoulder::Screen,
+            // The card's numeric rows take [R] as the keyboard; the arena view
+            // is the one that does not - it spends [Y] on the time instead.
+            Screen::Guild if right && self.guild_view() != GUILD_TAB_ARENA => Shoulder::Screen,
+            _ => Shoulder::SubTab,
+        }
+    }
+
+    /// Does the row under the cursor hold a number [R] can type?
+    ///
+    /// The inspector draws the [R] 数値入力 pill from this answer, so a row
+    /// that refuses the key has to answer false: the pill is a promise, and a
+    /// pill that only ever answers "no number here" is the shape of bug this
+    /// rule exists for. The guild card's comment and its own copy of the name
+    /// are text ([A] opens them), which is why they are not rows 0 and 1.
+    pub fn direct_input_available(&self, row: usize) -> bool {
+        match self.screen {
+            Screen::Items | Screen::Hunts => true,
+            // The equipment form's two id rows. The level and the sockets are
+            // not numbers anyone types, so the pill is not drawn on them.
+            Screen::EquipEdit => matches!(row, 1 | 8),
+            // Counters and the weapon grid type everywhere; the card types on
+            // its two numbers only.
+            Screen::Guild if self.guild_view() == GUILD_TAB_CARD => row < GUILD_ROW_COMMENT,
+            Screen::Guild => self.guild_view() != GUILD_TAB_ARENA,
+            // A reward / supply row has a number [R] can type.
+            Screen::EntryView => self.entry_has_numbers(),
+            _ => false,
+        }
+    }
+
+    /// Is the 詳細 / 生データ pill live on this screen?
+    ///
+    /// The pill opens the bytes behind the screen that is showing. Three
+    /// answers are false: a pick list (a mode of the screen under it, and
+    /// jumping out would leave a pick half answered), the file lists (no save
+    /// record behind them), and 生データ itself - the pill used to stay lit
+    /// there and only ever answered "already showing", a button that invites a
+    /// press it means to turn down.
+    pub fn detail_pill_live(&self) -> bool {
+        if matches!(
+            self.screen,
+            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
+        ) {
+            return false;
+        }
+        if self.screen == Screen::SaveMap {
+            return false;
+        }
+        // クエスト改造's 詳細 is its file screens, not the save map: the pill
+        // says ファイル there and it does open something.
+        self.screen == Screen::QuestEdit || Self::detail_field_name(self.screen).is_some()
+    }
+
+    /// The step table one screen really steps by, and the key that cycles it.
+    ///
+    /// The inspector used to draw [STEPS] on every screen and always name [Y].
+    /// The hunt screen steps by [HUNT_STEPS] (its fifth entry is a direction
+    /// flip, not a size) and spends [Y] on the column; 環境設定 spends [Y] on
+    /// the snapshot restore; the item box spends it on 空きも表示; the card
+    /// walks its four views with it; クエスト改造 opens its ▸詳細 rows. On all
+    /// of those the pills named a key the screen had already given away, so an
+    /// empty key is the honest answer: the five pills are the only route there
+    /// and the label names no key at all.
+    pub fn step_table(&self) -> (&'static [i64], &'static str) {
+        match self.screen {
+            Screen::Hunts => (&HUNT_STEPS[..], "A"),
+            Screen::Items | Screen::Guild | Screen::QuestEdit | Screen::Options => {
+                (&STEPS[..], "")
+            }
+            _ => (&STEPS[..], "Y"),
+        }
+    }
+
+    /// What [A] does on 環境設定: it saves.
+    ///
+    /// The panel said 切替 next to a key that wrote the card, while the keys
+    /// that do toggle a flag are [◀] / [▶]. The word lives here so the button,
+    /// the footer ("[X] 保存") and the state machine cannot disagree again.
+    pub fn options_a_label(&self) -> &'static str {
+        "保存"
     }
 
     // -------------------------------------------------------------------
@@ -10455,7 +10701,14 @@ impl Editor {
         }
     }
 
-    fn request_write_save(&mut self) {
+    /// Ask the I/O layer to write the open save back to the card.
+    ///
+    /// The one save request every screen's [X] ends in. Public because the
+    /// console's QuickSave has to reach it from screens whose own [A] is not a
+    /// save: it used to press [A] "for" the screen to get here, and on the
+    /// talisman form that [A] is the row's own action (a skill picker on a
+    /// skill row), so [X] opened a list and wrote nothing.
+    pub fn request_write_save(&mut self) {
         if let Some(p) = self.save_path.clone() {
             if let Some(s) = &self.save {
                 self.pending_write = Some(Write::File {
@@ -10464,6 +10717,72 @@ impl Editor {
                 });
                 self.message = String::from("セーブに書き込み中...");
             }
+        }
+    }
+
+    /// The [X] key on every screen: save, and nothing else.
+    ///
+    /// Moved here from the Switch layer (it was `ui::trigger_quick_save`) for
+    /// one reason: the two screens it singled out ran the row's own [A] before
+    /// saving. On 護石編集 that opened the skill picker when the cursor sat on a
+    /// skill row and wrote the form into the box on the box-slot row; on 装備編集
+    /// it opened the equipment / decoration picker or replaced the record. A
+    /// save key that edits is a save key nobody can trust, so on those two
+    /// screens it now only asks for the write: the form's own [A] is the one
+    /// commit, and a form that was never committed is simply not in the save.
+    ///
+    /// The quest screens keep their flush: their working copies (`.mib` bytes,
+    /// `.gmd` strings) are the edit, so [X] has to put them into the archive
+    /// before it writes it - that is not a row action, it is the save.
+    pub fn quick_save(&mut self) {
+        // The bulk menu owns [A]. [X] is the save key on every screen - the
+        // footer says so over the menu too - and this used to send [A], which
+        // ran the highlighted bulk edit and wrote nothing.
+        if self.item_menu_open {
+            self.item_screen_save();
+            return;
+        }
+        match self.screen {
+            // 護石編集 / 装備編集: save only. See the doc above.
+            Screen::CharmEdit | Screen::EquipEdit => self.request_write_save(),
+            // クエスト改造 edits the same .arc the file screens do: [X] flushes
+            // the two working copies and writes the file, or installs the quest
+            // into the open save when it came out of the save and has no path.
+            Screen::QuestEdit => {
+                self.flush_quest_edit();
+                if self.arc_path.is_some() {
+                    self.input(Key::X);
+                } else if self.save.is_some() {
+                    self.install_into_save();
+                    self.screen = Screen::QuestEdit;
+                } else {
+                    self.message =
+                        String::from("保存先がありません（.arc を開くか、セーブを開いてください）");
+                }
+            }
+            Screen::Mib | Screen::Gmd | Screen::EntryView | Screen::Check | Screen::ArcEntries => {
+                // The two working copies are the edit; store_entry puts both
+                // back into the archive by extension (the console's own helper
+                // did the same for the entry the cursor sat on, which is a
+                // narrower answer to the same question).
+                self.store_entry();
+                if self.arc_path.is_some() {
+                    // [A] is the .arc save on the .mib screen ([X] is the step
+                    // there) and [X] is it on the other four.
+                    if self.screen == Screen::Mib {
+                        self.input(Key::A);
+                    } else {
+                        self.input(Key::X);
+                    }
+                } else if self.save.is_some() {
+                    // A quest that came out of the save has no path: the write
+                    // is the save's.
+                    self.install_into_save();
+                    self.request_write_save();
+                }
+            }
+            // Every other screen: the save, exactly as [X] has always meant.
+            _ => self.request_write_save(),
         }
     }
 
@@ -13555,7 +13874,14 @@ impl Editor {
             Screen::Convert => "3DS と Switch の形式を変換します。[A] で変換出力、[Y] で出力名、[B] で戻る。",
             Screen::Options => "設定の行を [◀/▶] で変更、[A] で保存、[Y] で直近スナップショットへ戻す。",
             Screen::Csv => "CSV を選んで [A] で適用（2回）、[Y] で書き出し。",
-            Screen::SaveQuests => "クエストを選んで [A] で改造、[-] で書き出し。[L/R] で一覧切替。",
+            // [-] on the save's own list is the delete, twice, like every
+            // other list; the 書き出し moved to the deck's pill when [R] went
+            // back to the sub-tab. The line named the wrong key for the wrong
+            // job, and the only way to check it was to read
+            // `input_save_quests` beside it.
+            Screen::SaveQuests => {
+                "クエストを選んで [A] で改造、[-] で削除（2回）。書き出しは右のボタン。[L/R] で一覧切替。"
+            }
             Screen::QuestEquip => "固定装備の枠を [A] で開いて編集します。",
             Screen::QuestEdit => "4つのタブでクエストを作ります。[ファイル] でファイル単位の画面へ。",
             Screen::ArcList => ".arc を選んで [A] で開きます。[Y] でセーブへ導入、[-] で書き出し。",
@@ -20070,6 +20396,59 @@ impl Editor {
         }
         out
     }
+}
+
+// ---------------------------------------------------------------------------
+// Chrome geometry: the footer's key line and the inspector's tool deck
+// ---------------------------------------------------------------------------
+//
+// Two rectangles the console draws that each overlapped something. The key
+// guide on the footer's first line was right aligned at the bar's own edge
+// (1262) and ran under the [終了] pill that ends at the same 1262, and the item
+// box's tool deck was stacked one button under another until the last two fell
+// off the panel (658..694 against a panel that ends at 658). Both are
+// arithmetic, so both live here with tests instead of in the drawing code where
+// nothing can drive them.
+
+/// Right edge of the console's footer line, in the 1280px frame.
+pub const FOOTER_RIGHT: i32 = 1262;
+
+/// Width of the 終了 pill at that end of the footer's first line.
+pub const FOOTER_QUIT_W: i32 = 84;
+
+/// Clear space between the key guide and the 終了 pill.
+pub const FOOTER_GUIDE_GAP: i32 = 12;
+
+/// Left edge of the 終了 pill: the right end of the room the guide has.
+#[inline]
+pub fn footer_quit_x() -> i32 {
+    FOOTER_RIGHT - FOOTER_QUIT_W
+}
+
+/// Right edge a footer hint may be drawn at: [FOOTER_GUIDE_GAP] left of the pill.
+///
+/// The hint is right aligned, so this is the number its draw call takes. It was
+/// [FOOTER_RIGHT], which is the pill's own right edge: a hint short enough to
+/// fit beside the pill still had its last glyphs under it.
+#[inline]
+pub fn footer_guide_right() -> i32 {
+    footer_quit_x() - FOOTER_GUIDE_GAP
+}
+
+/// Stack `rows` buttons from `top` down to `bottom`, at most `row_h` tall each.
+///
+/// Returns `(y, height)` per row, `gap` pixels apart. The height shrinks when
+/// the full stack would not fit, so a deck can never be drawn past the panel's
+/// edge; a caller that wants every row at full height has to fit in the rows it
+/// asks for, which is what the item box's two-column deck does (four rows
+/// instead of five).
+pub fn deck_stack(top: i32, bottom: i32, rows: usize, row_h: i32, gap: i32) -> Vec<(i32, i32)> {
+    let n = rows.max(1) as i32;
+    let gap = gap.max(0);
+    let avail = (bottom - top).max(1);
+    let fit = (avail - gap * (n - 1)) / n;
+    let h = fit.clamp(1, row_h.max(1));
+    (0..n).map(|i| (top + i * (h + gap), h)).collect()
 }
 
 // ---------------------------------------------------------------------------
