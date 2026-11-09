@@ -5493,16 +5493,20 @@ pub struct Editor {
     pub quest_edit_chance: bool,
     /// Award names from the user's own romfs, 132 entries, or empty.
     ///
-    /// Game text, so this crate never ships it: a caller that has the dump
-    /// hands the names over and the screen appends them, and a caller that
-    /// has none (the console, which cannot read romfs) shows the number alone.
+    /// The dump's own text wins over the bundled table ([crate::idmemo]): a
+    /// release whose medal order differs would otherwise be named wrongly, and
+    /// the file the user pointed at belongs to the save being edited. An empty
+    /// or short table names the rest from the bundled one rather than showing
+    /// fewer names.
     pub romfs_awards: Vec<String>,
     /// Request names from the same dump, one per request record, or empty.
     pub romfs_requests: Vec<String>,
     /// The request table from the same dump, or empty.
     ///
     /// Carries the accept / complete flag numbers, which is what ties a flag
-    /// in the map to a request in the table.
+    /// in the map to a request in the table. Empty is the normal state: the
+    /// bundled table ([crate::idmemo]) already carries the same 184 records,
+    /// and it is what a console or a Switch build without a romfs uses.
     pub romfs_records: Vec<RequestRecord>,
     /// Whether the quest-equipment screen is showing the items of one slot.
     pub qe_open: bool,
@@ -13582,12 +13586,24 @@ impl Editor {
         self.romfs_records = records;
     }
 
-    /// Name of one award, or "" when no table was supplied.
+    /// Name of one award: the supplied table first, then the bundled one.
+    ///
+    /// "" only when neither names the bit, which is what makes the caller print
+    /// the number instead of an invented title.
     pub fn award_name(&self, award: usize) -> &str {
         self.romfs_awards
             .get(award)
             .map(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| crate::idmemo::award_name(award))
             .unwrap_or("")
+    }
+
+    /// Name of the quest a progress row stands for, or "" when none is known.
+    ///
+    /// The row is 0 based and the quest index is 1 based: row 0 is index 1.
+    pub fn progress_quest_name(&self, row: usize) -> &'static str {
+        crate::idmemo::quest_name(row.saturating_add(1)).unwrap_or("")
     }
 
     /// (held, total) awards of the current slot.
@@ -13657,33 +13673,50 @@ impl Editor {
             .count()
     }
 
-    /// What a request flag number is, when the request table was supplied.
+    /// What a request flag number is: the request that owns it, and its name.
     ///
-    /// Without the table (the console, which has no romfs) a flag number is
-    /// only an event flag: the save does not say which request it opens.
+    /// The save only holds a flag number, so the answer comes from a table -
+    /// the supplied activityData.atd when there is one, the bundled 184
+    /// records otherwise. A flag no request owns is an event flag: the 1536
+    /// bit space is shared with other unlocks, and calling one of those a
+    /// request would be inventing a row that does not exist.
     pub fn request_flag_label(&self, flag: usize) -> String {
-        let Some(rec) = self
+        let Some((index, complete, name)) = self.request_owner(flag) else {
+            return String::from("イベント");
+        };
+        let step = if complete { "完了" } else { "受理" };
+        match name {
+            Some(name) if !name.is_empty() => {
+                alloc::format!("依頼 #{:03} {} {}", index, step, name)
+            }
+            _ => alloc::format!("依頼 #{:03} {}", index, step),
+        }
+    }
+
+    /// Which request owns a flag: the supplied table first, the bundled one
+    /// after it.
+    ///
+    /// The supplied table is the user's own activityData.atd, which stays
+    /// authoritative when it is there: a save from a different release could
+    /// disagree with the bundled rows, and the file on disk is the one the
+    /// save it came with was written against.
+    fn request_owner(&self, flag: usize) -> Option<(usize, bool, Option<&str>)> {
+        if let Some(rec) = self
             .romfs_records
             .iter()
             .find(|r| r.accept_flag as usize == flag || r.complete_flag as usize == flag)
-        else {
-            return String::from("イベント");
-        };
-        let step = if rec.accept_flag as usize == flag {
-            "受理"
-        } else {
-            "完了"
-        };
-        let name = self
-            .romfs_requests
-            .get(rec.index)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        if name.is_empty() {
-            alloc::format!("依頼 #{:03} {}", rec.index, step)
-        } else {
-            alloc::format!("依頼 #{:03} {} {}", rec.index, step, name)
+        {
+            let complete = rec.complete_flag as usize == flag;
+            let name = self
+                .romfs_requests
+                .get(rec.index)
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| crate::idmemo::request_name(rec.index));
+            return Some((rec.index, complete, name));
         }
+        let (index, complete, name) = crate::idmemo::request_flag_owner(u16::try_from(flag).ok()?)?;
+        Some((index, complete, Some(name)))
     }
 
     /// (cleared, seen, failed) counts of the current slot.
@@ -19846,7 +19879,7 @@ impl Editor {
                             let name = self.award_name(row);
                             if name.is_empty() {
                                 alloc::format!(
-                                    "  勲章 {:03}  {}",
+                                    "  勲章 {:03}  {:6}  名前不明",
                                     row + 1,
                                     if held { "取得" } else { "未取得" }
                                 )
@@ -19877,11 +19910,15 @@ impl Editor {
                         _ => {
                             let (cleared, seen, failed) = self.progress_quest_state(row);
                             alloc::format!(
-                                "  クエスト {:04}  {}  {}  {}",
+                                "  クエスト {:04}  {}  {}  {}  {}",
                                 row + 1,
                                 if cleared { "クリア" } else { "------" },
                                 if seen { "既読" } else { "----" },
-                                if failed { "失敗" } else { "----" }
+                                if failed { "失敗" } else { "----" },
+                                match self.progress_quest_name(row) {
+                                    "" => "名前不明",
+                                    name => name,
+                                }
                             )
                         }
                     };
@@ -21594,8 +21631,14 @@ mod tests {
         assert_eq!(ed.progress_request_band_count(), 1);
         let save = ed.save.as_ref().expect("a save");
         assert_eq!(requests::get(save, 0, 300), Some(true));
-        // Without the romfs table a flag can only be called what it is.
-        assert_eq!(ed.request_flag_label(300), "イベント");
+        // The bundled table names the flag even with no romfs loaded.
+        assert_eq!(
+            ed.request_flag_label(300),
+            "依頼 #000 受理 しっかり者の村人の依頼１"
+        );
+        // A flag no request owns stays an event flag: the save shares those 444
+        // bits with other unlocks, and naming one would be a guess.
+        assert_eq!(ed.request_flag_label(1), "イベント");
         assert!(ed.message.contains("フラグ 300"), "{}", ed.message);
 
         ed.input(Key::A);
@@ -21623,10 +21666,65 @@ mod tests {
             }],
         );
         assert_eq!(ed.award_name(0), "勲章の名前");
-        assert_eq!(ed.award_name(1), "", "a short table names nothing else");
+        // A short table names what it holds and the bundled one names the rest:
+        // the alternative was a blank row for every award the dump lacks.
+        assert_eq!(ed.award_name(1), "ベルナ村長の杖");
         assert_eq!(ed.request_flag_label(300), "依頼 #000 受理 村長の依頼");
         assert_eq!(ed.request_flag_label(301), "依頼 #000 完了 村長の依頼");
-        assert_eq!(ed.request_flag_label(302), "イベント");
+        // A flag the supplied table does not own falls through to the bundled
+        // one: 302 is the second record there, so the row is named rather than
+        // shown as an event the save does not have.
+        assert_eq!(
+            ed.request_flag_label(302),
+            "依頼 #001 受理 しっかり者の村人の依頼２"
+        );
+        // A flag no request anywhere owns still says what it is.
+        assert_eq!(ed.request_flag_label(1), "イベント");
+    }
+
+    #[test]
+    fn the_bundled_tables_name_the_rows_without_any_romfs() {
+        let mut ed = editor_on_a_used_slot();
+        // Nothing was handed over: the console and the Switch build have no
+        // romfs, and this is what they show.
+        assert!(ed.romfs_awards.is_empty());
+        assert!(ed.romfs_requests.is_empty());
+        assert!(ed.romfs_records.is_empty());
+
+        assert_eq!(ed.award_name(0), "ベルナ村長の飾り帯");
+        assert_eq!(ed.award_name(131), "愛しのプーギー麗しのフェニー");
+        assert_eq!(ed.award_name(132), "", "past the map there is no name");
+        assert_eq!(
+            ed.request_flag_label(300),
+            "依頼 #000 受理 しっかり者の村人の依頼１"
+        );
+        // 444 of the save's event flags belong to no request, and those keep
+        // saying so instead of borrowing a name.
+        assert_eq!(ed.request_flag_label(5), "イベント");
+        assert_eq!(ed.progress_quest_name(0), "古代林の特産ゼンマイ");
+        assert_eq!(ed.progress_quest_name(1507), "イベント：大連続狩猟５");
+        assert_eq!(ed.progress_quest_name(1508), "", "past the last index");
+
+        // The console row the player reads carries it.
+        ed.open_progress();
+        ed.set_progress_cursor(0);
+        let lines = ed.lines();
+        let row = lines
+            .iter()
+            .find(|l| l.text.contains("勲章 001"))
+            .map(|l| l.text.clone())
+            .unwrap_or_default();
+        assert!(row.contains("ベルナ村長の飾り帯"), "{}", row);
+
+        ed.progress_tab = PROGRESS_QUESTS;
+        ed.set_progress_cursor(0);
+        let lines = ed.lines();
+        let row = lines
+            .iter()
+            .find(|l| l.text.contains("クエスト 0001"))
+            .map(|l| l.text.clone())
+            .unwrap_or_default();
+        assert!(row.contains("古代林の特産ゼンマイ"), "{}", row);
     }
 
     // ------------------------------------------------------- whole save undo

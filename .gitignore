@@ -25,9 +25,11 @@ Thumbs.db
 /tools/_*
 /.re_review*/
 
-# Game data. The repository ships none of it: these files are produced from
-# your own copy of the game by tools/gen_official_dlc.py, and build.rs falls
-# back to the empty stub in dlc_bundle_stub.rs when they are absent.
+# Game data. The repository ships none of it - the only game text it carries is
+# the four name tables in crates/mhnx-core/src/idmemo.rs, which come from the
+# author's own mhxx-id-memo repository (see tools/gen_idmemo.py) - and these
+# files are produced from your own copy of the game by tools/gen_official_dlc.py:
+# build.rs falls back to the empty stub in dlc_bundle_stub.rs when they are absent.
 /crates/mhnx-core/src/official_dlc.bin
 /crates/mhnx-core/src/dlc_bundle_gen.rs
 /crates/mhnx-core/src/dlc_bundle.rs

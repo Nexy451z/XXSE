@@ -9143,7 +9143,10 @@ impl GuiState {
                         .unwrap_or(false);
                     let name = ed.award_name(award);
                     let title = if name.is_empty() {
-                        format!("勲章 {:03}", award + 1)
+                        // The bundled table names all 132, so this is the case
+                        // of a build with neither table: the number is all
+                        // there is, and the row says that instead of pretending.
+                        format!("勲章 {:03}  名前不明", award + 1)
                     } else {
                         format!("勲章 {:03}  {}", award + 1, name)
                     };
@@ -9216,7 +9219,12 @@ impl GuiState {
                     };
                     rows.push((
                         row,
-                        format!("クエスト {:04}", row + 1),
+                        // The index is what the save holds; the name is what the
+                        // game shows, from the bundled table (mhnx_core::idmemo).
+                        match ed.progress_quest_name(row) {
+                            "" => format!("クエスト {:04}  名前不明", row + 1),
+                            name => format!("クエスト {:04}  {}", row + 1, name),
+                        },
                         // The failure bit is read-only, so its line says so
                         // (hbedit::Editor::progress_quest_meta).
                         ed.progress_quest_meta(row),

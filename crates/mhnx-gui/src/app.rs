@@ -15,6 +15,7 @@ use mhnx_core::equipops::{self, EquipError};
 use mhnx_core::equiprefs::EquipRef;
 use mhnx_core::gamedata::LAST_ITEM_ID;
 use mhnx_core::hbedit::{DiffRange, SaveDiff};
+use mhnx_core::idmemo;
 use mhnx_core::itembox::{self, DedupePreview, ItemSlot, MAX_COUNT};
 use mhnx_core::quest::{Gmd, Mib};
 use mhnx_core::questfields::FieldKind;
@@ -1805,9 +1806,9 @@ impl Default for MhnxEditor {
             romfs_path: String::new(),
             romfs_status: String::new(),
             romfs_dir: None,
-            award_names: Vec::new(),
-            request_names: Vec::new(),
-            request_records: Vec::new(),
+            award_names: Self::bundled_award_names(),
+            request_names: Self::bundled_request_names(),
+            request_records: Self::bundled_request_records(),
             guild_section: GuildSection::default(),
             guild_filter: String::new(),
             progress_filter: String::new(),
@@ -18303,9 +18304,24 @@ impl MhnxEditor {
             Some(load) => {
                 self.romfs_dir = Some(load.dir);
                 self.romfs_status = load.report.clone();
-                self.award_names = load.award_names;
-                self.request_names = load.request_names;
-                self.request_records = load.request_records;
+                // A dump that lacks one of the tables names the half it has: the
+                // rows it cannot name keep the bundled name rather than falling
+                // back to a number.
+                self.award_names = if load.award_names.is_empty() {
+                    Self::bundled_award_names()
+                } else {
+                    load.award_names
+                };
+                self.request_names = if load.request_names.is_empty() {
+                    Self::bundled_request_names()
+                } else {
+                    load.request_names
+                };
+                self.request_records = if load.request_records.is_empty() {
+                    Self::bundled_request_records()
+                } else {
+                    load.request_records
+                };
                 self.title_table = load.titles;
                 self.message = load.report;
             }
@@ -18314,9 +18330,9 @@ impl MhnxEditor {
                 // this path: the tab would show one dump's text beside another
                 // dump's flag numbers.
                 self.romfs_dir = None;
-                self.award_names.clear();
-                self.request_names.clear();
-                self.request_records.clear();
+                self.award_names = Self::bundled_award_names();
+                self.request_names = Self::bundled_request_names();
+                self.request_records = Self::bundled_request_records();
                 self.title_table = mhnx_core::guildcard::TitleTable::default();
                 self.romfs_status = format!(
                     "{} に romfs の table が見つかりません（nativeNX/table を探しました）",
@@ -18328,14 +18344,50 @@ impl MhnxEditor {
     }
 
     /// Drop the names that were read, keeping the path so it can be retried.
+    ///
+    /// The bundled tables come back: 勲章 / 依頼 / クエスト名 are shipped with
+    /// the editor now, and closing a dump must not take them away as well.
     pub fn clear_romfs(&mut self) {
-        self.award_names.clear();
-        self.request_names.clear();
-        self.request_records.clear();
+        self.award_names = Self::bundled_award_names();
+        self.request_names = Self::bundled_request_names();
+        self.request_records = Self::bundled_request_records();
         self.title_table = mhnx_core::guildcard::TitleTable::default();
         self.romfs_dir = None;
-        self.romfs_status = String::from("romfs を読み込んでいません");
-        self.message = "romfs を閉じました（読み込んだ名前は捨てました）".to_owned();
+        self.romfs_status = String::from("romfs を読み込んでいません（同梱の名前を使います）");
+        self.message = "romfs を閉じました（読み込んだ名前は捨て、同梱の名前に戻しました）".to_owned();
+    }
+
+    // ------------------------------------------------- the bundled names
+    //
+    // 勲章 / 依頼 / クエスト名 are game text, but they are not *save* text: the
+    // save only holds numbers, and the names come from a table the author keeps
+    // beside this repository (mhnx_core::idmemo). Shipping them is what turned
+    // "勲章 001" and "依頼 12" into the names the game shows. A romfs dump, when
+    // the user loads one, replaces them - see load_romfs - because the file
+    // that came with the save is the one the save was written against.
+
+    /// The 132 award names the editor ships with.
+    fn bundled_award_names() -> Vec<String> {
+        idmemo::AWARD_NAMES.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The 184 request names the editor ships with.
+    fn bundled_request_names() -> Vec<String> {
+        idmemo::REQUEST_NAMES.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// The 184 request records the editor ships with, in the shape the list
+    /// and the flag lookup work in.
+    fn bundled_request_records() -> Vec<RequestRecord> {
+        (0..idmemo::REQUEST_NAMES.len())
+            .map(|index| RequestRecord {
+                index,
+                kind: idmemo::REQUEST_KINDS[index],
+                quest_id: idmemo::REQUEST_QUEST_IDS[index],
+                accept_flag: idmemo::REQUEST_ACCEPT_FLAGS[index],
+                complete_flag: idmemo::REQUEST_COMPLETE_FLAGS[index],
+            })
+            .collect()
     }
 
     // ------------------------------------------- database (データベース)
@@ -18640,8 +18692,8 @@ impl MhnxEditor {
         match self.request_names.get(record).map(|n| n.trim()) {
             Some(n) if !n.is_empty() => n.to_owned(),
             _ => match self.request_records.get(record) {
-                Some(r) => format!("依頼 {}", r.index + 1),
-                None => format!("依頼 {}", record + 1),
+                Some(r) => format!("依頼 {}（名前不明）", r.index + 1),
+                None => format!("依頼 {}（名前不明）", record + 1),
             },
         }
     }
@@ -18664,7 +18716,27 @@ impl MhnxEditor {
     fn award_label(&self, award: usize) -> String {
         match self.award_names.get(award).map(|n| n.trim()) {
             Some(n) if !n.is_empty() => format!("{:03} {}", award + 1, Self::short_name(n)),
-            _ => format!("勲章 {:03}", award + 1),
+            // No name at all: say so rather than pass the number off as a name.
+            _ => format!("勲章 {:03}（名前不明）", award + 1),
+        }
+    }
+
+    /// An award as the history list and the status line spell it.
+    ///
+    /// The number stays in front: it is what the save holds and what a guide
+    /// lists, and the name alone is not enough to find the bit again.
+    fn award_title(&self, award: usize) -> String {
+        match self.award_names.get(award).map(|n| n.trim()) {
+            Some(n) if !n.is_empty() => format!("勲章 {} {}", award + 1, n),
+            _ => format!("勲章 {} 名前不明", award + 1),
+        }
+    }
+
+    /// A quest as the history list and the status line spell it.
+    fn quest_title(index: usize) -> String {
+        match idmemo::quest_name(index) {
+            Some(name) => format!("クエスト {} {}", index, name),
+            None => format!("クエスト {} 名前不明", index),
         }
     }
 
@@ -18741,15 +18813,16 @@ impl MhnxEditor {
     /// game - so the bytes of all three are kept first and 元に戻す puts the
     /// whole set back.
     pub fn set_award(&mut self, award: usize, on: bool) {
+        let name = self.award_title(award);
         let (label, done) = if on {
             (
-                format!("勲章 {} を取得", award + 1),
-                format!("勲章 {} を取得しました", award + 1),
+                format!("{} を取得", name),
+                format!("{} を取得しました", name),
             )
         } else {
             (
-                format!("勲章 {} を未取得に戻す", award + 1),
-                format!("勲章 {} を未取得に戻しました", award + 1),
+                format!("{} を未取得に戻す", name),
+                format!("{} を未取得に戻しました", name),
             )
         };
         let Some(step) = self.progress_snapshot(label, &awards::COPIES) else {
@@ -18764,7 +18837,7 @@ impl MhnxEditor {
             None => false,
         };
         if !ok {
-            self.message = format!("勲章 {} は変更できませんでした", award + 1);
+            self.message = format!("{} は変更できませんでした", name);
             return;
         }
         self.push_progress_undo(step);
@@ -18889,9 +18962,10 @@ impl MhnxEditor {
             Progress::Seen => "既読",
             Progress::Failed => "失敗",
         };
+        let name = Self::quest_title(index);
         let label = format!(
-            "クエスト {} の{}を{}",
-            index,
+            "{} の{}を{}",
+            name,
             word,
             if on { "立てる" } else { "外す" }
         );
@@ -18917,7 +18991,7 @@ impl MhnxEditor {
                 (Progress::Seen, false) => {
                     "クリア済みなので既読は外せません（クリアを先に外してください）".to_owned()
                 }
-                _ => format!("クエスト {} は変更できませんでした", index),
+                _ => format!("{} は変更できませんでした", name),
             };
             return;
         }
@@ -19143,7 +19217,11 @@ impl MhnxEditor {
                                 .stroke(egui::Stroke::new(1.0_f32, award_stroke(on))),
                         );
                         let tip = if full.is_empty() {
-                            format!("勲章 {}（{}）", a + 1, if on { "取得済み" } else { "未取得" })
+                            format!(
+                                "勲章 {}（名前不明）\n{}",
+                                a + 1,
+                                if on { "取得済み" } else { "未取得" }
+                            )
                         } else {
                             format!(
                                 "{}\n{}",
@@ -19165,6 +19243,10 @@ impl MhnxEditor {
 
 
     /// The request list, or the raw flags when there is no activity table.
+    ///
+    /// The bundled table means the list is always there (184 records, seeded by
+    /// the Default impl), so the raw-flag view is what a build with no table at
+    /// all would fall back to rather than a state a reader will meet.
     fn progress_requests(&mut self, ui: &mut egui::Ui) {
         if self.request_records.is_empty() {
             self.progress_raw_flags(ui);
@@ -19289,6 +19371,10 @@ impl MhnxEditor {
 
     /// What the request section shows without an activity table: flag numbers.
     ///
+    /// Kept as the last resort for a build that ships no names: the bundled
+    /// table normally answers first, so this is unreachable in the shipped
+    /// editor rather than a screen a reader meets.
+    ///
     /// The flags are read only here. 444 of the 742 bits set in the verified
     /// save belong to events that are not requests at all, and without the
     /// table there is no way to tell which of them this tool may write.
@@ -19402,7 +19488,7 @@ impl MhnxEditor {
         }
         ui.horizontal_wrapped(|ui| {
             ui.label("絞り込み");
-            Self::filter_edit(ui, &mut self.quest_filter, 80.0, "索引", &mut self.focus_filter);
+            Self::filter_edit(ui, &mut self.quest_filter, 140.0, "索引・クエスト名", &mut self.focus_filter);
             ui.checkbox(&mut self.quest_missing_only, "未クリアのみ");
             if ui.small_button("クリア").clicked() {
                 self.quest_filter.clear();
@@ -19411,7 +19497,11 @@ impl MhnxEditor {
         let needle = self.quest_filter.trim().to_lowercase();
         let rows: Vec<usize> = (1..questprogress::BITS)
             .filter(|i| {
-                (needle.is_empty() || i.to_string().contains(&needle))
+                (needle.is_empty()
+                    || i.to_string().contains(&needle)
+                    || idmemo::quest_name(*i)
+                        .map(|n| n.to_lowercase().contains(&needle))
+                        .unwrap_or(false))
                     && (!self.quest_missing_only || !self.quest_on(*i, Progress::Cleared))
             })
             .collect();
@@ -19420,13 +19510,17 @@ impl MhnxEditor {
             .striped(true)
             .id_salt("questprogress")
             .column(Column::exact(64.0))
-            .column(Column::exact(64.0))
-            .column(Column::exact(64.0))
-            .column(Column::exact(64.0))
             .column(Column::remainder())
+            .column(Column::exact(64.0))
+            .column(Column::exact(64.0))
+            .column(Column::exact(64.0))
+            .column(Column::exact(150.0))
             .header(22.0, |mut h| {
                 h.col(|ui| {
                     ui.strong("索引");
+                });
+                h.col(|ui| {
+                    ui.strong("クエスト名");
                 });
                 h.col(|ui| {
                     ui.strong("クリア");
@@ -19449,6 +19543,23 @@ impl MhnxEditor {
                     let is_failed = self.quest_on(index, Progress::Failed);
                     row.col(|ui| {
                         ui.label(format!("{}", index));
+                    });
+                    row.col(|ui| {
+                        match idmemo::quest_name(index) {
+                            Some(name) => {
+                                let response = ui.label(name);
+                                // The area is not a number anywhere else on the
+                                // screen, so it rides on the name's tooltip.
+                                if let Some(stage) = idmemo::quest_stage_name(index) {
+                                    response.on_hover_text(stage);
+                                }
+                            }
+                            // No name at all: the index column carries the
+                            // number, and this says why there is nothing here.
+                            None => {
+                                ui.label(egui::RichText::new("（名前不明）").weak());
+                            }
+                        }
                     });
                     row.col(|ui| {
                         let mut on = is_cleared;
@@ -21336,6 +21447,53 @@ mod tests {
         out
     }
 
+    /// The 132 awards, the 184 requests and the 1508 quests are named by the
+    /// table the editor ships with: no romfs, no dump, no folder to point at.
+    #[test]
+    fn the_bundled_tables_name_the_awards_and_requests_without_a_romfs() {
+        let dir = Scratch::new("bundlednames");
+        let path = write_a_save_with_slots(dir.path(), "system");
+        let mut app = MhnxEditor::default();
+        app.open_save(path);
+        assert!(app.save.is_some(), "{}", app.message);
+        assert!(app.romfs_dir.is_none(), "nothing was loaded");
+
+        assert_eq!(app.award_names.len(), 132);
+        assert_eq!(app.request_names.len(), 184);
+        assert_eq!(app.request_records.len(), 184);
+        // The grid cell keeps the number in front of a shortened name, so a
+        // cell can still be matched against a guide.
+        assert_eq!(app.award_label(0), "001 ベルナ村長の飾り…");
+        assert_eq!(app.award_title(5), "勲章 6 黄金のメダル");
+        assert_eq!(app.request_title(0), "しっかり者の村人の依頼１");
+        // The record table is the bundled one too, so the request list opens
+        // without a dump and the accept flags are known.
+        assert_eq!(app.request_records[0].accept_flag, 300);
+        assert_eq!(app.request_records[0].complete_flag, 301);
+        assert_eq!(app.request_records[183].kind, 3);
+
+        // A row with no name at all says so instead of passing the number off
+        // as a name.
+        app.award_names.clear();
+        app.request_names.clear();
+        assert_eq!(app.award_label(3), "勲章 004（名前不明）");
+        assert_eq!(app.request_title(0), "依頼 1（名前不明）");
+
+        // The history line carries the name, which is what makes it findable
+        // again after a few presses.
+        let mut app = MhnxEditor::default();
+        let path = write_a_save_with_slots(dir.path(), "system");
+        app.open_save(path);
+        app.save.as_mut().expect("save").set_slot_used(0, true);
+        app.set_award(0, true);
+        assert!(
+            app.message.contains("勲章 1 ベルナ村長の飾り帯 を取得しました"),
+            "{}",
+            app.message
+        );
+        assert!(app.undo_label().unwrap_or_default().contains("飾り帯"));
+    }
+
     #[test]
     fn the_romfs_tables_are_found_and_parsed() {
         let dir = Scratch::new("romfs");
@@ -21391,12 +21549,16 @@ mod tests {
         std::fs::create_dir_all(&empty).expect("empty folder");
         app.romfs_path = empty.display().to_string();
         app.load_romfs();
-        assert!(
-            app.award_names.is_empty(),
+        // The dump's names must not stay on screen - but the bundled tables
+        // come back, because 勲章 / 依頼名 ship with the editor now and only
+        // the loaded dump was discarded.
+        assert_eq!(
+            app.award_names[0], "ベルナ村長の飾り帯",
             "the previous folder's names must not stay on screen"
         );
-        assert!(app.request_names.is_empty());
-        assert!(app.request_records.is_empty());
+        assert_eq!(app.request_names[0], "しっかり者の村人の依頼１");
+        assert_eq!(app.request_records.len(), 184);
+        assert_eq!(app.request_records[0].accept_flag, 300);
         assert!(app.romfs_dir.is_none());
         assert!(app.message.contains("見つかりません"), "{}", app.message);
     }
@@ -23520,8 +23682,12 @@ mod tests {
         assert!(text.contains("スロット1 オトモ #1 レベル: 1 → 5"), "{}", text);
         assert!(text.contains("スロット1 コメント: （空） → コメント"), "{}", text);
         assert!(text.contains("オプション 明るさ: 0 → 7"), "{}", text);
-        assert!(text.contains("スロット1 勲章ビット #5: なし → 取得"), "{}", text);
-        assert!(text.contains("スロット1 クエスト #3 クリア: 未 → 済"), "{}", text);
+        assert!(text.contains("スロット1 勲章 6 黄金のメダル: なし → 取得"), "{}", text);
+        assert!(
+            text.contains("スロット1 クエスト #3 滋養強壮不老の蛾 クリア: 未 → 済"),
+            "{}",
+            text
+        );
         assert!(text.contains("スロット1 依頼フラグ #0: 未 → 済"), "{}", text);
         // The ranges are still there below the values.
         assert!(text.contains("■ 変更される範囲"), "{}", text);

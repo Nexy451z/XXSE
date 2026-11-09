@@ -1007,7 +1007,10 @@ fn quest_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>)
                 (Some(x), Some(y)) if x != y => differing(
                     out,
                     at,
-                    format!("クエスト #{} {}", index, word),
+                    match crate::idmemo::quest_name(index) {
+                        Some(name) => alloc::format!("クエスト #{} {} {}", index, name, word),
+                        None => alloc::format!("クエスト #{} 名前不明 {}", index, word),
+                    },
                     on_word(x),
                     on_word(y),
                 ),
@@ -1049,13 +1052,14 @@ fn award_values(old: &Save, new: &Save, slot: usize, out: &mut Vec<ValueChange>)
         }
         let (before, after) = (before.unwrap_or(false), after.unwrap_or(false));
         if before != after {
-            differing(
-                out,
-                at,
-                format!("勲章ビット #{}", index),
-                award_word(before),
-                award_word(after),
-            );
+            // The number is 1 based, like the award grid and the console, and
+            // it carries the name the game shows: a review line that only said
+            // "#5" made the reader go and count.
+            let label = match crate::idmemo::award_name(index) {
+                Some(name) => alloc::format!("勲章 {} {}", index + 1, name),
+                None => alloc::format!("勲章 {} 名前不明", index + 1),
+            };
+            differing(out, at, label, award_word(before), award_word(after));
         }
     }
 }

@@ -71,6 +71,10 @@ pub mod questprogress;
 pub mod requests;
 /// Names that live in the user's romfs, not in this repository.
 pub mod romfstables;
+/// The names the game shows for a number, bundled: 勲章 / 依頼 / クエスト /
+/// ステージ, from the author's own id memo table. Generated - see the module
+/// docs for the source and the commit.
+pub mod idmemo;
 pub mod myset;
 pub mod palico;
 pub mod palicogear;
