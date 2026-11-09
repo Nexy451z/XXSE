@@ -15,10 +15,14 @@ extern crate alloc;
 
 pub mod app;
 pub mod editor;
+/// The console's sockets and libcurl, transcribed from the devkitPro headers.
+pub mod net;
 pub mod savedata;
 pub mod swkbd;
 pub mod sys;
 pub mod text;
+/// The update check, the download and the .nro swap.
+pub mod update;
 pub mod ui;
 
 /// Backed by devkitA64's newlib heap, which is what libnx itself uses.

@@ -73,11 +73,14 @@ Monster Hunter XX (3DS / Switch) のセーブエディタです。
 
 ## 配置
 
+## 配置
+
 ```
 SD カードのルート/
 └─ switch/
    └─ XXSE/
       ├─ XXSE.nro
+      ├─ update.cfg        起動時の更新チェックの設定（初回起動時に作られます）
       ├─ backups/          書き込み前の控え
       └─ mhxx/quest/arc/   クエストの書き出し先
 ```
@@ -103,6 +106,24 @@ hbmenu から起動します。PC 版は XXSE.exe をそのまま実行してく
 
 画面下のフッターに、その画面で使えるキーが出ます。タッチ操作は 1 回目で選択、2 回目で決定です。
 
+## 起動時の更新チェック（Switch 版・任意）
+
+起動時に **1 回だけ** GitHub の release を見に行き、新しい版があればガイド行の右端に
+1 行のバナーで知らせます。通信できなければ**何も表示せずに通常起動**します。
+
+* バナー `新しいバージョン vX.Y.Z があります  [A] 詳細` をタップ、または
+  セーブ一覧（起動画面）で `[A]` / `[R]` 長押し → 確認ダイアログ。
+* `[A]` でダウンロード（0〜100% 表示、`[A]` で中止）。
+* 完了すると `switch/XXSE/XXSE.nro` を差し替えて**その場で新しい版を起動**します。
+  差し替えは `XXSE.nro.new` に書き切ってから `XXSE.nro.bak` 経由で行うので、
+  途中で失敗しても既存の .nro は壊れません（`.bak` を戻せば復旧できます）。
+* `[Y]` で起動時の確認をオン / オフ（`switch/XXSE/update.cfg`）。オフにすると
+  起動時にソケットを一切開きません。
+* **セーブデータには触れません。** 書き込むのは `switch/XXSE/` の中だけです。
+
+TLS は本体の `ssl` サービスが担当するので、`cacert.pem` の同梱は不要です
+（詳細は `switch/README.md`）。
+
 ## ビルド
 
 ```powershell
@@ -117,6 +138,17 @@ pwsh -File .\tools\make_release.ps1
 ```
 
 Switch 版のビルドには devkitPro（libnx）と rustup の `aarch64-nintendo-switch-libnx` が必要です。
+更新チェックを使う場合は devkitPro の portlib `switch-curl` も入れます
+（無くてもビルドは通り、更新チェックだけが無効になります）:
+
+```powershell
+$env:MSYSTEM='MSYS'
+C:\devkitPro\msys2\usr\bin\pacman.exe -S switch-curl
+```
+
+リリース zip には追加のファイルは要りません（CA 証明書は本体が持っています）。
+GitHub の release には **`XXSE.nro` という名前で** asset を添付してください
+（名前が違う場合は最初の `.nro` を探します）。
 
 ## 注意
 

@@ -496,6 +496,16 @@ pub enum UiAction {
     OskNewline,
     OskConfirm,
     OskCancel,
+    // The update banner and its dialog: four answers, none of which is a key
+    // on the screen under it.
+    /// A tap on the banner (or [A] on the start screen): open the dialog.
+    UpdateOpen,
+    /// [A] in the dialog: 確認 / ダウンロード / 中止 / もう一度.
+    UpdatePrimary,
+    /// [B] in the dialog: put the banner away until the next start.
+    UpdateLater,
+    /// [Y] in the dialog: the start-up check on or off.
+    UpdateToggle,
 }
 
 #[derive(Clone)]
@@ -652,6 +662,12 @@ pub struct GuiState {
     fling: i32,
     /// Rows the finger moved on the last drag frame: the speed a flick starts at.
     drag_rows: i32,
+    /// The optional update check, its banner and its dialog.
+    ///
+    /// It lives here because the banner is part of the guide strip and the
+    /// dialog is a modal layer of the same frame; the network and the card
+    /// behind it are in crate::update.
+    pub update: crate::update::UpdateState,
 }
 
 impl GuiState {
@@ -686,6 +702,7 @@ impl GuiState {
             bar_drag: None,
             fling: 0,
             drag_rows: 0,
+            update: crate::update::UpdateState::new(),
         }
     }
 
@@ -2591,6 +2608,35 @@ impl GuiState {
             return true;
         }
 
+        // The update dialog is modal in exactly the way the review is: only its
+        // own three answers hear a tap, and a gesture that was running when it
+        // opened is dropped rather than paused.
+        if self.update.dialog {
+            self.cancel_gestures();
+            if touching && !self.was_touching {
+                let hit = self
+                    .hits
+                    .iter()
+                    .rev()
+                    .find(|h| {
+                        h.contains(tx, ty)
+                            && matches!(
+                                h.action,
+                                UiAction::UpdatePrimary
+                                    | UiAction::UpdateLater
+                                    | UiAction::UpdateToggle
+                                    | UiAction::ModalBlank
+                            )
+                    })
+                    .copied();
+                if let Some(h) = hit {
+                    self.apply_action(ed, h.action);
+                }
+            }
+            self.was_touching = touching;
+            return true;
+        }
+
         let mut changed = false;
 
         if touching && !self.was_touching {
@@ -2740,6 +2786,14 @@ impl GuiState {
             // A tap outside a modal panel: it is here to stop, and stopping is
             // all it does.
             UiAction::ModalBlank => {}
+            // The four answers the update layer takes. Each one is a method on
+            // crate::update::UpdateState, so the pad and a finger run the same
+            // code and neither can leave the updater in a state the other
+            // cannot reach.
+            UiAction::UpdateOpen => self.update.open_dialog(),
+            UiAction::UpdatePrimary => self.update.primary(),
+            UiAction::UpdateLater => self.update.dismiss(),
+            UiAction::UpdateToggle => self.update.toggle_setting(),
             // The way out for a finger. It goes through the same two-press
             // quit as [＋] (hbedit::Editor::press_quit), so a dirty save is
             // never discarded by one tap either.
@@ -4071,6 +4125,12 @@ impl GuiState {
         if ed.review_open() {
             self.draw_review(c, ed);
         }
+        // The update dialog is above even that: it is the one panel a key or a
+        // tap cannot land under, because it owns the pad while it is up.
+        if self.update.dialog {
+            self.add_hit(0, 0, 1280, 720, UiAction::ModalBlank);
+            self.draw_update_dialog(c);
+        }
 
         c.present();
     }
@@ -4092,11 +4152,20 @@ impl GuiState {
         c.rect(MAIN_X - 6, GUIDE_Y + 4, 3, GUIDE_H - 8, t.accent_secondary);
 
         let mut right = 1262;
+        // The update banner takes this end of the strip while it is up. It is
+        // the quietest place a line can be put in this layout: the strip is one
+        // line high, it already belongs to the program rather than to the play,
+        // and nothing under it moves. It displaces the [R長押し] note while it
+        // is shown, which is the right trade: the note is a hint about a key,
+        // the banner is new information.
+        if self.update.banner_visible() {
+            right = self.draw_update_banner(c, right);
+        }
         // Not on 生データ itself: the note would advertise the screen that is
         // already showing. It names the pill by the word the pill itself
         // carries (Editor::detail_pill_label), so the two cannot drift into
         // "詳細" and "生データ" for the same button.
-        if detail_available(ed) && ed.screen != Screen::SaveMap {
+        if !self.update.banner_visible() && detail_available(ed) && ed.screen != Screen::SaveMap {
             let word = ed
                 .detail_pill_label()
                 .trim_start_matches('[')
@@ -10744,3 +10813,179 @@ fn osk_cycle_last_char(buf: &mut String) {
         _ => osk_apply_dakuten(buf),
     }
 }
+
+// ---------------------------------------------------------------------------
+// The update banner and its dialog
+// ---------------------------------------------------------------------------
+//
+// Two shapes and no third one: a banner that fits in the guide strip's right
+// end, and a dialog that is only ever opened on purpose. Nothing here knows how
+// a release is read or where a file goes - crate::update owns all of that, and
+// every state this code draws is a state that module produced.
+
+impl GuiState {
+    /// Draw the banner at the right end of the guide strip, and return the x the
+    /// screen's own guide has to stop at.
+    ///
+    /// The pill is the tap target; the pad route to the same dialog is [A] on
+    /// the start screen (and [R] held there at any time). Its width is capped so
+    /// that a long version string cannot eat the guide line it sits beside.
+    fn draw_update_banner(&mut self, c: &mut Canvas, right: i32) -> i32 {
+        let t = theme();
+        let text = self.update.banner.clone();
+        let w = (c.text_width_sized(&text, FontSize::Small) + 24).clamp(200, 640);
+        let x = (right - w).max(MAIN_X);
+        let h = GUIDE_H - 4;
+        let y = GUIDE_Y + 2;
+        c.round_rect(x, y, w, h, 5, t.bg_btn_primary);
+        c.round_rect_border(x, y, w, h, 5, 1, t.border_focus);
+        c.text_clipped(
+            x + 10,
+            GUIDE_Y + 2,
+            w - 16,
+            &text,
+            white_or_dark(t.bg_btn_primary),
+            FontSize::Small,
+        );
+        self.add_hit(x, GUIDE_Y, w, GUIDE_H, UiAction::UpdateOpen);
+        x - 12
+    }
+
+    /// The details dialog.
+    ///
+    /// Three answers and no scrolling: [A] is whatever the current phase can do
+    /// (確認 / ダウンロード / 中止 / もう一度), [B] puts the banner away until the
+    /// next start, [Y] flips the start-up check. The body is the release notes
+    /// or the reason there are none, and while a transfer runs it is a bar with
+    /// the percentage the worker published.
+    fn draw_update_dialog(&mut self, c: &mut Canvas) {
+        use crate::update::Phase;
+        let t = theme();
+        c.rect(0, 0, 1280, 720, rgba(0, 0, 0, 185));
+
+        let mx = 170;
+        let my = 84;
+        let mw = 940;
+        let mh = 552;
+        c.round_rect(mx, my, mw, mh, 12, t.bg_panel);
+        c.round_rect_border(mx, my, mw, mh, 12, 2, t.border_focus);
+
+        // Title: the version when there is one, the tool when there is not.
+        let title = match &self.update.version {
+            Some(v) => mhnx_core::update::dialog_title(v),
+            None => String::from("更新の確認"),
+        };
+        c.text_clipped(mx + 26, my + 14, mw - 52, &title, t.text_primary, FontSize::Large);
+        let state_word = match self.update.phase {
+            Phase::Idle => "待機",
+            Phase::Checking => "確認中",
+            Phase::Available => "更新あり",
+            Phase::Downloading => "ダウンロード中",
+            Phase::Updated => "完了",
+            Phase::UpdatedManual => "完了（手動で再起動）",
+            Phase::Failed => "失敗",
+        };
+        c.text_right(mx + mw - 26, my + 20, state_word, t.accent_secondary, FontSize::Small);
+        c.hline(mx + 20, my + 52, mw - 40, t.border_subtle);
+
+        // The line under the rule: what happened, or what is happening.
+        if !self.update.message.is_empty() {
+            let color = match self.update.phase {
+                Phase::Failed => t.accent_danger,
+                Phase::Available | Phase::Updated | Phase::UpdatedManual => t.accent_ok,
+                _ => t.text_secondary,
+            };
+            c.text_clipped(mx + 30, my + 62, mw - 60, &self.update.message, color, FontSize::Small);
+        }
+
+        // The body: a bar while a transfer runs, notes otherwise.
+        let body_top = my + 92;
+        let body_bottom = my + mh - 96;
+        if self.update.phase == Phase::Downloading {
+            let pct = self.update.progress.min(100);
+            let bx = mx + 30;
+            let bw = mw - 60;
+            let by = body_top + 8;
+            c.round_rect(bx, by, bw, 16, 7, t.bg_val_box);
+            let filled = (bw as i64 * pct as i64 / 100) as i32;
+            if filled > 0 {
+                c.round_rect(bx, by, filled.max(6), 16, 7, t.accent_primary);
+            }
+            c.text_centered(bx, by + 22, bw, 24, &format!("{}%", pct), t.text_primary, FontSize::Medium);
+            c.text_clipped(
+                bx,
+                by + 54,
+                bw,
+                "中止すると元のファイルはそのまま残ります（[A] 中止）",
+                t.text_muted,
+                FontSize::Small,
+            );
+        } else {
+            let fallback: Vec<String> = if self.update.notes.is_empty() {
+                let mut one = Vec::with_capacity(1);
+                one.push(String::from(
+                    "起動時に更新を確認します。オフにすると次の起動から通信しません。",
+                ));
+                one
+            } else {
+                Vec::new()
+            };
+            let lines: &[String] = if fallback.is_empty() {
+                &self.update.notes
+            } else {
+                &fallback
+            };
+            let mut y = body_top;
+            let row = 22;
+            for line in lines {
+                if y + row > body_bottom {
+                    c.text_clipped(mx + 30, y, mw - 60, "…", t.text_muted, FontSize::Small);
+                    break;
+                }
+                c.text_clipped(mx + 30, y, mw - 60, line, t.text_primary, FontSize::Small);
+                y += row;
+            }
+        }
+
+        // The three answers.
+        let by = my + mh - 74;
+        let primary_w = 280;
+        let (bg, fg, bd) = match self.update.phase {
+            Phase::Checking => (t.bg_btn, t.text_muted, t.border_subtle),
+            Phase::Failed => (t.bg_danger, t.text_primary, t.text_primary),
+            _ => (t.bg_btn_primary, white_or_dark(t.bg_btn_primary), t.border_focus),
+        };
+        c.round_rect(mx + 26, by, primary_w, 40, 6, bg);
+        c.round_rect_border(mx + 26, by, primary_w, 40, 6, 1, bd);
+        btn_text(
+            c,
+            mx + 26,
+            by,
+            primary_w,
+            40,
+            &format!("[A] {}", self.update.primary_label()),
+            fg,
+            FontSize::Medium,
+        );
+        self.add_hit(mx + 26, by, primary_w, 40, UiAction::UpdatePrimary);
+
+        let later_w = 170;
+        let later_x = mx + 26 + primary_w + 12;
+        c.round_rect(later_x, by, later_w, 40, 6, t.bg_btn);
+        c.round_rect_border(later_x, by, later_w, 40, 6, 1, t.border_subtle);
+        btn_text(c, later_x, by, later_w, 40, "[B] あとで", t.text_secondary, FontSize::Medium);
+        self.add_hit(later_x, by, later_w, 40, UiAction::UpdateLater);
+
+        let check_w = 320;
+        let check_x = mx + mw - 26 - check_w;
+        c.round_rect(check_x, by, check_w, 40, 6, t.bg_btn);
+        c.round_rect_border(check_x, by, check_w, 40, 6, 1, t.border_subtle);
+        let check = format!(
+            "[Y] 起動時の確認: {}",
+            if self.update.settings.check_on_start { "オン" } else { "オフ" }
+        );
+        btn_text(c, check_x, by, check_w, 40, &check, t.text_secondary, FontSize::Small);
+        self.add_hit(check_x, by, check_w, 40, UiAction::UpdateToggle);
+    }
+}
+

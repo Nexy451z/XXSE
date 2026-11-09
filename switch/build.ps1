@@ -47,7 +47,12 @@ $appName    = 'XXSE'
 # Shown by hbmenu: one line of title, one of author.
 $appTitle   = 'XXSE'
 $appAuthor  = 'Nexy451z'
-$appVersion = '0.2.5-alpha'
+# The NACP version is the crate's own version, not a second string: the update
+# check compares the compiled CARGO_PKG_VERSION against the GitHub tag, so the
+# number hbmenu shows has to be that same number.
+$appVersion = (Select-String -Path (Join-Path $switchDir 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' |
+    Select-Object -First 1).Matches[0].Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($appVersion)) { Die "could not read the version from switch/Cargo.toml" }
 
 function Step([string] $Message) { Write-Host ""; Write-Host "==> $Message" -ForegroundColor Cyan }
 function Info([string] $Message) { Write-Host "    $Message" }
@@ -96,6 +101,22 @@ $elf2nro  = Join-Path $DevkitPro 'tools\bin\elf2nro.exe'
 $nacptool = Join-Path $DevkitPro 'tools\bin\nacptool.exe'
 foreach ($tool in @($gcc, $elf2nro, $nacptool)) {
     if (-not (Test-Path $tool)) { Die "missing devkitPro tool: $tool" }
+}
+
+# switch-curl is the one portlib this application uses (the in-app update
+# check). It is optional on purpose: without it the editor builds and runs
+# exactly as before, with the update check compiled out (build.rs reports the
+# same thing through cargo::warning).
+$portlibsDir = Join-Path $DevkitPro 'portlibs\switch'
+$curlLib     = Join-Path $portlibsDir 'lib\libcurl.a'
+$zlibLib     = Join-Path $portlibsDir 'lib\libz.a'
+$hasCurl     = (Test-Path $curlLib) -and (Test-Path $zlibLib)
+if ($hasCurl) {
+    Info "switch-curl = $curlLib"
+} else {
+    Write-Host '    warning: switch-curl is not installed; the update check is compiled out.' -ForegroundColor Yellow
+    Write-Host "             install it with: $DevkitPro\msys2\usr\bin\pacman.exe -S switch-curl" -ForegroundColor Yellow
+    Write-Host '             (run it from an MSYS shell: MSYSTEM=MSYS)' -ForegroundColor Yellow
 }
 
 # devkitPro's specs expand paths with %:getenv(DEVKITPRO ...), so forward slashes
@@ -148,7 +169,14 @@ if (-not (Test-Path $staticlib)) { Die "staticlib not found: $staticlib" }
 Step "Link ($Route route)"
 $elf  = Join-Path $outDir "$appName.elf"
 $arch = @('-march=armv8-a+crc+crypto', '-mtune=cortex-a57', '-mtp=soft', '-fPIE')
-$linkCommon = @("-specs=$devkitProFwd/libnx/switch.specs", "-g", "-L", "$devkitProFwd/libnx/lib") + $arch
+$linkCommon = @(
+    "-specs=$devkitProFwd/libnx/switch.specs", "-g",
+    "-L", "$devkitProFwd/libnx/lib",
+    "-L", "$devkitProFwd/portlibs/switch/lib"
+) + $arch
+# The route this script links itself ("c") has to name libcurl and libz too:
+# rustc's link arguments only reach the ELF rustc produces, not this one.
+$portlibFlags = if ($hasCurl) { @('-lcurl', '-lz') } else { @() }
 
 if ($Route -eq 'cargo') {
     # Route A: rustc produced the ELF directly (build.rs adds the same flags).
@@ -161,7 +189,13 @@ if ($Route -eq 'cargo') {
     if (-not (Test-Path $cMain)) { Die "missing $cMain" }
     $obj = Join-Path $outDir 'rustmain.o'
     Invoke-Tool $gcc (@('-c', '-g') + $arch + @('-O2', '-o', $obj, $cMain))
-    Invoke-Tool $gcc ($linkCommon + @('-o', $elf, $obj, $staticlib, '-lnx'))
+    # build.rs compiled tools/font_shim.c into libfont_shim.a inside its own OUT_DIR
+    # (the hash changes with the crate), so it is found rather than named.
+    $fontShim = Get-ChildItem -Path (Join-Path $outDir 'build') -Recurse -Filter 'libfont_shim.a' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $fontShim) { Die "libfont_shim.a not found under $outDir\build (did cargo build run?)" }
+    Info "font shim = $($fontShim.FullName)"
+    Invoke-Tool $gcc ($linkCommon + @('-o', $elf, $obj, $staticlib, $fontShim.FullName) + $portlibFlags + @('-lnx', '-lm'))
 }
 
 # ---------------------------------------------------------------------------

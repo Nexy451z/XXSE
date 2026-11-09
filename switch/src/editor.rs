@@ -1857,6 +1857,14 @@ pub fn run() -> i32 {
 
         let mut need_draw = true;
         while sys::appletMainLoop() {
+            // The optional update check, collected once per frame. The check
+            // itself runs on its own thread (crate::update), so this call only
+            // takes an answer that is already there: the frame never waits for
+            // a socket. The first call also starts it, once, when the setting
+            // allows it - the frame it starts on has already been drawn.
+            painter.gui.update.poll();
+            painter.gui.update.start_once();
+
             sys::padUpdate(&mut pad);
             let down = pad.buttons_down();
             let cur = pad.buttons_cur;
@@ -1883,6 +1891,64 @@ pub fn run() -> i32 {
             // this flag marks fold into it (Editor::push_undo), and the release
             // closes it again.
             ed.set_repeating(repeated);
+
+            // The update dialog is modal: while it is up the pad answers it and
+            // nothing else, so a press cannot edit a value on the screen behind
+            // it. [A] is the dialog's own action, [B] puts the offer away for
+            // this session, [Y] flips the start-up check.
+            if painter.gui.update.dialog {
+                if let Some(k) = key {
+                    match k {
+                        Key::A => painter.gui.update.primary(),
+                        Key::B => painter.gui.update.dismiss(),
+                        Key::Y => painter.gui.update.toggle_setting(),
+                        _ => {}
+                    }
+                    need_draw = true;
+                } else if painter.gui.update.busy() {
+                    // The percentage moves: the bar has to be redrawn.
+                    need_draw = true;
+                }
+                // A finger answers the dialog's three buttons and nothing else:
+                // GuiState::handle_touch has the same modal rule the review's
+                // dialog has, so a tap cannot reach the list underneath.
+                let mut touch_state = sys::HidTouchScreenState::ZERO;
+                let n_states = sys::hidGetTouchScreenStates(&mut touch_state, 1);
+                let (touching, tx, ty) = if n_states > 0 && touch_state.count > 0 {
+                    let t = touch_state.touches[0];
+                    (true, t.x as i32, t.y as i32)
+                } else {
+                    (false, 0, 0)
+                };
+                if painter.gui.handle_touch(&mut ed, touching, tx, ty) {
+                    need_draw = true;
+                }
+                if painter.gui.update.restart_pending {
+                    break;
+                }
+                if need_draw {
+                    painter.draw(&ed);
+                    need_draw = false;
+                }
+                sys::svcSleepThread(16_000_000);
+                continue;
+            }
+
+            // The banner's [A]. It is answered on the start screen only, and
+            // only while the banner is up: everywhere else [A] is the screen's
+            // own key (開く / 編集) and a press must never open a dialog in the
+            // middle of an edit. The same dialog is reachable from any screen by
+            // tapping the banner, and from the start screen at any time by
+            // holding [R].
+            if ed.screen == mhnx_core::hbedit::Screen::SaveList
+                && painter.gui.update.banner_visible()
+                && down & BTN_A != 0
+            {
+                painter.gui.update.open_dialog();
+                need_draw = true;
+                // The press belongs to the banner, not to the save under it.
+                key = None;
+            }
 
             if painter.gui.osk.is_some() {
                 // L / R answer the keyboard here, not the list: forget the
@@ -2085,7 +2151,15 @@ pub fn run() -> i32 {
                         mhnx_core::confirm::HoldAction::Arm
                         | mhnx_core::confirm::HoldAction::Run => {
                             r_press.clear_arm();
-                            painter.gui.open_detail(&mut ed);
+                            // 詳細 has nothing to show on the start screen, so
+                            // the hold is the settings door of the updater there:
+                            // it is the one way in when the start-up check is off
+                            // or the banner was already put away.
+                            if ed.screen == mhnx_core::hbedit::Screen::SaveList {
+                                painter.gui.update.open_dialog();
+                            } else {
+                                painter.gui.open_detail(&mut ed);
+                            }
                             need_draw = true;
                         }
                         mhnx_core::confirm::HoldAction::None => {}
@@ -2149,6 +2223,12 @@ pub fn run() -> i32 {
             }
 
             if ed.quit {
+                break;
+            }
+
+            // The new .nro is on the card and the loader has been told to start
+            // it: the process has to leave for that to happen.
+            if painter.gui.update.restart_pending {
                 break;
             }
 

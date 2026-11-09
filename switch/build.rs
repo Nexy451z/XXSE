@@ -15,6 +15,9 @@ fn main() {
     println!("cargo::rerun-if-changed=tools/stb_truetype.h");
     println!("cargo::rerun-if-env-changed=DEVKITPRO");
     println!("cargo::rerun-if-env-changed=XXSE_UI_VARIANT");
+    // switch_curl is set below when the portlib is installed; declaring it here
+    // is what keeps the unexpected_cfgs lint quiet about it.
+    println!("cargo::rustc-check-cfg=cfg(switch_curl)");
 
     let devkitpro = env::var("DEVKITPRO").unwrap_or_else(|_| "C:/devkitPro".to_string());
     let devkitpro = devkitpro.replace('\\', "/");
@@ -26,9 +29,35 @@ fn main() {
     // it can simply join the link line.
     let font_shim = build_font_shim(&devkitpro);
 
+    // The update check is the only part of this crate that needs a portlib, and
+    // a machine without switch-curl must still be able to build the editor: the
+    // socket compiles out and the banner simply never appears. build.ps1 prints
+    // the same warning with the command that fixes it.
+    // The archive appears (or disappears) when the portlib is installed or
+    // removed, and that is exactly when this decision has to be made again:
+    // without these two lines cargo keeps the previous answer and the link
+    // fails on a -lcurl that is no longer there.
+    // The directory is watched as well as the two archives: pacman installs and
+    // removes files, which moves the directory's own timestamp even when the
+    // archive is put back with the one it had.
+    println!("cargo::rerun-if-changed={portlibs}/lib");
+    println!("cargo::rerun-if-changed={portlibs}/lib/libcurl.a");
+    println!("cargo::rerun-if-changed={portlibs}/lib/libz.a");
+
+    let curl = Path::new(&format!("{portlibs}/lib/libcurl.a")).is_file()
+        && Path::new(&format!("{portlibs}/lib/libz.a")).is_file();
+    if curl {
+        println!("cargo::rustc-cfg=switch_curl");
+    } else {
+        println!(
+            "cargo::warning=switch-curl is not installed, so the update check is compiled out. \
+             Install it with: C:/devkitPro/msys2/usr/bin/pacman.exe -S switch-curl"
+        );
+    }
+
     // Mirrors $(LDFLAGS) / $(LIBS) / $(LIBPATHS) of the devkitPro application
     // template Makefile one flag at a time.
-    let args = [
+    let mut args: Vec<String> = vec![
         // switch.specs injects: -T .../libnx/switch.ld, -pie, --no-dynamic-linker,
         // --gc-sections, -z text -z now -z nodynamic-undefined-weak,
         // -z pack-relative-relocs, --build-id=sha1, --nx-module-name and the
@@ -42,28 +71,37 @@ fn main() {
         format!("-L{portlibs}/lib"),
         // libnx, exactly like the Makefile template.
         "-lnx".to_string(),
-        // font_shim.c -> libfont_shim.a.  It sits after -lnx and before the
-        // --start-group below so its newlib/libm references (malloc, memcpy,
-        // sqrt, ...) are resolved by the group; it does not reference libnx.
-        font_shim,
-        // rustc passes -nodefaultlibs (this target has no C runtime "fallback"
-        // crt objects), which also removes the libraries the gcc driver would
-        // normally append.  These are the ones devkitA64 needs - taken
-        // verbatim from a native link:
-        //   collect2 ... -lnx --start-group -lgcc -lg -lc -lsysbase --end-group
-        // -lm is part of that reference set but not of the template (a pure C
-        // homebrew never needs it); tools/font_shim.c does, because
-        // stb_truetype calls sqrt/pow/cos/acos/fmod in its SDF/GPOS code.
-        // It is added *inside* the group so it is rescanned like libc.
-        // (gcc still appends its own crtend.o/crtn.o afterwards.)
-        "-Wl,--start-group".to_string(),
-        "-lgcc".to_string(),
-        "-lg".to_string(),
-        "-lc".to_string(),
-        "-lm".to_string(),
-        "-lsysbase".to_string(),
-        "-Wl,--end-group".to_string(),
     ];
+    if curl {
+        // switch-curl: the update check's only portlib. It is a static archive
+        // that references libnx (sslCreateContext, socket*, svc*) and zlib, so
+        // both are named again below inside the --start-group where the linker
+        // rescan can resolve them.
+        args.push("-lcurl".to_string());
+    }
+    // font_shim.c -> libfont_shim.a.  It sits after -lnx and before the
+    // --start-group below so its newlib/libm references (malloc, memcpy,
+    // sqrt, ...) are resolved by the group; it does not reference libnx.
+    args.push(font_shim);
+    // rustc passes -nodefaultlibs (this target has no C runtime "fallback"
+    // crt objects), which also removes the libraries the gcc driver would
+    // normally append.  These are the ones devkitA64 needs - taken
+    // verbatim from a native link:
+    //   collect2 ... -lnx --start-group -lgcc -lg -lc -lsysbase --end-group
+    // -lm is part of that reference set but not of the template (a pure C
+    // homebrew never needs it); tools/font_shim.c does, because
+    // stb_truetype calls sqrt/pow/cos/acos/fmod in its SDF/GPOS code.
+    // It is added *inside* the group so it is rescanned like libc.
+    // (gcc still appends its own crtend.o/crtn.o afterwards.)
+    args.push("-Wl,--start-group".to_string());
+    if curl {
+        args.push("-lz".to_string());
+        args.push("-lnx".to_string());
+    }
+    for flag in ["-lgcc", "-lg", "-lc", "-lm", "-lsysbase"] {
+        args.push(flag.to_string());
+    }
+    args.push("-Wl,--end-group".to_string());
 
     for a in args {
         println!("cargo::rustc-link-arg={a}");

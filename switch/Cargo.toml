@@ -1,6 +1,11 @@
 [package]
 name = "mhnx-switch"
-version = "0.2.5"
+# Kept in step with the workspace version by hand (this crate is excluded from
+# the workspace). build.ps1 reads this line for the NACP version and the update
+# check compares it with the release tag, so the number a user sees in hbmenu,
+# the number compiled into the .nro and the number GitHub is asked about are one
+# number.
+version = "0.3.1"
 edition = "2021"
 description = "XXSE - Monster Hunter XX (NX) Save Editor for Nintendo Switch (libnx homebrew)"
 license = "MIT OR Apache-2.0"

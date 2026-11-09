@@ -242,6 +242,45 @@ const _: () = {
     assert!(core::mem::offset_of!(HidTouchScreenState, touches) == 16);
 };
 
+/// `Thread` (kernel/thread.h): { Handle handle; bool owns_stack_mem;
+/// void* stack_mem; void* stack_mirror; size_t stack_sz; void** tls_array;
+/// struct Thread* next; struct Thread** prev_next; }
+#[repr(C)]
+pub struct Thread {
+    pub handle: Handle,
+    pub owns_stack_mem: bool,
+    pub stack_mem: *mut c_void,
+    pub stack_mirror: *mut c_void,
+    pub stack_sz: usize,
+    pub tls_array: *mut *mut c_void,
+    pub next: *mut Thread,
+    pub prev_next: *mut *mut Thread,
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Thread>() == 56);
+    assert!(core::mem::offset_of!(Thread, handle) == 0);
+    assert!(core::mem::offset_of!(Thread, owns_stack_mem) == 4);
+    assert!(core::mem::offset_of!(Thread, stack_mem) == 8);
+    assert!(core::mem::offset_of!(Thread, stack_sz) == 24);
+};
+
+impl Thread {
+    pub const ZERO: Self = Self {
+        handle: 0,
+        owns_stack_mem: false,
+        stack_mem: core::ptr::null_mut(),
+        stack_mirror: core::ptr::null_mut(),
+        stack_sz: 0,
+        tls_array: core::ptr::null_mut(),
+        next: core::ptr::null_mut(),
+        prev_next: core::ptr::null_mut(),
+    };
+}
+
+/// `ThreadFunc` (kernel/thread.h): void (*)(void*).
+pub type ThreadFunc = unsafe extern "C" fn(*mut c_void);
+
 /// Opaque `PrintConsole` (runtime/devices/console.h) - we always pass NULL,
 /// which makes libnx use its built-in default console.
 #[repr(C)]
@@ -288,7 +327,13 @@ extern "C" {
     pub fn free(ptr: *mut c_void);
     pub fn fopen(path: *const c_char, mode: *const c_char) -> *mut c_void;
     pub fn fread(ptr: *mut c_void, size: usize, nmemb: usize, stream: *mut c_void) -> usize;
+    pub fn fwrite(ptr: *const c_void, size: usize, nmemb: usize, stream: *mut c_void) -> usize;
+    pub fn fflush(stream: *mut c_void) -> c_int;
     pub fn fclose(stream: *mut c_void) -> c_int;
+    // The two file operations the .nro swap is made of. fsdev implements both
+    // for sdmc:, and neither of them ever truncates the file it moves.
+    pub fn remove(path: *const c_char) -> c_int;
+    pub fn rename(from: *const c_char, to: *const c_char) -> c_int;
 
     // --- services/hid.h + runtime/pad.h --------------------------------------------
     pub fn padConfigureInput(max_players: u32, style_set: u32);
@@ -346,6 +391,31 @@ extern "C" {
     pub fn fsFsOpenDirectory(fs: *mut FsFileSystem, path: *const c_char, mode: u32, out: *mut FsDir) -> Result;
     pub fn fsDirRead(d: *mut FsDir, total_entries: *mut i64, max_entries: usize, buf: *mut FsDirectoryEntry) -> Result;
     pub fn fsDirClose(d: *mut FsDir);
+
+    // --- kernel/thread.h -----------------------------------------------------------
+    //
+    // The update check and the download run on a thread of their own so the
+    // frame loop never waits for a socket. switch/output (newlib) allocates the
+    // stack when stack_mem is null and owns it until threadClose.
+    pub fn threadCreate(
+        t: *mut Thread,
+        entry: ThreadFunc,
+        arg: *mut c_void,
+        stack_mem: *mut c_void,
+        stack_sz: usize,
+        prio: i32,
+        cpuid: i32,
+    ) -> Result;
+    pub fn threadStart(t: *mut Thread) -> Result;
+    pub fn threadWaitForExit(t: *mut Thread) -> Result;
+    pub fn threadClose(t: *mut Thread);
+    pub fn threadExit() -> !;
+
+    // --- runtime/env.h -------------------------------------------------------------
+    /// Tell the loader which .nro to start once this process exits (self-restart).
+    pub fn envSetNextLoad(path: *const c_char, argv: *const c_char) -> Result;
+    pub fn envHasNextLoad() -> bool;
+    pub fn envGetLastLoadResult() -> Result;
 }
 
 // ---------------------------------------------------------------------------

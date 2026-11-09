@@ -79,6 +79,10 @@ pub mod entries;
 pub mod hbedit;
 pub mod hunts;
 pub mod itembox;
+/// A small strict JSON reader (the update check's only network document).
+pub mod json;
+/// The update check's rules: release parsing, versions, the .nro swap.
+pub mod update;
 pub mod quest;
 pub mod questfields;
 /// The smithy's recipes: what each product costs, and what each item makes.
