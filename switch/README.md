@@ -1,7 +1,7 @@
 # mhnx-switch — Nintendo Switch (.nro) 版 mhnxeditor
 
 MHXX MHNX Editor の Switch homebrew フロントエンド。**Rust (no_std + alloc)** で書き、
-devkitPro (devkitA64 / libnx) のツールチェーンでリンクして `mhnxeditor.nro` を作る。
+devkitPro (devkitA64 / libnx) のツールチェーンでリンクして `XXSE.nro` を作る。
 実機は不要で、ビルドが通ることと `NRO0` マジックを持つ NRO が生成されることを
 `build.ps1` が自動検証する。
 
@@ -43,32 +43,29 @@ pwsh -File .\build.ps1 -Route c        # devkitA64 gcc が Rust staticlib をリ
 
 出力:
 
-* `switch/target/aarch64-nintendo-switch-libnx/release/mhnxeditor` … ELF (route cargo)
+* `switch/target/aarch64-nintendo-switch-libnx/release/XXSE` … rustc が作る ELF (route cargo)
+* `switch/target/.../release/XXSE.elf` … リンク済み ELF (両ルートの成果物)
 * `switch/target/.../release/libmhnx_switch.a` … Rust staticlib (route c 用)
-* `switch/target/.../release/mhnxeditor.nro` … 中間 NRO
-* **`dist/mhnxeditor.nro`** … 成果物 (build.ps1 がコピー)
+* `switch/target/.../release/XXSE.nro` … 中間 NRO
+* **`dist/XXSE.nro`** … 成果物 (build.ps1 がコピー)
 
 ## 実行時の動作
 
-1. libnx の `consoleInit(NULL)` + `printf` でテキスト表示
-2. `argc/argv` を表示（argv[0] = NRO のパス）
-3. SD カードプローブ
-   * `fsInitialize()` → `fsOpenSdCardFileSystem()`
-   * `fsFsGetFreeSpace/TotalSpace("/")`
-   * `fsFsOpenDirectory("/switch/mhnxeditor")` + `fsDirRead()` で一覧表示
-   * `fsFsOpenFile()/fsFileRead()` で `/switch/mhnxeditor/hello.txt` を読む
-   * さらに newlib の `fopen()/fread()` でも同じファイルを読む（libnx が fsdev 経由で
-     `sdmc` を stdio に繋いでいることの確認）
-4. **A ボタン**で再プローブ、**＋ボタンまたは B ボタン**で終了して hbmenu に戻る
+起動するとエディタ本体（`src/editor.rs` + `src/ui.rs`）が動きます。セーブの読み書きは
+`src/savedata.rs`（本体の `save:` デバイス）と `src/editor.rs`（SD カードの `fopen`）です。
+
+`src/app.rs` には初期の SD カードプローブ（`consoleInit` + `printf` で `/switch/XXSE` を
+一覧し `hello.txt` を読む）が残っていますが、`run()` は `crate::editor::run()` を返した
+あと `return` するので**到達しません**（診断用）。
 
 `alloc` は newlib の malloc/free を `#[global_allocator]` として使用しており、
-String / Vec / format! がそのまま使える（`mhnx-core` を載せる前提の確認）。
+String / Vec / format! がそのまま使える。
 
 ## ファイル構成
 
 | パス | 役割 |
 | --- | --- |
-| `Cargo.toml` | bin `mhnxeditor` + lib `mhnx_switch` (rlib + staticlib) |
+| `Cargo.toml` | bin `XXSE` + lib `mhnx_switch` (rlib + staticlib) |
 | `rust-toolchain.toml` | nightly + rust-src を固定 |
 | `.cargo/config.toml` | ターゲット JSON、`build-std`、`json-target-spec`、DEVKITPRO 既定値 |
 | `targets/aarch64-nintendo-switch-libnx.json` | カスタムターゲット定義（gcc リンカを指定） |
@@ -79,11 +76,18 @@ String / Vec / format! がそのまま使える（`mhnx-core` を載せる前提
 | `../crates/mhnx-core/src/json.rs` | no_std の JSON リーダ（深さ制限つき） |
 | `../crates/mhnx-core/src/update.rs` | 版比較・アセット選択・保存先・差し替えの規則（**ホストでテスト可能**） |
 | `../crates/mhnx-core/tests/update_check.rs` | 上記のホストテスト 18 件 |
-| `src/app.rs` | 画面表示・SD カードプローブ本体 |
+| `src/app.rs` | 入口（`editor::run()` を呼ぶ）と、診断用に残した SD カードプローブ |
+| `src/editor.rs` | SD カードの読み書き・ボタン入力・メインループ（判断は `mhnx-core` の `hbedit`） |
+| `src/ui.rs` | 画面の描画（キャンバス UI・内蔵キーボード・タッチ） |
+| `src/text.rs` | 日本語フォント（pl:u 共有フォント → stb_truetype → フレームバッファ） |
+| `src/swkbd.rs` | システムキーボード（swkbd）の FFI 宣言 |
+| `src/savedata.rs` | 本体のセーブ（`save:` デバイス）の読み書き |
 | `src/main.rs` | `#![no_main]` + `#[no_mangle] extern "C" fn main` |
 | `src/lib.rs` | panic handler / global allocator / `mhnx_main()` (route c 用) |
+| `examples/text_probe.rs` | 診断用 NRO（`-Probe` でビルド） |
 | `tools/rustmain.c` | route c 用の C エントリポイント |
-| `sdcard/` | SD カードにコピーするサンプル (`/switch/mhnxeditor/hello.txt`) |
+| `tools/font_shim.c` / `tools/stb_truetype.h` | フォント描画の C シム（`build.rs` がコンパイル） |
+| `sdcard/` | SD カードへコピーする中身の置き場（`switch/XXSE/`。いまは空）。build.ps1 が `dist/` にも複製します |
 | `build.ps1` | ビルド〜NRO 生成〜検証〜dist 配置 |
 
 ## 2 つのリンク経路
@@ -94,7 +98,7 @@ String / Vec / format! がそのまま使える（`mhnx-core` を載せる前提
 * **route c**: `cargo build` が生成した `libmhnx_switch.a` を、devkitA64 の gcc が
   `tools/rustmain.c` と一緒にリンクする（devkitPro Makefile 方式）。
 
-どちらも同じ内容の `mhnxeditor.nro` (235,717 バイト) を生成することを確認済み。
+どちらも同じ内容の `XXSE.nro` を生成する（サイズは switch-curl の有無で約 1.63 MB / 約 2.16 MB。「必要なもの」の表を参照）。
 
 
 ## 起動時の更新チェック（任意）
@@ -111,7 +115,7 @@ String / Vec / format! がそのまま使える（`mhnx-core` を載せる前提
 3. `tag_name` を semver として `CARGO_PKG_VERSION` と比較する。
    * 同じ / 古い → **何も表示しない**
    * 新しい → ガイド行の右端に 1 行のバナー
-     `新しいバージョン v0.3.2 があります  [A] 詳細`
+     `新しいバージョン vX.Y.Z があります  [A] 詳細`
 4. `[A]`（またはバナーをタップ）で確認ダイアログ。`[A]` でダウンロード開始。
 5. ダウンロードは `sdmc:/switch/XXSE/XXSE.nro.new` へ。0〜100% と [A] 中止を表示。
 6. 完了 → サイズ検証 → 既存を `.bak` に退避 → `.new` を `XXSE.nro` に差し替え →
@@ -215,4 +219,5 @@ https 必須、保存先決定、差し替えの全失敗経路、進捗%、設�
 * `linker `aarch64-none-elf-gcc` not found` … `$env:PATH` に devkitA64\bin が無い。
   `build.ps1` 経由でビルドするか PATH を設定する。
 
-詳しい調査ログ・ハマりどころは `../docs/switch_build.md` を参照。
+`docs/` はリポジトリに含めていません（swkbd の構造体レイアウトの実測値は
+`src/swkbd.rs` の `const` アサーションに残しています）。

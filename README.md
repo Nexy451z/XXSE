@@ -75,8 +75,8 @@ Switch 版でできることです。PC 版だけの機能は「実機と PC の
 * `romfs` を指定できるのは PC 版だけです（指定した dump の名前が優先され、外すと
   同梱の名前に戻ります。セーブと一緒に配られたファイルのほうが、そのセーブにとっては
   正しいため）
-* アイテム名・スキル名・モンスター名・装飾品名も同梱の表から引きます
-  （`crates/mhnx-core/src/gamedata.rs`。出所は下の「ライセンス」に書いています）
+* アイテム名・スキル名・モンスター名・装飾品名・装備名も同梱の表から引きます
+  （`gamedata.rs` / `skills.rs` / `equipnames.rs`。出所は下の「ライセンス」に書いています）
 
 ### セーブマップ（生データ）
 
@@ -88,6 +88,17 @@ Switch 版でできることです。PC 版だけの機能は「実機と PC の
 - 各画面の `[R]` 長押し（詳細）でも、その画面が扱う行から開けます
 
 ## 実機と PC の違い
+
+同じ画面でも呼び名が違います（実機側はタブの見出し）。読み替えはこの表で:
+
+| PC 版 | 実機（Switch） |
+|---|---|
+| クエスト（ファイル） | `SD(.arc)` |
+| ギルド | ギルドカード |
+| お守り | 護石一覧 |
+| DLC | 公式 / 没クエ / 配信オトモ |
+
+機能の差はこちら:
 
 | 項目 | 実機（Switch） | PC 版 |
 |---|---|---|
@@ -133,7 +144,7 @@ hbmenu から起動します。PC 版は XXSE.exe をそのまま実行してく
 | ボタン | 動作 |
 |---|---|
 | `ZL` | セクション（サイドバー）切替 |
-| `ZR` | 画面の第 2 操作（検索・装備・表示切替など）。持たない画面ではセクション送り |
+| `ZR` | 画面の第 2 操作（検索・一括操作・装備・表示切替など）。持たない画面ではセクション送り |
 | `L` / `R` | サブタブ切替（選択リストでは 10 行送り） |
 | `L` 長押し 2 回 | 元に戻す（1 回目は確認） |
 | `R` 長押し | 詳細（生データ） |
@@ -141,14 +152,39 @@ hbmenu から起動します。PC 版は XXSE.exe をそのまま実行してく
 | `B` | 戻る・キャンセル |
 | `X` | 保存（保存前レビューを経ます） |
 | `Y` | 画面の第 1 切替（刻み幅・検索・表示切替など） |
-| `R` | 数値の直接入力（対応する画面のみ） |
+| `R` | 数値の直接入力（対応する画面のみ）。アイテムセットではポーチへ適用（2 回）。**押した時点ではなく離した時点で実行**されます（長押しの詳細と区別するため） |
 | `-` | 削除（2 回押し）。削除するものが無い画面では何もしません |
 | `+` | 終了（未保存なら確認）。お守り・装備・オトモでは新規 / スキル |
 | `◀` / `▶` | 数値の増減（選択リストでは 10 行送り） |
 | `▲` / `▼` | 項目移動 |
 | `R スティック` | 頁送り（`◀` / `▶` で先頭 / 末尾へ） |
 
-画面下のフッターに、その画面で使えるキーが出ます。タッチは行を 1 回目で選び、2 回目で決定します（ボタンは 1 回で動きます）。
+画面下のフッターに、その画面で使えるキーが出ます。タッチは行を 1 回目で選び、2 回目で決定します（ボタンは 1 回で動きます）。ただし `[R]` の 1 回押しは離した時点で動きます。
+
+内蔵キーボード（文字入力）を開いている間だけ、キーの意味が変わります（→「内蔵キーボード」）。
+
+### 内蔵キーボード（文字入力）
+
+改行を入れられる欄（ハンター名・オトモ名・マイセット名・ギルドカード名・コメント）は
+**必ずこのキーボード**です。1 行の欄はシステムのキーボードを使い、それが開けない環境
+（アルバムから起動した等）では理由を出してこちらに切り替わります。
+
+**この画面だけキーの意味が違う**ので、上の表ではなくこちらを見てください。
+
+| ボタン | 動作 |
+|---|---|
+| `A` | 選択中の文字を入力 |
+| `B` | 1 文字削除 |
+| `X` | 全消去（2 回押し） |
+| `Y` | 濁点 / 半濁点 / 小字（直前の 1 文字を変える） |
+| `ZR` | 改行（複数行の欄のみ。1 行の欄では入りません） |
+| `ZL` / `L` / `R` | 文字種（ひらがな / カタカナ / 英数字 / 単語・漢字） |
+| `+` | 確定 |
+| `-` | 取消（入力していた文字は捨てます） |
+| `▲` / `▼` / `◀` / `▶` | 文字を選ぶ |
+
+`[B]` は戻るではなく **1 文字削除**、`[-]` は削除ではなく **取消**、`[+]` は終了ではなく
+**確定**です。
 
 ## 起動時の更新チェック（Switch 版・任意）
 
@@ -181,6 +217,24 @@ cargo build --release -p mhnx-gui -p mhnx-cli
 pwsh -File .\tools\make_release.ps1
 ```
 
+### 公式 DLC バンドル（任意）
+
+公式クエスト・没クエストのバンドルは**同梱していません**。そのままビルドすると空の
+`dlc_bundle_stub.rs` が使われ、クエストの「公式」「没クエ」タブを開いても**0 件**になります
+（他の機能はそのまま動きます）。自前のゲームファイルから作る場合:
+
+```powershell
+python tools\gen_official_dlc.py
+```
+
+* スクリプトは引数を取りません。先頭の `PLAYABLE_DIR` / `DEAD_DIR`（クエストの .arc を
+  置いたフォルダ）と `SAVE_PATH`（DLC 領域を含むセーブ）を自分のパスに書き換えてから
+  実行します。
+* `crates/mhnx-core/src/dlc_bundle_gen.rs` と `official_dlc.bin` を書き出します
+  （どちらも .gitignore 済み）。`build.rs` は**両方**揃っているときだけそちらを
+  コンパイルし、欠けていれば stub に戻します。
+* 件数が 189 / 34 でないとスクリプトは停止します（`assert`）。
+
 Switch 版のビルドには devkitPro（libnx）と rustup の `aarch64-nintendo-switch-libnx` が必要です。
 更新チェックを使う場合は devkitPro の portlib `switch-curl` も入れます
 （無くてもビルドは通り、更新チェックだけが無効になります）:
@@ -206,14 +260,21 @@ MIT
 ---
 
 ゲームのファイル（`.arc` / `.gmd` / `.mib` / `romfs` / セーブ）は含みません。
-同梱しているのは**名前などのテキスト**です。
+同梱しているのは**名前などのテキスト**と、**配信オトモのレコード**（セーブへ書き込む 1 体分のバイト列）です。
 
 | 同梱しているファイル | 中身 | 出所 |
 |---|---|---|
 | `crates/mhnx-core/src/idmemo.rs`（約 80KB） | 勲章 132・依頼 184・クエスト 1508・ステージ 31 の名前 | [**Nexy451z/mhxx-id-memo**](https://github.com/Nexy451z/mhxx-id-memo)（MIT・作者本人のリポジトリ）の `data/world/*.tsv`。commit `a284583b3bd04b8fe95e559b8b92d9e29bbdca00`（2026-11-09 取得）を `tools/gen_idmemo.py` が固定して取り込みます |
-| `crates/mhnx-core/src/gamedata.rs`（約 316KB） | アイテム名・スキル名・モンスター名・装飾品名・狩猟系の表 | [**Dawnshifter/MHXXSwitchSaveEditor**](https://github.com/Dawnshifter/MHXXSwitchSaveEditor)（GPL-3.0）の `MHXXSaveEditor/Data/GameConstants.cs`。commit `0624c7ac31ccdc1a57db4480890c0ec6b11feea3` を `tools/gen_names.py` が読んで生成します |
+| `crates/mhnx-core/src/gamedata.rs`（約 316KB） | アイテム名・スキル名・モンスター名・装飾品名・狩猟系の表（英語名） | [**Dawnshifter/MHXXSwitchSaveEditor**](https://github.com/Dawnshifter/MHXXSwitchSaveEditor)（GPL-3.0）の `MHXXSaveEditor/Data/GameConstants.cs`。commit `0624c7ac31ccdc1a57db4480890c0ec6b11feea3` を `tools/gen_names.py` が読んで生成します |
+| `crates/mhnx-core/src/skills.rs`（約 7KB） | スキル名 306 件（日本語） | [**SilverJolteon/SilverJolteon.github.io**](https://github.com/SilverJolteon/SilverJolteon.github.io) の `MHGU/save-manager/scripts/main.js`（`skill_names`。並び順）を、MHXX Kiranico の日本語名で訳したもの。`tools/gen_skills.py` が生成します。**このリポジトリに LICENSE ファイルはありません** |
+| `crates/mhnx-core/src/equipnames.rs`（約 245KB） | 武器 15 種・防具 6,435 件の日本語名 | ゲーム本体の `weaponNNMsgData_jpn.gmd` / `armorSeriesData_jpn.gmd` から抽出。生成器 `tools/_gen_equip.py` は作業用スクリプトのため同梱していません |
+| `crates/mhnx-core/src/dlcats.rs`（約 176KB） | 配信オトモのセーブレコード 84 本（1 本 0x144 バイト。JP 57 / EN 27、重複を除くと 60 体。名前はレコード先頭 32 バイト） | [**SilverJolteon/SilverJolteon.github.io**](https://github.com/SilverJolteon/SilverJolteon.github.io) の `MHGU/save-manager/scripts/DLC_CATS.js`（`EN_DLC_CAT_DATA` / `JP_DLC_CAT_DATA`）を `tools/gen_dlcats.py` がそのまま書き出したもの。**このリポジトリに LICENSE ファイルはありません** |
+| `crates/mhnx-core/src/questfields.rs`（約 97KB） | クエスト条件 (.mib) の項目表（オフセット・列挙・日本語の選択肢） | 項目の定義は Quedixx エディタのもの。同梱のクエスト 141 本で検証済み。`tools/gen_quest_fields.py` が生成します |
 
-* どちらも**生成物**です。手で編集しないでください（生成器が表の形を検査し、
-  合わなければ書き込みを拒否します）。
+* すべて**生成物**です。手で編集しないでください。
+  `idmemo.rs` は生成器が表の形を検査し、合わなければ書き込みを拒否します。
+  それ以外は生成器がそのまま書き出すので、手で直しても次の生成で消えます。
 * `romfs` の dump を指定できるのは PC 版だけです（指定した dump の名前が優先され、
   外すと同梱の名前に戻ります）。実機は `romfs` を読みません。
+* 上の表は**ゲーム由来のデータ**です。ゲーム由来でない同梱物は、Switch 版のフォント描画に
+  使う `switch/tools/stb_truetype.h`（stb_truetype v1.26・パブリックドメイン）だけです。
