@@ -678,7 +678,7 @@ fn extracting_one_quest_asks_for_exactly_that_id() {
     assert!(want > 0);
 
     assert_eq!(ed.take_request(), None);
-    ed.input(Key::Minus);
+    ed.input(Key::Z);
     match ed.take_request() {
         Some(Request::ExtractQuests { ids }) => assert_eq!(ids, vec![want]),
         other => panic!("expected an extract request, got {:?}", other),
@@ -1482,6 +1482,10 @@ fn a_switch_save_converts_to_a_3ds_body() {
     open_save(&mut ed);
     ed.input(Key::B);
     ed.input(Key::L);
+    // The write replaces whatever is at the output path, so [A] asks first
+    // (the review's ninth finding): the first press only names the file.
+    ed.input(Key::A);
+    assert!(ed.take_write().is_none(), "the first press must not write");
     ed.input(Key::A);
     match ed.take_write() {
         Some(mhnx_core::hbedit::Write::File { path, bytes }) => {
@@ -1513,6 +1517,9 @@ fn a_3ds_save_converts_to_a_switch_container() {
     ed.input(Key::B); // slots -> save list
     ed.input(Key::L); // convert
     assert_eq!(ed.screen, Screen::Convert);
+    // Two presses: the write replaces whatever is at the output path.
+    ed.input(Key::A);
+    assert!(ed.take_write().is_none(), "the first press must not write");
     ed.input(Key::A);
     match ed.take_write() {
         Some(mhnx_core::hbedit::Write::File { path, bytes }) => {
@@ -1681,8 +1688,9 @@ fn a_reward_chance_can_be_stepped_and_typed_from_the_console() {
     assert!(ed.entry_has_chance(), "a .rem carries a chance column");
     assert_eq!(ed.entry_field_label(), "個数", "◀/▶ starts on the count");
 
-    // [-] moves the key onto the chance column; the guide says which one.
-    ed.input(Key::Minus);
+    // [ZR] moves the key onto the chance column; the guide says which one
+    // ([-] is the delete key and nothing else).
+    ed.input(Key::Z);
     assert_eq!(ed.entry_field_label(), "確率%");
     assert!(ed.message.contains("確率"), "message was {}", ed.message);
     assert!(ed.entry_reward_sub().contains("編集中: 確率%"), "{}", ed.entry_reward_sub());
@@ -1731,8 +1739,8 @@ fn a_reward_chance_can_be_stepped_and_typed_from_the_console() {
         "a refused answer writes nothing"
     );
 
-    // [-] goes back to the count, which still moves the count byte.
-    ed.input(Key::Minus);
+    // [ZR] goes back to the count, which still moves the count byte.
+    ed.input(Key::Z);
     assert_eq!(ed.entry_field_label(), "個数");
     let count_before = {
         let e = &ed.arc.as_ref().unwrap().entries[5];
@@ -1767,8 +1775,8 @@ fn a_supply_row_says_it_has_no_chance() {
     assert!(!ed.entry_has_chance(), "a .sup has no chance column");
     assert!(ed.entry_reward_sub().contains("確率は使いません"), "{}", ed.entry_reward_sub());
     assert!(ed.entry_reward_warnings().is_empty());
-    // [-] refuses to switch to a chance the file does not have.
-    ed.input(Key::Minus);
+    // [ZR] refuses to switch to a chance the file does not have.
+    ed.input(Key::Z);
     assert_eq!(ed.entry_field_label(), "個数");
     assert!(ed.message.contains("確率を使いません"), "message was {}", ed.message);
 }
@@ -1798,8 +1806,8 @@ fn a_reward_chance_survives_a_write_and_a_re_read() {
     };
     assert!(before >= 1, "the sample row has a chance: {}", before);
 
-    // [-] puts the cursor on the chance column, then one step down.
-    ed.input(Key::Minus);
+    // [ZR] puts the cursor on the chance column, then one step down.
+    ed.input(Key::Z);
     ed.input(Key::Left);
 
     // X is what hands the archive to the io layer.
@@ -2006,6 +2014,8 @@ fn the_converted_save_can_be_given_a_name() {
     let shown = ed.lines().iter().map(|l| l.text.clone()).collect::<Vec<_>>().join("\n");
     assert!(shown.contains("before-edit.3ds"), "{}", shown);
     ed.input(Key::A);
+    assert!(ed.take_write().is_none(), "the first press must not write");
+    ed.input(Key::A);
     match ed.take_write() {
         Some(mhnx_core::hbedit::Write::File { path, .. }) => {
             assert!(path.ends_with("before-edit.3ds"), "wrote {}", path);
@@ -2029,6 +2039,8 @@ fn a_slash_in_the_name_cannot_escape_the_directory() {
     ed.input(Key::B);
     ed.input(Key::L);
     ed.apply_convert_name(String::from("../escape"));
+    ed.input(Key::A);
+    assert!(ed.take_write().is_none(), "the first press must not write");
     ed.input(Key::A);
     match ed.take_write() {
         Some(mhnx_core::hbedit::Write::File { path, .. }) => {
@@ -2514,8 +2526,9 @@ fn the_console_equipment_screen_lists_real_names() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     assert_eq!(ed.screen, Screen::Slots, "open_save lands on the slot list");
-    ed.input(Key::Minus);
-    assert_eq!(ed.screen, Screen::Equip);
+    // The equipment box is a section, not a key on the slot list: [-] is the
+    // delete key and nothing else (the review's twelfth finding).
+    ed.screen = Screen::Equip;
     let all = ed.equipment();
     assert!(all.len() > 300, "expected a used box, got {}", all.len());
     // Every row must carry a real name, not the "-" fallback.
@@ -2547,7 +2560,7 @@ fn the_console_equipment_filter_narrows_and_clears() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Minus);
+    ed.screen = Screen::Equip;
     let all = ed.equipment().len();
     ed.input(Key::Y);
     let (idx, _) = ed.take_text_request().expect("a filter request");
@@ -3368,7 +3381,8 @@ fn the_console_shows_the_hunt_records() {
     open_save(&mut ed);
     ed.input(Key::A); // character
     assert_eq!(ed.screen, Screen::Char);
-    ed.input(Key::Minus);
+    // The hunt record is the オトモ・記録 section: [-] is the delete key.
+    ed.screen = Screen::Hunts;
     assert_eq!(ed.screen, Screen::Hunts);
     let rows = ed.hunt_rows();
     assert!(rows.len() > 100, "expected the recorded monsters, got {}", rows.len());
@@ -3400,8 +3414,7 @@ fn the_console_shows_the_guild_card_and_arena() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Minus); // equipment
-    assert_eq!(ed.screen, Screen::Equip);
+    ed.screen = Screen::Equip; // the box is a section, not a key
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::Guild);
     let lines: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
@@ -3432,7 +3445,7 @@ fn the_arena_view_finds_the_times_the_real_save_holds() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Minus);
+    ed.screen = Screen::Equip; // the box is a section, not a key
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::Guild);
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_ARENA);
@@ -3504,7 +3517,7 @@ fn the_console_lists_the_palicos() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Minus); // equipment
+    ed.screen = Screen::Equip; // the box is a section, not a key
     ed.input(Key::R);
     assert_eq!(ed.screen, Screen::Roster);
     let list = ed.palicos();
@@ -4012,7 +4025,7 @@ fn audit_every_screen_is_reachable_by_keys() {
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Slots);
 
-    press!(Key::Minus);
+    ed.screen = Screen::Equip; // the box is a section, not a key
     assert_eq!(ed.screen, Screen::Equip);
     // A opens the equipment form, and Y on a decoration row opens the
     // decoration picker; both are reachable without writing anything.
@@ -4048,9 +4061,10 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Equip);
     press!(Key::L);
     assert_eq!(ed.screen, Screen::Guild);
-    // [-] on the card is the progress screen: one slot's awards, request
-    // flags and quest bits, with its three views on the sub-tab bar.
-    press!(Key::Minus);
+    // [ZR] on the card is the progress screen: one slot's awards, request
+    // flags and quest bits, with its three views on the sub-tab bar. It used
+    // to be [-], which is the delete key and nothing else now.
+    press!(Key::Z);
     assert_eq!(ed.screen, Screen::Progress);
     // L / R walk the three views without leaving the screen.
     press!(Key::R);
@@ -4063,7 +4077,10 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Guild);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Slots);
-    press!(Key::Minus, Key::R);
+    // The roster hangs off the equipment box's [R]; the box is a section now,
+    // because [-] is the delete key and nothing else.
+    ed.screen = Screen::Equip;
+    press!(Key::R);
     assert_eq!(ed.screen, Screen::Roster);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Slots);
@@ -4185,7 +4202,11 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Review);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Char, "B must come back to the record screen");
-    press!(Key::Minus);
+    // The hunt record is the オトモ・記録 section now: [-] is the delete key.
+    // The section bar is the console's (ZL / ZR and the tappable bar), so the
+    // core test names the screen the section lands on.
+    ed.screen = Screen::Hunts;
+    audit_note(&ed, &mut seen);
     assert_eq!(ed.screen, Screen::Hunts);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::Slots);
@@ -4602,7 +4623,7 @@ fn audit_the_guild_card_can_be_edited() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Minus);
+    ed.screen = Screen::Equip; // the box is a section, not a key
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::Guild);
     let joined = ed
@@ -4636,7 +4657,7 @@ fn audit_the_palico_roster_can_be_edited() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Minus);
+    ed.screen = Screen::Equip; // the box is a section, not a key
     ed.input(Key::R);
     assert_eq!(ed.screen, Screen::Roster);
     assert!(!ed.palicos().is_empty());
@@ -4661,7 +4682,7 @@ fn audit_the_hunt_records_can_be_edited() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::A);
-    ed.input(Key::Minus);
+    ed.screen = Screen::Hunts; // the record section, not a key
     assert_eq!(ed.screen, Screen::Hunts);
     assert!(ed.hunt_rows().len() > 100);
     assert!(ed.hunt_rows().iter().any(|(_, slay, _, _, _)| *slay > 0));
@@ -4771,7 +4792,7 @@ fn gap_the_equipment_box_is_display_only() {
     audit_assert_read_only(
         "Equip",
         |ed| {
-            ed.input(Key::Minus);
+            ed.screen = Screen::Equip; // the box is a section, not a key
             assert_eq!(ed.screen, Screen::Equip);
         },
         &[Key::A, Key::Left, Key::Right, Key::Up, Key::Down],
@@ -4876,7 +4897,7 @@ fn gap_the_slots_screen_calls_the_download_palico_list_the_roster() {
     );
     // The real roster is two screens away and the slot screen never says so.
     ed.input(Key::B);
-    ed.input(Key::Minus);
+    ed.screen = Screen::Equip; // the box is a section, not a key
     ed.input(Key::R);
     assert_eq!(ed.screen, Screen::Roster);
 }
@@ -5012,7 +5033,7 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     ed.open_arc_bytes(&arc.to_string_lossy(), &bytes);
     assert_eq!(ed.screen, Screen::ArcEntries);
     assert_eq!(ed.take_request(), None);
-    ed.input(Key::Minus);
+    ed.input(Key::Z);
     match ed.take_request() {
         Some(Request::ExtractQuests { ids }) => assert_eq!(ids.len(), 1),
         other => panic!("expected one quest, got {:?}", other),

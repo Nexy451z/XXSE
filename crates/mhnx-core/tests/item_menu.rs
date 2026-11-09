@@ -61,8 +61,11 @@ fn open_items(ed: &mut Editor) {
 }
 
 fn open_menu(ed: &mut Editor) {
-    ed.input(Key::Minus);
-    assert!(ed.item_menu_open, "Minus must open the operation menu");
+    // The menu is the sub-bar's pill now: [-] is the delete key and nothing
+    // else (the review's twelfth finding), and this screen has nothing to
+    // delete.
+    ed.open_item_menu();
+    assert!(ed.item_menu_open, "the pill must open the operation menu");
 }
 
 fn box_of(ed: &Editor) -> Vec<ItemSlot> {
@@ -374,8 +377,11 @@ fn the_minus_key_and_the_back_button_belong_to_the_menu() {
     open(&mut ed, &copy);
     open_items(&mut ed);
 
-    // Minus is the menu's, and the folder rescan never fires on this screen.
+    // [-] is nobody's here: it is the delete key and this screen has nothing
+    // to delete, and the folder rescan never fires on it either.
     assert!(!ed.minus_rescans(), "the item screen must not rescan on Minus");
+    ed.input(Key::Minus);
+    assert!(!ed.item_menu_open, "[-] must not open the menu");
 
     open_menu(&mut ed);
     let cursor = ed.item_menu_cursor;

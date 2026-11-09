@@ -313,11 +313,21 @@ fn the_picker_moves_one_row_ten_rows_and_answers_y_and_x() {
     assert_eq!(ed.equip_pick_search_line(137), "検索: 大剣（137件）");
     // The footer names the keys the list answers, including the type filter.
     let footer = ed.footer_hint();
-    assert!(footer.contains("10件"), "{}", footer);
+    assert!(footer.contains("10"), "{}", footer);
     assert!(footer.contains("種別"), "{}", footer);
     // One word for the action everywhere: 検索 (it used to say 名前で絞る here
     // and 名前で検索 on the equipment form, for the same key and the same box).
-    assert!(footer.contains("名前で検索"), "{}", footer);
+    assert!(footer.contains("[Y] 検索"), "{}", footer);
+    // The type filter is [ZR]: [-] is the delete key and a picker has nothing
+    // to delete (the review's twelfth finding).
+    assert!(footer.contains("[ZR] 種別"), "{}", footer);
+    assert!(!footer.contains("[-]"), "{}", footer);
+    // And the line still fits the strip it is drawn in.
+    assert!(
+        mhnx_core::hbedit::caption_width(&footer) <= mhnx_core::hbedit::FOOTER_HINT_ROOM,
+        "{}",
+        footer
+    );
 }
 
 #[test]

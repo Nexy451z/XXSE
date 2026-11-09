@@ -116,7 +116,7 @@ fn the_skill_picker_uses_the_same_ten_rows() {
 #[test]
 fn the_bulk_add_keeps_the_big_step_on_the_same_key_pair() {
     let mut ed = editor_on_the_item_box();
-    ed.input(Key::Minus);
+    ed.open_item_menu();
     assert!(ed.item_menu_open);
     ed.item_menu_cursor = ITEM_OP_ADD;
     ed.item_armed = None;

@@ -1762,7 +1762,23 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                 .unwrap_or("クエスト文章");
             (label, 512)
         };
-        let spec = mhnx_core::hbedit::NameSpec::singleline(max_bytes);
+        // The 基本 tab's three text rows are .gmd strings, and a .gmd string is
+        // a paragraph: the game draws its U+000A as a line break, and the
+        // console used to edit one with the *system* keyboard, which is single
+        // line - so opening a two-line 依頼内容 and pressing 決定 wrote it back
+        // as one line and the break was gone. The field is multiline, so it
+        // takes the same built-in keyboard a name does (hbedit::keyboard_route
+        // sends every multiline field there, and that keyboard has [ZR] 改行).
+        // Every other request in this list really is one line.
+        // The .gmd rows are the only requests whose id is a plain index: every
+        // other request in this dispatch is a sentinel near usize::MAX
+        // (hbedit::TEXT_*), and the six names were answered above.
+        let is_quest_text = idx < mhnx_core::quest::Gmd::LABELS.len();
+        let spec = if is_quest_text {
+            mhnx_core::hbedit::NameSpec::name(max_bytes, mhnx_core::save::NameUnit::Bytes)
+        } else {
+            mhnx_core::hbedit::NameSpec::singleline(max_bytes)
+        };
         // Which keyboard to use, decided by one function so the screen, this
         // dispatch and the host tests cannot each have their own answer
         // (hbedit::keyboard_route):
@@ -2089,12 +2105,26 @@ pub fn run() -> i32 {
                     ed.clear_quit_arm();
                 }
 
-                // ZL / ZR intuitively moves up / down through the left sidebar tabs!
+                // ZL walks the sidebar back; ZR is the sidebar's forward key
+                // only on the screens that have no second action of their own.
+                //
+                // ZR used to be the section key everywhere and the key was then
+                // dropped before the state machine saw it, so every screen that
+                // answered `Key::Z` - the progress screen's search, the item
+                // set name, the palico skill panel - was answering a key nobody
+                // could press. hbedit::Editor::zr_job is the one answer to
+                // "whose key is this", and it is the same answer the footer's
+                // guide is written from.
                 if down & BTN_ZL != 0 {
                     painter.gui.cycle_sidebar_tab(&mut ed, false);
                     need_draw = true;
                 } else if down & BTN_ZR != 0 {
-                    painter.gui.cycle_sidebar_tab(&mut ed, true);
+                    if ed.zr_job() == mhnx_core::hbedit::ZrJob::Screen {
+                        painter.gui.stop_fling();
+                        painter.gui.handle_pad_key(&mut ed, Key::Z, cur);
+                    } else {
+                        painter.gui.cycle_sidebar_tab(&mut ed, true);
+                    }
                     need_draw = true;
                 }
 

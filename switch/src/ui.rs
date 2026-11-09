@@ -222,13 +222,18 @@ const SUB_TAB_Y: i32 = TOP_SEC_H;
 const SUB_TAB_H: i32 = 44;
 /// The one-line guide strip under the sub-tab bar (Editor::screen_guide).
 ///
-/// 22px, and CONTENT_Y takes the whole of it rather than adding a gap: that is
-/// what keeps the nine-row list layout every screen is drawn around. The glyphs
-/// of a 17px line are shorter than the line box, so the strip reads as padded
-/// rather than cramped.
+/// 28px, holding the 22px row font: the strip was 22px of 17px text, so the one
+/// sentence a first-time player reads was the smallest type on the screen -
+/// smaller than the row values it explains. The review asked for the row size
+/// and this is it.
+///
+/// The cost is the six pixels CONTENT_Y moves down, which is the row every list
+/// loses (nine rows to eight). It is a real cost and it is the reason the 22px
+/// upgrade was deferred once before; it is taken now because a guide nobody can
+/// read is not a guide.
 const GUIDE_Y: i32 = SUB_TAB_Y + SUB_TAB_H; // 92
-const GUIDE_H: i32 = 22;
-const CONTENT_Y: i32 = GUIDE_Y + GUIDE_H; // 114
+const GUIDE_H: i32 = 28;
+const CONTENT_Y: i32 = GUIDE_Y + GUIDE_H; // 120
 const FOOTER_Y: i32 = 668;
 const FOOTER_H: i32 = 52;
 const CONTENT_H: i32 = FOOTER_Y - CONTENT_Y - 8; // 546
@@ -377,6 +382,17 @@ pub enum UiAction {
     /// underneath it.
     ModalBlank,
     SelectSlot(usize),
+    /// One slot card's "このキャラを編集" button: the slot is the card's own.
+    ///
+    /// It used to send a bare `Key::A`, and the pad's [A] opens `ed.slot` - so
+    /// the button on card 2 opened card 1's character. The slot travels with the
+    /// action now, and an empty slot pushes no button at all.
+    OpenSlot(usize),
+    /// ポーチへ on the item set form: copy the set into the pouch.
+    ///
+    /// It was [-]'s job, and [-] is the delete key now. The form's [ZR] is
+    /// already the set-name keyboard, so the copy is a pill.
+    ItemSetToPouch,
     /// The slot badge in the header: one tap switches the hunter who is being
     /// edited, so it asks first. A card on the スロット screen selects a slot
     /// and changes nothing, so that one is still [UiAction::SelectSlot].
@@ -2132,11 +2148,10 @@ impl GuiState {
                     let next = (ed.slot + 1) % 3;
                     self.apply_action(ed, UiAction::SelectSlot(next));
                 }
-                Key::A => {
-                    ed.screen = Screen::Char;
-                    ed.field = 0;
-                    ed.cursor = 0;
-                }
+                // The same call the card's button makes, so a blank slot
+                // answers with the sentence instead of an empty character
+                // screen.
+                Key::A => self.apply_action(ed, UiAction::OpenSlot(ed.slot)),
                 Key::Y => self.apply_action(ed, UiAction::CharMaxAll),
                 Key::B => {
                     ed.screen = Screen::SaveList;
@@ -2322,7 +2337,7 @@ impl GuiState {
             // one for its parts, the item one for its thirty-two entries.
             Screen::Sets if ed.set_editor_open() => match key {
                 Key::Up | Key::Down | Key::Left | Key::Right | Key::A | Key::Y | Key::Minus
-                | Key::B => ed.input(key),
+                | Key::Z | Key::B => ed.input(key),
                 _ => {},
             },
             Screen::Sets => match key {
@@ -2363,7 +2378,7 @@ impl GuiState {
             // an apply replaces a box), Y writes both boxes out and Minus reads
             // the folder again.
             Screen::Csv => match key {
-                Key::Up | Key::Down | Key::A | Key::Y | Key::Minus | Key::B => {
+                Key::Up | Key::Down | Key::A | Key::Y | Key::Z | Key::B => {
                     ed.input(key);
                 }
                 _ => {}
@@ -2430,7 +2445,9 @@ impl GuiState {
                 // Through the action, so the pad and the deck's button run the
                 // same two-press install (hbedit::Editor::arc_install_press).
                 Key::Y => self.apply_action(ed, UiAction::InstallArcRow(ed.cursor)),
-                Key::Minus => {
+                // [ZR] writes the bundled quests out. It used to be [-],
+                // which is the delete key.
+                Key::Z => {
                     self.wants_extract_official_arcs = true;
                 }
                 Key::B => {
@@ -2491,7 +2508,9 @@ impl GuiState {
                     // has to come back here, not to the .rem file screen.
                     self.quest_pick_return = ed.screen == Screen::ItemPick;
                 }
-                Key::Z => self.open_quest_detail(ed),
+                // [ZR] is the tab's own value switch now (the state
+                // machine's), so the file screens keep their two other doors:
+                // the [ファイル] pill on the bar and [R 長押し].
                 other => ed.input(other),
             },
             Screen::Mib => {
@@ -2504,7 +2523,9 @@ impl GuiState {
                         let idx = ed.mib_cursor;
                         self.open_mib_row_picker(ed, idx);
                     }
-                    Key::Minus if is_mob => {
+                    // [ZR] walks the eight values of a monster slot. It used
+                    // to be [-], which is the delete key.
+                    Key::Z if is_mob => {
                         self.mib_mob_sub = (self.mib_mob_sub + 1) % 8;
                         ed.message = format!(
                             "モンスター編集項目を [{}] に切り替えました ([◀/▶]で増減)",
@@ -2852,6 +2873,17 @@ impl GuiState {
                     self.osk_result = None;
                 }
             }
+            // A slot card's button: the slot is the card's, and an empty one
+            // says so instead of opening a screen of zeroes.
+            UiAction::OpenSlot(s) => {
+                if ed.open_slot(s) {
+                    self.mib_picker = None;
+                    self.quest_area_slot = None;
+                    self.osk = None;
+                    self.osk_result = None;
+                }
+            }
+            UiAction::ItemSetToPouch => ed.item_set_to_pouch(),
             UiAction::GotoSection(sec) => self.goto_section(ed, sec),
             UiAction::SelectSubTab(idx) => self.select_sub_tab(ed, idx),
             UiAction::CycleSection(fwd) => self.cycle_sidebar_tab(ed, fwd),
@@ -4115,17 +4147,17 @@ impl GuiState {
                 .trim_end_matches(']');
             let note = format!("[R長押し] {}", word);
             let nw = c.text_width_sized(&note, FontSize::Small);
-            c.text_right(right, GUIDE_Y + 2, &note, t.text_muted, FontSize::Small);
+            c.text_right(right, GUIDE_Y + 5, &note, t.text_muted, FontSize::Small);
             right -= nw + 16;
         }
         let room = (right - (MAIN_X + 4)).max(120);
         c.text_clipped(
             MAIN_X + 4,
-            GUIDE_Y + 2,
+            GUIDE_Y + 3,
             room,
             ed.screen_guide(),
             t.text_secondary,
-            FontSize::Small,
+            FontSize::Medium,
         );
     }
 
@@ -4343,11 +4375,15 @@ impl GuiState {
                 // instead of promising a single *99 that is only one row.
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
+                // No key name on the pill: [-] is the delete key now and the
+                // menu is opened from here (or by the deck's own row), so the
+                // button says the word and the guide says nothing it cannot
+                // keep.
                 if ed.item_menu_open {
-                    btn_text(c, 1108, sy, 158, sh, "[-] 閉じる", t.text_primary, FontSize::Small);
-                    self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Minus));
+                    btn_text(c, 1108, sy, 158, sh, "[B] 閉じる", t.text_primary, FontSize::Small);
+                    self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::B));
                 } else {
-                    btn_text(c, 1108, sy, 158, sh, "[-] 一括操作", t.text_primary, FontSize::Small);
+                    btn_text(c, 1108, sy, 158, sh, "一括操作", t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::OpenItemMenu);
                 }
             }
@@ -4355,20 +4391,20 @@ impl GuiState {
             // button on the right that leads to the file-by-file screens.
             Screen::QuestEdit => {
                 let chip = if ed.quest_edit_tab == QUEST_TAB_MONSTERS {
-                    format!("[-] {}", ed.quest_field_label())
+                    format!("[ZR] {}", ed.quest_field_label())
                 } else if ed.quest_edit_tab == QUEST_TAB_REWARDS {
                     if ed.quest_edit_chance {
-                        String::from("[-] 確率%")
+                        String::from("[ZR] 確率%")
                     } else {
-                        String::from("[-] 個数")
+                        String::from("[ZR] 個数")
                     }
                 } else {
-                    String::from("[-] 項目")
+                    String::from("[ZR] 項目")
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &chip, t.text_primary, FontSize::Small);
-                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
                 // The second pill used to be a third entry point to the file
                 // screens ("[詳細] ファイル単位") beside the [ファイル] pill on
                 // the tab bar and the row the list ends with. One screen with
@@ -4381,7 +4417,7 @@ impl GuiState {
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 // One word for the action on every screen: 検索. The pill
                 // says what it searches rather than a second verb.
-                btn_text(c, 964, sy, 136, sh, "[検索] 護石", t.text_primary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, "[Y] 検索", t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::FilterCharms);
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
@@ -4423,8 +4459,8 @@ impl GuiState {
             Screen::Roster => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[-] 装備", t.accent_secondary, FontSize::Small);
-                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
+                btn_text(c, 964, sy, 136, sh, "[ZR] 装備", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
@@ -4434,8 +4470,8 @@ impl GuiState {
             Screen::Palico => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[-] 装備", t.accent_secondary, FontSize::Small);
-                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
+                btn_text(c, 964, sy, 136, sh, "[ZR] 装備", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
@@ -4547,9 +4583,9 @@ impl GuiState {
             // finger.
             Screen::Progress => {
                 let label = if ed.progress_filter.trim().is_empty() {
-                    String::from("[検索] 名前")
+                    String::from("[ZR] 検索")
                 } else {
-                    format!("[検索] {}", ed.progress_filter.trim())
+                    format!("[ZR] {}", ed.progress_filter.trim())
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -4595,8 +4631,8 @@ impl GuiState {
 
                     c.round_rect(1082, sy, 96, sh, 5, t.bg_btn);
                     c.round_rect_border(1082, sy, 96, sh, 5, 1, t.border_subtle);
-                    btn_text(c, 1082, sy, 96, sh, "[-] 種別", t.text_secondary, FontSize::Small);
-                    self.add_hit(1082, sy, 96, sh, UiAction::Key(Key::Minus));
+                    btn_text(c, 1082, sy, 96, sh, "[ZR] 種別", t.text_secondary, FontSize::Small);
+                    self.add_hit(1082, sy, 96, sh, UiAction::Key(Key::Z));
 
                     c.round_rect(1184, sy, 82, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1184, sy, 82, sh, 5, 1, t.accent_primary);
@@ -4626,8 +4662,8 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[-] 再読込", t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Minus));
+                btn_text(c, 1108, sy, 158, sh, "[ZR] 再読込", t.text_primary, FontSize::Small);
+                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Z));
             }
             // セーブ内クエスト / 公式 / 没: [Y] is the search box.
             Screen::SaveQuests => {
@@ -4763,14 +4799,17 @@ impl GuiState {
         } else {
             &ed.message
         };
-        // Touch has one rule that is invisible until it bites: the first tap
-        // only selects a row, the second one runs it. It is printed here rather
-        // than in a help screen nobody opens. The right stick rides along on
-        // this line because the list header could drop it: the header only
-        // draws the note while it fits beside the counter and the filter chip,
-        // so a long heading was enough to hide the only words about the stick.
+        // Touch has one rule that is invisible until it bites, and it is not
+        // the one this line used to state. A button - every pill, every deck
+        // control, the footer's undo and 終了 - runs on one tap; only a *row*
+        // works the way the old sentence described, and only while it is not
+        // the selected one - so the old sentence was wrong about most of the
+        // screen. The right stick rides along because the list header
+        // could drop it: the header only draws its note while it fits beside
+        // the counter and the filter chip, so a long heading was enough to hide
+        // the only words about the stick.
         let tap_note =
-            "[タップ] 1回=選択・2回=決定  [ドラッグ] スクロール  [Rスティック] ▲▼=1頁 ◀▶=端";
+            "[タップ] ボタン=即実行 / 行=選択→再タップ  [Rスティック] ▲▼=1頁 ◀▶=端";
         let tap_w = c.text_width_sized(tap_note, FontSize::Small);
         c.text_right(1262, FOOTER_Y + 30, tap_note, t.text_muted, FontSize::Small);
         let max_msg_w = (1262 - tap_w - 60).max(160);
@@ -4837,9 +4876,15 @@ impl GuiState {
         // (an empty spacer row is 10px), the body starts at my + 64 and the
         // footer rule sits at foot_y - 12, so the last row drawn here ends at
         // most 7px above the rule and the two can never overlap.
-        const ROW: i32 = 23;
-        const SPACER: i32 = 10;
-        const GLYPH: i32 = 17;
+        // The body is the 22px row font now, not the 17px caption one: this
+        // dialog exists to be read before a write, and it was the smallest type
+        // on the screen. The row pitch follows the glyph (22 + 6), so a line
+        // still has air around it; the window shows four fewer lines than it
+        // did (16 instead of 20) and the body scrolls, which is what the
+        // scrollbar and the ほか N 行 line are for.
+        const ROW: i32 = 28;
+        const SPACER: i32 = 12;
+        const GLYPH: i32 = 22;
         let foot_y = my + mh - 56;
         let body_top = my + 64;
         let body_bottom = foot_y - 20;
@@ -4867,7 +4912,7 @@ impl GuiState {
             } else {
                 t.text_primary
             };
-            c.text_clipped(mx + 30, y, mw - 60, line, color, FontSize::Small);
+            c.text_clipped(mx + 30, y, mw - 60, line, color, FontSize::Medium);
             y += ROW;
             last = i + 1;
         }
@@ -5654,10 +5699,20 @@ impl GuiState {
             has_stepper,
             primary_a_label,
             &[],
+            &[],
         );
     }
 
-    /// Same list/inspector layout, plus 1〜2 amber warning lines under the list.
+    /// Same list/inspector layout, plus a strip of at most two lines under the
+    /// list: the real warnings first, in the warning colour, then one line of
+    /// explanation in the ordinary ink.
+    ///
+    /// The strip used to be one colour for both, so the equipment box's
+    /// permanent operating note ("[-] 2回で削除 / [＋] 新規…") was drawn in
+    /// amber exactly where a real warning goes - and it took both lines, so a
+    /// record that did not fit its own type had nowhere to be said. The note is
+    /// still drawn; it is grey now, it is one line, and a warning always gets
+    /// the strip first.
     #[allow(clippy::too_many_arguments)]
     fn draw_adaptive_rows_warn(
         &mut self,
@@ -5669,6 +5724,7 @@ impl GuiState {
         active_row_idx: usize,
         has_stepper: bool,
         primary_a_label: &str,
+        notice: &[String],
         warnings: &[String],
     ) {
         let t = theme();
@@ -5680,13 +5736,16 @@ impl GuiState {
         let body_y = CONTENT_Y + 30; // 132
         let body_h = FOOTER_Y - body_y - 10; // 526
 
-        // A warning strip needs one or two lines under the list, so the list
-        // gives up a row rather than drawing text over the last entry.
+        // The strip needs one or two lines under the list, so the list gives up
+        // a row rather than drawing text over the last entry. Warnings are
+        // counted first and the explanation only gets what is left of the two
+        // lines.
         let warn_lh = c.line_height_sized(FontSize::Small).max(16);
-        let warn_reserve = if warnings.is_empty() {
+        let strip_lines = (warnings.len().min(2) + notice.len().min(1)).min(2) as i32;
+        let warn_reserve = if strip_lines == 0 {
             0
         } else {
-            warnings.len().min(2) as i32 * warn_lh + 16
+            strip_lines * warn_lh + 16
         };
         let row_h = LIST_ROW_H;
         // The scrollbar's own geometry decides where a row's text and its tap
@@ -5699,7 +5758,7 @@ impl GuiState {
         let row_hit_w = track.row_right - (MAIN_X + 8);
         let rows_that_fit = ((body_h - 10 - warn_reserve).max(row_h)) / row_h;
         let vis = (rows_that_fit.max(1) as usize).min(9);
-        let vis = if warnings.is_empty() { vis } else { vis.min(8) };
+        let vis = if strip_lines == 0 { vis } else { vis.min(8) };
         let cur_pos = rows
             .iter()
             .position(|r| r.0 == active_row_idx)
@@ -5900,14 +5959,26 @@ impl GuiState {
             false,
         );
 
-        // Amber warning strip, pinned to the bottom of the list panel.
-        if !warnings.is_empty() {
-            let mut lines: Vec<String> = Vec::new();
-            lines.push(warnings[0].clone());
-            if warnings.len() == 2 {
-                lines.push(warnings[1].clone());
-            } else if warnings.len() > 2 {
-                lines.push(format!("ほか {} 件 — 上の行を直してください", warnings.len() - 1));
+        // The strip, pinned to the bottom of the list panel: warnings first, in
+        // the warning colour, then the one line of explanation in grey.
+        if strip_lines > 0 {
+            let mut lines: Vec<(String, bool)> = Vec::new();
+            if warnings.is_empty() {
+                if let Some(n) = notice.first() {
+                    lines.push((n.clone(), false));
+                }
+            } else {
+                lines.push((warnings[0].clone(), true));
+                if warnings.len() > 1 {
+                    let second = if warnings.len() == 2 {
+                        warnings[1].clone()
+                    } else {
+                        format!("ほか {} 件 — 上の行を直してください", warnings.len() - 1)
+                    };
+                    lines.push((second, true));
+                } else if let Some(n) = notice.first() {
+                    lines.push((n.clone(), false));
+                }
             }
             let drawn = total.min(vis);
             let rows_bottom = body_y + 10 + drawn as i32 * row_h;
@@ -5924,13 +5995,13 @@ impl GuiState {
             if top - 8 > rows_bottom + 2 {
                 c.hline(MAIN_X + 16, top - 8, V1_LIST_W - 32, t.border_subtle);
             }
-            for (i, line) in lines.iter().enumerate() {
+            for (i, (line, is_warning)) in lines.iter().enumerate() {
                 c.text_clipped(
                     MAIN_X + 20,
                     top + i as i32 * warn_lh,
                     V1_LIST_W - 40,
                     line,
-                    t.accent_warn,
+                    if *is_warning { t.accent_warn } else { t.text_secondary },
                     FontSize::Small,
                 );
             }
@@ -6418,8 +6489,8 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[-] メニューを閉じる",
-                        UiAction::Key(Key::Minus),
+                        "[B] メニューを閉じる",
+                        UiAction::Key(Key::B),
                     );
                 } else {
                     c.text_sized(ix + 20, cur_y, "一括操作", t.text_muted, FontSize::Small);
@@ -6443,7 +6514,7 @@ impl GuiState {
                         row_y(0),
                         full_w,
                         row_h(0),
-                        "[-] 一括操作メニュー",
+                        "一括操作メニュー",
                         UiAction::OpenItemMenu,
                     );
                     self.draw_tool_button(
@@ -6487,9 +6558,9 @@ impl GuiState {
                     // picker, [R] the count, [X] the save, [-] the menu and [L]
                     // the undo - so this pill is its route.
                     let search_lbl = if ed.item_box_filter.trim().is_empty() {
-                        "[検索] 名前"
+                        "[ZR] 検索"
                     } else {
-                        "[検索] 検索中"
+                        "[ZR] 検索中"
                     };
                     self.draw_tool_button(
                         c,
@@ -6583,7 +6654,7 @@ impl GuiState {
                     // The type filter: [-] walks every type of the scope and
                     // then the scope's first one, which is the only way to see
                     // the other half of a 6,435 row table.
-                    let kind_lbl = format!("[-] 種別: {}", ed.equip_pick_kind_label());
+                    let kind_lbl = format!("[ZR] 種別: {}", ed.equip_pick_kind_label());
                     self.draw_tool_button(
                         c,
                         ix + 20,
@@ -6717,7 +6788,7 @@ impl GuiState {
                     let to_lbl = if ed.item_set_armed == Some(ItemSetOp::ToPouch) {
                         "もう一度タップで適用する"
                     } else {
-                        "[-] ポーチへ適用（2回）"
+                        "ポーチへ適用（2回）"
                     };
                     self.draw_tool_button(
                         c,
@@ -6726,7 +6797,7 @@ impl GuiState {
                         full_w,
                         38,
                         to_lbl,
-                        UiAction::Key(Key::Minus),
+                        UiAction::ItemSetToPouch,
                     );
                     cur_y += 44;
                     self.draw_tool_button(
@@ -6934,7 +7005,7 @@ impl GuiState {
                     c.text_sized(
                         ix + 20,
                         cur_y,
-                        "モンスター個別パラメータ ([-] またはタッチで選択)",
+                        "モンスター個別パラメータ ([ZR] またはタッチで選択)",
                         t.text_muted,
                         FontSize::Small,
                     );
@@ -7034,8 +7105,8 @@ impl GuiState {
                         cur_y,
                         full_w,
                         34,
-                        &format!("[-] 編集する項目: {}", field),
-                        UiAction::Key(Key::Minus),
+                        &format!("[ZR] 編集する項目: {}", field),
+                        UiAction::Key(Key::Z),
                     );
                     cur_y += 38;
                     self.draw_tool_button(
@@ -7176,8 +7247,8 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[-] フォルダを読み直す",
-                    UiAction::Key(Key::Minus),
+                    "[ZR] フォルダを読み直す",
+                    UiAction::Key(Key::Z),
                 );
                 cur_y += 44;
                 self.draw_tool_button(
@@ -7352,32 +7423,54 @@ impl GuiState {
             }
 
             let btn_y = y + card_h - 62;
-            let btn_bg = if is_sel { t.accent_primary } else { t.bg_btn };
-            let btn_fg = if is_sel {
-                white_or_dark(t.accent_primary)
+            let has_char = ed.slot_has_character(s);
+            // A blank slot draws no button. It used to draw the same one as the
+            // other two and send a bare [A], which opened `ed.slot` - the
+            // highlighted card, not this one - so the button on card 2 opened
+            // card 1's character, and on an empty card it opened a character
+            // screen whose every writer refuses.
+            if has_char {
+                let btn_bg = if is_sel { t.accent_primary } else { t.bg_btn };
+                let btn_fg = if is_sel {
+                    white_or_dark(t.accent_primary)
+                } else {
+                    t.text_secondary
+                };
+                c.round_rect(x + 20, btn_y, card_w - 40, 42, 6, btn_bg);
+                btn_text(
+                    c,
+                    x + 20,
+                    btn_y,
+                    card_w - 40,
+                    42,
+                    "[A] このキャラを編集",
+                    btn_fg,
+                    FontSize::Medium,
+                );
             } else {
-                t.text_secondary
-            };
-            c.round_rect(x + 20, btn_y, card_w - 40, 42, 6, btn_bg);
-            btn_text(
-                c,
-                x + 20,
-                btn_y,
-                card_w - 40,
-                42,
-                "[A] このキャラを編集",
-                btn_fg,
-                FontSize::Medium,
-            );
+                // The shape of a button with nothing behind it: the card still
+                // selects, and the label says why there is nothing to open.
+                c.round_rect(x + 20, btn_y, card_w - 40, 42, 6, t.bg_val_box);
+                c.round_rect_border(x + 20, btn_y, card_w - 40, 42, 6, 1, t.border_subtle);
+                btn_text(
+                    c,
+                    x + 20,
+                    btn_y,
+                    card_w - 40,
+                    42,
+                    "この枠にキャラがいません",
+                    t.text_muted,
+                    FontSize::Small,
+                );
+            }
 
-            // The whole card selects the slot; the button opens the character.
-            // It had no target of its own, so a press on the one control that
-            // is drawn as a button only moved the highlight under it: the card
-            // and the button answered the same tap with two different promises,
-            // and the drawn one was the false one. Pushed after the card, so
-            // `hits` (searched newest first) finds this one first.
+            // The whole card selects the slot; the button opens *this* card's
+            // character. Pushed after the card, so `hits` (searched newest
+            // first) finds the button first.
             self.add_hit(x, y, card_w, card_h, UiAction::SelectSlot(s));
-            self.add_hit(x + 20, btn_y, card_w - 40, 42, UiAction::Key(Key::A));
+            if has_char {
+                self.add_hit(x + 20, btn_y, card_w - 40, 42, UiAction::OpenSlot(s));
+            }
         }
     }
 
@@ -7891,6 +7984,7 @@ impl GuiState {
             ce.field.min(CHARM_EDIT_ROWS - 1),
             true,
             ce.a_label(),
+            &[],
             &warnings,
         );
     }
@@ -7912,16 +8006,21 @@ impl GuiState {
                 tname.to_string(),
             ));
         }
-        // The amber strip is where a pending operation explains itself: the key
-        // guide cannot say which record is armed, and both a delete and a type
-        // change fire on one press unless the screen says they are waiting.
+        // The strip under the list carries two different things and they are
+        // drawn in two different colours now: a pending operation (amber - the
+        // key guide cannot say which record is armed, and both a delete and a
+        // type change fire on one press unless the screen says they are
+        // waiting) and the one line that explains the keys (grey). The
+        // explanation used to be amber too and it took both lines, so a record
+        // that does not fit its own type had nowhere to be said.
         let mut notice: Vec<String> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
         if let Some((index, refs, _)) = ed.equip_delete_pending() {
-            notice.push(format!(
+            warnings.push(format!(
                 "削除の確認中: 枠 #{:04} / 参照 {} 件",
                 index, refs
             ));
-            notice.push(if refs == 0 {
+            warnings.push(if refs == 0 {
                 String::from("もう一度 [-] で削除確定 / [B] で取りやめ")
             } else {
                 String::from("もう一度 [-] で強制削除 / 参照は下のメッセージ")
@@ -7929,11 +8028,11 @@ impl GuiState {
         } else if let Some((_, _, text)) = ed.equip_kind_pending() {
             // The second [A] writes; anything else (a cursor move, [B]) drops
             // it, so the line has to say what the press is waiting for.
-            notice.push(text);
-            notice.push(String::from("前の種別のデータは消しません（警告のみ）"));
+            warnings.push(text);
+            warnings.push(String::from("前の種別のデータは消しません（警告のみ）"));
         } else {
             notice.push(String::from(
-                "[-] 2回で削除 / [＋] 新規追加 / [A] 編集・種別やIDを変えると差し替え",
+                "[-] 2回で削除 / [＋] 新規 / [A] 編集（種別・ID を変えると差し替え）",
             ));
         }
         // The record under the cursor: what does not fit the type it carries.
@@ -7946,7 +8045,7 @@ impl GuiState {
                     .into_iter()
                     .take(2)
                 {
-                    notice.push(w);
+                    warnings.push(w);
                 }
             }
         }
@@ -7963,6 +8062,7 @@ impl GuiState {
             false,
             "編集",
             &notice,
+            &warnings,
         );
     }
 
@@ -7994,10 +8094,12 @@ impl GuiState {
                 .collect();
 
         if ee.new {
-            let notice = alloc::vec![
-                String::from("種別・ID は [A] で一覧から、レベルは [◀/▶] で決めます"),
-                String::from("最後の [A] で空き枠に作成します（[B] で中止）"),
-            ];
+            // One line, grey: it explains the keys, it is not a warning. The
+            // sentence that matters (the last [A] creates the record) is the
+            // one that stays.
+            let notice = alloc::vec![String::from(
+                "最後の [A] で空き枠に作成します（[B] で中止・種別と ID は [A] で一覧）",
+            )];
             self.draw_adaptive_rows_warn(
                 c,
                 ed,
@@ -8008,6 +8110,7 @@ impl GuiState {
                 true,
                 ee.a_label(),
                 &notice,
+                &[],
             );
             return;
         }
@@ -8018,11 +8121,14 @@ impl GuiState {
             .as_ref()
             .map(|q| q.kind != ee.kind || q.id != ee.id)
             .unwrap_or(false);
-        let notice = if identity_changed {
-            let mut v = alloc::vec![
-                String::from("種別/ID を変えて書き込むと差し替えます（装飾品3枠は外れます）"),
-            ];
-            v.push(if eq.as_ref().map(|q| q.kind != ee.kind).unwrap_or(false) {
+        // The identity rows decide whether [A] patches the record or replaces
+        // it, and that is a real warning: amber, and it gets the strip. The
+        // ordinary explanation is one grey line.
+        let (notice, warnings): (Vec<String>, Vec<String>) = if identity_changed {
+            let mut w = alloc::vec![String::from(
+                "種別/ID を変えて書き込むと差し替えます（装飾品3枠は外れます）",
+            )];
+            w.push(if eq.as_ref().map(|q| q.kind != ee.kind).unwrap_or(false) {
                 // A type change asks once more before it writes: the first [A]
                 // only says what the change costs (hbedit::Editor::
                 // equip_kind_pending).
@@ -8030,12 +8136,14 @@ impl GuiState {
             } else {
                 String::from("名前行は [A] で一覧、書き込みは「装備枠」の行の [A] です")
             });
-            v
+            (Vec::new(), w)
         } else {
-            alloc::vec![
-                String::from("[A] は行ごとの操作です（選ぶ / 値を増やす / 書き込み）"),
-                String::from("書き込みは「装備枠」の行の [A]。X でファイルに保存します"),
-            ]
+            (
+                alloc::vec![String::from(
+                    "[A] は行ごとの操作（選ぶ / 値を増やす / 書き込み）。X で保存",
+                )],
+                Vec::new(),
+            )
         };
 
         self.draw_adaptive_rows_warn(
@@ -8048,6 +8156,7 @@ impl GuiState {
             true,
             ee.a_label(),
             &notice,
+            &warnings,
         );
     }
 
@@ -8261,6 +8370,7 @@ impl GuiState {
                 "決定"
             },
             &notice,
+            &[],
         );
     }
 
@@ -8337,6 +8447,7 @@ impl GuiState {
             false,
             "決定",
             &notice,
+            &[],
         );
     }
 
@@ -8379,6 +8490,7 @@ impl GuiState {
                 "選択"
             },
             &notice,
+            &[],
         );
     }
 
@@ -8427,6 +8539,7 @@ impl GuiState {
             false,
             "装着",
             &notice,
+            &[],
         );
     }
 
@@ -8484,7 +8597,7 @@ impl GuiState {
             rows_total
         );
         let warnings = ed.palico_skill_warnings();
-        self.draw_adaptive_rows_warn(c, ed, &hdr, "", &rows, field, false, "差し替え", &warnings);
+        self.draw_adaptive_rows_warn(c, ed, &hdr, "", &rows, field, false, "差し替え", &[], &warnings);
     }
 
     fn draw_roster(&mut self, c: &mut Canvas, ed: &Editor) {
@@ -8687,6 +8800,7 @@ impl GuiState {
             // The row's own word: コメント is text ([A] opens the keyboard),
             // HR and 時間 are numbers ([A] adds one step, like ▶).
             ed.guild_a_label(),
+            &[],
             &warnings,
         );
     }
@@ -8730,6 +8844,7 @@ impl GuiState {
             ed.guild_count_selected(),
             true,
             ed.guild_a_label(),
+            &[],
             &warnings,
         );
     }
@@ -9543,6 +9658,7 @@ impl GuiState {
             ed.progress_cursor(),
             false,
             a_label,
+            &[],
             &warnings,
         );
     }
@@ -9702,7 +9818,12 @@ impl GuiState {
                     .collect();
                 rows.push(detail_row(rows.len()));
                 let cur = ed.quest_edit_cursor.min(rows.len().saturating_sub(1));
-                self.draw_adaptive_rows(c, ed, "クエスト改造", &sub, &rows, cur, false, "テキスト編集");
+                // The button's word follows the row: three of the four rows are
+                // .gmd text ([A] opens the keyboard), the fourth is the .mib
+                // 制限時間 (which steps with [◀/▶] and has no text at all), and
+                // the last row of every tab is 詳細.
+                let a_label = ed.quest_basic_a_label();
+                self.draw_adaptive_rows(c, ed, "クエスト改造", &sub, &rows, cur, false, a_label);
             }
             QUEST_TAB_MONSTERS => {
                 let monsters = ed.quest_monsters();
@@ -9803,6 +9924,7 @@ impl GuiState {
                     cur,
                     true,
                     "アイテム選択",
+                    &[],
                     &warnings,
                 );
             }
@@ -10247,6 +10369,7 @@ impl GuiState {
             ed.entry_row_cursor.min(rows.len().saturating_sub(1)),
             matches!(ext, "rem" | "sup" | "sem" | "esl" | "qdp"),
             if is_table { "アイテム" } else { "変更" },
+            &[],
             &warnings,
         );
     }

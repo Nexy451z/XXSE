@@ -392,8 +392,11 @@ fn the_csv_buttons_write_and_rescan() {
     ed.input(Key::Y);
     assert!(ed.take_csv_export(), "[Y] asks for the export");
     assert!(!ed.take_csv_export(), "and only once");
+    ed.input(Key::Z);
+    assert!(ed.take_csv_rescan(), "[ZR] asks for the folder again");
+    // [-] is the delete key and a folder list has nothing to delete.
     ed.input(Key::Minus);
-    assert!(ed.take_csv_rescan(), "[-] asks for the folder again");
+    assert!(!ed.take_csv_rescan(), "[-] is not the rescan any more");
 }
 
 /// The byte editor's four directions: the panel's four new buttons send these.

@@ -225,16 +225,18 @@ fn only_the_save_list_rescans_on_minus() {
         Screen::EntryView,
     ] {
         ed.screen = screen;
-        let want = matches!(screen, Screen::SaveList);
-        assert_eq!(
-            ed.minus_rescans(),
-            want,
-            "the rescan must fire on the save list and nowhere else: {:?}",
+        // Nowhere, on any screen: [-] is the delete key and nothing else, and
+        // the save list's refresh is [Y] 再読込 (the review's twelfth finding).
+        assert!(
+            !ed.minus_rescans(),
+            "the rescan must not fire on Minus anywhere: {:?}",
             screen
         );
     }
-    // The quest list refreshes itself: its [-] is 展開, which re-reads the
-    // quest folder as part of that one action.
+    ed.screen = Screen::SaveList;
+    assert!(!ed.minus_rescans(), "the save list refreshes on [Y]");
+    // The quest list refreshes itself: its 展開 re-reads the quest folder as
+    // part of that one action.
     ed.screen = Screen::ArcList;
     assert!(!ed.minus_rescans());
 }
@@ -249,12 +251,16 @@ fn the_item_box_footer_names_the_box_switch() {
     let mut ed = Editor::new();
     ed.screen = Screen::Items;
     let hint = ed.footer_hint();
+    // L / R still switch the BOX page; the footer spends its 763px on the
+    // keys a player cannot guess instead (the tab bar is on the glass and
+    // tappable), so what is pinned here is that the word ページ is gone and the
+    // line fits.
+    assert!(!hint.contains("ページ"), "{}", hint);
     assert!(
-        hint.contains("[L/R] BOX切替"),
-        "the item box footer must name what L/R does: {}",
+        mhnx_core::hbedit::caption_width(&hint) <= mhnx_core::hbedit::FOOTER_HINT_ROOM,
+        "{}",
         hint
     );
-    assert!(!hint.contains("ページ"), "{}", hint);
 }
 
 /// B2: the checker's [A] is the automatic fix, and there is no ◀/▶ 調整.
@@ -274,7 +280,7 @@ fn the_arc_list_footer_lists_its_own_keys() {
     let mut ed = Editor::new();
     ed.screen = Screen::ArcList;
     let hint = ed.footer_hint();
-    for chip in ["[A] 開く", "[Y] セーブへ導入", "[-] SDへ展開", "[B] 戻る"] {
+    for chip in ["[A] 開く", "[Y] 導入", "[ZR] SDへ展開", "[B] 戻る"] {
         assert!(
             hint.contains(chip),
             "the .arc list footer is missing {}: {}",
@@ -345,7 +351,7 @@ fn the_screens_that_use_plus_say_how_to_quit() {
         ed.screen = screen;
         let hint = ed.footer_hint();
         assert!(
-            hint.contains("終了は [B]"),
+            hint.contains("[＋]は[B]の後"),
             "{:?} spends [＋], so its footer must name the way out: {}",
             screen,
             hint
@@ -367,8 +373,7 @@ fn the_equipment_filter_is_shown_and_can_be_cleared() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Minus);
-    assert_eq!(ed.screen, Screen::Equip);
+    ed.screen = Screen::Equip; // the box is a section, not a key
     let all = ed.equipment().len();
     assert_eq!(ed.equip_filter_heading(), "装備BOX");
 

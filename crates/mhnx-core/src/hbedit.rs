@@ -197,6 +197,32 @@ pub enum Shoulder {
     Swallow,
 }
 
+/// What [ZR] means on the screen that is showing.
+///
+/// The review found two problems with one cause. The progress screen's search
+/// was drawn as "[検索] 名前" and answered `Key::Z` - but the console spends ZR
+/// on the section bar and then dropped the key before the state machine saw it,
+/// so the one key the guide named could not be pressed. And [-] carried nine
+/// meanings, one of which was 削除: a key that deletes on one screen and opens a
+/// menu on the next is a key nobody can learn.
+///
+/// So the two are the same answer. [-] is the delete key and nothing else, and
+/// the jobs it used to do are [ZR]'s - which means ZR has to become a key the
+/// console actually delivers. [Editor::zr_job] is that question, asked once, so
+/// the console's dispatch, the footer and the host tests cannot disagree about
+/// whether this screen's ZR is the section bar or the screen's own second
+/// action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZrJob {
+    /// The section bar: the console cycles it and the state machine never sees
+    /// the key. This is the default, and it is what the header's ZR button
+    /// promises.
+    Sidebar,
+    /// The screen's own second action. The console hands the press to the state
+    /// machine, exactly as it does for every other key.
+    Screen,
+}
+
 /// The three views of [Screen::Progress], in the order L / R walks them.
 pub const PROGRESS_AWARDS: usize = 0;
 /// The request / event flag view.
@@ -1478,7 +1504,7 @@ impl CharmEdit {
         // other screen uses for "choose"), so [Y] is the search shortcut rather
         // than the only way in.
         format!(
-            "[A] {}  [▲/▼] 行  [◀/▶] 値  [Y] スキルを検索  [X] 保存  [B] 戻る（下書きは2回）",
+            "[A] {}  [◀/▶] 値  [X] 保存  [B] 戻る（下書きは2回）",
             self.a_label()
         )
     }
@@ -5497,6 +5523,15 @@ pub struct Editor {
     pub entry_field: u8,
     /// File name chosen for the converted save, without path or extension.
     pub convert_name: String,
+    /// The two-press offer on the conversion screen.
+    ///
+    /// [A] used to build the converted save and hand it to the I/O layer on one
+    /// press, with no word about the file it was about to replace. The state
+    /// machine cannot stat the card, so it cannot tell "new file" from
+    /// "overwrite" - it asks on every press instead, and the sentence names the
+    /// path and says that an existing file is replaced (the I/O layer keeps a
+    /// .bak beside it). Any other key takes the offer back.
+    pub convert_armed: bool,
     /// Hunt record cursor and the working copies.
     pub hunt_cursor: usize,
     /// Which of the four numbers (slay, capture, smallest, largest) is being
@@ -5939,6 +5974,7 @@ impl Editor {
             item_undo: Vec::new(),
             skill_pick_field: 1,
             convert_name: String::new(),
+            convert_armed: false,
             hunt_cursor: 0,
             hunt_field: 0,
             roster_cursor: 0,
@@ -6602,6 +6638,62 @@ impl Editor {
         true
     }
 
+    /// Is there a character in this slot?
+    ///
+    /// The one question the slot cards ask before they draw an edit button and
+    /// before they open one: a blank slot has no record, so `read_character`
+    /// answers None and every writer on the character screen would refuse.
+    pub fn slot_has_character(&self, slot: usize) -> bool {
+        // Both halves matter: the slot has to be marked used *and* its record
+        // has to resolve. A blank card in a fresh save has a base pointer but
+        // no marker, and `read_character` alone answered yes for it.
+        self.save
+            .as_ref()
+            .map(|s| s.slot_used(slot) && s.read_character(slot).is_some())
+            .unwrap_or(false)
+    }
+
+    /// Open the character in `slot`: what the card's button and [A] both mean.
+    ///
+    /// The review's second finding was that all three cards drew the same
+    /// button and every one of them sent a bare [A], which the console answered
+    /// with `ed.slot` - so the button on card 2 opened card 1's character. The
+    /// slot is an argument now, and it goes through [Editor::switch_slot] so a
+    /// form left open on the old slot is closed the same way the header badge
+    /// closes it.
+    ///
+    /// An empty slot answers false and says so: the card draws no button for it
+    /// (UiAction::OpenSlot is not pushed), and a press that arrives anyway - the
+    /// pad's [A] on a blank card - gets the sentence rather than a screen of
+    /// zeroes that the writers all refuse.
+    pub fn open_slot(&mut self, slot: usize) -> bool {
+        if slot >= 3 {
+            return false;
+        }
+        if self.save.is_none() {
+            self.message = String::from("先にセーブを開いてください");
+            return false;
+        }
+        if !self.slot_has_character(slot) {
+            self.message = alloc::format!(
+                "Slot {} にキャラがいません（この枠は空きです）",
+                slot + 1
+            );
+            return false;
+        }
+        if slot != self.slot {
+            self.switch_slot(slot);
+        }
+        self.screen = Screen::Char;
+        self.field = 0;
+        self.cursor = 0;
+        self.message = alloc::format!(
+            "Slot {} のキャラを編集します（[B] でスロット一覧へ）",
+            slot + 1
+        );
+        true
+    }
+
     /// Does a Minus press on this screen refresh the card listing?
     ///
     /// One press does one thing. The rescan is what Minus means on the save
@@ -6618,7 +6710,14 @@ impl Editor {
     /// `wants_extract_official_arcs`), so the list is refreshed without the
     /// global rescan stepping on it.
     pub fn minus_rescans(&self) -> bool {
-        matches!(self.screen, Screen::SaveList)
+        // Nothing, on any screen. [-] is the delete key and nothing else: a
+        // refresh is what [Y] 再読込 already does on the save list, and the
+        // review's finding was that one key with nine meanings is one key
+        // nobody can learn. The method stays because the console's dispatch
+        // asks it once per frame and a screen that wants the rescan back has
+        // to change this answer rather than add a second key.
+        let _ = self;
+        false
     }
 
     /// May [＋] quit from this screen, or is it a tool here?
@@ -6646,15 +6745,17 @@ impl Editor {
             // The form's [A] is the row's own action, so the form writes the
             // line (CharmEdit::footer).
             Screen::CharmEdit => self.charm_edit.map(|c| c.footer()).unwrap_or_else(|| {
-                String::from("[A] 行ごとの操作  [▲/▼] 行  [◀/▶] 値  [X] 保存  [B] 戻る（下書きは2回）")
+                String::from("[A] 行ごとの操作  [◀/▶] 値  [X] 保存  [B] 戻る（下書きは2回）")
             }),
             // [A] installs on a row that is not in the save and releases on one
             // that is: the same key, two words, and the footer says which one
             // is waiting under the cursor (Editor::palico_row_action).
+            // [ZR] opens the palico's equipment panel: [-] is the delete key,
+            // and the panel's own [-] is the 解除 that deletes a worn record.
             Screen::Palico => {
                 let id = dlcats::all_ids().get(self.palico_cursor).copied().unwrap_or(0);
                 format!(
-                    "[A] {}  [Y] 全導入（2回）  [◀/▶] 言語  [-] 装備  [L/R] サブタブ  [X] 保存",
+                    "[A] {}  [Y] 全導入（2回）  [ZR] 装備  [X] 保存  [B] 戻る",
                     self.palico_row_action(id)
                 )
             }
@@ -6663,44 +6764,64 @@ impl Editor {
             // Three of the four views answer [A] differently, so the line is
             // written per view rather than once for the screen.
             Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => String::from(
-                "[▲/▼] 項目  [◀/▶] 増減  [R] 数値入力  [A] +刻み  [-] 進行状況  [B] カード  [X] 保存",
+                "[◀/▶] 増減  [R] 数値  [A] +刻み  [ZR] 進行状況  [B] カード  [X] 保存",
             ),
             Screen::Guild if self.guild_view() == GUILD_TAB_WEAPONS => {
                 if self.guild_wpn_edit {
-                    String::from(
-                        "[▲/▼] ±刻み  [◀/▶] ±10  [R] 数値入力  [A] 終了  [X] 保存",
-                    )
+                    String::from("[▲/▼] ±刻み  [◀/▶] ±10  [R] 数値  [A] 終了  [X] 保存")
                 } else {
                     String::from(
-                        "[▲/▼] 武器  [◀/▶] 会場  [A] 編集  [R] 数値入力  [B] カード  [X] 保存",
+                        "[▲/▼] 武器  [◀/▶] 会場  [A] 編集  [R] 数値  [B] カード  [X] 保存",
                     )
                 }
             }
             Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => format!(
-                "[▼] 項目  [◀/▶] 増減  [R] 数値入力  [Y] 回数/武器  [A] {}  [-] 進行状況  [X] 保存",
+                "[◀/▶] 増減  [R] 数値  [Y] 回数/武器  [A] {}  [ZR] 進行状況  [X] 保存",
                 self.guild_a_label()
             ),
             _ => String::from(self.static_footer()),
         };
+        // The way out. [＋] is the quit key everywhere except the three screens
+        // that give it a tool of their own, and there the line says so in six
+        // characters rather than twenty: the footer has 763px and the guide's
+        // own items are worth more than a sentence.
         if self.plus_is_a_tool() {
-            format!("{}（[＋] 終了は [B] で戻ってから）", base)
+            format!("{}（[＋]は[B]の後）", base)
         } else {
             format!("{}  [＋] 終了", base)
         }
     }
 
+    /// How wide [Editor::footer_hint] draws, in the console's 17px caption font.
+    ///
+    /// The console measures the string before it draws it (ui.rs draw_footer),
+    /// so this is only for the host tests - but it is the same arithmetic, and
+    /// a guide that does not fit [FOOTER_HINT_ROOM] is a guide whose last items
+    /// are clipped.
+    pub fn footer_hint_width(&self) -> i32 {
+        caption_width(&self.footer_hint())
+    }
+
     /// The fixed key guide for every screen but the talisman form.
+    ///
+    /// Every line here is measured against the strip the footer really has
+    /// (hbedit::FOOTER_HINT_ROOM, 763px) by the host tests, and the rule the
+    /// review asked for is the one the lines follow: the way out is never the
+    /// item that gets cut. "[B] 戻る" is on every screen that has one, the
+    /// delete key is named where a record can be deleted, and the guide's low
+    /// value items ([▲/▼] 行, [L/R] サブタブ - both drawn on the glass already)
+    /// are the ones that went.
     fn static_footer(&self) -> &'static str {
         let base = match self.screen {
-            Screen::SaveList => "[A] 開く  [Y] 再読込  [L/R] サブタブ  [ZL/ZR] セクション",
+            Screen::SaveList => "[A] 開く  [Y] 再読込  [ZL/ZR] セクション",
             // [A] opens the character that is highlighted, so the guide names
             // the character and not a bare 決定: the card's button says the same
             // words (ui.rs draw_slots) and a touch and a pad press must not read
             // as two different promises.
-            Screen::Slots => "[◀/▶] 枠選択  [A] このキャラを編集  [Y] 一括MAX（2回）  [L/R] サブタブ",
+            Screen::Slots => "[◀/▶] 枠  [A] このキャラを編集  [Y] 一括MAX（2回）  [B] 戻る",
             // Row 0 is the name: ◀ / ▶ opens the keyboard, and the name may hold
-            // a line break, which the footer says because no key hints at it.
-            Screen::Char => "[◀/▶] 増減（0行目=名前・改行可）  [A] 最大（2回）/編集  [Y] 刻み  [L/R] サブタブ  [X] 保存",
+            // a line break, which the guide says because no key hints at it.
+            Screen::Char => "[◀/▶] 増減  [A] 最大（2回）/編集  [Y] 刻み  [X] 保存  [B] 戻る",
             Screen::Items if self.item_menu_open => {
                 "[▲/▼] 選択  [A] 実行（2回）  [-] 閉じる  [B] 戻る  [X] 保存"
             }
@@ -6708,146 +6829,137 @@ impl Editor {
             // rows: the chip used to say ページ, which reads like a scroll and
             // is not what the key does.
             // [Y] is the list's own state here: 所持品のみ <-> 空き枠も表示.
-            // The step the [◀/▶] pair uses has no key on this screen any more
-            // (every one of them is taken), so it is the deck's button and the
-            // footer does not promise a key for it.
+            // [ZR] is the name search - the one input this screen had left, and
+            // the same key the progress screen's search answers.
             Screen::Items => {
-                "[A] 変更  [-] 一括操作  [◀/▶] 個数  [L/R] BOX切替  [Y] 空き表示  [R] 数値入力  [X] 保存"
+                "[A] 変更  [◀/▶] 個数  [R] 数値  [Y] 空き  [ZR] 検索  [X] 保存  [B] 戻る"
             }
             // The three pick lists print the same line: the direction keys are
-            // one rule everywhere, and the footer says which is which instead
+            // one rule everywhere, and the guide says which is which instead
             // of leaving the user to find out per route.
             Screen::ItemPick if self.item_pick_mode == 3 && self.item_pick_stage == 1 => {
-                "[◀/▶] 個数±10  [▲/▼] 個数±1  [A] この個数を追加  [B] 選び直す"
+                "[◀/▶] 個数±10  [▲/▼] ±1  [A] この個数を追加  [B] 選び直す"
             }
             Screen::ItemPick | Screen::SkillPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [X] クリア  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 検索  [X] クリア  [B] 戻る"
             }
             // One delete key on every screen: [-] twice.
-            Screen::Charms => {
-                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [L/R] サブタブ  [X] 保存"
-            }
+            Screen::Charms => "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る",
             // Built by the form, not here: see footer_hint.
             Screen::CharmEdit => "",
-            Screen::Equip => {
-                "[A] 編集  [▲/▼] 行  [Y] 検索/解除  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る"
-            }
+            Screen::Equip => "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る",
             // [A] is the row's own action (hbedit::EquipFormAction): the two
             // rows that name the record open the picker, the sockets open the
             // decoration list, the numeric rows step, 装備枠 writes and the new
             // form's レベル creates. [Y] is the search shortcut into the same
             // two lists.
             Screen::EquipEdit => {
-                "[A] 行の操作  [▲/▼] 行  [◀/▶] 10件/値  [Y] 名前で検索  [R] ID入力  [X] 保存  [B] 戻る（下書きは2回）"
+                "[A] 行の操作  [◀/▶] 10件/値  [Y] 検索  [X] 保存  [B] 戻る（下書きは2回）"
             }
             Screen::JewelPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [X] クリア  [B] 戻る"
+                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 検索  [X] クリア  [B] 戻る"
             }
             // One line for the name picker: the id is printed in hex
             // everywhere, so the guide says "名前か 16進ID" rather than
             // leaving the reader to guess which of the two the box takes.
-            Screen::EquipPick if self.equip_pick_kind != 0 => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [-] 種別を全種  [X] クリア  [B] 戻る"
-            }
+            // [ZR] is the type filter - [-] is the delete key and a picker has
+            // nothing to delete.
             Screen::EquipPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 名前で検索  [-] 種別  [X] クリア  [B] 戻る"
+                "[◀/▶] 10  [▲/▼] 1  [A] 決定  [Y] 検索  [ZR] 種別  [X] クリア  [B] 戻る"
             }
             Screen::Sets if self.set_edit.is_some() => {
-                "[A] 決定/名前  [▲/▼] 行  [◀/▶] 装備  [-] 解除（2回）  [Y] 警告  [X] 保存  [B] 一覧（下書きは2回）"
+                "[A] 決定  [◀/▶] 装備  [-] 解除（2回）  [X] 保存  [B] 一覧（下書きは2回）"
             }
             Screen::Sets if self.item_set_edit.is_some() => {
-                "[A] 決定  [▲/▼] 枠  [◀/▶] アイテム  [Y] 取込（2回）  [-] ポーチへ（2回）  [B] 一覧（下書きは2回）"
+                "[A] 決定  [Y] 取込（2回）  [ZR] 名前  [B] 一覧（下書きは2回）"
             }
-            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る  [L/R] サブタブ",
+            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る",
             Screen::Csv if self.csv_armed.is_some() => {
-                "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [-] 再読込"
+                "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [ZR] 再読込"
             }
-            Screen::Csv => "[A] 適用（2回）  [Y] 書き出し  [-] 再読込  [▲/▼] 行  [L/R] タブ",
+            Screen::Csv => "[A] 適用（2回）  [Y] 書き出し  [ZR] 再読込  [B] 戻る",
             Screen::Options => {
                 "[◀/▶] 値変更  [Y] スナップショットへ戻す(確認)  [X] 保存  [B] 戻る"
             }
+            // The rows are the three parts and ▲ / ▼ walks them, which the list
+            // itself shows; the 763px goes on the four keys a player cannot
+            // guess. (The line was 22px too long with "[▲/▼] 部位" in it.)
             Screen::Roster | Screen::Palico if self.palico_equip_open() => {
-                "[▲/▼] 部位  [◀/▶] 候補  [A] 装着  [-] 解除（2回）  [B] 一覧  [X] 保存"
+                "[◀/▶] 候補  [A] 装着  [-] 解除（2回）  [B] 一覧  [X] 保存"
             }
             Screen::Roster if self.palico_skill_open() => {
-                "[▲/▼] 枠  [◀/▶] 候補  [L/R] ±10  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
+                "[▲/▼] 枠  [◀/▶] 候補  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
             }
             Screen::Roster => {
-                "[◀/▶] 増減  [Y] 項目切替  [A] 名前  [-] 装備  [+] スキル  [L/R] タブ  [X] 保存"
+                "[◀/▶] 増減  [A] 名前  [ZR] 装備  [＋] スキル  [X] 保存  [B] 戻る"
             }
             // Built in footer_hint: the word after [A] follows the row.
             Screen::Palico => "",
             Screen::Hunts => {
-                "[◀/▶] 増減  [Y] 列切替  [A] 刻み  [-] 表示切替  [R] 数値入力  [L/R] サブタブ  [X] 保存"
+                "[◀/▶] 増減  [Y] 列  [A] 刻み  [ZR] 表示  [R] 数値  [X] 保存  [B] 戻る"
             }
             Screen::Progress if self.progress_view() == PROGRESS_QUESTS => {
-                "[A] クリア  [Y] 既読  [▲/▼] 行  [◀/▶] ±50  [検索] 名前  [L/R] タブ  [X] 保存  [B] 戻る"
+                "[A] クリア  [Y] 既読  [◀/▶] ±50  [ZR] 検索  [X] 保存  [B] 戻る"
             }
             Screen::Progress => {
-                "[A] ビット切替  [Y] タブ  [▲/▼] 行  [◀/▶] ±50  [検索] 名前  [L/R] タブ  [X] 保存  [B] 戻る"
+                "[A] ビット  [Y] タブ  [◀/▶] ±50  [ZR] 検索  [X] 保存  [B] 戻る"
             }
             // No [R] in this line: the console answers [R] with the sub-tab,
             // so the SD write every quest needs is the deck's button
             // (Editor::request_extract_all_quests) rather than a promise this
             // key cannot keep.
             Screen::SaveQuests => {
-                "[A] 編集/導入（解除は2回）  [Y] 検索  [-] 削除（2回）  [L/R] サブタブ  [X] 保存"
+                "[A] 編集/導入（解除は2回）  [Y] 検索  [-] 削除（2回）  [X] 保存  [B] 戻る"
             }
             // Screen-specific because every key here does something the other
             // screens do not have: Y installs the file into the open save and
-            // Minus writes the bundled quests out.
-            Screen::ArcList => "[A] 開く  [Y] セーブへ導入（2回）  [-] SDへ展開  [B] 戻る",
-            Screen::ArcEntries => "[A] 開く  [Y] 検査  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            // [ZR] writes the bundled quests out.
+            Screen::ArcList => "[A] 開く  [Y] 導入（2回）  [ZR] SDへ展開  [B] 戻る",
+            Screen::ArcEntries => "[A] 開く  [Y] 検査  [ZR] 抽出  [X] 保存  [B] 戻る",
             Screen::Mib => {
-                "[A] 一覧選択  [◀/▶] 増減  [-] 項目切替  [Y] 刻み  [L/R] タブ  [X] 保存"
+                "[A] 一覧選択  [◀/▶] 増減  [ZR] 項目  [Y] 刻み  [X] 保存  [B] 戻る"
             }
-            Screen::Gmd => "[A] 文章編集  [L/R] サブタブ  [X] 保存  [B] 戻る",
+            Screen::Gmd => "[A] 文章編集  [X] 保存  [B] 戻る",
             // A reward / supply row carries its numbers, so the guide names the
             // key that picks which one and the key that types it.
             Screen::EntryView if self.entry_has_numbers() => {
-                "[◀/▶] 増減  [-] 個数/確率  [A] アイテム  [R] 数値入力  [Y] 刻み  [X] 保存"
+                "[◀/▶] 増減  [ZR] 個数/確率  [A] アイテム  [R] 数値  [Y] 刻み  [X] 保存"
             }
-            Screen::EntryView => {
-                "[◀/▶] 座標・数値変更  [Y] 刻み  [L/R] サブタブ  [X] 保存  [B] 戻る"
-            }
+            Screen::EntryView => "[◀/▶] 座標・数値  [Y] 刻み  [X] 保存  [B] 戻る",
             // The arena editor's four directions mean one thing each: ◀/▶ walk
             // the parts of the time and ▲/▼ step the part under the cursor.
             Screen::Guild if self.guild_view() == GUILD_TAB_ARENA && self.arena_edit => {
-                "[◀/▶] 項目  [▲/▼] 増減  [A] 終了  [Y] 直接入力  [X] 保存"
+                "[◀/▶] 項目  [▲/▼] 増減  [A] 終了  [Y] 入力  [X] 保存"
             }
             Screen::Guild if self.guild_view() == GUILD_TAB_ARENA => {
-                "[▲/▼] アリーナ  [◀/▶] 順位  [A] 編集  [Y] 直接入力  [X] 保存  [B] カードへ"
+                "[▲/▼] アリーナ  [◀/▶] 順位  [A] 編集  [Y] 入力  [X] 保存  [B] カードへ"
             }
             // Built in footer_hint: the word after [A] follows the row.
             Screen::Guild => "",
             // The checker's [A] is the automatic fix, and it is the only thing
-            // the key does: the old catch-all said "決定" with "◀/▶ 調整"
-            // beside it, neither of which this screen has.
+            // the key does.
             Screen::Check => "[A] 自動修正  [▲/▼] 指摘  [X] .arc 保存  [B] 戻る",
-            Screen::QuestEquip => {
-                "[A] 開く  [◀/▶] 個数  [▲/▼] 行  [L/R] サブタブ  [X] 保存  [B] 戻る"
-            }
-            // Convert and the remaining leaf screens have no tools of their own.
+            Screen::QuestEquip => "[A] 開く  [◀/▶] 個数  [X] 保存  [B] 戻る",
             // The aggregate quest screen: one row pair moves the cursor, the
-            // other steps whatever value the tab is on, [-] picks which value
+            // other steps whatever value the tab is on, [ZR] picks which value
             // that is, [Y] opens the ▸詳細 rows, [A] opens the row's own
             // chooser or keyboard, and 詳細 is a bar button on the console.
             Screen::QuestEdit => {
                 // The file screens are reached by the [ファイル] pill on the
                 // touched route and by [R 長押し] on the pad. ZR is the
-                // section key (the console answers it before the editor sees
-                // it), so it cannot be the pad's way in.
+                // screen's own second action here (the value switch), so it
+                // cannot be the pad's way in.
                 if self.quest_edit_tab == QUEST_TAB_BASIC {
                     "[▲/▼] 行  [A] 文字編集  [◀/▶] 制限時間  [L/R] タブ  [R長押し] ファイル"
                 } else {
-                    "[▲/▼] 行  [◀/▶] 値  [-] 項目切替  [A] 選択  [Y] 詳細行  [L/R] タブ  [R長押し] ファイル"
+                    "[▲/▼] 行  [◀/▶] 値  [ZR] 項目  [A] 選択  [Y] 詳細  [R長押し] ファイル"
                 }
             }
             // Conversion is the one screen whose keys are not the usual set:
             // ◀ / ▶ change nothing, and [X] saves the *open* save rather than
-            // writing the converted file, so a guide that promised both was
-            // three keys wrong on a screen with three working ones.
-            Screen::Convert => "[A] 変換出力  [Y] 出力名変更  [B] 戻る",
+            // writing the converted file. [A] asks twice because the write
+            // replaces whatever is at the output path.
+            Screen::Convert => "[A] 変換出力（2回）  [Y] 出力名  [B] 戻る",
             // 生データ: the list is a viewer until [A] opens the byte editor.
             // Inside it the four directions belong to the byte, so the line
             // says what they do there rather than what they do to the list -
@@ -6876,6 +6988,49 @@ impl Editor {
     // keyboard, a pill drawn on a row that refused it, a pill lit on the
     // screen it opens, a panel naming a key the screen spends elsewhere. The
     // console asks now, so the answer a test pins is the answer on the glass.
+
+    /// What [ZR] means on the screen that is showing.
+    ///
+    /// See [ZrJob]. The screens that answer `Screen` are exactly the screens
+    /// that used to give [-] a job of its own, plus the two whose search had no
+    /// key at all (the item box and the progress screen): [-] is the delete key
+    /// now, and the key that took its other work is this one.
+    ///
+    /// The palico skill panel is listed as `Screen` although it only swallows
+    /// the key: the panel owns every key while it is open, and letting the
+    /// section bar move under it would leave the panel open on a screen that no
+    /// longer shows it.
+    pub fn zr_job(&self) -> ZrJob {
+        // The two panels that own the screen while they are open come first:
+        // a guarded arm after an unguarded one for the same screen would never
+        // be reached.
+        if self.palico_equip_open() {
+            return ZrJob::Sidebar;
+        }
+        if self.palico_skill_open() {
+            return ZrJob::Screen;
+        }
+        match self.screen {
+            // The two searches that had no key of their own.
+            Screen::Items | Screen::Progress => ZrJob::Screen,
+            // The jobs [-] used to do.
+            Screen::Csv
+            | Screen::ArcList
+            | Screen::ArcEntries
+            | Screen::Mib
+            | Screen::EntryView
+            | Screen::QuestEdit
+            | Screen::Roster
+            | Screen::Palico
+            | Screen::Hunts
+            | Screen::Guild
+            | Screen::EquipPick => ZrJob::Screen,
+            // The item set form's ZR is its name keyboard, which is the same
+            // "the screen's own second action" answer.
+            Screen::Sets if self.item_set_edit.is_some() => ZrJob::Screen,
+            _ => ZrJob::Sidebar,
+        }
+    }
 
     /// What a shoulder press means on the screen that is showing.
     ///
@@ -7545,6 +7700,26 @@ impl Editor {
         self.quest_edit_cursor >= self.quest_value_rows()
     }
 
+    /// What [A] does on the row the cursor is on, as the deck's button says it.
+    ///
+    /// The 基本 tab is the only tab whose rows answer [A] differently: the three
+    /// .gmd lines open the keyboard and the .mib 制限時間 has no text to edit -
+    /// it steps with [◀/▶]. The button said "テキスト編集" on all four rows, so
+    /// pressing it on 制限時間 promised a keyboard and answered with a sentence.
+    /// The label follows the row now, the same way the equipment form's
+    /// (hbedit::EquipFormAction) does.
+    pub fn quest_basic_a_label(&self) -> &'static str {
+        if self.quest_on_detail_row() {
+            return "ファイル画面へ";
+        }
+        let rows = self.quest_basic_rows();
+        match rows.get(self.quest_edit_cursor.min(rows.len().saturating_sub(1))) {
+            Some(row) if row.text_index.is_some() => "テキスト編集",
+            Some(_) => "増減は [◀/▶]",
+            None => "行の操作",
+        }
+    }
+
     /// How many rows the current tab lists.
     ///
     /// One more than the values: the last row of every tab is 詳細, so the pad
@@ -7840,7 +8015,9 @@ impl Editor {
                 let _ = self.quest_activate();
             }
             Key::Y => self.quest_toggle_detail(),
-            Key::Minus => self.quest_cycle_field(),
+            // [ZR] switches which value [◀/▶] steps. [-] is the delete key and
+            // a quest has nothing to delete, so the two must not share it.
+            Key::Z => self.quest_cycle_field(),
             Key::X => {
                 self.flush_quest_edit();
                 self.request_write_arc();
@@ -9885,7 +10062,7 @@ impl Editor {
                     let d = STEPS[self.step].min(10).max(1);
                     self.adjust_entry_field(d);
                 }
-                Key::Minus => self.toggle_entry_field(),
+                Key::Z => self.toggle_entry_field(),
                 Key::R => self.request_entry_number_text(),
                 // Only the reward and supply tables hold editable records.
                 Key::A => {
@@ -10429,11 +10606,13 @@ impl Editor {
             // row prints comes from Editor::palico_row_action, so the key and
             // the label are the same answer.
             Key::A => self.palico_a_press(),
-            // Minus opens the equipment panel for the palico the highlighted
+            // [ZR] opens the equipment panel for the palico the highlighted
             // download entry became in the roster. Y already means "install
             // all", L / R mean "language", A installs or removes and X saves,
-            // so Minus is the one key this screen had left.
-            Key::Minus => {
+            // so [ZR] is the one key this screen had left - and [-] is the
+            // delete key, which is the one thing this screen must not spend on
+            // something else.
+            Key::Z => {
                 if let Some(&id) = ids.get(self.palico_cursor) {
                     self.open_palico_equip_for_dlc(id);
                 }
@@ -10624,7 +10803,7 @@ impl Editor {
                 self.wants_csv_export = true;
                 self.message = String::from("CSV を書き出しています…");
             }
-            Key::Minus => {
+            Key::Z => {
                 self.csv_armed = None;
                 self.wants_csv_rescan = true;
                 self.message = String::from("CSV フォルダを読み直しています…");
@@ -11585,12 +11764,10 @@ impl Editor {
                 self.cursor = 0;
                 self.field = 0;
             }
-            // - opens the equipment box: this screen had every other key
-            // spoken for.
-            Key::Minus => {
-                self.screen = Screen::Equip;
-                self.equip_cursor = 0;
-            }
+            // [-] is the delete key and nothing else (see the key table in
+            // the module docs): the equipment box it used to open is one
+            // section press away, and a key that opens a box on one screen and
+            // deletes a record on the next is the hazard this rule removes.
             Key::X => {
                 self.screen = Screen::Items;
                 self.cursor = 0;
@@ -11624,13 +11801,8 @@ impl Editor {
             }
             Key::L => self.slot = (self.slot + 2) % 3,
             Key::R => self.slot = (self.slot + 1) % 3,
-            // The slot screen has no spare key, so the record screens hang off
-            // this one: - for hunt records and the guild card, plus palicos
-            // from the equipment screen.
-            Key::Minus => {
-                self.screen = Screen::Hunts;
-                self.hunt_cursor = 0;
-            }
+            // [-] is the delete key and nothing else. The hunt record it used
+            // to open is the オトモ・記録 section, one ZL away.
             Key::Y => self.screen = Screen::Sets,
             Key::X => self.step = (self.step + 1) % STEPS.len(),
             Key::Left | Key::Right => {
@@ -11718,9 +11890,12 @@ impl Editor {
                     );
                 }
             }
-            // The bulk menu hangs off Minus: X is the step key on this screen
-            // and A writes the save, so this is the only key it had free.
-            Key::Minus => self.open_item_menu(),
+            // The name search. The item box has no key left for it ([A] picks,
+            // [Y] toggles 空きも表示, [R] types the count, [X] saves, L / R are
+            // the BOX tabs, [-] is the delete key and this screen has nothing to
+            // delete), so [ZR] is the one input the console still has free here
+            // - the same key the progress screen's search uses.
+            Key::Z => self.request_item_box_filter(),
             Key::A => self.request_write_save(),
             Key::B => {
                 self.screen = Screen::Slots;
@@ -12638,28 +12813,40 @@ impl Editor {
             self.message = String::from("出力先を決められません");
             return;
         };
+        // One press used to write the file. A conversion replaces whatever is
+        // at that path, and the screen said so in English after the fact. The
+        // first [A] now names the file and what happens to it; the second one
+        // writes. The state machine cannot stat the card, so it asks every
+        // time rather than guessing - and the sentence says which of the two
+        // cases the I/O layer will handle (a .bak is kept beside the file it
+        // replaces, see the Switch layer's Write::File arm).
+        if !self.convert_armed {
+            self.convert_armed = true;
+            self.message = alloc::format!(
+                "もう一度 [A] で書き出します: {}（同じ名前のファイルは .bak を残して上書き・[B] で取りやめ）",
+                path
+            );
+            return;
+        }
+        self.convert_armed = false;
         let (bytes, what) = match save.kind() {
             crate::save::SaveKind::ThreeDs => {
-                let name = if save.header().iter().any(|b| *b != 0) {
-                    "system"
-                } else {
-                    "system"
-                };
+                let name = "system";
                 match crate::save::Save::from_3ds_body(save.body(), name) {
-                    Ok(sw) => (sw.to_bytes(), "Switch (36 byte header synthesised)"),
+                    Ok(sw) => (sw.to_bytes(), "Switch 形式（36 バイトのヘッダを付けました）"),
                     Err(_) => {
                         self.message = String::from("Switch 形式を作れません");
                         return;
                     }
                 }
             }
-            _ => (save.to_3ds_bytes(), "3DS (header stripped)"),
+            _ => (save.to_3ds_bytes(), "3DS 形式（ヘッダを外しました）"),
         };
         self.pending_write = Some(Write::File {
             path: path.clone(),
             bytes,
         });
-        self.message = alloc::format!("writing {} -> {}", what, path);
+        self.message = alloc::format!("{}で書き出しました: {}", what, path);
     }
 
     /// Equipment of the current slot, after the filter.
@@ -12797,10 +12984,10 @@ impl Editor {
                     self.message = String::from("先にセーブを開いてください");
                 }
             }
-            // [-] switches the list. Nothing else on this screen wants the
-            // key (the delete rule does not apply: a hunt record has no
-            // delete), and a display toggle is exactly a one-press thing.
-            Key::Minus => self.toggle_hunt_show_all(),
+            // [ZR] switches the list. It used to be [-], which is the delete
+            // key everywhere else; a hunt record has nothing to delete, so the
+            // key is free there and the toggle moved to it.
+            Key::Z => self.toggle_hunt_show_all(),
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = self.slot;
@@ -12902,9 +13089,9 @@ impl Editor {
             }
             // The card is the last record of this kind and the progress screen
             // continues it: awards, request flags and quest bits of the same
-            // slot. [-] rather than a new screen-wide key, because A / Y / L /
-            // R on the card already mean something.
-            Key::Minus => self.open_progress(),
+            // slot. [ZR] rather than [-], because [-] is the delete key and
+            // nothing else on every screen.
+            Key::Z => self.open_progress(),
             Key::X => self.request_write_save(),
             Key::B => {
                 self.screen = Screen::Slots;
@@ -12953,7 +13140,7 @@ impl Editor {
                     self.ask_arena_time();
                 }
                 Key::X => self.request_write_save(),
-                Key::Minus => {
+                Key::Z => {
                     // The editor is a mode of the view, and the progress screen
                     // is not it: leaving it armed would put a stepping cursor
                     // on a screen with no time to step.
@@ -13006,7 +13193,7 @@ impl Editor {
                 self.ask_arena_time();
             }
             Key::X => self.request_write_save(),
-            Key::Minus => self.open_progress(),
+            Key::Z => self.open_progress(),
             Key::B => {
                 // Back to the card: the arena log is a view of this screen, so
                 // one press goes one level up and the card's own B goes to the
@@ -13180,7 +13367,7 @@ impl Editor {
             }
             Key::Y => self.guild_next_view(),
             Key::X => self.request_write_save(),
-            Key::Minus => self.open_progress(),
+            Key::Z => self.open_progress(),
             Key::B => self.set_guild_view(GUILD_TAB_CARD),
             Key::Plus => {
                 self.press_quit();
@@ -13355,7 +13542,7 @@ impl Editor {
                     self.request_guild_weapon_text();
                 }
                 Key::X => self.request_write_save(),
-                Key::Minus => {
+                Key::Z => {
                     self.guild_wpn_edit = false;
                     self.open_progress();
                 }
@@ -13398,7 +13585,7 @@ impl Editor {
             }
             Key::Y => self.guild_next_view(),
             Key::X => self.request_write_save(),
-            Key::Minus => self.open_progress(),
+            Key::Z => self.open_progress(),
             Key::B => self.set_guild_view(GUILD_TAB_CARD),
             Key::Plus => {
                 self.press_quit();
@@ -14932,10 +15119,11 @@ impl Editor {
                 };
                 self.pending_text = Some((TEXT_PALICO_NAME + p.index, p.name.clone()));
             }
-            // Minus opens the equipment panel for the highlighted palico. The
-            // Switch layer therefore stops rescanning on this screen; one
-            // press cannot do both (see `uses_minus`).
-            Key::Minus => {
+            // [ZR] opens the equipment panel for the highlighted palico. It
+            // used to be [-], which is the delete key; the panel's own [-] is
+            // the 解除 that deletes a worn record, so the two must not share a
+            // key.
+            Key::Z => {
                 if let Some(p) = list.get(self.roster_cursor) {
                     let index = p.index;
                     self.open_palico_equip(index);
@@ -16601,7 +16789,7 @@ impl Editor {
     /// would be lost; the second one writes. A record the game left unused is
     /// refused by the API itself, which is why a zero result is reported as a
     /// refusal rather than as success.
-    fn item_set_to_pouch(&mut self) {
+    pub fn item_set_to_pouch(&mut self) {
         let Some(e) = self.item_set_edit else {
             return;
         };
@@ -16706,11 +16894,9 @@ impl Editor {
                 }
                 return;
             }
-            Key::Minus => {
-                self.item_set_edit = Some(e);
-                self.item_set_to_pouch();
-                return;
-            }
+            // [-] is the delete key; ポーチへ is not a delete, so it is the
+            // deck's pill on this form (UiAction::ItemSetToPouch) and no key
+            // claims it. [ZR] is already the set-name keyboard here.
             Key::B => {
                 self.item_set_edit = Some(e);
                 if self.form_discard_press(self.item_set_draft_dirty(), "アイテムセット編集") {
@@ -17704,6 +17890,11 @@ impl Editor {
     }
 
     fn input_convert(&mut self, key: Key) {
+        // Any key but [A] takes the write offer back: the second press has to
+        // be the next thing the user does.
+        if key != Key::A {
+            self.convert_armed = false;
+        }
         match key {
             Key::A => self.convert_now(),
             // Name the output instead of taking the default.
@@ -18386,7 +18577,7 @@ impl Editor {
             Key::X => self.install_into_save(),
             Key::L => self.run_check(),
             // Pull the quest arc back out of the save as a file.
-            Key::Minus => {
+            Key::Z => {
                 let id = self
                     .arc
                     .as_ref()
@@ -21032,6 +21223,12 @@ impl Editor {
 /// Right edge of the console's footer line, in the 1280px frame.
 pub const FOOTER_RIGHT: i32 = 1262;
 
+/// Left edge of the footer's key guide, in the 1280px frame.
+///
+/// The undo pill starts at 14 and is as wide as its own label plus 22px of
+/// padding; the guide starts 12px right of it (see the console's draw_footer).
+pub const FOOTER_HINT_X: i32 = 14 + 12;
+
 /// Width of the 終了 pill at that end of the footer's first line.
 pub const FOOTER_QUIT_W: i32 = 84;
 
@@ -21053,6 +21250,79 @@ pub fn footer_quit_x() -> i32 {
 pub fn footer_guide_right() -> i32 {
     footer_quit_x() - FOOTER_GUIDE_GAP
 }
+
+// ---------------------------------------------------------------------------
+// How wide a line is, in the console's two text sizes
+// ---------------------------------------------------------------------------
+//
+// The footer's key guide is drawn right aligned in the one strip the undo pill
+// and the 終了 pill leave, and a guide longer than that strip is clipped at its
+// left end - which is where the last items of the line live ("[X] 保存",
+// "[B] 戻る", "[＋] 終了"). The review found 17 of the 40 guides cut that way,
+// the worst of them 240px too long.
+//
+// Nothing in the drawing code could answer "does this fit" before it drew, so
+// the strings and the strip never met. These are the two advances the console's
+// shared font really uses (measured off the framebuffer: 9px per half-width
+// glyph and 17px per full-width one at the 17px size, 11 / 22 at the 22px one),
+// and [footer_hint_room] is the strip itself. A guide is now checked against
+// them by a host test rather than by a person reading the screen.
+
+/// Advance of one character in the console's 17px caption font.
+pub const fn caption_advance(c: char) -> i32 {
+    let u = c as u32;
+    if u >= 0x20 && u <= 0x7E {
+        9
+    } else {
+        17
+    }
+}
+
+/// Advance of one character in the console's 22px row font.
+pub const fn row_advance(c: char) -> i32 {
+    let u = c as u32;
+    if u >= 0x20 && u <= 0x7E {
+        11
+    } else {
+        22
+    }
+}
+
+/// Width of a string in the 17px caption font, in pixels.
+pub fn caption_width(s: &str) -> i32 {
+    s.chars().map(caption_advance).sum()
+}
+
+/// Width of a string in the 22px row font, in pixels.
+pub fn row_width(s: &str) -> i32 {
+    s.chars().map(row_advance).sum()
+}
+
+/// The width the console gives the undo pill: its label plus 22px of padding.
+///
+/// Capped at 470 so a long label cannot eat the whole line; the console draws
+/// the same number (ui.rs draw_footer).
+pub fn footer_undo_w(label: &str) -> i32 {
+    (caption_width(label) + 22).min(470)
+}
+
+/// The room a footer's key guide has, for a given undo pill label.
+///
+/// This is the strip between the undo pill and the 終了 pill, minus the 12px of
+/// clear space each side keeps. The console used to right-align the guide at
+/// the bar's own edge and clip whatever did not fit; a guide is now required to
+/// be no wider than this, and [footer_hint_room] is what the host tests check.
+pub fn footer_hint_room(undo_label: &str) -> i32 {
+    footer_guide_right() - (FOOTER_HINT_X + footer_undo_w(undo_label))
+}
+
+/// The narrowest the footer's key guide strip ever gets, in pixels.
+///
+/// Both undo labels the pill can carry are measured and the wider one wins, so
+/// this is a property of the geometry rather than a number somebody typed: the
+/// longest label is "[タップ2回 / L 2回長押し] 元に戻す（0/4）", which is 355px,
+/// and 355 + 22 + 26 leaves 763px for the guide.
+pub const FOOTER_HINT_ROOM: i32 = 763;
 
 /// Stack `rows` buttons from `top` down to `bottom`, at most `row_h` tall each.
 ///
@@ -21530,7 +21800,7 @@ mod tests {
         let (mut ed, gear) = editor_with_palico_gear(&["テスト"]);
         ed.screen = Screen::Roster;
         ed.roster_cursor = 0;
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
         assert!(ed.palico_equip_open(), "{}", ed.message);
         // A mode, not a screen: the list underneath is still the roster.
         assert_eq!(ed.screen, Screen::Roster);
@@ -21570,7 +21840,7 @@ mod tests {
         let (mut ed, gear) = editor_with_palico_gear(&["テスト"]);
         ed.screen = Screen::Roster;
         ed.roster_cursor = 0;
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
         assert!(ed.palico_equip_open(), "{}", ed.message);
         let base = ed
             .save
@@ -21630,7 +21900,7 @@ mod tests {
         let (mut ed, gear) = editor_with_palico_gear(&["テスト"]);
         ed.screen = Screen::Roster;
         ed.roster_cursor = 0;
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
         assert!(ed.palico_equip_open(), "{}", ed.message);
         ed.input(Key::A);
         let weapon = gear[0] as u16;
@@ -21698,7 +21968,7 @@ mod tests {
         ed.open_save_bytes("C:/mhnx/test/system", &save.to_bytes());
         ed.screen = Screen::Palico;
         ed.palico_cursor = ids.iter().position(|v| *v == id).expect("in the list");
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
         assert!(ed.palico_equip_open(), "{}", ed.message);
         assert_eq!(ed.palico_equip_target().map(|p| p.index), Some(5));
 
@@ -21706,7 +21976,7 @@ mod tests {
         ed.close_palico_equip();
         let other = ids.iter().copied().find(|v| *v != id).expect("a second id");
         ed.palico_cursor = ids.iter().position(|v| *v == other).expect("pos");
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
         assert!(!ed.palico_equip_open());
         assert!(ed.message.contains("導入"), "{}", ed.message);
     }
@@ -21716,7 +21986,7 @@ mod tests {
         let (mut ed, _gear) = editor_with_palico_gear(&["テスト"]);
         ed.screen = Screen::Roster;
         ed.roster_cursor = 0;
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
         assert!(ed.palico_equip_open(), "{}", ed.message);
         let rows = ed.palico_equip_rows();
         assert_eq!(rows[0].pick_text(), format!("枠 {} / ID 431", rows[0].pick));
@@ -22109,12 +22379,14 @@ mod tests {
             assert!(crate::myset::set_pouch_item(save, 0, 1, 0, 0));
         }
         ed.dirty = false;
-        ed.input(Key::Minus);
+        // ポーチへ is a pill now: [-] is the delete key and this form has
+        // nothing to delete.
+        ed.item_set_to_pouch();
         assert_eq!(ed.item_set_armed, Some(ItemSetOp::ToPouch));
         assert!(!ed.dirty);
         assert_eq!(crate::myset::pouch(ed.save.as_ref().expect("save"), 0)[0].id, 0);
 
-        ed.input(Key::Minus);
+        ed.item_set_to_pouch();
         assert!(ed.dirty);
         let pouch = crate::myset::pouch(ed.save.as_ref().expect("save"), 0);
         assert_eq!(pouch[0], crate::myset::SetItem { id: 11, count: 7 });
@@ -24026,9 +24298,12 @@ mod tests {
         let mut ed = Editor::new();
         ed.screen = Screen::Convert;
         let hint = ed.footer_hint();
-        for key in ["[A] 変換出力", "[Y] 出力名変更", "[B] 戻る"] {
+        for key in ["[A] 変換出力", "[Y] 出力名", "[B] 戻る"] {
             assert!(hint.contains(key), "{key} is missing from {hint}");
         }
+        // The write replaces whatever is at the output path, so the guide says
+        // it asks twice (the review's ninth finding).
+        assert!(hint.contains("（2回）"), "{hint}");
         for wrong in ["[◀/▶] 値変更", "[X] 保存"] {
             assert!(!hint.contains(wrong), "{wrong} is on a screen that ignores it");
         }

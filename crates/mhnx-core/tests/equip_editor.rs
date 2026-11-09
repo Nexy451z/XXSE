@@ -86,8 +86,10 @@ fn unreferenced_row(ed: &Editor) -> Option<(usize, usize)> {
 fn the_equip_list_deletes_only_on_the_second_press() {
     let Some(mut ed) = open_editor() else { return };
     let slot = ed.slot;
-    ed.input(Key::Minus);
-    assert_eq!(ed.screen, Screen::Equip, "[-] on the slot screen opens the box");
+    // The box is a section, not a key on the slot screen: [-] is the delete
+    // key and nothing else (the review's twelfth finding).
+    ed.screen = Screen::Equip;
+    assert_eq!(ed.screen, Screen::Equip);
 
     let Some((pos, index)) = unreferenced_row(&ed) else {
         return;
@@ -134,7 +136,7 @@ fn the_equip_list_deletes_only_on_the_second_press() {
 fn a_referenced_record_shows_its_references_before_the_force_delete() {
     let Some(mut ed) = open_editor() else { return };
     let slot = ed.slot;
-    ed.input(Key::Minus);
+    ed.screen = Screen::Equip;
 
     let save = ed.save.as_ref().unwrap();
     let found = ed
@@ -180,8 +182,7 @@ fn the_new_form_creates_a_record_and_selects_its_row() {
     };
     let before = used_records(ed.save.as_ref().unwrap(), slot);
 
-    ed.input(Key::Minus);
-    assert_eq!(ed.screen, Screen::Equip);
+    ed.screen = Screen::Equip;
     ed.input(Key::Plus);
     assert_eq!(ed.screen, Screen::EquipEdit, "[+] opens the new form");
     let form = ed.equip_edit.expect("the form is open");
@@ -231,7 +232,7 @@ fn the_new_form_creates_a_record_and_selects_its_row() {
 fn changing_the_type_in_the_form_replaces_the_record() {
     let Some(mut ed) = open_editor() else { return };
     let slot = ed.slot;
-    ed.input(Key::Minus);
+    ed.screen = Screen::Equip;
     let Some((pos, index)) = unreferenced_row(&ed) else {
         return;
     };
