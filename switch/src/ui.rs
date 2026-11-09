@@ -656,10 +656,6 @@ pub struct GuiState {
     pub quest_tab: usize,
     pub quest_cat_cursor: [usize; 4],
     pub mib_picker: Option<MibPickerState>,
-    /// Set when the item chooser was opened from a 報酬 / 支給品 row, so the
-    /// pick comes back to the aggregate screen rather than to the .rem file
-    /// screen it was opened from.
-    pub quest_pick_return: bool,
     /// The monster slot whose エリア番号 chooser is open, if it is the one
     /// the shared picker modal is showing. The picker is the same modal the
     /// .mib screen uses; this says which writer its [A] lands in.
@@ -723,7 +719,6 @@ impl GuiState {
             quest_tab: 0,
             quest_cat_cursor: [0; 4],
             mib_picker: None,
-            quest_pick_return: false,
             quest_area_slot: None,
             mib_mob_sub: 0,
             osk: None,
@@ -2022,17 +2017,35 @@ impl GuiState {
     /// without a destination per screen. The screens that already *are* a
     /// detail view answer with a message rather than leaving a dead button.
     pub fn open_detail(&mut self, ed: &mut Editor) {
+        let target = ed.detail_target(self.sets_tab);
+        self.open_detail_at(ed, target);
+    }
+
+    /// The same, on the screen state captured when [R] went down.
+    ///
+    /// [R]'s tap waits for the release (hbedit::ShoulderTap), so the hold that
+    /// opens this can arrive a second after the press. The review's requirement
+    /// was that the detail view opens on the screen the user was looking at
+    /// when they pressed - and the row is resolved from the snapshot
+    /// (hbedit::Editor::detail_row_of), not from whatever the release frame
+    /// shows.
+    pub fn open_detail_at(
+        &mut self,
+        ed: &mut Editor,
+        target: mhnx_core::hbedit::DetailTarget,
+    ) {
+        let from = target.screen;
         // クエスト改造's 詳細 is its own set of file screens, not the save map.
-        if ed.screen == Screen::QuestEdit {
+        if from == Screen::QuestEdit {
             self.open_quest_detail(ed);
             return;
         }
-        if ed.screen == Screen::SaveMap {
+        if from == Screen::SaveMap {
             ed.message = String::from("生データを表示中です（[B] で戻ります）");
             return;
         }
         if matches!(
-            ed.screen,
+            from,
             Screen::ArcList
                 | Screen::ArcEntries
                 | Screen::EntryView
@@ -2046,7 +2059,7 @@ impl GuiState {
         // A pick list is a mode of the screen under it: jumping away from it
         // would leave a pick half answered.
         if matches!(
-            ed.screen,
+            from,
             Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
         ) {
             ed.message = String::from("選択中は生データを開けません（[B] で戻ってから）");
@@ -2061,31 +2074,10 @@ impl GuiState {
         self.close_set_form(ed);
         self.close_palico_panel(ed);
         ed.dismiss_item_menu();
-        let from = ed.screen;
-        // Two screens have one region per view, and the view lives in this
-        // layer, so this is the one place that can resolve them.
-        let row = match from {
-            Screen::Sets => {
-                let name = if self.sets_tab == 0 {
-                    "アイテムマイセット"
-                } else {
-                    "装備マイセット"
-                };
-                Editor::save_map_row_named(name, ed.slot)
-            }
-            Screen::Progress => {
-                let name = match ed.progress_view() {
-                    PROGRESS_REQUESTS => "依頼フラグ",
-                    PROGRESS_QUESTS => "クエスト（クリア）",
-                    _ => "勲章（解禁マップ）",
-                };
-                Editor::save_map_row_named(name, ed.slot)
-            }
-            Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => {
-                Editor::save_map_row_named("闘技大会の記録", ed.slot)
-            }
-            _ => Editor::detail_row_for(from, ed.slot),
-        };
+        // The row comes from the snapshot: three screens resolve theirs from a
+        // view number, and the state machine owns that rule now
+        // (hbedit::Editor::detail_row_of).
+        let row = ed.detail_row_of(target);
         if row.is_none() {
             ed.message = String::from("この画面には対応する生データがありません");
             return;
@@ -2104,20 +2096,23 @@ impl GuiState {
     /// | [◀] / [▶]      | 10 rows (hbedit::pick_move)           | value / page by the row's meaning | value ±step; 10 on an id row |
     /// | [▲] / [▼]      | 1 row                                 | 1 row                             | 1 row              |
     /// | held [◀]/[▶]   | repeats at 8 / 4 / 3 frames           | repeats at 8 / 4 / 3 frames       | repeats at 8 / 4 / 3 frames |
-    /// | [L] / [R] tap  | ten rows, same as [◀] / [▶], repeated while held | the mode's own key (swallowed by the set / palico form) | previous / next sub-tab |
+    /// | [L] / [R] tap  | ten rows, same as [◀] / [▶], repeated while held | the mode's own key (swallowed by the set / palico form) | previous / next sub-tab; [R]'s tap runs on the *release* |
     /// | held [L]       | (repeats the ten-row step)            | —                                 | first hold offers 元に戻す, second hold runs it |
-    /// | held [R]       | (repeats the ten-row step)            | —                                 | opens 詳細 |
+    /// | held [R]       | (repeats the ten-row step)            | —                                 | opens 詳細 (from the screen the key went down on) |
     /// | [A]            | 決定                                  | the row's own action              | the row's own action (equipment / talisman forms: 選ぶ・書き込み・作成) |
     /// | [Y]            | 検索 (the keyboard)                    | 一覧の表示切替 (item box: 空きも表示) / the mode's own key | 一覧の 検索・表示切替, otherwise the screen's own second action |
     /// | [X]            | クリア／保存 (per screen)              | 保存                              | 保存 (global QuickSave) |
     /// | [ZR]           | 種別 filter (the name picker; the other three send it to the section bar) | the screen's own second action | the screen's own second action, else the section bar |
     /// | [－] / [＋]     | 2-press delete / 終了                  | 2-press delete / quit             | 2-press delete / the screen's own tool |
     ///
-    /// The two rules that make it collision-free: (1) a shoulder is answered on
-    /// the press, and its hold is a *second* answer that never undoes the first,
-    /// so a hold cannot lose its tab move and two taps cannot be swallowed by a
-    /// hold; (2) a pick list owns L / R as movement before the sub-tab rule is
-    /// reached (see `shoulder_moves`), exactly as it owns [◀] / [▶].
+    /// The two rules that make it collision-free: (1) [L] is answered on the
+    /// press and its hold is a *second* answer that never undoes the first, so a
+    /// hold cannot lose its tab move and two taps cannot be swallowed by a
+    /// hold - while [R]'s tap waits for the release, because its hold opens
+    /// 詳細 and a hold that also moved the sub-tab opened it on the wrong screen
+    /// (hbedit::ShoulderTap); (2) a pick list owns L / R as movement before the
+    /// sub-tab rule is reached (see `shoulder_moves`), exactly as it owns
+    /// [◀] / [▶].
     pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
         // What a shoulder press means is the state machine's answer
         // (hbedit::Editor::shoulder_job): the sub-tab by default, the ten row
@@ -2156,11 +2151,17 @@ impl GuiState {
             }
         }
 
-        // [B] on a file screen opened through 詳細 goes back to クエスト改造,
-        // not to the arc list: the quest is still the thing being edited and
-        // those screens are its detail view. The working copies are flushed
-        // first, the same way leaving them by their own [B] did.
-        if key == Key::B && ed.arc.is_some() && is_quest_inner(ed.screen) {
+        // [B] on the file list (構成(.arc)) goes back to クエスト改造, not to
+        // the arc list: the quest is still the thing being edited and this list
+        // is its detail view. The working copies are flushed first, the same
+        // way leaving them by their own [B] did.
+        //
+        // Only the list itself: the screens *inside* it (.mib / .gmd / 検査 /
+        // the decoded view) unwind one level, back to the list. The arm used to
+        // catch all five, so their own [B] arms - which say exactly that - were
+        // dead code, and a press on the .mib screen skipped the list it came
+        // from.
+        if key == Key::B && ed.arc.is_some() && ed.screen == Screen::ArcEntries {
             safe_flush_quest_entry(ed);
             ed.screen = Screen::QuestEdit;
             ed.cursor = 0;
@@ -2226,8 +2227,11 @@ impl GuiState {
                         if ed.field == 0 {
                             ed.input(Key::Right); // Open Name OSK
                         } else if ed.field == 13 {
-                            let cur = ed.char_value(13);
-                            ed.set_char_value(13, if cur == 0 { 1 } else { 0 });
+                            // The 性別 row is the one [A] that is neither a MAX
+                            // nor a keyboard. It flipped the byte and said
+                            // nothing, which reads as a key that did nothing:
+                            // the state machine names the value it wrote.
+                            ed.char_gender_flip();
                         } else {
                             self.apply_action(ed, UiAction::SetRowMax(ed.field));
                         }
@@ -2253,9 +2257,9 @@ impl GuiState {
                 // which left the state machine's toggle unreachable - the one
                 // thing this screen's heading can say that nothing else does.
                 // The step is the deck's button now (every key on this screen
-                // is spoken for: A picks, R types the count, X saves, ZR is the
-                // search, +/- are tools and quit, L/R are the BOX tabs, ZL/ZR
-                // the sidebar, and [-] is the delete key with nothing to
+                // is spoken for: A picks, R types the count, X saves, ZR opens
+                // the bulk menu, +/- are tools and quit, L/R are the BOX tabs,
+                // ZL/ZR the sidebar, and [-] is the delete key with nothing to
                 // delete here).
                 Key::Y if ed.item_menu_open => {}
                 Key::Y => self.apply_action(ed, UiAction::ToggleItemEmpty),
@@ -2266,8 +2270,10 @@ impl GuiState {
                     ed.request_item_count_text();
                 }
                 // [-] is the delete key and this screen has nothing to
-                // delete: the bulk menu is the 一括操作 pill (or the deck's own
-                // row), and 元に戻す is one of its rows.
+                // delete. [ZR] opens the bulk menu (hbedit::Editor::
+                // open_item_menu), and 元に戻す is one of its rows - the pill
+                // on the bar and the deck's own row are the touch routes to the
+                // same menu.
                 other => ed.input(other),
             },
             Screen::ItemPick => match key {
@@ -2280,15 +2286,12 @@ impl GuiState {
                             ed.cursor = pos;
                         }
                     }
-                    // An item picked for a reward / supply row belongs to the
-                    // 報酬 tab it was opened from, so the pick comes back there
-                    // instead of leaving the user on the .rem file screen.
-                    if mode == 1 && self.quest_pick_return {
-                        self.quest_pick_return = false;
-                        if ed.screen == Screen::EntryView {
-                            ed.enter_quest_edit();
-                        }
-                    }
+                    // The pick comes back to the screen that opened the
+                    // picker, and the state machine knows which one that is
+                    // (hbedit::Editor::item_pick_return). This layer used to
+                    // carry a flag for it, which only knew about one of the
+                    // four routes and was never cleared when the pick was
+                    // cancelled.
                 }
                 other => ed.input(other),
             },
@@ -2303,13 +2306,13 @@ impl GuiState {
                 // quest list and the three pickers - and the state machine
                 // turns it into a keyboard request, so it falls through to
                 // ed.input below like every other key this layer does not use.
-                Key::A => {
-                    if ed.charms().is_empty() {
-                        ed.input(Key::L);
-                    } else {
-                        ed.input(Key::A);
-                    }
-                }
+                // [A] opens the selected talisman's form, creates the first one
+                // in an empty box, and says "no matches" when a search hides
+                // every record. The three answers are the state machine's
+                // (hbedit::Editor::charm_a_press): this layer used to ask
+                // `charms().is_empty()` itself, and that is the *filtered*
+                // list - so a search with no hits started a new talisman.
+                Key::A => ed.charm_a_press(),
                 // [-] is the one destructive key on every screen, twice: the
                 // same key the equipment box, the sets and the palico panels
                 // use. Both presses are the state machine's
@@ -2423,9 +2426,10 @@ impl GuiState {
                     self.sets_tab = 1 - self.sets_tab;
                     self.sets_cursor = 0;
                 }
-                Key::B => {
-                    ed.open_charms();
-                }
+                // [B] leaves for the talisman list, which is the destination
+                // the footer names. The state machine answers the same way
+                // (Editor::input_sets), so the two layers cannot disagree.
+                Key::B => ed.input(Key::B),
                 _ => {},
             },
             // The CSV screen is a folder list: A applies a file (twice, since
@@ -2506,14 +2510,12 @@ impl GuiState {
                 Key::Z => {
                     self.wants_extract_official_arcs = true;
                 }
-                Key::B => {
-                    if ed.save.is_some() {
-                        self.quest_tab = 0;
-                        ed.screen = Screen::SaveQuests;
-                    } else {
-                        ed.screen = Screen::SaveList;
-                    }
-                }
+                // [B] leaves the quest section for the save list. It used to go
+                // to セーブ内, whose [B] comes back here: one key, two screens,
+                // neither ever leaving. The state machine answers the same way
+                // (Editor::input_arc_list), so the footer's "[B] セーブ一覧" is
+                // true of both layers.
+                Key::B => ed.input(Key::B),
                 other => ed.input(other),
             },
             Screen::ArcEntries => match key {
@@ -2560,9 +2562,9 @@ impl GuiState {
                         QuestPick::Detail => self.open_quest_detail(ed),
                         QuestPick::None => {}
                     }
-                    // A reward / supply row opens the item chooser; the pick
-                    // has to come back here, not to the .rem file screen.
-                    self.quest_pick_return = ed.screen == Screen::ItemPick;
+                    // A reward / supply row opens the item chooser, and the
+                    // pick comes back here: the state machine records that when
+                    // it opens the picker (Editor::item_pick_return).
                 }
                 // [ZR] is the tab's own value switch now (the state
                 // machine's), so the file screens keep their two other doors:
@@ -4282,12 +4284,33 @@ impl GuiState {
             sx += tw + 6;
         }
 
-        // [ZR] button, straight after the last section
+        // The section-forward button, straight after the last section.
+        //
+        // It used to be labelled "ZR", and that was a lie on most screens: the
+        // pad's ZR is the screen's own second action wherever
+        // hbedit::Editor::zr_job answers ZrJob::Screen (the item box's search
+        // is the menu now, the progress screen's search, the .mib's 項目, the
+        // quest's 個数/確率, the pickers' 種別 ...), and only the section bar
+        // where it answers Sidebar. One label, two meanings - the review's
+        // finding. The button is a tap target, so it says what the tap does and
+        // names no key at all; [ZL] on the left keeps its name because the pad
+        // really does deliver ZL to the section bar on every screen.
+        let zr_label = "セクション送り";
+        let zr_w = (c.text_width_sized(zr_label, FontSize::Small) + 16).clamp(44, 148);
         let zr_x = sx;
-        c.round_rect(zr_x, 8, 44, 32, t.corner_r, t.bg_btn);
-        c.round_rect_border(zr_x, 8, 44, 32, t.corner_r, 1, t.border_subtle);
-        btn_text(c, zr_x, 8, 44, 32, "ZR", t.accent_primary, FontSize::Small);
-        self.add_hit(zr_x, 8, 44, 32, UiAction::CycleSection(true));
+        c.round_rect(zr_x, 8, zr_w, 32, t.corner_r, t.bg_btn);
+        c.round_rect_border(zr_x, 8, zr_w, 32, t.corner_r, 1, t.border_subtle);
+        btn_text(
+            c,
+            zr_x,
+            8,
+            zr_w,
+            32,
+            zr_label,
+            t.accent_primary,
+            FontSize::Small,
+        );
+        self.add_hit(zr_x, 8, zr_w, 32, UiAction::CycleSection(true));
 
         // Right Status Area: Active Slot badge + [X] Save Pill
         //
@@ -4297,8 +4320,10 @@ impl GuiState {
         // to three glyphs and "..". The badge takes the whole gap and puts the
         // slot number on its own line, which leaves the name its full 188px.
         // The badge takes the gap the sections left, so a wider row of short
-        // labels gives the name more room rather than leaving a hole.
-        let slot_x = (zr_x + 50).min(900).max(zr_x + 48);
+        // labels gives the name more room rather than leaving a hole. It starts
+        // after the section-forward button: the button is wider than the 44px
+        // "ZR" it replaced, and the badge must not be drawn under it.
+        let slot_x = zr_x + zr_w + 6;
         let slot_w = (1108 - slot_x).max(0);
         let slot_name = ed
             .save
@@ -4459,18 +4484,16 @@ impl GuiState {
                 self.add_hit(964, sy, 136, sh, UiAction::ToggleItemEmpty);
 
                 // The bulk edits live in one menu now, so the pill opens it
-                // instead of promising a single *99 that is only one row.
+                // instead of promising a single *99 that is only one row. The
+                // key is [ZR] (hbedit::Editor::open_item_menu) - [-] is the
+                // delete key and the menu had no key at all before this.
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                // No key name on the pill: [-] is the delete key now and the
-                // menu is opened from here (or by the deck's own row), so the
-                // button says the word and the guide says nothing it cannot
-                // keep.
                 if ed.item_menu_open {
                     btn_text(c, 1108, sy, 158, sh, "[B] 閉じる", t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::B));
                 } else {
-                    btn_text(c, 1108, sy, 158, sh, "一括操作", t.text_primary, FontSize::Small);
+                    btn_text(c, 1108, sy, 158, sh, "[ZR] 一括操作", t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::OpenItemMenu);
                 }
             }
@@ -6622,7 +6645,7 @@ impl GuiState {
                         row_y(0),
                         full_w,
                         row_h(0),
-                        "一括操作メニュー",
+                        "[ZR] 一括操作メニュー",
                         UiAction::OpenItemMenu,
                     );
                     self.draw_tool_button(
@@ -6899,7 +6922,10 @@ impl GuiState {
                     let to_lbl = if ed.item_set_armed == Some(ItemSetOp::ToPouch) {
                         "もう一度タップで適用する"
                     } else {
-                        "ポーチへ適用（2回）"
+                        // [R] is the same operation on the pad
+                        // (hbedit::Editor::shoulder_job): the pill and the key
+                        // run one method, so they cannot disagree.
+                        "[R] ポーチへ適用（2回）"
                     };
                     self.draw_tool_button(
                         c,

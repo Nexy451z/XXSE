@@ -115,8 +115,10 @@ fn the_menu_offers_every_row_and_says_how_much_each_would_change() {
     open_items(&mut ed);
     open_menu(&mut ed);
 
-    // The console renders the same six rows the state machine runs.
-    assert_eq!(ITEM_OPS.len(), 6);
+    // The console renders the same rows the state machine runs. Seven since
+    // the name search moved in here: [ZR] opens this menu now, so the search it
+    // used to be is a row of it.
+    assert_eq!(ITEM_OPS.len(), 7);
     let text: Vec<String> = ed.lines().iter().map(|l| l.text.clone()).collect();
     let joined = text.join("\n");
     assert!(joined.contains("ITEM OPS"), "{}", joined);

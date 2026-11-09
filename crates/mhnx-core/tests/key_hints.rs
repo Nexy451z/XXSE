@@ -29,7 +29,6 @@ const SWITCH_EDITOR_SRC: &str = include_str!("../../../switch/src/editor.rs");
 /// * Sets - the list's ◀ / ▶ / Y switch tabs (the set form owns them instead,
 ///   and its footer names them as its own keys).
 /// * Palico - ◀ / ▶ run `UiAction::TogglePalicoLang`.
-/// * ArcList - [B] goes back to セーブ内 (the state machine has no arm).
 /// * Mib - [Y] is the step and [ZR] walks a monster slot's eight values.
 /// * Options / EntryView - [Y] is the snapshot restore and the step.
 /// * Slots - ◀ / ▶ pick the previous / next slot (the state machine only
@@ -38,7 +37,6 @@ const CONSOLE_ONLY: &[(&str, &[&str])] = &[
     ("Slots", &["Left", "Right"]),
     ("Sets", &["Left", "Right", "Y"]),
     ("Palico", &["Left", "Right"]),
-    ("ArcList", &["B"]),
     ("Mib", &["Y", "Z"]),
     ("Options", &["Y"]),
     ("EntryView", &["Y"]),

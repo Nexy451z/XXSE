@@ -165,14 +165,39 @@ fn the_save_key_on_the_talisman_form_only_saves() {
 
 /// A2 (equipment form): the same key on an identity row opened the equipment
 /// picker, and on the 装備枠 row it replaced the record, before it saved.
+///
+/// The form is built the way the console builds one - create a record, then
+/// open the form on it - because the blank save holds no equipment: a form
+/// pointing at an empty row cannot be committed, and the save key correctly
+/// refuses to write a file that lacks what is on screen.
 #[test]
 fn the_save_key_on_the_equipment_form_only_saves() {
     let mut ed = Editor::new();
     open_blank(&mut ed);
-    let mut form = EquipEdit::default();
-    form.field = 7; // 種別: the row whose [A] opens the equipment picker
+    ed.screen = Screen::Equip;
+    ed.input(Key::Plus); // [＋] opens the new-record form on this screen
+    let mut new = ed.equip_edit.expect("the creator opens a form");
+    new.kind = 1;
+    new.id = 1;
+    new.level = 1;
+    new.field = new.write_row();
+    ed.equip_edit = Some(new);
+    ed.input(Key::A); // レベル: 作成
+    assert!(
+        ed.equip_edit.is_none(),
+        "[A] creates and leaves the form: {}",
+        ed.message
+    );
+    assert_eq!(ed.screen, Screen::Equip);
+
+    // Now edit it: the form holds a level the record does not have.
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
+    let mut form = ed.equip_edit.expect("the form is open");
+    form.level = 3;
+    form.field = 0; // 装備枠: the row whose [A] writes
     ed.equip_edit = Some(form);
-    ed.screen = Screen::EquipEdit;
+    ed.take_write();
 
     ed.quick_save();
 
@@ -188,6 +213,16 @@ fn the_save_key_on_the_equipment_form_only_saves() {
         ed.take_text_request().is_none(),
         "and it must not open a keyboard"
     );
+    // The fifth review's fix: [X] saves, it does not leave. The commit used to
+    // be [A]'s, and [A] closes the form - so saving threw the user back to the
+    // list they had just left.
+    assert_eq!(
+        ed.screen,
+        Screen::EquipEdit,
+        "the save key must not close the form: {}",
+        ed.message
+    );
+    assert!(ed.equip_edit.is_some(), "the form is still the one on screen");
     assert!(
         ed.take_write().is_some(),
         "the save request is the one thing [X] does"

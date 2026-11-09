@@ -3706,8 +3706,10 @@ fn the_console_shows_the_sets() {
     assert!(joined.contains("ITEM SETS"), "{}", joined);
     assert!(joined.contains("EQUIPMENT SETS"), "{}", joined);
     assert!(joined.contains("剣士"), "{}", joined);
+    // [B] leaves the set screen for the talisman list, which is the screen the
+    // console opens it from and the one the footer names ("[B] 護石一覧").
     ed.input(Key::B);
-    assert_eq!(ed.screen, Screen::Slots);
+    assert_eq!(ed.screen, Screen::Charms);
 }
 
 // ---------------------------------------------------------------------------
@@ -4145,12 +4147,13 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Check);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::ArcEntries);
+    // The file list is クエスト改造's detail view, so its [B] goes back there.
     press!(Key::B);
-    assert_eq!(ed.screen, Screen::ArcList);
+    assert_eq!(ed.screen, Screen::QuestEdit);
 
     // クエスト改造 is where the console lands when a quest is picked (the
-    // I/O layer calls this after open_arc_bytes), and its [B] goes back to
-    // the file list, so the screen is reachable and leaves the same way.
+    // I/O layer calls this after open_arc_bytes), and its [B] goes back to the
+    // list the quest was opened from.
     ed.enter_quest_edit();
     audit_note(&ed, &mut seen);
     assert_eq!(ed.screen, Screen::QuestEdit);
@@ -4213,7 +4216,7 @@ fn audit_every_screen_is_reachable_by_keys() {
     press!(Key::A, Key::Y);
     assert_eq!(ed.screen, Screen::Sets);
     press!(Key::B);
-    assert_eq!(ed.screen, Screen::Slots);
+    assert_eq!(ed.screen, Screen::Charms, "the set screen goes to the talisman list");
 
     let missing: Vec<&str> = AUDIT_SCREENS
         .iter()
@@ -4416,7 +4419,14 @@ fn audit_a_charm_can_be_edited_through_the_skill_picker() {
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Charms);
     assert!(ed.dirty);
-    let idx = ed.charm_edit.expect("kept").index;
+    // The write is [A]'s, and [A] leaves the form: the record is the box's now,
+    // so the list is where the next thing happens (the save key is the one that
+    // writes without leaving).
+    assert!(
+        ed.charm_edit.is_none(),
+        "the write closes the form it wrote from"
+    );
+    let idx = edit.index;
     let rec = {
         let s = ed.save.as_ref().expect("a save");
         let b = s.equipment_box(ed.slot).expect("a box");
@@ -4844,12 +4854,10 @@ fn audit_the_entry_view_x_writes_the_archive() {
 
 /// The .arc list's way back is [B], and the chip has to say so.
 ///
-/// It was the one screen whose chips named no way out: the state machine has no
-/// [B] arm on ArcList (the console answers the key before the state machine
-/// ever sees it), so the table - which describes the console's dispatch - was
-/// written from the state machine and lost the key. The gap is closed on the
-/// console side and the chips say [B] now; the state machine still does not,
-/// which is why the two assertions below are not the same one.
+/// It was the one screen whose chips named no way out: the console answered the
+/// key before the state machine ever saw it, so the table - which describes the
+/// console's dispatch - was written from the state machine and lost the key.
+/// Both layers answer it now, and both go to the save list.
 #[test]
 fn audit_the_arc_list_names_the_back_key_the_console_answers() {
     let arms = switch_hint_arms();
@@ -4864,16 +4872,18 @@ fn audit_the_arc_list_names_the_back_key_the_console_answers() {
     open_save(&mut ed);
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::ArcList);
-    let message = ed.message.clone();
+    // The state machine answers [B] too now, and it goes where the console
+    // sends it: the save list. It used to go to セーブ内, whose own [B] comes
+    // right back here - one key, two screens, neither ever leaving the section.
     ed.input(Key::B);
     assert_eq!(
         ed.screen,
-        Screen::ArcList,
-        "the state machine has no [B] arm here - the console's dispatch does"
+        Screen::SaveList,
+        "[B] leaves the quest section for the save list"
     );
-    assert_eq!(ed.message, message);
-    // The state machine's own way back is Y, which is labelled as the save
-    // editor.
+    // [Y] is the other way back (the save editor), and it lands in the same
+    // place.
+    ed.screen = Screen::ArcList;
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::SaveList);
 }

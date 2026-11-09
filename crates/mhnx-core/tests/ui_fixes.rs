@@ -280,7 +280,9 @@ fn the_arc_list_footer_lists_its_own_keys() {
     let mut ed = Editor::new();
     ed.screen = Screen::ArcList;
     let hint = ed.footer_hint();
-    for chip in ["[A] 開く", "[Y] 導入", "[ZR] SDへ展開", "[B] 戻る"] {
+    // [B] names the screen it goes to: the save list. It used to say 戻る and
+    // send the user to セーブ内, whose [B] came right back here.
+    for chip in ["[A] 開く", "[Y] 導入", "[ZR] SDへ展開", "[B] セーブ一覧"] {
         assert!(
             hint.contains(chip),
             "the .arc list footer is missing {}: {}",

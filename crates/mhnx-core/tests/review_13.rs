@@ -11,8 +11,8 @@
 use mhnx_core::hbedit::{
     caption_width, footer_hint_room, footer_undo_w, Editor, Key, Screen, ZrJob,
     FOOTER_HINT_ROOM, GUILD_TAB_ARENA, GUILD_TAB_CARD, GUILD_TAB_COUNTS, GUILD_TAB_WEAPONS,
-    PROGRESS_AWARDS, PROGRESS_QUESTS, QUEST_TAB_BASIC, QUEST_TAB_MONSTERS, TEXT_CHARM_FILTER,
-    TEXT_ITEM_BOX_FILTER, TEXT_PROGRESS_FILTER,
+    ITEM_OP_FIND, PROGRESS_AWARDS, PROGRESS_QUESTS, QUEST_TAB_BASIC, QUEST_TAB_MONSTERS,
+    TEXT_CHARM_FILTER, TEXT_ITEM_BOX_FILTER, TEXT_PROGRESS_FILTER,
 };
 use mhnx_core::save::{Save, BODY_SIZE, SLOT_STRIDE};
 
@@ -419,19 +419,30 @@ fn the_save_review_body_is_the_row_font() {
 
 /// The item box's search was a pill only ([Y] is 空きも表示 and every other key
 /// is spoken for), and the talisman list's footer never named the way back.
+///
+/// The search has a key again, one press further in: [ZR] opens the bulk menu
+/// (the review's finding was that the one screen whose whole point is bulk
+/// edits could not reach them from the pad), and the search is a row of that
+/// menu. The key is still the state machine's and the footer still names it.
 #[test]
 fn the_item_box_search_is_a_key_and_both_footers_name_the_way_back() {
     let mut ed = open_blank();
     ed.screen = Screen::Items;
     assert_eq!(ed.zr_job(), ZrJob::Screen);
+    // The list's own line names the key; the menu has a line of its own.
+    let hint = ed.footer_hint();
+    assert!(hint.contains("[ZR] 一括"), "{hint}");
+    assert!(hint.contains("[B] 戻る"), "{hint}");
     ed.input(Key::Z);
+    assert!(ed.item_menu_open, "[ZR] opens the bulk menu: {}", ed.message);
+    // The search is one of its rows, and it is the row that asks for a name.
+    ed.item_menu_cursor = ITEM_OP_FIND;
+    ed.input(Key::A);
     assert_eq!(
         ed.take_text_request().map(|(id, _)| id),
-        Some(TEXT_ITEM_BOX_FILTER)
+        Some(TEXT_ITEM_BOX_FILTER),
+        "the menu's 名前で探す row is the search"
     );
-    let hint = ed.footer_hint();
-    assert!(hint.contains("[ZR] 検索"), "{hint}");
-    assert!(hint.contains("[B] 戻る"), "{hint}");
 
     // The talisman list already answered [Y]; what it did not do was name the
     // way back. It names it now, and by the screen it goes to: the fourth
@@ -605,10 +616,14 @@ fn minus_is_the_delete_key_and_nothing_else() {
     ed.input(Key::Minus);
     assert!(!ed.item_menu_open, "[-] does not open the bulk menu any more");
     ed.input(Key::Z);
+    assert!(ed.item_menu_open, "[ZR] is the bulk menu");
+    // The search it used to be is a row of that menu.
+    ed.item_menu_cursor = ITEM_OP_FIND;
+    ed.input(Key::A);
     assert_eq!(
         ed.take_text_request().map(|(id, _)| id),
         Some(TEXT_ITEM_BOX_FILTER),
-        "[ZR] is the search"
+        "[ZR] then 名前で探す is the search"
     );
     ed.screen = Screen::Hunts;
     let before = ed.hunt_show_all;

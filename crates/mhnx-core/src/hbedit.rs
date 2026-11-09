@@ -223,6 +223,26 @@ pub enum ZrJob {
     Screen,
 }
 
+/// What 詳細 would open, captured when the key went down.
+///
+/// [R]'s tap waits for the release (see [ShoulderTap]), and the hold opens the
+/// byte view of the screen the user was on when they pressed. Three screens
+/// resolve that row from a view that lives in the console layer - マイセット's
+/// two arrays, 進行状況's three bit maps, the card's four views - so the view
+/// numbers travel with the screen rather than being read again on the release
+/// frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailTarget {
+    /// The screen 詳細 was pressed on.
+    pub screen: Screen,
+    /// [Editor::progress_view] at that moment.
+    pub progress_view: usize,
+    /// [Editor::guild_view] at that moment.
+    pub guild_view: usize,
+    /// The console's マイセット tab (0 = items, 1 = equipment).
+    pub sets_tab: usize,
+}
+
 /// The three views of [Screen::Progress], in the order L / R walks them.
 pub const PROGRESS_AWARDS: usize = 0;
 /// The request / event flag view.
@@ -3901,12 +3921,20 @@ pub fn charm_points_ceiling(e: &CharmEdit, second: bool) -> Option<i8> {
 // that can drop data can say what they would drop before they run.
 // ---------------------------------------------------------------------------
 
-/// The rows of the item box operation menu, opened with `-`.
+/// The rows of the item box operation menu, opened with [ZR].
 ///
-/// The first four are the requested bulk edits, then the two rows that do not
-/// fit that shape: adding through the picker and taking the last edit back.
-/// Order is menu order; the constants below name the rows.
-pub const ITEM_OPS: [(&str, &str); 6] = [
+/// The first four are the requested bulk edits, then the three rows that do not
+/// fit that shape: adding through the picker, taking the last edit back, and the
+/// name search. Order is menu order; the constants below name the rows.
+///
+/// The menu itself is [ZR]'s job on the item box: [-] is the delete key and has
+/// been since the review that took its nineteen jobs away, and the item box has
+/// no other free key (A picks, Y toggles the empty rows, R types the count, X
+/// saves, L / R are the BOX tabs, ZL / ZR are the section bar). The name search
+/// had [ZR] before this, so it moved in here as a row: the key that opens the
+/// menu is one press and the search is two, which is the right way round for a
+/// menu that is opened rarely and a list that is 1,500 rows long.
+pub const ITEM_OPS: [(&str, &str); 7] = [
     (
         "すべて 99 に",
         "所持している全枠の個数を 99 にそろえます（空き枠はそのまま）",
@@ -3931,6 +3959,10 @@ pub const ITEM_OPS: [(&str, &str); 6] = [
         "直前の操作を元に戻す",
         "この画面での直前の変更を1つ取り消します",
     ),
+    (
+        "名前で探す",
+        "アイテム名で一覧を絞り込みます（空にすると解除）",
+    ),
 ];
 
 /// "すべて 99 に" - itembox::fill_all.
@@ -3945,6 +3977,8 @@ pub const ITEM_OP_CLAMP: usize = 3;
 pub const ITEM_OP_ADD: usize = 4;
 /// "直前の操作を元に戻す" - pops Editor::item_undo.
 pub const ITEM_OP_UNDO: usize = 5;
+/// "名前で探す" - the name search that used to be [ZR] on the list itself.
+pub const ITEM_OP_FIND: usize = 6;
 
 /// What the operation menu shows next to each row, read from the box once.
 ///
@@ -5562,6 +5596,17 @@ pub struct Editor {
     pub item_pick_mode: u8,
     /// Which .mib field mode 4 writes (the .mib field index of a com*).
     pub item_pick_mib_field: usize,
+    /// The screen the item picker goes back to when it closes.
+    ///
+    /// The picker is a mode of the screen that opened it, and four different
+    /// screens open it: the item box, the .rem / .sup reward row (either the
+    /// file screen or クエスト改造), the quest-equipment list and the .mib's
+    /// 対象ID row. It used to be the console's flag (`quest_pick_return`),
+    /// which knew about one of the four and was never cleared when the pick was
+    /// cancelled - so [B] out of a reward pick landed on the file screen, and
+    /// the next .rem pick jumped to クエスト改造. The state machine owns it now,
+    /// so every route in and out of the picker uses the same answer.
+    pub item_pick_return: Screen,
     /// Which reward record the picker will write.
     pub entry_item_row: usize,
     /// Cursor over the records of the open reward table.
@@ -6081,6 +6126,7 @@ impl Editor {
             equip_pick_cursor: 0,
             item_pick_mode: 0,
             item_pick_mib_field: 0,
+            item_pick_return: Screen::Items,
             entry_item_row: 0,
             entry_row_cursor: 0,
             entry_field: 0,
@@ -6886,10 +6932,11 @@ impl Editor {
             // rows: the chip used to say ページ, which reads like a scroll and
             // is not what the key does.
             // [Y] is the list's own state here: 所持品のみ <-> 空き枠も表示.
-            // [ZR] is the name search - the one input this screen had left, and
-            // the same key the progress screen's search answers.
+            // [ZR] opens the bulk operation menu - the key [-] used to carry
+            // before it became the delete key. The name search is a row inside
+            // that menu now, so the line names the menu and not the search.
             Screen::Items => {
-                "[A] 変更  [◀/▶] 個数  [R] 数値  [Y] 空き  [ZR] 検索  [X] 保存  [B] 戻る"
+                "[A] 変更  [◀/▶] 個数  [R] 数値  [Y] 空き  [ZR] 一括  [X] 保存  [B] 戻る"
             }
             // The three pick lists print the same line: the direction keys are
             // one rule everywhere, and the guide says which is which instead
@@ -6909,7 +6956,12 @@ impl Editor {
             }
             // Built by the form, not here: see footer_hint.
             Screen::CharmEdit => "",
-            Screen::Equip => "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 戻る",
+            // [B] goes to the slot cards, not to the screen the box was opened
+            // from: the guide names the destination rather than saying 戻る and
+            // sending the user somewhere else.
+            Screen::Equip => {
+                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 枠選択"
+            }
             // [A] is the row's own action (hbedit::EquipFormAction): the two
             // rows that name the record open the picker, the sockets open the
             // decoration list, the numeric rows step, 装備枠 writes and the new
@@ -6932,10 +6984,15 @@ impl Editor {
             Screen::Sets if self.set_edit.is_some() => {
                 "[A] 決定  [◀/▶] 装備  [-] 解除（2回）  [X] 保存  [B] 一覧（下書きは2回）"
             }
+            // [R] is ポーチへ適用: the copy into the pouch had no key at all
+            // (the deck's pill was the only door), so the form's one free key
+            // took it.
             Screen::Sets if self.item_set_edit.is_some() => {
-                "[A] 決定  [Y] 取込（2回）  [ZR] 名前  [B] 一覧（下書きは2回）"
+                "[A] 決定  [Y] 取込（2回）  [R] ポーチへ  [ZR] 名前  [B] 一覧（下書きは2回）"
             }
-            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 戻る",
+            // The list's [B] goes to the talisman list (the console opens it),
+            // so the guide names that screen instead of saying 戻る.
+            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 護石一覧",
             Screen::Csv if self.csv_armed.is_some() => {
                 "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [ZR] 再読込"
             }
@@ -6970,14 +7027,24 @@ impl Editor {
             // so the SD write every quest needs is the deck's button
             // (Editor::request_extract_all_quests) rather than a promise this
             // key cannot keep.
+            // [B] goes to the SD(.arc) list, which is the tab beside this one
+            // - the guide names it rather than saying 戻る.
             Screen::SaveQuests => {
-                "[A] 編集/導入（解除は2回）  [Y] 検索  [-] 削除（2回）  [X] 保存  [B] 戻る"
+                "[A] 編集/導入（解除2回）  [Y] 検索  [-] 削除（2回）  [X] 保存  [B] SD(.arc)"
             }
             // Screen-specific because every key here does something the other
             // screens do not have: Y installs the file into the open save and
             // [ZR] writes the bundled quests out.
-            Screen::ArcList => "[A] 開く  [Y] 導入（2回）  [ZR] SDへ展開  [B] 戻る",
-            Screen::ArcEntries => "[A] 開く  [Y] 検査  [ZR] 抽出  [X] 保存  [B] 戻る",
+            // [B] leaves the quest section for the save list. It used to go to
+            // セーブ内, which sent [B] back here: two screens bouncing one key.
+            Screen::ArcList => {
+                "[A] 開く  [Y] 導入（2回）  [ZR] SDへ展開  [B] セーブ一覧"
+            }
+            // The file screens are クエスト改造's detail view, so [B] goes
+            // there - and the guide says so instead of 戻る.
+            Screen::ArcEntries => {
+                "[A] 開く  [Y] 検査  [ZR] 抽出  [X] 保存  [B] 改造へ"
+            }
             Screen::Mib => {
                 "[A] 一覧選択  [◀/▶] 増減  [ZR] 項目  [Y] 刻み  [X] 保存  [B] 戻る"
             }
@@ -7133,6 +7200,11 @@ impl Editor {
             // The card's numeric rows take [R] as the keyboard; the arena view
             // is the one that does not - it spends [Y] on the time instead.
             Screen::Guild if right && self.guild_view() != GUILD_TAB_ARENA => Shoulder::Screen,
+            // The item set form's [R] is ポーチへ適用: the copy into the pouch
+            // was the deck's pill alone, so the pad could not reach it at all.
+            // [L] keeps the sub-tab, [R] is the form's own key - the same shape
+            // the equipment form's [R] (the id keyboard) has.
+            Screen::Sets if right && self.item_set_edit.is_some() => Shoulder::Screen,
             _ => Shoulder::SubTab,
         }
     }
@@ -8081,6 +8153,9 @@ impl Editor {
                 self.entry_item_row = index;
                 self.entry_row_cursor = index;
                 self.item_pick_mode = 1;
+                // The pick comes back to this screen, not to the .rem file
+                // screen the same picker opens from the file list.
+                self.item_pick_return = Screen::QuestEdit;
                 self.item_pick_cursor = 0;
                 self.item_pick_filter.clear();
                 self.screen = Screen::ItemPick;
@@ -8100,6 +8175,7 @@ impl Editor {
                 self.entry_item_row = index;
                 self.entry_row_cursor = index;
                 self.item_pick_mode = 1;
+                self.item_pick_return = Screen::QuestEdit;
                 self.item_pick_cursor = 0;
                 self.item_pick_filter.clear();
                 self.screen = Screen::ItemPick;
@@ -8331,6 +8407,7 @@ impl Editor {
         self.cursor = field_idx;
         self.item_pick_mib_field = field_idx;
         self.item_pick_mode = 4;
+        self.item_pick_return = Screen::Mib;
         self.item_pick_cursor = 0;
         self.item_pick_filter.clear();
         self.screen = Screen::ItemPick;
@@ -9139,6 +9216,22 @@ impl Editor {
             10..=16 => v.clamp(0, 255),
             _ => v,
         }
+    }
+
+    /// [A] on the 性別 row: flip it and say which one it is now.
+    ///
+    /// The console flipped the byte itself and said nothing, so the one row
+    /// whose [A] is neither a MAX nor a keyboard looked like a key that did
+    /// nothing - and a silent write on a character record is the shape of bug
+    /// the review keeps finding. The answer lives here so the row's [A] and its
+    /// message cannot disagree.
+    pub fn char_gender_flip(&mut self) {
+        let next = if self.char_value(13) == 0 { 1 } else { 0 };
+        self.set_char_value(13, next);
+        self.message = alloc::format!(
+            "性別を「{}」にしました（[◀/▶] でも変えられます / [X] で保存）",
+            if next == 0 { "男" } else { "女" }
+        );
     }
 
     /// Set a numeric character field.
@@ -10308,6 +10401,9 @@ impl Editor {
                     if matches!(ext, Some("rem") | Some("sup")) {
                         self.entry_item_row = self.entry_row_cursor;
                         self.item_pick_mode = 1;
+                        // The file screen is where this picker was opened from,
+                        // so [B] and the pick itself come back here.
+                        self.item_pick_return = Screen::EntryView;
                         self.item_pick_cursor = 0;
                         self.item_pick_filter.clear();
                         self.screen = Screen::ItemPick;
@@ -10534,6 +10630,35 @@ impl Editor {
         self.cursor = 0;
     }
 
+    /// [A] on the talisman list: open the form, create the first one, or say
+    /// why neither is right.
+    ///
+    /// The console used to decide this itself: `if ed.charms().is_empty()` ->
+    /// `Key::L` (create). `charms()` is the *filtered* list, so a search that
+    /// matched nothing started a brand new talisman - a press on a list that
+    /// said "no matches" wrote a record. The three answers live here now, the
+    /// same way the equipment box's [A] does, so the console's key and the
+    /// tests cannot disagree about which one a press gets.
+    pub fn charm_a_press(&mut self) {
+        if !self.charms().is_empty() {
+            self.input(Key::A);
+            return;
+        }
+        if !self.charm_filter.trim().is_empty() {
+            // A filtered list with no hits is not an empty box: creating here
+            // would write a record the user never asked for, on a list whose
+            // heading says the search found nothing.
+            self.message = alloc::format!(
+                "検索「{}」に一致するお守りがありません（[Y] で変える・空で解除 / 新規は [＋]）",
+                self.charm_filter.trim()
+            );
+            return;
+        }
+        // An empty box: [A] still creates, which is what the empty list's own
+        // message promises.
+        self.open_charm_editor(true);
+    }
+
     fn input_charms(&mut self, key: Key) {
         let list = self.charms();
         let n = list.len();
@@ -10719,12 +10844,22 @@ impl Editor {
             // [B] leaves the form. The draft is [A]'s to write, so leaving it
             // with one still in hand asks first: it used to be dropped by the
             // same press that closed the screen, with nothing saying so.
+            //
+            // Closing the form means closing it: this arm used to change the
+            // screen only, and the tail below put `charm_edit` back, so the
+            // list came back with a form still attached to it - the next [A]
+            // opened the form on a record nobody had chosen, and the next
+            // switch_slot had a draft to warn about. The equipment form's [B]
+            // clears its own, and the two now answer the same way.
             Key::B => {
                 self.charm_edit = Some(e);
                 if self.form_discard_press(self.charm_draft_dirty(), "護石編集") {
                     return;
                 }
+                self.charm_edit = None;
                 self.screen = Screen::Charms;
+                self.cursor = 0;
+                return;
             }
             Key::Plus => {
                 self.press_quit();
@@ -10745,6 +10880,29 @@ impl Editor {
     /// talisman says why and returns false; the caller must not then pretend
     /// the draft is in the save.
     pub fn commit_charm_draft(&mut self) -> bool {
+        if !self.write_charm_draft() {
+            return false;
+        }
+        // [A] wrote the record, so the list is where the next thing happens.
+        self.charm_edit = None;
+        self.screen = Screen::Charms;
+        self.cursor = 0;
+        true
+    }
+
+    /// The same write, without moving the screen, the form or the cursor.
+    ///
+    /// [X] is the save key on every screen, and the review's finding was that
+    /// pressing it on a form closed the form: the commit used to be the same
+    /// function [A] runs, and that one leaves for the list. Saving is not
+    /// leaving - the user is still editing the record, and the form is where
+    /// they were - so the save key runs this half.
+    pub fn commit_charm_draft_here(&mut self) -> bool {
+        self.write_charm_draft()
+    }
+
+    /// Write the form into the box and leave the navigation to the caller.
+    fn write_charm_draft(&mut self) -> bool {
         let Some(e) = self.charm_edit else {
             return false;
         };
@@ -10776,12 +10934,10 @@ impl Editor {
         }
         self.dirty = true;
         self.message = format!("お守り {} を書き込みました（{}）", e.index, kind_name);
-        // The values stay in the form (they are the record's now, so the draft
-        // is clean) and the screen goes back to the list, exactly as the row's
-        // [A] did.
+        // The values stay in the form: they are the record's now, so the draft
+        // is clean. Where the screen goes is the caller's half of the answer
+        // ([Editor::commit_charm_draft] leaves, [..._here] stays).
         self.charm_edit = Some(e);
-        self.screen = Screen::Charms;
-        self.cursor = 0;
         true
     }
 
@@ -11304,6 +11460,8 @@ impl Editor {
                 }
             }
             Key::X => self.request_write_arc(),
+            // The same answer the .mib screen gives: one level up, to the file
+            // list.
             Key::B => {
                 self.screen = Screen::ArcEntries;
                 self.cursor = self.entry;
@@ -11367,7 +11525,12 @@ impl Editor {
     /// one press: the first one only says what would be lost, and the second one
     /// quits. An unmodified editor quits at once, the way it always did.
     pub fn press_quit(&mut self) -> bool {
-        if !self.dirty || self.quit_armed {
+        // A form's draft is not in the save yet, so a clean save is not a clean
+        // session: [＋] used to look at `dirty` alone and ended the process
+        // with a talisman / equipment / my-set form still in memory, which is
+        // the same loss [B] asks about - through a key that never asked.
+        let draft = self.draft_form_name();
+        if (!self.dirty && draft.is_none()) || self.quit_armed {
             self.quit_armed = false;
             self.quit = true;
             return true;
@@ -11376,9 +11539,15 @@ impl Editor {
         // Both routes to the same offer: the pad's key and the footer's 終了
         // pill. The message names the key first because every other message on
         // this line does, and the pill is on screen with the same word.
-        self.message = String::from(
-            "未保存の変更があります。もう一度 [＋]（画面下の [終了]）で終了します（2回・変更は破棄されます）",
-        );
+        self.message = match draft {
+            Some(what) => alloc::format!(
+                "{}の下書きがまだ書き込まれていません（[A] で書き込み）。もう一度 [＋]（画面下の [終了]）で破棄して終了します",
+                what
+            ),
+            None => String::from(
+                "未保存の変更があります。もう一度 [＋]（画面下の [終了]）で終了します（2回・変更は破棄されます）",
+            ),
+        };
         false
     }
 
@@ -11622,9 +11791,11 @@ impl Editor {
     /// skill row and wrote the form into the box on the box-slot row; on 装備編集
     /// it opened the equipment / decoration picker or replaced the record. A
     /// save key that edits is a save key nobody can trust, so on those two
-    /// screens it runs the form's *commit* - [Editor::commit_charm_draft] /
-    /// [Editor::commit_equip_draft], the same write the form's [A] runs on the
-    /// row that writes - and nothing else. A draft that cannot be committed
+    /// screens it runs the form's *commit* - [Editor::commit_charm_draft_here]
+    /// / [Editor::commit_equip_draft_here], the same write the form's [A] runs
+    /// on the row that writes, without the half of it that leaves the form.
+    /// Saving is not leaving: running [A]'s commit from the save key closed the
+    /// form the user was still editing. A draft that cannot be committed
     /// (a type change waiting for its second [A], a slot that refuses the
     /// record) stops the save and says 下書きが残っています, because a file
     /// written without it would be a lie about the screen.
@@ -11651,7 +11822,10 @@ impl Editor {
             // went out, and leaving the screen threw it away.
             Screen::CharmEdit => {
                 if self.charm_draft_dirty() {
-                    self.commit_charm_draft();
+                    // The save key writes the draft and stays on the form: it
+                    // used to run [A]'s commit, which leaves for the list, so
+                    // [X] closed the form the user was editing.
+                    self.commit_charm_draft_here();
                 }
                 if self.charm_draft_dirty() {
                     self.message = String::from(
@@ -11663,7 +11837,7 @@ impl Editor {
             }
             Screen::EquipEdit => {
                 if self.equip_draft_dirty() {
-                    self.commit_equip_draft();
+                    self.commit_equip_draft_here();
                 }
                 if self.equip_draft_dirty() {
                     // A type change waits for its second [A], and a record that
@@ -12206,6 +12380,7 @@ impl Editor {
             Key::R => {
                 if let Some(&idx) = vis.get(self.cursor) {
                     self.item_pick_mode = 0;
+                    self.item_pick_return = Screen::Items;
                     self.item_pick_target = idx;
                     self.item_pick_cursor = 0;
                     self.item_pick_filter.clear();
@@ -12217,12 +12392,14 @@ impl Editor {
                     );
                 }
             }
-            // The name search. The item box has no key left for it ([A] picks,
-            // [Y] toggles 空きも表示, [R] types the count, [X] saves, L / R are
-            // the BOX tabs, [-] is the delete key and this screen has nothing to
-            // delete), so [ZR] is the one input the console still has free here
-            // - the same key the progress screen's search uses.
-            Key::Z => self.request_item_box_filter(),
+            // [ZR] opens the bulk operation menu. It used to be the name search
+            // here, and the menu had no key at all: the review's finding was
+            // that the one screen whose whole point is bulk edits could not
+            // reach them from the pad. [-] cannot take it back (it is the delete
+            // key), and every other key on this screen is spoken for, so the
+            // search moved into the menu as a row (ITEM_OP_FIND) and the menu
+            // took the key.
+            Key::Z => self.open_item_menu(),
             Key::A => self.request_write_save(),
             Key::B => {
                 self.screen = Screen::Slots;
@@ -12237,11 +12414,12 @@ impl Editor {
 
     // ---------------------------------------------------- item bulk operations
 
-    /// Open the item box operation menu (Minus on the item screen).
+    /// Open the item box operation menu ([ZR] on the item screen, or the
+    /// 一括操作 pill).
     ///
     /// The menu is a mode of the item screen instead of a screen of its own,
     /// so it needs no extra place in every match on Screen: the list
-    /// underneath keeps its place and B or Minus goes back to it.
+    /// underneath keeps its place and [B] (or [ZR] again) goes back to it.
     pub fn open_item_menu(&mut self) {
         if self.save.is_none() {
             self.message = String::from("先にセーブを開いてください");
@@ -12309,6 +12487,10 @@ impl Editor {
             // it too, which is the one thing the delete key must not do: a
             // menu with nothing to delete does not own it.
             Key::B => self.close_item_menu(),
+            // [ZR] opened the menu, so [ZR] closes it again: the key that took
+            // the menu's side is a toggle, and a press that did nothing on the
+            // screen it opened would be the "無反応" the review keeps finding.
+            Key::Z => self.close_item_menu(),
             Key::Plus => {
                 self.press_quit();
             }
@@ -12422,6 +12604,10 @@ impl Editor {
             ITEM_OP_UNDO => {
                 self.item_armed = None;
                 self.undo_item();
+            }
+            ITEM_OP_FIND => {
+                self.item_armed = None;
+                self.request_item_box_filter();
             }
             _ => {
                 self.message = alloc::format!("{}. この行に操作はありません（[B] で閉じる）", op);
@@ -12561,6 +12747,7 @@ impl Editor {
     /// Open the picker for the two-stage bulk add: item first, then count.
     fn open_item_add(&mut self) {
         self.item_pick_mode = 3;
+        self.item_pick_return = Screen::Items;
         self.item_pick_stage = 0;
         self.item_pick_cursor = 0;
         self.item_pick_filter.clear();
@@ -14166,6 +14353,30 @@ impl Editor {
         };
     }
 
+    /// The row [A] / [Y] would write, or None when the search hides every row.
+    ///
+    /// [Editor::progress_cursor] answers with the row under the cursor, and
+    /// when the search matches nothing it falls back to the *unfiltered* row -
+    /// which is right for drawing (the list is empty, the cursor has to sit
+    /// somewhere) and wrong for writing: [A] then flipped the bit of a row the
+    /// user could not see, on a list that said "no matches". A press on an
+    /// empty list has to write nothing and say why, so the writers ask this
+    /// first.
+    pub fn progress_row_under_cursor(&self) -> Option<usize> {
+        if self.progress_visible_len() == 0 {
+            return None;
+        }
+        Some(self.progress_cursor())
+    }
+
+    /// The line a press on an empty (fully filtered) progress list prints.
+    fn progress_no_match_line(&self) -> String {
+        alloc::format!(
+            "検索「{}」に一致する行がありません（何も書き換えていません / [ZR] で検索を変える・空で解除）",
+            self.progress_filter.trim()
+        )
+    }
+
     /// Move the cursor by `delta` rows of the list that is on screen.
     ///
     /// With a search on, the list on screen is the filtered one, so one press
@@ -14271,6 +14482,54 @@ impl Editor {
     pub fn detail_row_for(screen: Screen, slot: usize) -> Option<usize> {
         let name = Self::detail_field_name(screen)?;
         Self::save_map_row_named(name, slot)
+    }
+
+    /// What 詳細 would open right now, as a value that survives the hold.
+    ///
+    /// [R]'s tap is deferred to the release (see [ShoulderTap]), so the hold
+    /// needs the screen state *as it was when the key went down*: the review's
+    /// requirement was that the detail view opens on the screen the user was
+    /// looking at when they pressed, not on whatever the release frame happens
+    /// to show. Three screens resolve their row from a view that lives in the
+    /// console (マイセット's two arrays, 進行状況's three bit maps, the card's
+    /// four views), so the view is part of the snapshot.
+    pub fn detail_target(&self, sets_tab: usize) -> DetailTarget {
+        DetailTarget {
+            screen: self.screen,
+            progress_view: self.progress_view(),
+            guild_view: self.guild_view(),
+            sets_tab,
+        }
+    }
+
+    /// The 生データ row a captured [DetailTarget] opens.
+    ///
+    /// The console used to resolve this itself, in a match on its own copy of
+    /// the view numbers. It lives here now, so the snapshot, the row and the
+    /// test that pins them are one answer.
+    pub fn detail_row_of(&self, target: DetailTarget) -> Option<usize> {
+        match target.screen {
+            Screen::Sets => {
+                let name = if target.sets_tab == 0 {
+                    "アイテムマイセット"
+                } else {
+                    "装備マイセット"
+                };
+                Self::save_map_row_named(name, self.slot)
+            }
+            Screen::Progress => {
+                let name = match target.progress_view {
+                    PROGRESS_REQUESTS => "依頼フラグ",
+                    PROGRESS_QUESTS => "クエスト（クリア）",
+                    _ => "勲章（解禁マップ）",
+                };
+                Self::save_map_row_named(name, self.slot)
+            }
+            Screen::Guild if target.guild_view == GUILD_TAB_ARENA => {
+                Self::save_map_row_named("闘技大会の記録", self.slot)
+            }
+            other => Self::detail_row_for(other, self.slot),
+        }
     }
 
     /// The save map rows this screen lists, in the order it draws them.
@@ -15286,7 +15545,13 @@ impl Editor {
     /// Flip the bit under the cursor. One press, because one press is the undo.
     fn progress_toggle(&mut self) {
         let slot = self.slot;
-        let row = self.progress_cursor();
+        // A search that matches nothing leaves the list empty: there is no row
+        // under the cursor to flip, and the fallback row would be one the user
+        // cannot see. Nothing is written and the line says why.
+        let Some(row) = self.progress_row_under_cursor() else {
+            self.message = self.progress_no_match_line();
+            return;
+        };
         self.push_undo("進行状況");
         match self.progress_view() {
             PROGRESS_AWARDS => {
@@ -15372,7 +15637,12 @@ impl Editor {
     /// the quest is still cleared.
     fn progress_quest_seen(&mut self) {
         let slot = self.slot;
-        let index = self.progress_cursor() + 1;
+        // The same rule [A] follows: an empty list has no row to write.
+        let Some(row) = self.progress_row_under_cursor() else {
+            self.message = self.progress_no_match_line();
+            return;
+        };
+        let index = row + 1;
         self.push_undo("クエスト既読");
         let Some(save) = &mut self.save else {
             self.message = String::from("先にセーブを開いてください");
@@ -16233,8 +16503,22 @@ impl Editor {
             // [-] is the equipment panel's key on the list under this one, so it
             // must not reach it while the skill panel is open; Z is ZR, which the
             // pad spends on the section bar and the PC build on the arc list.
-            Key::Minus | Key::Z => {
+            // Both used to be swallowed in silence, which reads as a broken
+            // panel: the two keys say what they are instead.
+            Key::Minus => {
                 self.palico_skill = Some(state);
+                // [-] is the delete key and this panel deletes nothing (a
+                // skill is replaced, not removed), so the press says that
+                // rather than doing nothing at all.
+                self.message = String::from(
+                    "[-] 削除できるものがありません（スキルの差し替えは [A] / タブは [Y] / 一覧は [B]）",
+                );
+            }
+            Key::Z => {
+                self.palico_skill = Some(state);
+                self.message = String::from(
+                    "[ZR] はこのパネルでは使いません（タブは [Y]、候補は [◀/▶]、差し替えは [A]）",
+                );
             }
         }
     }
@@ -16347,6 +16631,7 @@ impl Editor {
                 if self.qe_open {
                     if let Some(entry) = self.quest_equip_items().get(self.qe_item_cursor).copied() {
                         self.item_pick_mode = 2;
+                        self.item_pick_return = Screen::QuestEquip;
                         self.qe_target = entry;
                         self.item_pick_cursor = 0;
                         self.item_pick_filter.clear();
@@ -16591,10 +16876,11 @@ impl Editor {
                     }
                 }
             }
-            Key::B => {
-                self.screen = Screen::Slots;
-                self.cursor = self.slot;
-            }
+            // [B] leaves the set screen for the talisman list: the console
+            // opened it there, and the footer names that screen. The state
+            // machine used to answer Slots, so the two layers disagreed about
+            // the same key.
+            Key::B => self.open_charms(),
             Key::Plus => {
                 self.press_quit();
             }
@@ -17157,7 +17443,7 @@ impl Editor {
                 .map(|r| r.used_items().len())
                 .unwrap_or(0);
             self.message = alloc::format!(
-                "ポーチをセット #{:02} の内容で置き換えます（ポーチ {} 枠 → {} 枠）。もう一度「ポーチへ適用」で実行",
+                "ポーチをセット #{:02} の内容で置き換えます（ポーチ {} 枠 → {} 枠）。もう一度 [R]（画面下の「ポーチへ適用」）で実行",
                 e.set + 1,
                 self.pouch_used(),
                 held
@@ -17206,11 +17492,11 @@ impl Editor {
         let Some(e) = self.item_set_edit else {
             return String::from("アイテムセットを選んで [A]");
         };
-        // ポーチへ has no key: [-] is the delete key and this is not a delete,
-        // so the pill on the deck is the only door and the line names it by
-        // the word on the button rather than by a key nobody can press.
+        // ポーチへ is [R]: [-] is the delete key and this is not a delete, so
+        // the export took the one key the form had left (the same one the
+        // equipment form spends on its id keyboard).
         alloc::format!(
-            "枠 {:02} {} — [◀/▶] 巡回 / [A] 決定 / [Y] 取込 / ポーチへ適用（2回） / [ZR] 名前",
+            "枠 {:02} {} — [◀/▶] 巡回 / [A] 決定 / [Y] 取込 / [R] ポーチへ（2回） / [ZR] 名前",
             e.field + 1,
             self.item_set_row_label(e.field)
         )
@@ -17221,11 +17507,10 @@ impl Editor {
         let Some(mut e) = self.item_set_edit else {
             return;
         };
-        // The one keyed two-press operation ([Y] 取込) belongs to the row the
-        // user is looking at, so any other key drops the pending one before it
-        // does its own work. ポーチへ has no key, so its offer is dropped by
-        // every press - the pill is the only thing that can carry it.
-        if key != Key::Y {
+        // The two keyed two-press operations ([Y] 取込 and [R] ポーチへ) belong
+        // to the row the user is looking at, so any other key drops the pending
+        // one before it does its own work.
+        if key != Key::Y && key != Key::R {
             self.item_set_armed = None;
         }
         match key {
@@ -17244,6 +17529,15 @@ impl Editor {
             Key::Y => {
                 self.item_set_edit = Some(e);
                 self.item_set_from_pouch();
+                return;
+            }
+            // [R] is the other half of [Y]: the set into the pouch instead of
+            // the pouch into the set. It was the deck's pill alone, so the pad
+            // could not press it; [ZR] is the set-name keyboard here and [-] is
+            // the delete key, so [R] is the one key the form had left.
+            Key::R => {
+                self.item_set_edit = Some(e);
+                self.item_set_to_pouch();
                 return;
             }
             // The set name is the one thing this form does not list as a row,
@@ -17675,14 +17969,13 @@ impl Editor {
                         self.input(Key::Right);
                         return;
                     }
-                    EquipFormAction::CreateRecord => {
+                    // The two rows that write go through the form's one
+                    // commit, so [A] and [X] cannot disagree about what
+                    // "write the form" means - [A] leaves for the list, [X]
+                    // stays on the form (commit_equip_draft_here).
+                    EquipFormAction::CreateRecord | EquipFormAction::WriteForm => {
                         self.equip_edit = Some(e);
-                        self.write_new_equip(&e);
-                        return;
-                    }
-                    EquipFormAction::WriteForm => {
-                        self.equip_edit = Some(e);
-                        self.write_equip_edit(&e);
+                        self.commit_equip_draft();
                         return;
                     }
                 }
@@ -18022,7 +18315,7 @@ impl Editor {
 
     /// Write the form's values for an existing record, replacing it when its
     /// type or id changed.
-    fn write_equip_edit(&mut self, e: &EquipEdit) {
+    fn write_equip_edit(&mut self, e: &EquipEdit, leave: bool) {
         let idx = e.index;
         let slot = self.slot;
         let current = match self.save.as_ref().and_then(|s| s.equipment_at(slot, idx)) {
@@ -18114,8 +18407,10 @@ impl Editor {
                 msg.push_str(&alloc::format!(" ほか {} 件", warnings.len() - 2));
             }
             self.message = msg;
-            self.equip_edit = None;
-            self.screen = Screen::Equip;
+            if leave {
+                self.equip_edit = None;
+                self.screen = Screen::Equip;
+            }
             return;
         }
 
@@ -18148,12 +18443,14 @@ impl Editor {
         } else {
             self.message = String::from("書き込めませんでした（空き枠は編集できません）");
         }
-        self.equip_edit = None;
-        self.screen = Screen::Equip;
+        if leave {
+            self.equip_edit = None;
+            self.screen = Screen::Equip;
+        }
     }
 
     /// Create the form's values in the first blank record of the box.
-    fn write_new_equip(&mut self, e: &EquipEdit) {
+    fn write_new_equip(&mut self, e: &EquipEdit, leave: bool) {
         let slot = self.slot;
         self.push_undo("装備の新規作成");
         let Some(save) = &mut self.save else {
@@ -18163,14 +18460,25 @@ impl Editor {
         match equipops::create(save, slot, e.kind, e.id, e.level) {
             Ok(index) => {
                 self.dirty = true;
-                self.equip_edit = None;
                 self.equip_delete_armed = None;
-                self.screen = Screen::Equip;
                 // Select the row that was just written, so the list shows what
                 // create() produced instead of leaving the cursor behind.
                 let list = self.equipment();
                 let pos = list.iter().position(|q| q.index == index);
                 self.equip_cursor = pos.unwrap_or_else(|| self.equip_cursor.min(list.len().saturating_sub(1)));
+                if leave {
+                    self.equip_edit = None;
+                    self.screen = Screen::Equip;
+                } else {
+                    // The record exists now, so the form edits it: keeping it
+                    // marked "new" would make the next [X] create a second copy
+                    // of what the user just wrote.
+                    let mut here = *e;
+                    here.new = false;
+                    here.index = index;
+                    here.field = here.write_row();
+                    self.equip_edit = Some(here);
+                }
                 self.message = alloc::format!(
                     "枠 #{} に {} ID {} Lv{} を新規作成しました",
                     index,
@@ -18183,21 +18491,35 @@ impl Editor {
         }
     }
 
-    /// Write the equipment form into the box: the one commit the form has.
+    /// Write the equipment form into the box and leave for the list.
     ///
-    /// [A] runs it on the row whose word says 書き込み / 作成; [X] runs it
-    /// before it saves, so the file cannot be written without the record the
-    /// form is showing. A type change still asks for its second [A] (see
-    /// [Editor::write_equip_edit]), so this can return with the draft still in
-    /// hand - the caller asks [Editor::equip_draft_dirty] whether it did.
+    /// [A] runs it on the row whose word says 書き込み / 作成. The record is the
+    /// box's afterwards, so the list is where the next thing happens. A type
+    /// change still asks for its second [A] (see [Editor::write_equip_edit]),
+    /// so this can return with the draft still in hand - the caller asks
+    /// [Editor::equip_draft_dirty] whether it did.
     pub fn commit_equip_draft(&mut self) -> bool {
+        self.write_equip_draft(true)
+    }
+
+    /// The same write, without moving the screen, the form or the cursor.
+    ///
+    /// [X] is the save key on every screen; running the form's [A] commit from
+    /// it closed the form the user was still editing. Saving is not leaving, so
+    /// the save key runs this half and the form, its row and the cursor stay
+    /// where they were.
+    pub fn commit_equip_draft_here(&mut self) -> bool {
+        self.write_equip_draft(false)
+    }
+
+    fn write_equip_draft(&mut self, leave: bool) -> bool {
         let Some(e) = self.equip_edit else {
             return false;
         };
         if e.new {
-            self.write_new_equip(&e);
+            self.write_new_equip(&e, leave);
         } else {
-            self.write_equip_edit(&e);
+            self.write_equip_edit(&e, leave);
         }
         !self.equip_draft_dirty()
     }
@@ -18398,7 +18720,11 @@ impl Editor {
                     if let Some(&id) = matches.get(self.item_pick_cursor) {
                         self.store_reward_item(id);
                     }
-                    self.screen = Screen::EntryView;
+                    // The row belongs to the screen the picker was opened from:
+                    // the .rem file screen, or クエスト改造's 報酬 tab. It used
+                    // to be the file screen every time, so a reward picked on
+                    // the aggregate screen threw the user onto a file list.
+                    self.screen = self.item_pick_return;
                     return;
                 }
                 // Mode 2 writes into a quest-equipment entry instead of the
@@ -18439,7 +18765,7 @@ impl Editor {
                             }
                         }
                     }
-                    self.screen = Screen::QuestEquip;
+                    self.screen = self.item_pick_return;
                     return;
                 }
                 // Mode 4 writes the 対象ID of a .mib row: the same list and
@@ -18449,7 +18775,7 @@ impl Editor {
                     if let Some(&id) = matches.get(self.item_pick_cursor) {
                         let field = self.item_pick_mib_field;
                         self.mib_set_target_id(field, id);
-                        self.screen = Screen::Mib;
+                        self.screen = self.item_pick_return;
                         self.mib_cursor = field;
                         self.cursor = field;
                     }
@@ -18490,13 +18816,15 @@ impl Editor {
                     self.cursor = 0;
                 }
             }
+            // [B] cancels the pick and goes back to the screen that opened the
+            // picker - the same screen a pick would have written to. It used to
+            // be the file screen for mode 1 whatever the picker was opened
+            // from, so cancelling a クエスト改造 reward pick dropped the user on
+            // a file list they had never seen, and the console's own
+            // `quest_pick_return` flag then stayed set for the next pick.
             Key::B => {
-                if self.item_pick_mode == 4 {
-                    self.screen = Screen::Mib;
-                } else if self.item_pick_mode == 1 {
-                    self.screen = Screen::EntryView;
-                } else if self.item_pick_mode == 2 {
-                    self.screen = Screen::QuestEquip;
+                if self.item_pick_mode == 1 || self.item_pick_mode == 2 || self.item_pick_mode == 4 {
+                    self.screen = self.item_pick_return;
                 } else {
                     // Back to the box, and back into the menu the add started
                     // from when it came from there.
@@ -18543,6 +18871,15 @@ impl Editor {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
                 self.message = String::from("セーブ編集");
+            }
+            // [B] leaves the quest section for the save list. The console used
+            // to send セーブ内 here, and セーブ内's [B] sends this screen - so
+            // [B] on either of the two quest lists bounced between them and
+            // neither key ever left the section.
+            Key::B => {
+                self.screen = Screen::SaveList;
+                self.cursor = 0;
+                self.message = String::from("セーブ一覧へ戻りました");
             }
             // Z installs the highlighted archive into the save: the one action
             // the console could not do at all before. It writes a quest record
@@ -18993,9 +19330,16 @@ impl Editor {
             Key::R => {
                 self.pending_request = Some(Request::ExtractQuests { ids: Vec::new() });
             }
+            // The file list is クエスト改造's detail view, so [B] goes back
+            // there - flushing the working copies first, the same way leaving
+            // by the aggregate screen's own keys does. It used to go to the
+            // .arc list, which is the screen the quest was *opened* from, not
+            // the one this list belongs to; the console answered the key itself
+            // and the two layers disagreed about it.
             Key::B => {
-                self.screen = Screen::ArcList;
-                self.cursor = 0;
+                self.flush_quest_edit();
+                self.gmd = None;
+                self.enter_quest_edit_keeping_return();
             }
             Key::Plus => {
                 self.press_quit();
@@ -19107,7 +19451,18 @@ impl Editor {
                     }
                 }
             }
+            // [ZR] walks the eight values of a monster slot (the console's
+            // MIB_MOB_SUB_LABELS). Every other row holds one value and has no
+            // sub-field to switch, and the key used to do nothing there at all
+            // - silently, on most of the rows the footer promised it on.
+            Key::Z => {
+                self.message = String::from(
+                    "この行には [ZR] で切り替える項目がありません（[ZR] はモンスター行の 体力・攻撃力・サイズ などを切り替えます）",
+                );
+            }
             Key::A => self.request_write_arc(),
+            // [B] unwinds one level: the file list this screen was opened from.
+            // The 構成(.arc) screen's own [B] is what leaves for クエスト改造.
             Key::B => {
                 self.screen = Screen::ArcEntries;
                 self.cursor = self.entry;
@@ -19138,6 +19493,8 @@ impl Editor {
                 }
             }
             Key::X => self.request_write_arc(),
+            // The same answer the .mib screen gives: one level up, to the file
+            // list.
             Key::B => {
                 self.screen = Screen::ArcEntries;
                 self.cursor = self.entry;
@@ -22119,6 +22476,91 @@ impl ShoulderPress {
     /// Is the hold's action offered, waiting for the second hold?
     pub fn is_armed(&self) -> bool {
         self.hold.is_armed()
+    }
+
+    /// Is the key still down?
+    pub fn is_down(&self) -> bool {
+        self.down
+    }
+}
+
+/// A shoulder press whose tap job waits for the release.
+///
+/// [ShoulderPress] answers the tap on the frame the key goes down. That is right
+/// for [L], whose hold is the whole-save undo: the tab has already been drawn
+/// and a hold must not take it back. It is wrong for [R], whose hold opens
+/// 詳細: the review found that holding R to read the bytes behind a screen also
+/// moved the sub-tab, so the screen changed under the hold and the detail view
+/// opened on the wrong one.
+///
+/// This keeps the tap in hand until the key comes up and then decides:
+///
+///   * released before the threshold -> the tap's job, now
+///   * held past the threshold -> the hold's job only, no tap
+///
+/// The cost is that [R]'s tap arrives on the release instead of the press. That
+/// is the trade the review asked for: a hold that also taps is worse than a tap
+/// that is one frame late.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShoulderTap {
+    down: bool,
+    hold: HoldConfirm,
+    /// This press's tap was answered already (or is not wanted).
+    spent: bool,
+}
+
+impl ShoulderTap {
+    pub const fn new() -> Self {
+        ShoulderTap {
+            down: false,
+            hold: HoldConfirm::new(),
+            spent: false,
+        }
+    }
+
+    /// The key went down. True means this is a new press, not a repeat frame.
+    pub fn press(&mut self) -> bool {
+        if self.down {
+            return false;
+        }
+        self.down = true;
+        self.spent = false;
+        self.hold.press();
+        true
+    }
+
+    /// This press owes no tap: the caller answered it on the press itself (a
+    /// pick list, where the shoulder is movement and the hold repeats it).
+    pub fn spend(&mut self) {
+        self.spent = true;
+    }
+
+    /// One frame with the key still down: the hold's own answer.
+    pub fn tick(&mut self) -> HoldAction {
+        if !self.down {
+            return HoldAction::None;
+        }
+        self.hold.tick()
+    }
+
+    /// The key came up. True means the tap's job is owed now.
+    pub fn release(&mut self) -> bool {
+        let was_down = self.down;
+        self.down = false;
+        let tap = self.hold.release() && !self.spent;
+        self.spent = false;
+        was_down && tap
+    }
+
+    /// Take the hold's offer back, because the press did something else.
+    pub fn clear_arm(&mut self) {
+        self.hold.clear_arm();
+    }
+
+    /// The press did something else: no tap and no offer is left.
+    pub fn cancel(&mut self) {
+        self.spent = true;
+        self.hold.clear_arm();
     }
 
     /// Is the key still down?

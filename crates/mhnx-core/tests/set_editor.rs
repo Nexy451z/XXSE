@@ -291,7 +291,9 @@ fn the_list_still_offers_the_editor_and_leaving_returns_to_it() {
     ed.input(Key::B);
     assert!(!ed.set_editor_open(), "B closes the form");
     assert_eq!(ed.screen, Screen::Sets, "and leaves the list where it was");
+    // [B] again leaves the screen for the talisman list: that is the screen the
+    // console opens the set screen from, and the one the footer names.
     ed.input(Key::B);
-    assert_eq!(ed.screen, Screen::Slots, "B again leaves the screen");
+    assert_eq!(ed.screen, Screen::Charms, "B again leaves the screen");
     cleanup(&dir);
 }

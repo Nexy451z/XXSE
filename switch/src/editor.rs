@@ -1098,14 +1098,16 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         // [Y] is the list's own state (所持品のみ <-> 空きも表示) and [A] opens
         // the picker; the step the arrows use is the deck's button, because
         // every key on this screen is spoken for.
-        // [-] is the delete key and the item box has nothing to delete: the
-        // bulk menu is the 一括操作 pill (or the deck's own row), and [L] is
-        // the sub-tab, not the undo. The undo is the deck's button.
+        // [-] is the delete key and the item box has nothing to delete, so the
+        // bulk menu took [ZR]: the review's finding was that the one screen
+        // whose whole point is bulk edits could not reach them from the pad.
+        // [L] is the sub-tab, not the undo - the undo is the deck's button.
         Items => &[
             ("A", "種類変更"),
             ("</>", "個数"),
             ("R", "数値入力"),
             ("Y", "空き表示"),
+            ("ZR", "一括操作"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1131,7 +1133,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("-", "削除(2回)"),
             ("+", "新規"),
             ("X", "保存"),
-            ("B", "戻る"),
+            ("B", "枠選択"),
         ],
         // The form's [A] is the selected row's own action (hbedit::CharmAction),
         // so this line cannot name a single one; the drawn build prints the
@@ -1158,7 +1160,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("+", "新規"),
             ("X", "保存"),
             ("L/R", "サブタブ"),
-            ("B", "戻る"),
+            ("B", "枠選択"),
         ],
         // [A] is the row's own action (hbedit::EquipFormAction): the three
         // sockets open the decoration list, 種別 / ID the equipment list, the
@@ -1203,17 +1205,17 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("Y", "検索"),
             ("L/R", "サブタブ"),
             ("X", "保存"),
-            ("B", "戻る"),
+            ("B", "SD(.arc)"),
         ],
         // [ZR] writes the bundled quests out (the state machine's Key::Z); the
-        // way back is [B], which the state machine does not answer but the
-        // console does - it returns to セーブ内 (or the save list without one).
+        // way back is [B], and both layers answer it: the save list. It used to
+        // go to セーブ内, whose own [B] comes right back here.
         ArcList => &[
             ("A", "開く"),
             ("Y", "セーブへ導入(2回)"),
             ("ZR", "SDへ展開"),
             ("X", "保存"),
-            ("B", "戻る"),
+            ("B", "セーブ一覧"),
             ("+", "終了"),
         ],
         // クエスト改造: one row pair moves, the other steps, [A] opens the
@@ -1237,7 +1239,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("Y", "検査"),
             ("ZR", "抽出"),
             ("X", "保存"),
-            ("B", "戻る"),
+            ("B", "改造へ"),
         ],
         // The reward / supply row's two numbers are [ZR]'s job (the state
         // machine's Key::Z) and [Y] is the step; [A] opens the item list on
@@ -1321,7 +1323,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("-", "解除(2回)"),
             ("Y", "警告/タブ切替"),
             ("X", "保存"),
-            ("B", "戻る"),
+            ("B", "護石一覧"),
         ],
         // The language is the arrow pair on this build (the console answers
         // ◀ / ▶ before the state machine, whose L / R are the sub-tabs), the
@@ -1593,8 +1595,15 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                             // fifteen files to choose from: the console lands
                             // on クエスト改造, and the [ファイル] pill goes back
                             // to the file list this used to open directly.
+                            //
+                            // The return target travels with the open: a quest
+                            // picked from the SD (.arc) list comes back there on
+                            // [B]. This used to call the bare enter_quest_edit,
+                            // which keeps whatever the *last* quest set - so a
+                            // quest opened from the card came back to セーブ内,
+                            // a list that does not hold it.
                             if ed.arc.is_some() {
-                                ed.enter_quest_edit();
+                                ed.enter_quest_edit_from(mhnx_core::hbedit::Screen::ArcList);
                             }
                         }
                         None => ed.message = format!("cannot read {}", p),
@@ -1911,7 +1920,13 @@ pub fn run() -> i32 {
     // undo still costs two holds, so a press that lingers cannot throw a save
     // away (confirm::HoldConfirm).
     let mut l_press = mhnx_core::hbedit::ShoulderPress::new();
-    let mut r_press = mhnx_core::hbedit::ShoulderPress::new();
+    // [R] is the one shoulder whose tap waits for the release: its hold opens
+    // 詳細, and answering the tap on the press meant a hold also moved the
+    // sub-tab (hbedit::ShoulderTap). The target is the screen state at press
+    // time, so the detail view opens on the screen the key went down on
+    // (hbedit::DetailTarget).
+    let mut r_tap = mhnx_core::hbedit::ShoulderTap::new();
+    let mut r_target: Option<mhnx_core::hbedit::DetailTarget> = None;
     // A held shoulder repeats on the four pick lists, where L / R are the ten
     // row step rather than the sub-tab: the same 8 / 4 / 3 cadence the
     // direction keys use, so holding L crosses a 6,435 row list instead of
@@ -2025,7 +2040,8 @@ pub fn run() -> i32 {
                 // holds so a press that came up inside the keyboard cannot
                 // reach the screen behind it later.
                 l_press = mhnx_core::hbedit::ShoulderPress::new();
-                r_press = mhnx_core::hbedit::ShoulderPress::new();
+                r_tap = mhnx_core::hbedit::ShoulderTap::new();
+                r_target = None;
                 l_repeat.tick(false);
                 r_repeat.tick(false);
                 // ZL walks the character tabs; ZR inserts a line break (Key::Z
@@ -2041,7 +2057,8 @@ pub fn run() -> i32 {
                 }
             } else if painter.gui.mib_picker.is_some() {
                 l_press = mhnx_core::hbedit::ShoulderPress::new();
-                r_press = mhnx_core::hbedit::ShoulderPress::new();
+                r_tap = mhnx_core::hbedit::ShoulderTap::new();
+                r_target = None;
                 l_repeat.tick(false);
                 r_repeat.tick(false);
                 if down & BTN_RSTICK_UP != 0 {
@@ -2064,7 +2081,8 @@ pub fn run() -> i32 {
                 }
             } else if ed.review_open() {
                 l_press = mhnx_core::hbedit::ShoulderPress::new();
-                r_press = mhnx_core::hbedit::ShoulderPress::new();
+                r_tap = mhnx_core::hbedit::ShoulderTap::new();
+                r_target = None;
                 l_repeat.tick(false);
                 r_repeat.tick(false);
                 // The save review is modal: A writes, B goes back, and nothing
@@ -2221,10 +2239,29 @@ pub fn run() -> i32 {
                     l_repeat.press();
                     need_draw = true;
                 }
-                if down & BTN_R != 0 && r_press.press() {
+                // [R]: the tap waits for the release, the hold is 詳細.
+                //
+                // It used to be answered on the press like [L], and the review
+                // found what that costs: holding R to read the bytes behind a
+                // screen also moved the sub-tab, so the screen changed under
+                // the hold and 詳細 opened on the wrong one. The press only
+                // remembers where it happened (hbedit::DetailTarget) now; the
+                // release decides between the tap and the hold
+                // (hbedit::ShoulderTap).
+                //
+                // A pick list is the exception: there [R] is the ten-row step
+                // and there is no hold job at all, so the press is answered at
+                // once and the auto-repeat follows it.
+                if down & BTN_R != 0 && r_tap.press() {
                     painter.gui.stop_fling();
-                    painter.gui.handle_pad_key(&mut ed, Key::R, cur);
-                    r_repeat.press();
+                    if crate::ui::shoulder_moves(&ed) {
+                        painter.gui.handle_pad_key(&mut ed, Key::R, cur);
+                        r_repeat.press();
+                        // The tap was this press: the release owes nothing.
+                        r_tap.spend();
+                    } else {
+                        r_target = Some(ed.detail_target(painter.gui.sets_tab));
+                    }
                     need_draw = true;
                 }
                 // A held shoulder repeats where L / R mean movement. On every
@@ -2268,18 +2305,24 @@ pub fn run() -> i32 {
                         }
                         mhnx_core::confirm::HoldAction::None => {}
                     }
-                    match r_press.tick() {
+                    // R: 詳細. The target is the state captured when the key
+                    // went down, so a hold that started on 進行状況's 依頼 view
+                    // opens the 依頼フラグ region even though the release frame
+                    // is a second later.
+                    match r_tap.tick() {
                         mhnx_core::confirm::HoldAction::Arm
                         | mhnx_core::confirm::HoldAction::Run => {
-                            r_press.clear_arm();
+                            r_tap.clear_arm();
+                            let target = r_target
+                                .unwrap_or_else(|| ed.detail_target(painter.gui.sets_tab));
                             // 詳細 has nothing to show on the start screen, so
                             // the hold is the settings door of the updater there:
                             // it is the one way in when the start-up check is off
                             // or the banner was already put away.
-                            if ed.screen == mhnx_core::hbedit::Screen::SaveList {
+                            if target.screen == mhnx_core::hbedit::Screen::SaveList {
                                 painter.gui.update.open_dialog();
                             } else {
-                                painter.gui.open_detail(&mut ed);
+                                painter.gui.open_detail_at(&mut ed, target);
                             }
                             need_draw = true;
                         }
@@ -2291,7 +2334,16 @@ pub fn run() -> i32 {
                     l_press.release();
                 }
                 if cur & BTN_R == 0 {
-                    r_press.release();
+                    // A press that never reached the hold was a tap, and the
+                    // tap's job runs now - on the screen that is showing, which
+                    // is the one the key went down on (nothing else can change
+                    // it while R is held).
+                    if r_tap.release() {
+                        painter.gui.stop_fling();
+                        painter.gui.handle_pad_key(&mut ed, Key::R, cur);
+                        need_draw = true;
+                    }
+                    r_target = None;
                 }
 
                 if let Some(k) = key {
@@ -2306,7 +2358,10 @@ pub fn run() -> i32 {
                         // have to be asked for again rather than waiting for the
                         // next hold however long later.
                         l_press.clear_arm();
-                        r_press.clear_arm();
+                        // The pending [R] tap is not owed any more: the user
+                        // pressed something else while it was still down.
+                        r_tap.cancel();
+                        r_target = None;
                         painter.gui.handle_pad_key(&mut ed, k, cur);
                         need_draw = true;
                     }
