@@ -338,12 +338,15 @@ fn the_picker_buttons_send_the_search_clear_and_kind_keys() {
     ed.input(Key::Y);
     assert_eq!(ed.take_text_request().map(|(id, _)| id), Some(TEXT_JEWEL_FILTER));
 
-    // The name picker also has [-] for the type filter, which the deck draws.
+    // The name picker also has [ZR] for the type filter, which the deck draws.
+    // It used to be [-], which is the delete key and does nothing here.
     ed.screen = Screen::EquipPick;
     ed.equip_pick_scope = mhnx_core::hbedit::EquipScope::Weapons;
     let first = ed.equip_pick_kind;
     ed.input(Key::Minus);
-    assert_ne!(ed.equip_pick_kind, first, "[-] walks the type filter");
+    assert_eq!(ed.equip_pick_kind, first, "[-] is not the type filter any more");
+    ed.input(Key::Z);
+    assert_ne!(ed.equip_pick_kind, first, "[ZR] walks the type filter");
     ed.input(Key::Y);
     assert_eq!(
         ed.take_text_request().map(|(id, _)| id),

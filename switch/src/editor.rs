@@ -1071,35 +1071,41 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         ],
         Convert => &[("A", "変換して保存"), ("Y", "名前"), ("B", "戻る")],
         // [Y] is the bulk MAX on this build (the console answers it before the
-        // state machine sees it), and it asks for a second press now. The quest
-        // files are the クエスト section's first tab, one ZR away.
+        // state machine sees it), and it asks for a second press now. The five
+        // keys the state machine gives this screen (X items, L charms, R the
+        // download pallet, - the equipment box) are not what the console does
+        // with them: X is the save key everywhere, L / R are the sub-tab pair,
+        // and [-] is the delete key. The sections - the way to the boxes the
+        // state machine's own keys would have opened - are ZL / ZR.
         Slots => &[
             ("A", "キャラ"),
-            ("X", "アイテム"),
-            ("-", "装備"),
-            ("L", "お守り"),
-            ("R", "オトモ"),
             ("Y", "一括MAX(2回)"),
+            ("L/R", "サブタブ"),
+            ("X", "保存"),
             ("B", "戻る"),
         ],
+        // [Y] is the step key on this build (the console answers it before the
+        // state machine, whose Y opens マイセット). [-] is the delete key and a
+        // character has nothing to delete: the hunt record it used to open is
+        // the オトモ・記録 section, one ZL away.
         Char => &[
             ("A", "最大(2回)/編集"),
             ("</>", "値を変更"),
             ("Y", "刻み"),
-            ("-", "狩猟記録"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
         // [Y] is the list's own state (所持品のみ <-> 空きも表示) and [A] opens
         // the picker; the step the arrows use is the deck's button, because
         // every key on this screen is spoken for.
+        // [-] is the delete key and the item box has nothing to delete: the
+        // bulk menu is the 一括操作 pill (or the deck's own row), and [L] is
+        // the sub-tab, not the undo. The undo is the deck's button.
         Items => &[
             ("A", "種類変更"),
             ("</>", "個数"),
             ("R", "数値入力"),
-            ("-", "一括操作"),
             ("Y", "空き表示"),
-            ("L", "元に戻す"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1175,14 +1181,15 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("B", "戻る"),
         ],
         // The name picker: the same four movement chips as the other pick
-        // lists, plus [-] for the type filter and the hex note, because the id
-        // this list prints is the one it searches.
+        // lists, plus [ZR] for the type filter and the hex note, because the id
+        // this list prints is the one it searches. [-] is the delete key and a
+        // picker has nothing to delete.
         EquipPick => &[
             ("A", "決定"),
             ("◀/▶", "10件"),
             ("▲/▼", "1件"),
             ("Y", "検索"),
-            ("-", "種別"),
+            ("ZR", "種別"),
             ("X", "クリア"),
             ("B", "戻る"),
         ],
@@ -1198,60 +1205,87 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("X", "保存"),
             ("B", "戻る"),
         ],
+        // [ZR] writes the bundled quests out (the state machine's Key::Z); the
+        // way back is [B], which the state machine does not answer but the
+        // console does - it returns to セーブ内 (or the save list without one).
         ArcList => &[
             ("A", "開く"),
-            ("Z", "クエスト追加"),
-            ("X", "セーブ内"),
             ("Y", "セーブへ導入(2回)"),
+            ("ZR", "SDへ展開"),
+            ("X", "保存"),
+            ("B", "戻る"),
             ("+", "終了"),
         ],
         // クエスト改造: one row pair moves, the other steps, [A] opens the
-        // row's chooser, [Y] the ▸詳細 rows, [ZR] the file-by-file screens.
+        // row's chooser, [ZR] picks which value steps and [Y] is the step. The
+        // file-by-file screens are the [ファイル] pill and [R 長押し], because
+        // [ZR] is the value switch here.
         QuestEdit => &[
             ("</>", "値"),
             ("A", "選択"),
-            ("Y", "詳細行"),
-            ("-", "項目"),
-            ("Z", "ファイル単位"),
+            ("Y", "刻み"),
+            ("ZR", "項目"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
+        // [Y] is the checker on this build (the console answers it before the
+        // state machine, whose Y is the decoded view) and [ZR] writes this one
+        // quest out. [-] is the delete key and a file list has nothing to
+        // delete, so the 抽出 it used to do is [ZR] now.
         ArcEntries => &[
-            ("A", "編集"),
-            ("Y", "表示"),
+            ("A", "開く"),
+            ("Y", "検査"),
+            ("ZR", "抽出"),
             ("X", "保存"),
-            ("-", "書き出す"),
-            ("R", "全部"),
-            ("L", "検査"),
             ("B", "戻る"),
         ],
-        EntryView => &[("A", "値変更"), ("X", ".arc 保存"), ("B", "戻る")],
-        Mib => &[("</>", "値変更"), ("X", "刻み"), ("A", ".arc 保存"), ("B", "戻る")],
+        // The reward / supply row's two numbers are [ZR]'s job (the state
+        // machine's Key::Z) and [Y] is the step; [A] opens the item list on
+        // those rows and steps the coordinate rows. [X] is the save key, and
+        // on the quest screens the save key writes the .arc
+        // (hbedit::Editor::quick_save).
+        EntryView => &[
+            ("</>", "値"),
+            ("A", "アイテム/値変更"),
+            ("Y", "刻み"),
+            ("ZR", "個数/確率"),
+            ("R", "数値"),
+            ("X", ".arc 保存"),
+            ("B", "戻る"),
+        ],
+        Mib => &[
+            ("</>", "増減"),
+            ("A", "一覧選択"),
+            ("Y", "刻み"),
+            ("ZR", "項目"),
+            ("X", ".arc 保存"),
+            ("B", "戻る"),
+        ],
         Gmd => &[("A", "文章編集"), ("X", ".arc 保存"), ("B", "戻る")],
         Check => &[("A", "修正"), ("X", ".arc 保存"), ("B", "戻る")],
+        // [ZR] is the list toggle (hbedit::Editor::toggle_hunt_show_all); [-]
+        // is the delete key and a hunt record has nothing to delete.
         Hunts => &[
             ("</>", "値"),
             ("Y", "列切替"),
             ("A", "刻み"),
             ("R", "数値入力"),
-            ("-", "表示切替"),
+            ("ZR", "表示"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
-        // Minus on the card opens this screen; here the three views are the
-        // sub-tabs above, so Y is the second bit of the quest view (seen) and
-        // the view key on the other two - the footer names which, per view.
-        // The card's own view: [X] is the save key on every screen, and the
-        // arena log is the other view of this screen, reached with L / R.
-        // カード / クエスト回数 / 武器使用数 are the card's own three views and
-        // [Y] walks them; the arena log keeps its own bar tab.
+        // カード / クエスト回数 / 武器使用数 / 闘技大会 are the card's four views
+        // and [Y] walks them (on the quest view it is the 既読 bit instead), so
+        // the arena log is a view, not a shoulder. [ZR] opens the progress
+        // screen (hbedit::Editor::open_progress), [R] types a number on the
+        // three numeric views, and [-] is the delete key - the card has nothing
+        // to delete.
         Guild => &[
             ("</>", "値"),
             ("R", "数値入力"),
             ("Y", "回数/武器"),
             ("A", "行の操作"),
-            ("-", "進行状況"),
-            ("L/R", "闘技大会"),
+            ("ZR", "進行状況"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1259,20 +1293,20 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "ビット切替"),
             ("Y", "タブ/既読"),
             ("</>", "±50行"),
-            ("検索", "名前で絞る"),
+            ("ZR", "検索"),
             ("L/R", "タブ"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
-        // Minus opens the palico equipment panel on both palico screens, and
-        // inside it Minus is the two-press release, so the chip says both.
+        // [ZR] opens the palico equipment panel on both palico screens, and
+        // inside it [-] is the two-press release (the footer there says so).
         // Plus opens the skill / support move panel on the roster alone; it is
         // not the quit key there, the slot list one B away still is.
         Roster => &[
             ("</>", "値"),
             ("Y", "項目切替"),
             ("A", "名前"),
-            ("-", "装備/解除(2回)"),
+            ("ZR", "装備"),
             ("+", "スキル/サポ"),
             ("X", "保存"),
             ("B", "戻る"),
@@ -1289,12 +1323,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("X", "保存"),
             ("B", "戻る"),
         ],
+        // The language is the arrow pair on this build (the console answers
+        // ◀ / ▶ before the state machine, whose L / R are the sub-tabs), the
+        // equipment panel is [ZR], and [-] is the delete key.
         Palico => &[
             ("A", "追加/削除"),
             ("Y", "全導入(2回)"),
-            ("L", "言語"),
-            ("R", "言語"),
-            ("-", "装備/解除(2回)"),
+            ("</>", "言語"),
+            ("ZR", "装備"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1308,7 +1344,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Csv => &[
             ("A", "適用(2回)"),
             ("Y", "書き出し"),
-            ("-", "再読込"),
+            ("ZR", "再読込"),
             ("B", "戻る"),
         ],
         // 生データ: the list's four keys, plus [A] opening the byte editor.
@@ -1403,9 +1439,9 @@ fn apply_text_result(ed: &mut Editor, idx: usize, s: String) {
         // again, the same rule the equipment box's filter follows.
         ed.apply_charm_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_ITEM_BOX_FILTER {
-        // The item box's name search. It has no key on this build ([-] menu,
-        // [Y] step, [R] picker, [X] save, [L] undo), so it is opened from the
-        // inspector's pill; an empty answer is the whole box.
+        // The item box's name search: [ZR] (the one input this screen had
+        // left), and the inspector's pill sends the same key. An empty answer
+        // is the whole box.
         ed.apply_item_box_filter(s);
     } else if idx == mhnx_core::hbedit::TEXT_EQUIP_PICK_FILTER {
         // Through the editor: an empty answer is the whole list again, which is
@@ -1555,8 +1591,8 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                             ed.open_arc_bytes(&p, &b);
                             // A quest that was picked is a quest to edit, not
                             // fifteen files to choose from: the console lands
-                            // on クエスト改造, and [詳細] goes back to the file
-                            // list this used to open directly.
+                            // on クエスト改造, and the [ファイル] pill goes back
+                            // to the file list this used to open directly.
                             if ed.arc.is_some() {
                                 ed.enter_quest_edit();
                             }

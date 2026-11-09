@@ -4842,16 +4842,24 @@ fn audit_the_entry_view_x_writes_the_archive() {
     );
 }
 
+/// The .arc list's way back is [B], and the chip has to say so.
+///
+/// It was the one screen whose chips named no way out: the state machine has no
+/// [B] arm on ArcList (the console answers the key before the state machine
+/// ever sees it), so the table - which describes the console's dispatch - was
+/// written from the state machine and lost the key. The gap is closed on the
+/// console side and the chips say [B] now; the state machine still does not,
+/// which is why the two assertions below are not the same one.
 #[test]
-fn gap_the_arc_list_has_no_back_key() {
+fn audit_the_arc_list_names_the_back_key_the_console_answers() {
+    let arms = switch_hint_arms();
+    assert!(
+        hint_keys(&arms, "ArcList").iter().any(|k| k == "B"),
+        "the console answers [B] on this screen, so the chips must name it"
+    );
     if !real_save().exists() {
         return;
     }
-    let arms = switch_hint_arms();
-    assert!(
-        !hint_keys(&arms, "ArcList").iter().any(|k| k == "B"),
-        "the chips do not mention B either"
-    );
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::Y);
@@ -4861,41 +4869,55 @@ fn gap_the_arc_list_has_no_back_key() {
     assert_eq!(
         ed.screen,
         Screen::ArcList,
-        "B is the back button on every other screen"
+        "the state machine has no [B] arm here - the console's dispatch does"
     );
     assert_eq!(ed.message, message);
-    // The only way back is Y, which is labelled as the save editor.
+    // The state machine's own way back is Y, which is labelled as the save
+    // editor.
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::SaveList);
 }
 
+/// The slot screen's chips must not promise the palico roster on [R].
+///
+/// The state machine's [R] opens the download catalogue (配信オトモ) and its
+/// [L] the talisman list, but the console answers both shoulders as the
+/// sub-tab pair before the state machine sees them - so a chip that said
+/// "R オトモ" named a key the console spends elsewhere. The five state
+/// machine jobs (X items, L charms, R the download catalogue, - the equipment
+/// box) are sections on this build: ZL / ZR, not keys.
 #[test]
-fn gap_the_slots_screen_calls_the_download_palico_list_the_roster() {
+fn audit_the_slots_screen_does_not_promise_the_palico_list() {
     let arms = switch_hint_arms();
     let slots = arms
         .iter()
         .find(|(n, _)| n == "Slots")
         .map(|(_, e)| e.clone())
         .expect("an arm for the slot screen");
-    let label = slots
-        .iter()
-        .find(|(k, _)| k == "R")
-        .map(|(_, l)| l.clone())
-        .expect("R on the slot screen");
-    assert_eq!(label, "オトモ", "the chip promises the roster");
+    assert!(
+        !slots.iter().any(|(k, _)| k == "R"),
+        "the console spends [R] on the sub-tab, not on the roster: {:?}",
+        slots
+    );
+    assert!(
+        slots.iter().any(|(k, _)| k == "L/R"),
+        "the sub-tab pair is what the shoulders do here: {:?}",
+        slots
+    );
 
     if !real_save().exists() {
         return;
     }
+    // The state machine still answers R with the download catalogue; the chips
+    // describe the console, which is the layer that answers the key first.
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::R);
     assert_eq!(
         ed.screen,
         Screen::Palico,
-        "R opens the download catalogue, not the palico roster"
+        "R opens the download catalogue in the state machine"
     );
-    // The real roster is two screens away and the slot screen never says so.
     ed.input(Key::B);
     ed.screen = Screen::Equip; // the box is a section, not a key
     ed.input(Key::R);
@@ -4942,23 +4964,32 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
 fn audit_the_hint_table_names_the_keys_that_work() {
     let arms = switch_hint_arms();
 
-    // Every chip must name a key the screen actually handles, and the charm
-    // screen has to advertise the key that creates a talisman. That is [-] on
-    // the console: switch/src/ui.rs sends it to the state machine's L, because
-    // a plain L is the sub-tab key on every screen. The table describes the
-    // console's dispatch (the drawn footer in switch/src/ui.rs prints the same
-    // [-]), so it is the console's key that has to be here.
+    // Every chip must name a key the console's dispatch really answers on that
+    // screen. The table describes switch/src/ui.rs handle_pad_key, not the bare
+    // state machine, so a key the console spends before the state machine sees
+    // it is not a chip.
+    //
+    // Charms: [＋] creates a talisman (the console sends the state machine's L,
+    // because a plain L is the sub-tab key), and [-] is the two-press delete.
+    let charms = hint_keys(&arms, "Charms");
     assert!(
-        hint_keys(&arms, "Charms").iter().any(|k| k == "-"),
-        "the charm screen creates with [-], so it must say so"
+        charms.iter().any(|k| k == "+"),
+        "the charm screen creates with [＋], so it must say so: {:?}",
+        charms
     );
     assert!(
-        !hint_keys(&arms, "Charms").iter().any(|k| k == "L"),
+        charms.iter().any(|k| k == "-"),
+        "[-] is the two-press delete here: {:?}",
+        charms
+    );
+    assert!(
+        !charms.iter().any(|k| k == "L"),
         "L is the sub-tab key on the console, not a talisman"
     );
-    // ArcEntries: - and R write quests out.
+    // ArcEntries: [ZR] writes this quest out, [Y] is the checker, [X] saves.
+    // [-] is the delete key and a file list has nothing to delete.
     let arc = hint_keys(&arms, "ArcEntries");
-    for k in ["-", "R"] {
+    for k in ["ZR", "Y", "X"] {
         assert!(
             arc.iter().any(|h| h == k),
             "ArcEntries handles {} but does not say so: {:?}",
@@ -4966,23 +4997,36 @@ fn audit_the_hint_table_names_the_keys_that_work() {
             arc
         );
     }
-    // SkillPick and Mib both change the step with X.
+    assert!(
+        !arc.iter().any(|h| h == "-"),
+        "[-] is the delete key and a file list has nothing to delete: {:?}",
+        arc
+    );
+    // The pickers' [X] is クリア and the .mib screen's [X] is the .arc save.
     assert!(hint_keys(&arms, "SkillPick").iter().any(|k| k == "X"));
     assert!(hint_keys(&arms, "Mib").iter().any(|k| k == "X"));
-    // Palico: L / R switch the name language.
+    // Palico: the language is the arrow pair (the console answers ◀ / ▶ before
+    // the state machine, whose L / R are the sub-tabs), so the chips say so.
     let palico = hint_keys(&arms, "Palico");
+    assert!(
+        palico.iter().any(|h| h == "</>"),
+        "the language is ◀ / ▶ on the console: {:?}",
+        palico
+    );
     for k in ["L", "R"] {
         assert!(
-            palico.iter().any(|h| h == k),
-            "Palico handles {} but does not say so",
-            k
+            !palico.iter().any(|h| h == k),
+            "the console spends {} on the sub-tab, not on the language: {:?}",
+            k,
+            palico
         );
     }
 
     if !real_save().exists() {
         return;
     }
-    // Charms: L really creates a new talisman.
+    // Charms: the state machine's L really creates a new talisman - it is the
+    // key the console's [＋] sends (ui.rs Screen::Charms, Key::Plus).
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::L);
@@ -4990,7 +5034,8 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::CharmEdit, "L must create a charm");
 
-    // Palico: L really switches the language.
+    // Palico: the state machine's L switches the language; the console's
+    // ◀ / ▶ run the same toggle through UiAction::TogglePalicoLang.
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::R);
@@ -5011,12 +5056,17 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     ed.input(Key::X);
     assert!(ed.skill_pick_filter.is_empty(), "X clears the filter");
 
-    // The core footer of the slot screen names three keys out of six.
+    // The core footer of the slot screen names the three keys the console
+    // really answers here: [A] opens the character, [Y] is the bulk MAX and
+    // [X] saves. The state machine's X / L / R / - jobs are sections (ZL / ZR)
+    // on this build, so the line must not name them.
     let mut ed = Editor::new();
     open_save(&mut ed);
     let footer = ed.lines().last().map(|l| l.text.clone()).unwrap_or_default();
     assert!(footer.contains("A char edit"), "{}", footer);
-    for k in ["L", "R", "-", "Y"] {
+    assert!(footer.contains("Y max all"), "{}", footer);
+    assert!(footer.contains("X save"), "{}", footer);
+    for k in ["L", "R", "-"] {
         assert!(
             !footer.contains(k),
             "the slot footer now names {}: {}",

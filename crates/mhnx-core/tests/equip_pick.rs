@@ -91,11 +91,11 @@ fn a_type_name_finds_that_type() {
     assert_eq!(ed.equip_pick_choices().len(), 137);
     assert_eq!(ed.equip_pick_search_line(137), "検索: 大剣（137件）");
 
-    // [-] walks the filter: the rest of the types, then the whole scope.
-    ed.input(Key::Minus);
+    // [ZR] walks the filter: the rest of the types, then the whole scope.
+    ed.input(Key::Z);
     assert_eq!(ed.equip_pick_kind, 8);
     for _ in 0..(hbedit::WEAPON_KINDS.len() - 1) {
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
     }
     assert_eq!(ed.equip_pick_kind, 0, "the walk ends on 全種");
     assert_eq!(ed.equip_pick_choices().len(), 1606);
@@ -119,9 +119,9 @@ fn a_type_name_finds_that_type() {
 fn a_partial_name_finds_the_row_and_the_header_names_the_search() {
     let mut ed = form_on(7, 1, 8, false);
     open_picker(&mut ed);
-    ed.input(Key::Minus); // widen to every weapon type
+    ed.input(Key::Z); // widen to every weapon type
     for _ in 0..(hbedit::WEAPON_KINDS.len() - 1) {
-        ed.input(Key::Minus);
+        ed.input(Key::Z);
     }
     ed.apply_equip_pick_filter(String::from("爆砕"));
     let choices = ed.equip_pick_choices();

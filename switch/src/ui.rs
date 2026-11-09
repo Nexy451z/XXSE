@@ -2110,7 +2110,8 @@ impl GuiState {
     /// | [A]            | 決定                                  | the row's own action              | the row's own action (equipment / talisman forms: 選ぶ・書き込み・作成) |
     /// | [Y]            | 検索 (the keyboard)                    | 一覧の表示切替 (item box: 空きも表示) / the mode's own key | 一覧の 検索・表示切替, otherwise the screen's own second action |
     /// | [X]            | クリア／保存 (per screen)              | 保存                              | 保存 (global QuickSave) |
-    /// | [－] / [＋]     | 種別 filter / 終了                     | 2-press delete / quit             | the screen's own tool |
+    /// | [ZR]           | 種別 filter (the name picker; the other three send it to the section bar) | the screen's own second action | the screen's own second action, else the section bar |
+    /// | [－] / [＋]     | 2-press delete / 終了                  | 2-press delete / quit             | 2-press delete / the screen's own tool |
     ///
     /// The two rules that make it collision-free: (1) a shoulder is answered on
     /// the press, and its hold is a *second* answer that never undoes the first,
@@ -2252,9 +2253,10 @@ impl GuiState {
                 // which left the state machine's toggle unreachable - the one
                 // thing this screen's heading can say that nothing else does.
                 // The step is the deck's button now (every key on this screen
-                // is spoken for: A picks, R types the count, X saves, L undoes,
-                // [-] is the bulk menu, +/- are tools and quit, L/R are the
-                // BOX tabs, ZL/ZR the sidebar).
+                // is spoken for: A picks, R types the count, X saves, ZR is the
+                // search, +/- are tools and quit, L/R are the BOX tabs, ZL/ZR
+                // the sidebar, and [-] is the delete key with nothing to
+                // delete here).
                 Key::Y if ed.item_menu_open => {}
                 Key::Y => self.apply_action(ed, UiAction::ToggleItemEmpty),
                 // [R] types the count of the selected slot. It used to open the
@@ -2263,8 +2265,9 @@ impl GuiState {
                 Key::R => {
                     ed.request_item_count_text();
                 }
-                // Minus is the bulk menu now; 元に戻す is one of its rows
-                // (and still L, as before).
+                // [-] is the delete key and this screen has nothing to
+                // delete: the bulk menu is the 一括操作 pill (or the deck's own
+                // row), and 元に戻す is one of its rows.
                 other => ed.input(other),
             },
             Screen::ItemPick => match key {
@@ -6658,10 +6661,10 @@ impl GuiState {
                         "上限を丸める",
                         UiAction::ItemOp(ITEM_OP_CLAMP),
                     );
-                    // The add's name search. The search has no key of its own
-                    // on this build - [Y] is the 空きも表示 toggle, [A] the
-                    // picker, [R] the count, [X] the save, [-] the menu and [L]
-                    // the undo - so this pill is its route.
+                    // The add's name search: [ZR] (the one input the item box
+                    // had left - [Y] is the 空きも表示 toggle, [A] the picker,
+                    // [R] the count, [X] the save, and [-] is the delete key),
+                    // so this pill sends the same key the pad does.
                     let search_lbl = if ed.item_box_filter.trim().is_empty() {
                         "[ZR] 検索"
                     } else {
@@ -6756,9 +6759,12 @@ impl GuiState {
                 );
                 cur_y += 44;
                 if ed.screen == Screen::EquipPick {
-                    // The type filter: [-] walks every type of the scope and
+                    // The type filter: [ZR] walks every type of the scope and
                     // then the scope's first one, which is the only way to see
-                    // the other half of a 6,435 row table.
+                    // the other half of a 6,435 row table. The button used to
+                    // send [-] while its own label said [ZR], so the pad did
+                    // nothing and the touch button did the one job [-] no
+                    // longer has.
                     let kind_lbl = format!("[ZR] 種別: {}", ed.equip_pick_kind_label());
                     self.draw_tool_button(
                         c,
@@ -6767,7 +6773,7 @@ impl GuiState {
                         full_w,
                         38,
                         &kind_lbl,
-                        UiAction::Key(Key::Minus),
+                        UiAction::Key(Key::Z),
                     );
                     cur_y += 44;
                 }

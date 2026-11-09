@@ -6383,12 +6383,12 @@ impl Editor {
                 "闘技大会: ▲▼ アリーナ / ◀▶ 順位 / [A] 編集 / [Y] 直接入力 / [X] 保存",
             ),
             GUILD_TAB_COUNTS => String::from(
-                "クエスト回数: ▼ 項目 / ◀▶ 増減 / [R] 数値入力 / [X] 保存（[-] 進行状況）",
+                "クエスト回数: ▼ 項目 / ◀▶ 増減 / [R] 数値入力 / [X] 保存（[ZR] 進行状況）",
             ),
             GUILD_TAB_WEAPONS => String::from(
                 "武器使用数: ▲▼ 武器 / ◀▶ 会場 / [A] 編集 / [R] 数値入力 / [X] 保存",
             ),
-            _ => String::from("ギルドカード: ▼ 項目 / ◀▶ 増減 / [A] コメント / [-] 進行状況 / [X] 保存"),
+            _ => String::from("ギルドカード: ▼ 項目 / ◀▶ 増減 / [A] コメント / [ZR] 進行状況 / [X] 保存"),
         };
     }
 
@@ -6877,8 +6877,10 @@ impl Editor {
             // Row 0 is the name: ◀ / ▶ opens the keyboard, and the name may hold
             // a line break, which the guide says because no key hints at it.
             Screen::Char => "[◀/▶] 増減  [A] 最大（2回）/編集  [Y] 刻み  [X] 保存  [B] 戻る",
+            // The menu is closed by [B] (the pill on the bar says the same
+            // word); [-] is the delete key and the menu has nothing to delete.
             Screen::Items if self.item_menu_open => {
-                "[▲/▼] 選択  [A] 実行（2回）  [-] 閉じる  [B] 戻る  [X] 保存"
+                "[▲/▼] 選択  [A] 実行（2回）  [B] 閉じる  [X] 保存"
             }
             // L / R walk the BOX pages of the item box rather than a page of
             // rows: the chip used to say ページ, which reads like a scroll and
@@ -7414,7 +7416,7 @@ impl Editor {
         self.quest_edit_open = [false; QUEST_MON_SLOTS];
         self.quest_edit_chance = false;
         let heading = self.quest_heading();
-        self.message = format!("クエスト改造 — {}（[詳細] でファイル単位の画面へ）", heading);
+        self.message = format!("クエスト改造 — {}（[ファイル] でファイル単位の画面へ）", heading);
     }
 
     /// Read the .mib and the .gmd of the open archive into the working copies.
@@ -8832,7 +8834,7 @@ impl Editor {
         if self.hunt_show_all {
             format!("狩猟記録（全モンスター {} 体）", rows)
         } else {
-            format!("狩猟記録（記録ありのみ {} 体・[-] で全表示）", rows)
+            format!("狩猟記録（記録ありのみ {} 体・[ZR] で全表示）", rows)
         }
     }
 
@@ -10211,7 +10213,7 @@ impl Editor {
         self.cursor = 0;
         let n = self.visible_items().len();
         self.message = alloc::format!(
-            "{}（[検索] で変更・空にすると解除）",
+            "{}（[ZR] で変更・空にすると解除）",
             self.item_box_search_line(n)
         );
     }
@@ -12303,7 +12305,10 @@ impl Editor {
             // [A] is the only key that runs a row: a direction key must never
             // be able to rewrite the whole box, however it was pressed.
             Key::A => self.run_item_op(self.item_menu_cursor),
-            Key::B | Key::Minus => self.close_item_menu(),
+            // [B] is the close key (the bar's pill says so). [-] used to close
+            // it too, which is the one thing the delete key must not do: a
+            // menu with nothing to delete does not own it.
+            Key::B => self.close_item_menu(),
             Key::Plus => {
                 self.press_quit();
             }
@@ -12419,7 +12424,7 @@ impl Editor {
                 self.undo_item();
             }
             _ => {
-                self.message = alloc::format!("{}. この行に操作はありません（[-] で閉じる）", op);
+                self.message = alloc::format!("{}. この行に操作はありません（[B] で閉じる）", op);
             }
         }
     }
@@ -13243,7 +13248,7 @@ impl Editor {
         self.message = if self.hunt_show_all {
             format!("全モンスター表示（{} 体）— 記録の無いモンスターも 0→1 にできます", n)
         } else {
-            format!("記録ありのみ表示（{} 体）— [-] で全モンスター", n)
+            format!("記録ありのみ表示（{} 体）— [ZR] で全モンスター", n)
         };
     }
 
@@ -13324,7 +13329,7 @@ impl Editor {
             // to step says so instead of doing nothing.
             other => {
                 self.message = format!(
-                    "この画面では {} は使いません（[◀/▶] 増減 / [Y] 列 / [-] 表示切替）",
+                    "この画面では {} は使いません（[◀/▶] 増減 / [Y] 列 / [ZR] 表示切替）",
                     key_name(other)
                 );
             }
@@ -14154,7 +14159,7 @@ impl Editor {
             )
         } else {
             alloc::format!(
-                "検索「{}」— {} 件。[検索] でもう一度変えられます（空で解除）",
+                "検索「{}」— {} 件。[ZR] でもう一度変えられます（空で解除）",
                 self.progress_filter.trim(),
                 shown
             )
@@ -15003,12 +15008,12 @@ impl Editor {
             Screen::Equip => "装備を選んで [A] で編集、[Y] で名前を検索、[＋] で新規。[生データ] で装備BOXのバイト。",
             Screen::EquipEdit => "行ごとに [A] で選択、[◀/▶] で10件/値。[B] で一覧へ。",
             Screen::JewelPick => "装飾品を選んで [A] で決定。[Y] で名前を検索できます。",
-            Screen::EquipPick => "装備を名前で選んで [A] で決定。[-] で種別を切り替え。",
+            Screen::EquipPick => "装備を名前で選んで [A] で決定。[ZR] で種別を切り替え。",
             Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
             Screen::Hunts => "狩猟記録の行を選んで [◀/▶] で増減。[Y] で項目切替。",
-            Screen::Guild => "ギルドカードの行を [◀/▶] で変更、[-] で進行状況。[生データ] でこの画面のバイト。",
-            Screen::Progress => "[A] でビットを切替、[L/R] でビット列を切替、[検索] で名前を絞り込み。",
-            Screen::Roster => "オトモを選んで [A] で名前、[-] で装備、[＋] でスキル。",
+            Screen::Guild => "ギルドカードの行を [◀/▶] で変更、[ZR] で進行状況。[生データ] でこの画面のバイト。",
+            Screen::Progress => "[A] でビットを切替、[L/R] でビット列を切替、[ZR] で名前を絞り込み。",
+            Screen::Roster => "オトモを選んで [A] で名前、[ZR] で装備、[＋] でスキル。",
             Screen::Palico => "配信オトモを選んで [A] で導入/解除、[Y] 2回で全導入。",
             // Only three keys answer here, so the line names those three and
             // nothing else: [X] saves the open save, not the converted file.
@@ -15025,7 +15030,7 @@ impl Editor {
             }
             Screen::QuestEquip => "固定装備の枠を [A] で開いて編集します。",
             Screen::QuestEdit => "4つのタブでクエストを作ります。[ファイル] でファイル単位の画面へ。",
-            Screen::ArcList => ".arc を選んで [A] で開きます。[Y] 2回でセーブへ導入、[-] で書き出し。",
+            Screen::ArcList => ".arc を選んで [A] で開きます。[Y] 2回でセーブへ導入、[ZR] で書き出し。",
             Screen::ArcEntries => "クエストの構成ファイルです。[A] で中身、[L/R] でタブ切替。",
             Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み。",
             Screen::Mib => "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。",
@@ -17134,7 +17139,8 @@ impl Editor {
         self.message = alloc::format!("ポーチから {} 枠を取り込みました（警告 {} 件）", n, w);
     }
 
-    /// First or second press of [-]: copy the set into the pouch.
+    /// First or second press of the ポーチへ適用 pill: copy the set into the
+    /// pouch.
     ///
     /// myset::apply_to_pouch replaces the pouch, so the first press names what
     /// would be lost; the second one writes. A record the game left unused is
@@ -17151,7 +17157,7 @@ impl Editor {
                 .map(|r| r.used_items().len())
                 .unwrap_or(0);
             self.message = alloc::format!(
-                "ポーチをセット #{:02} の内容で置き換えます（ポーチ {} 枠 → {} 枠）。もう一度 [-] で実行",
+                "ポーチをセット #{:02} の内容で置き換えます（ポーチ {} 枠 → {} 枠）。もう一度「ポーチへ適用」で実行",
                 e.set + 1,
                 self.pouch_used(),
                 held
@@ -17200,8 +17206,11 @@ impl Editor {
         let Some(e) = self.item_set_edit else {
             return String::from("アイテムセットを選んで [A]");
         };
+        // ポーチへ has no key: [-] is the delete key and this is not a delete,
+        // so the pill on the deck is the only door and the line names it by
+        // the word on the button rather than by a key nobody can press.
         alloc::format!(
-            "枠 {:02} {} — [◀/▶] 巡回 / [A] 決定 / [Y] 取込 / [-] 2回で適用 / [ZR] 名前",
+            "枠 {:02} {} — [◀/▶] 巡回 / [A] 決定 / [Y] 取込 / ポーチへ適用（2回） / [ZR] 名前",
             e.field + 1,
             self.item_set_row_label(e.field)
         )
@@ -17212,9 +17221,11 @@ impl Editor {
         let Some(mut e) = self.item_set_edit else {
             return;
         };
-        // Both two-press operations belong to the row the user is looking at,
-        // so any other key drops the pending one before it does its own work.
-        if !matches!(key, Key::Y | Key::Minus) {
+        // The one keyed two-press operation ([Y] 取込) belongs to the row the
+        // user is looking at, so any other key drops the pending one before it
+        // does its own work. ポーチへ has no key, so its offer is dropped by
+        // every press - the pill is the only thing that can carry it.
+        if key != Key::Y {
             self.item_set_armed = None;
         }
         match key {
@@ -17806,9 +17817,9 @@ impl Editor {
     /// Open the name picker on the record the form is holding.
     ///
     /// The type filter starts on the form's own type, so the first screen reads
-    /// "検索: 大剣（137件）" rather than all 1,606 weapons; [-] widens it to the
-    /// rest of the scope and back. The cursor starts on the id the form already
-    /// has, so opening the picker twice does not lose the row. Returns false
+    /// "検索: 大剣（137件）" rather than all 1,606 weapons; [ZR] widens it to
+    /// the rest of the scope and back. The cursor starts on the id the form
+    /// already has, so opening the picker twice does not lose the row. Returns false
     /// (with a message) when no form is open or the cursor is on a row that is
     /// not 種別 / ID.
     pub fn open_equip_picker(&mut self) -> bool {
@@ -17864,7 +17875,7 @@ impl Editor {
         self.message = self.equip_pick_search_line(n);
     }
 
-    /// [-]: walk the type filter - 全種, then every type of the scope, round.
+    /// [ZR]: walk the type filter - 全種, then every type of the scope, round.
     pub fn cycle_equip_pick_kind(&mut self) {
         let kinds = self.equip_pick_scope.kinds();
         self.equip_pick_kind = match kinds.iter().position(|k| *k == self.equip_pick_kind) {
@@ -17901,9 +17912,11 @@ impl Editor {
                 let n = self.equip_pick_choices().len();
                 self.message = self.equip_pick_search_line(n);
             }
-            // The type filter is the other axis of the same question, and [-]
-            // is the one key this modal screen has spare.
-            Key::Minus => self.cycle_equip_pick_kind(),
+            // The type filter is the other axis of the same question, and [ZR]
+            // is the key the footer and the deck both name for it. It used to
+            // be [-], which is the delete key - and a picker has nothing to
+            // delete, so the press did nothing on the console at all.
+            Key::Z => self.cycle_equip_pick_kind(),
             Key::A => {
                 let choices = self.equip_pick_choices();
                 if let Some(c) = choices.get(self.equip_pick_cursor).copied() {
@@ -19374,7 +19387,12 @@ impl Editor {
                         );
                     }
                 }
-                push(&mut out, String::from("  Up/Down slot   A char edit   X items"), false, false);
+                push(
+                    &mut out,
+                    String::from("  Up/Down slot   A char edit   Y max all   X save"),
+                    false,
+                    false,
+                );
             }
             Screen::Char => {
                 push(&mut out, format!("CHARACTER  slot {}", self.slot + 1), false, false);
@@ -19391,7 +19409,7 @@ impl Editor {
                         i == self.field,
                     );
                 }
-                push(&mut out, format!("  step {}   (X)", STEPS[self.step]), false, false);
+                push(&mut out, format!("  step {}   (Y)", STEPS[self.step]), false, false);
             }
             Screen::Items => {
                 // The bulk menu replaces the list while it is open; the list
@@ -19438,7 +19456,7 @@ impl Editor {
                     );
                     push(
                         &mut out,
-                        String::from("  Up/Down row  A run  - close"),
+                        String::from("  Up/Down row  A run  B close"),
                         false,
                         false,
                     );
@@ -19483,7 +19501,7 @@ impl Editor {
                 push(
                     &mut out,
                     String::from(
-                        "  Up/Down row  Left/Right count  - ops  R item  Y empty  L undo  A save",
+                        "  Up/Down row  Left/Right count  A item  R count  Y empty  X save  B back",
                     ),
                     false,
                     false,
@@ -19548,7 +19566,7 @@ impl Editor {
                                     push(
                                         &mut out,
                                         String::from(
-                                            "  Up/Down row  Left/Right value  - count/chance  A item  R type  X write .arc  B back",
+                                            "  Up/Down row  Left/Right value  ZR count/chance  A item  R number  Y step  X write .arc  B back",
                                         ),
                                         false,
                                         false,
@@ -19683,7 +19701,7 @@ impl Editor {
                     }
                     push(
                         &mut out,
-                        String::from("  A choose  Y type filter  X clear  Up/Down 1  Left/Right 10  B back"),
+                        String::from("  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back"),
                         false,
                         false,
                     );
@@ -19763,7 +19781,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A choose  Y type filter  X clear  Up/Down 1  Left/Right 10  B back"),
+                    String::from("  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back"),
                     false,
                     false,
                 );
@@ -19809,7 +19827,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A edit this quest  - extract this  R extract all  B back"),
+                    String::from("  A edit this quest  - delete(2)  Y search  X save  B back"),
                     false,
                     false,
                 );
@@ -19855,7 +19873,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A edit  X install  - extract this  R extract all  L check  B back"),
+                    String::from("  A open  Y check  ZR extract this  X save  B back"),
                     false,
                     false,
                 );
@@ -20082,7 +20100,7 @@ impl Editor {
                 push(
                     &mut out,
                     String::from(
-                        "  - delete(2)  A edit  Y search  L/+ new  X write save  B back",
+                        "  - delete(2)  A edit  Y search  + new  X write save  B back",
                     ),
                     false,
                     false,
@@ -20550,7 +20568,7 @@ impl Editor {
                         let armed = if self.item_set_armed == Some(ItemSetOp::FromPouch) {
                             "  << [Y] で取込確定"
                         } else if self.item_set_armed == Some(ItemSetOp::ToPouch) {
-                            "  << [-] で適用確定"
+                            "  << もう一度で確定"
                         } else {
                             ""
                         };
@@ -20582,7 +20600,7 @@ impl Editor {
                     push(
                         &mut out,
                         String::from(
-                            "  Up/Down 枠  Left/Right アイテム  A 決定  Y 取込(2回)  - ポーチへ(2回)  B 一覧",
+                            "  Up/Down 枠  Left/Right アイテム  A 決定  Y 取込(2回)  B 一覧",
                         ),
                         false,
                         false,
@@ -20673,7 +20691,7 @@ impl Editor {
                 );
                 push(
                     &mut out,
-                    String::from("  Y 項目切替   - 装備/解除(2回)   X save   B back"),
+                    String::from("  Y 項目切替   ZR 装備/解除(2回)   X save   B back"),
                     false,
                     false,
                 );
@@ -20818,14 +20836,14 @@ impl Editor {
                 } else {
                     push(
                         &mut out,
-                        String::from("  [-] 2回で削除 / [+] 新規追加 / [A] 編集（種別・IDを変えると差し替え）"),
+                        String::from("  [-] 2回で削除 / [＋] 新規追加 / [A] 編集（種別・IDを変えると差し替え）"),
                         false,
                         false,
                     );
                 }
                 push(
                     &mut out,
-                    String::from("  Up/Down row  A 編集  Y filter  X clear  B back"),
+                    String::from("  Up/Down row  A 編集  Y 検索  X save  B back"),
                     false,
                     false,
                 );
@@ -20959,7 +20977,7 @@ impl Editor {
                 push(
                     &mut out,
                     String::from(
-                        "  A choose  Y type filter  X clear  Up/Down 1  Left/Right 10  B back",
+                        "  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back",
                     ),
                     false,
                     false,
@@ -20998,7 +21016,7 @@ impl Editor {
                 push(
                     &mut out,
                     String::from(
-                        "  A choose  Y name filter  - type filter  X clear  Up/Down 1  Left/Right 10  B back",
+                        "  A choose  Y name filter  ZR type filter  X clear  Up/Down 1  Left/Right 10  B back",
                     ),
                     false,
                     false,
@@ -21096,7 +21114,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A choose  Y type  X clear  Up/Down 1  Left/Right 10  B back"),
+                    String::from("  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back"),
                     false,
                     false,
                 );
@@ -21241,7 +21259,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  Up/Down row  Left/Right value  Y pick skill  X step  A write"),
+                    String::from("  Up/Down row  Left/Right value  Y pick skill  A row  X save  B back"),
                     false,
                     false,
                 );
@@ -21283,7 +21301,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  A add/remove   - 装備/解除(2回)   L R language   X write save   B back"),
+                    String::from("  A add/remove   ZR 装備/解除(2回)   Left/Right language   X write save   B back"),
                     false,
                     false,
                 );
@@ -21335,7 +21353,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  Up/Down 行  A 適用(2回)  Y 書き出し  - 再読込  B back"),
+                    String::from("  Up/Down 行  A 適用(2回)  Y 書き出し  ZR 再読込  B back"),
                     false,
                     false,
                 );
@@ -21548,7 +21566,7 @@ impl Editor {
                 }
                 push(
                     &mut out,
-                    String::from("  Up/Down row  Left/Right value  A write save  B back"),
+                    String::from("  Up/Down row  Left/Right value  A open  X save  B back"),
                     false,
                     false,
                 );

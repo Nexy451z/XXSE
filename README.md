@@ -75,6 +75,8 @@ Switch 版でできることです。PC 版だけの機能は「実機と PC の
 * `romfs` を指定できるのは PC 版だけです（指定した dump の名前が優先され、外すと
   同梱の名前に戻ります。セーブと一緒に配られたファイルのほうが、そのセーブにとっては
   正しいため）
+* アイテム名・スキル名・モンスター名・装飾品名も同梱の表から引きます
+  （`crates/mhnx-core/src/gamedata.rs`。出所は下の「ライセンス」に書いています）
 
 ### セーブマップ（生データ）
 
@@ -140,7 +142,7 @@ hbmenu から起動します。PC 版は XXSE.exe をそのまま実行してく
 | `X` | 保存（保存前レビューを経ます） |
 | `Y` | 画面の第 1 切替（刻み幅・検索・表示切替など） |
 | `R` | 数値の直接入力（対応する画面のみ） |
-| `-` | 削除（2 回押し）。画面によってはその画面の道具（アイテム BOX の一括操作など） |
+| `-` | 削除（2 回押し）。削除するものが無い画面では何もしません |
 | `+` | 終了（未保存なら確認）。お守り・装備・オトモでは新規 / スキル |
 | `◀` / `▶` | 数値の増減（選択リストでは 10 行送り） |
 | `▲` / `▼` | 項目移動 |
@@ -203,11 +205,15 @@ MIT
 
 ---
 
-ゲームのファイル（`romfs` / セーブ / クエストの .arc）は含まれません。
+ゲームのファイル（`.arc` / `.gmd` / `.mib` / `romfs` / セーブ）は含みません。
+同梱しているのは**名前などのテキスト**です。
 
-例外は「表示する名前」の 4 表（勲章・依頼・クエスト・ステージ）だけです。
-これは作者本人が別リポジトリ
-[**Nexy451z/mhxx-id-memo**](https://github.com/Nexy451z/mhxx-id-memo)（MIT）で
-まとめている名前の表で、`tools/gen_idmemo.py` が commit を固定して取り込みます。
-それ以外のゲームテキストは今までどおり同梱せず、PC 版は実行時に `romfs` から読みます
-（実機は `romfs` を読みません）。
+| 同梱しているファイル | 中身 | 出所 |
+|---|---|---|
+| `crates/mhnx-core/src/idmemo.rs`（約 80KB） | 勲章 132・依頼 184・クエスト 1508・ステージ 31 の名前 | [**Nexy451z/mhxx-id-memo**](https://github.com/Nexy451z/mhxx-id-memo)（MIT・作者本人のリポジトリ）の `data/world/*.tsv`。commit `a284583b3bd04b8fe95e559b8b92d9e29bbdca00`（2026-11-09 取得）を `tools/gen_idmemo.py` が固定して取り込みます |
+| `crates/mhnx-core/src/gamedata.rs`（約 316KB） | アイテム名・スキル名・モンスター名・装飾品名・狩猟系の表 | [**Dawnshifter/MHXXSwitchSaveEditor**](https://github.com/Dawnshifter/MHXXSwitchSaveEditor)（GPL-3.0）の `MHXXSaveEditor/Data/GameConstants.cs`。commit `0624c7ac31ccdc1a57db4480890c0ec6b11feea3` を `tools/gen_names.py` が読んで生成します |
+
+* どちらも**生成物**です。手で編集しないでください（生成器が表の形を検査し、
+  合わなければ書き込みを拒否します）。
+* `romfs` の dump を指定できるのは PC 版だけです（指定した dump の名前が優先され、
+  外すと同梱の名前に戻ります）。実機は `romfs` を読みません。
