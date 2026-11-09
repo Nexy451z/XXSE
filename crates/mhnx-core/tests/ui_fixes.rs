@@ -352,9 +352,19 @@ fn the_screens_that_use_plus_say_how_to_quit() {
     for screen in [Screen::Charms, Screen::Equip] {
         ed.screen = screen;
         let hint = ed.footer_hint();
+        // The exit is its own item, not a parenthesis on the [＋] one: the
+        // third review found the same key on one line with two meanings
+        // ("[＋] 新規 …（[＋]は[B]の後）"). The line still has to say how to
+        // leave, and it says it without reusing the glyph.
         assert!(
-            hint.contains("[＋]は[B]の後"),
+            hint.contains("終了は [B] の後"),
             "{:?} spends [＋], so its footer must name the way out: {}",
+            screen,
+            hint
+        );
+        assert!(
+            !hint.contains("（[＋]は"),
+            "{:?} gives [＋] two meanings on one line: {}",
             screen,
             hint
         );

@@ -1914,7 +1914,13 @@ fn a_reward_item_can_be_changed_from_the_console() {
     assert_eq!(after, want, "the record must hold the chosen item");
     assert_ne!(after, before, "the test must actually change something");
     assert!(ed.dirty, "the archive must be marked changed");
-    assert!(ed.message.contains("X writes"), "message was {}", ed.message);
+    // The line names the key that writes the archive, in Japanese like every
+    // other status message (the third review's finding 4).
+    assert!(
+        ed.message.contains("[X] で .arc に保存"),
+        "message was {}",
+        ed.message
+    );
 }
 
 #[test]

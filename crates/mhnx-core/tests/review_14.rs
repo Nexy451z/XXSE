@@ -481,10 +481,13 @@ fn a_tapped_area_writes_the_sem_and_disarms_the_slot() {
     let select = fn_body(ui_src(), "UiAction::MibPickerSelect(idx) =>");
     assert!(select.contains("quest_area_slot.take()"), "{select}");
     assert!(select.contains("MibPickTarget::Area"), "{select}");
+    // The disarm is one call now (ui.rs close_picker_modal): the modal has
+    // three writers and the close path used to clear two of them, so the third
+    // review's finding was a 種別 flag that outlived its list.
     let close = fn_body(ui_src(), "UiAction::MibPickerClose =>");
-    assert!(close.contains("quest_area_slot = None"), "{close}");
+    assert!(close.contains("close_picker_modal()"), "{close}");
     let open = fn_body(ui_src(), "pub fn open_mib_picker");
-    assert!(open.contains("quest_area_slot = None"), "{open}");
+    assert!(open.contains("close_picker_modal()"), "{open}");
 }
 
 // ---------------------------------------------------------------------------

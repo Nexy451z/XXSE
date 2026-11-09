@@ -414,12 +414,8 @@ pub enum UiAction {
     /// count.
     GuildWeaponCell(usize, usize),
     AdjustRow(usize, Key),
-    AdjustBy(i64),
     SetRowMax(usize),
-    OpenItemPicker(usize),
     SelectSubField(usize, usize),
-    OpenCharmSkill(usize),
-    PageScroll(i32),
     Rescan,
     QuickSave,
     /// The whole-save undo (L held down, or the footer pill).
@@ -443,12 +439,7 @@ pub enum UiAction {
     DeleteCharmConfirm,
     RosterMaxAll,
     InstallDlcCategory(u8),
-    SetQuestTab(usize),
-    ToggleBundledQuest(i32),
-    OpenBundledQuest(i32),
-    OpenMibPicker(usize),
     MibPickerSelect(usize),
-    MibPickerScroll(i32),
     MibPickerClose,
     MibPreset(u8),
     SemPreset(u8),
@@ -955,6 +946,23 @@ impl GuiState {
         }
     }
 
+    /// Close the shared picker modal and every flag that says which writer its
+    /// [A] lands in.
+    ///
+    /// The panel is one modal with three writers - the .mib field, the .sem
+    /// area and the equipment form's 種別 - and each writer is a flag beside it.
+    /// Closing the panel used to clear two of the three: a 種別 list closed with
+    /// [B] left `equip_kind_picker` set, and the next .mib / area list's [A]
+    /// then ran `apply_equip_kind` instead of the row the list was showing - a
+    /// pick silently dropped, and a 種別 change the user never asked for.
+    /// Opening a list and closing one go through here, so the three answers
+    /// cannot drift apart.
+    fn close_picker_modal(&mut self) {
+        self.mib_picker = None;
+        self.quest_area_slot = None;
+        self.equip_kind_picker = false;
+    }
+
     /// Put the palico equipment panel away when a jump leaves its screens.
     ///
     /// The key path closes it through B, but a touch or a ZL / ZR jump changes
@@ -971,11 +979,16 @@ impl GuiState {
 
     fn goto_section(&mut self, ed: &mut Editor, sec: MainSection) {
         // The same question the sub-tab asks: ZL / ZR changes the screen
-        // without going through the form's own keys, and the two calls below
-        // throw the draft away.
+        // without going through the form's own keys, and the calls below throw
+        // the draft away.
         if ed.form_leave_press() {
             return;
         }
+        // The press that goes through drops the form. Without this the talisman
+        // and equipment drafts stayed in memory (only the my-set forms were
+        // closed here), so the next jump asked the same question again and [＋]
+        // named a form that was not on screen.
+        ed.drop_form_drafts();
         self.close_set_form(ed);
         self.close_palico_panel(ed);
         // The item bulk menu is a mode of the item box. A section jump changes
@@ -1282,6 +1295,9 @@ impl GuiState {
         if ed.form_leave_press() {
             return;
         }
+        // The press that goes through drops the form it asked about - the same
+        // half the section jump runs, and for the same reason.
+        ed.drop_form_drafts();
         // The マイセット tab means the list, so a tab press also closes the
         // set editor; leaving the screen any other way does too.
         self.close_set_form(ed);
@@ -1902,10 +1918,10 @@ impl GuiState {
     }
 
     pub fn open_mib_picker(&mut self, ed: &mut Editor, field_idx: usize) -> bool {
-        // Whatever the last chooser was for, this one is a .mib field: the
-        // area slot is disarmed before the list is built, so a pick can only
+        // Whatever the last chooser was for, this one is a .mib field: every
+        // other writer is disarmed before the list is built, so a pick can only
         // ever write the field the list is showing.
-        self.quest_area_slot = None;
+        self.close_picker_modal();
         let Some((title, items, cur_val)) = mib_field_choices(ed.mib_bytes(), field_idx) else {
             return false;
         };
@@ -1941,7 +1957,10 @@ impl GuiState {
             .iter()
             .position(|(v, _)| *v == e.kind as u32)
             .unwrap_or(0);
-        self.quest_area_slot = None;
+        // The two other writers are disarmed first: a 種別 list opened over a
+        // .mib field's list is still one modal, and the flag says which writer
+        // the [A] lands in.
+        self.close_picker_modal();
         self.equip_kind_picker = true;
         self.mib_picker = Some(MibPickerState {
             field_idx: usize::MAX,
@@ -1979,6 +1998,8 @@ impl GuiState {
             items.push((area, label));
         }
         let cursor = items.iter().position(|(v, _)| *v == current).unwrap_or(0);
+        // One modal, one writer: the 種別 flag and the previous list go first.
+        self.close_picker_modal();
         self.quest_area_slot = Some(slot);
         self.mib_picker = Some(MibPickerState {
             field_idx: usize::MAX,
@@ -2084,8 +2105,9 @@ impl GuiState {
                 }
             }
             Key::B | Key::Minus => {
-                self.quest_area_slot = None;
-                self.equip_kind_picker = false;
+                // Every writer, not just the two: a 種別 flag left set made the
+                // next list's [A] write a kind instead of the row.
+                self.close_picker_modal();
             }
             _ => {
                 self.mib_picker = Some(picker);
@@ -2932,7 +2954,6 @@ impl GuiState {
                 | UiAction::SetRowMax(_)
                 | UiAction::InstallAllPalicoes
                 | UiAction::InstallArcRow(_)
-                | UiAction::ToggleBundledQuest(_)
         ) {
             self.undo_press.clear();
             self.roster_max.clear();
@@ -2999,11 +3020,11 @@ impl GuiState {
             // the other character's same frame.
             UiAction::SelectSlot(s) => {
                 if ed.switch_slot(s) {
-                    // The two pickers this layer owns are modes of the screen the
-                    // switch just left, and the keyboard's request names a record
-                    // of the old slot: none of them survives it.
-                    self.mib_picker = None;
-                    self.quest_area_slot = None;
+                    // The modal this layer owns is a mode of the screen the
+                    // switch just left (and its three writer flags name records
+                    // of the old slot), and the keyboard's request names a
+                    // record of the old slot: none of them survives it.
+                    self.close_picker_modal();
                     self.osk = None;
                     self.osk_result = None;
                 }
@@ -3012,8 +3033,7 @@ impl GuiState {
             // says so instead of opening a screen of zeroes.
             UiAction::OpenSlot(s) => {
                 if ed.open_slot(s) {
-                    self.mib_picker = None;
-                    self.quest_area_slot = None;
+                    self.close_picker_modal();
                     self.osk = None;
                     self.osk_result = None;
                 }
@@ -3058,13 +3078,6 @@ impl GuiState {
                 set_active_cursor(ed, self, idx);
                 self.handle_pad_key(ed, key, 0);
             }
-            UiAction::AdjustBy(delta) => {
-                let prev_step = ed.step;
-                let abs_d = delta.abs();
-                ed.step = STEPS.iter().position(|&s| s == abs_d).unwrap_or(0);
-                self.handle_pad_key(ed, if delta >= 0 { Key::Right } else { Key::Left }, 0);
-                ed.step = prev_step;
-            }
             UiAction::SetRowMax(idx) => {
                 set_active_cursor(ed, self, idx);
                 // The character screen's [A] is the one MAX that writes without
@@ -3076,10 +3089,6 @@ impl GuiState {
                 } else {
                     apply_row_max(ed, self.mib_mob_sub, idx);
                 }
-            }
-            UiAction::OpenItemPicker(idx) => {
-                set_active_cursor(ed, self, idx);
-                ed.input(Key::R);
             }
             UiAction::SelectSubField(row_idx, sub) => {
                 set_active_cursor(ed, self, row_idx);
@@ -3104,17 +3113,6 @@ impl GuiState {
                     _ => {}
                 }
             }
-            UiAction::OpenCharmSkill(field_idx) => {
-                if let Some(mut ce) = ed.charm_edit {
-                    ce.field = field_idx;
-                    ed.charm_edit = Some(ce);
-                    // The browse route, which is what the pad's [A] does on a
-                    // skill row; [Y] would open the same list with the search
-                    // box up, and a tap on "スキル" should not pop a keyboard.
-                    ed.input(Key::A);
-                }
-            }
-            UiAction::PageScroll(delta) => self.page_scroll(ed, delta),
             UiAction::Rescan => self.wants_rescan = true,
             // The save itself lives in the state machine
             // (hbedit::Editor::quick_save): it was the console's copy of that
@@ -3201,34 +3199,7 @@ impl GuiState {
                     ed.install_dlc_category(true, false, &format!("公式イベント({}件)", official_n));
                 }
             }
-            UiAction::SetQuestTab(tab) => {
-                ed.set_quest_tab(tab);
-                ed.screen = Screen::SaveQuests;
-            }
-            // Installing is additive and stays one press; removing a quest
-            // from the save is the destructive half and asks
-            // (hbedit::Editor::bundled_quest_press).
-            UiAction::ToggleBundledQuest(qid) => {
-                ed.bundled_quest_press(qid);
-            }
-            UiAction::OpenBundledQuest(qid) => {
-                ed.open_bundled_quest(qid);
-                // A quest that was picked is a quest to edit: the aggregate
-                // screen is where it opens, not the file list. The list it was
-                // picked from is the save's own (the bundled tabs are on that
-                // screen), so [B] comes back there.
-                if ed.arc.is_some() {
-                    ed.enter_quest_edit_from(Screen::SaveQuests);
-                }
-            }
-
             UiAction::OpenDetail => self.open_detail(ed),
-            // The tap path and the pad path open the same thing: what the
-            // row's 種類 byte names. Before this, a tapped 納品 row opened the
-            // monster list (or, after the first fix, nothing at all).
-            UiAction::OpenMibPicker(field_idx) => {
-                let _ = self.open_mib_row_picker(ed, field_idx);
-            }
             UiAction::MibPickerSelect(idx) => {
                 if let Some(mut picker) = self.mib_picker.take() {
                     if picker.cursor == idx {
@@ -3258,12 +3229,11 @@ impl GuiState {
                     }
                 }
             }
-            UiAction::MibPickerScroll(delta) => self.scroll_mib_picker(delta),
             // Closing the chooser disarms it: an area slot left behind is what
-            // made the next monster pick write the .sem.
+            // made the next monster pick write the .sem, and a 種別 flag left
+            // behind made the next list's [A] write a kind instead of the row.
             UiAction::MibPickerClose => {
-                self.mib_picker = None;
-                self.quest_area_slot = None;
+                self.close_picker_modal();
             }
             // Both presets rewrite every monster / spawn of the record at
             // once, so they ask for a second press and say how many they would
@@ -4310,9 +4280,16 @@ impl GuiState {
         // ([B] / [＋]) is named. The tail is drawn instead, prefixed with an
         // ellipsis, so the last item survives the banner.
         let guide = ed.screen_guide();
+        // The tail is measured against the room the marker leaves, not against
+        // the whole strip. It used to be measured against `room` and then drawn
+        // in `room - marker_w`, so text_clipped cut it a second time - and the
+        // end of a guide is where the way out is named, so the item that lost
+        // its last glyph or two was the one the strip exists for.
+        let marker = "…";
+        let marker_w = c.text_width_sized(marker, FontSize::Medium);
+        let tail_room = (room - marker_w).max(0);
         let mut width = |s: &str| c.text_width_sized(s, FontSize::Medium);
-        let tail = mhnx_core::hbedit::guide_tail(guide, room, &mut width);
-        if tail.len() == guide.len() {
+        if width(guide) <= room {
             c.text_clipped(
                 MAIN_X + 4,
                 GUIDE_Y + 3,
@@ -4321,25 +4298,26 @@ impl GuiState {
                 t.text_secondary,
                 FontSize::Medium,
             );
-        } else if !tail.is_empty() {
-            let marker = "…";
-            let marker_w = c.text_width_sized(marker, FontSize::Medium);
-            c.text_clipped(
-                MAIN_X + 4,
-                GUIDE_Y + 3,
-                room,
-                marker,
-                t.text_muted,
-                FontSize::Medium,
-            );
-            c.text_clipped(
-                MAIN_X + 4 + marker_w,
-                GUIDE_Y + 3,
-                (room - marker_w).max(0),
-                tail,
-                t.text_secondary,
-                FontSize::Medium,
-            );
+        } else {
+            let tail = mhnx_core::hbedit::guide_tail(guide, tail_room, &mut width);
+            if !tail.is_empty() {
+                c.text_clipped(
+                    MAIN_X + 4,
+                    GUIDE_Y + 3,
+                    marker_w,
+                    marker,
+                    t.text_muted,
+                    FontSize::Medium,
+                );
+                c.text_clipped(
+                    MAIN_X + 4 + marker_w,
+                    GUIDE_Y + 3,
+                    tail_room,
+                    tail,
+                    t.text_secondary,
+                    FontSize::Medium,
+                );
+            }
         }
     }
 
@@ -4558,7 +4536,10 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "資金・P 一括MAX(2回)", t.text_primary, FontSize::Small);
+                // 174px of label in a 158px pill: it drew as "資金・P 一括..".
+                // The two-press rule is the message on the press
+                // (Editor::char_max_all_press), not the label.
+                btn_text(c, 1108, sy, 158, sh, "資金・P 一括MAX", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::CharMaxAll);
             }
             Screen::Items => {
@@ -4673,41 +4654,49 @@ impl GuiState {
             // The equipment panel is a mode of both palico screens, so its two
             // keys are the only chips while it is open.
             Screen::Roster | Screen::Palico if ed.palico_equip_open() => {
-                c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
-                c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[-] 解除（2回）", t.accent_secondary, FontSize::Small);
-                self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Minus));
+                // The two pills are sized the other way round from the rest of
+                // the deck: "[-] 解除（2回）" is 130px (it names the two-press
+                // delete, which is the one thing this key must not be guessed
+                // at) and "[A] 装着" is 70. 158 + 6 + 136 = 300 of the 302.
+                c.round_rect(964, sy, 158, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 158, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 158, sh, "[-] 解除（2回）", t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 158, sh, UiAction::Key(Key::Minus));
 
-                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
-                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[A] 装着", t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
+                c.round_rect(1128, sy, 136, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1128, sy, 136, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1128, sy, 136, sh, "[A] 装着", t.text_primary, FontSize::Small);
+                self.add_hit(1128, sy, 136, sh, UiAction::Key(Key::A));
             }
             Screen::Roster => {
                 // [Y] walks the three numbers the list edits (Lv / なつき /
                 // EXP) and was on neither the footer nor the deck: a touch-only
                 // player could not change the column at all.
-                let col = match ed.roster_field {
-                    0 => "Lv",
-                    1 => "なつき",
-                    _ => "EXP",
-                };
-                // Three pills in the 302px the deck has: 96 + 6 + 96 + 6 + 98.
-                let y_lbl = format!("[Y] 列: {}", col);
-                c.round_rect(964, sy, 96, sh, 5, t.bg_btn);
-                c.round_rect_border(964, sy, 96, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 96, sh, &y_lbl, t.accent_secondary, FontSize::Small);
-                self.add_hit(964, sy, 96, sh, UiAction::Key(Key::Y));
+                //
+                // The pill names the column and nothing else. It said
+                // "[Y] 列: なつき" - 122px in a 96px pill, so it drew as
+                // "[Y] 列:.." - and the footer already says "[Y] 列" (the key
+                // and what it walks); the pill is the state.
+                //
+                // Three pills in the 302px the deck has (964..1266), sized to
+                // their own labels: 99 + 6 + 91 + 6 + 99 = 301. The widest
+                // label of the three columns is "[Y] なつき" at 87px, and
+                // btn_text keeps 12px inside the pill.
+                let y_lbl = format!("[Y] {}", ed.roster_column_label());
+                c.round_rect(964, sy, 99, sh, 5, t.bg_btn);
+                c.round_rect_border(964, sy, 99, sh, 5, 1, t.border_subtle);
+                btn_text(c, 964, sy, 99, sh, &y_lbl, t.accent_secondary, FontSize::Small);
+                self.add_hit(964, sy, 99, sh, UiAction::Key(Key::Y));
 
-                c.round_rect(1066, sy, 96, sh, 5, t.bg_btn);
-                c.round_rect_border(1066, sy, 96, sh, 5, 1, t.border_subtle);
-                btn_text(c, 1066, sy, 96, sh, "[ZR] 装備", t.text_primary, FontSize::Small);
-                self.add_hit(1066, sy, 96, sh, UiAction::Key(Key::Z));
+                c.round_rect(1069, sy, 91, sh, 5, t.bg_btn);
+                c.round_rect_border(1069, sy, 91, sh, 5, 1, t.border_subtle);
+                btn_text(c, 1069, sy, 91, sh, "[ZR] 装備", t.text_primary, FontSize::Small);
+                self.add_hit(1069, sy, 91, sh, UiAction::Key(Key::Z));
 
-                c.round_rect(1168, sy, 98, sh, 5, t.bg_btn_primary);
-                c.round_rect_border(1168, sy, 98, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1168, sy, 98, sh, "[+] スキル", t.text_primary, FontSize::Small);
-                self.add_hit(1168, sy, 98, sh, UiAction::Key(Key::Plus));
+                c.round_rect(1166, sy, 99, sh, 5, t.bg_btn_primary);
+                c.round_rect_border(1166, sy, 99, sh, 5, 1, t.accent_primary);
+                btn_text(c, 1166, sy, 99, sh, "[+] スキル", t.text_primary, FontSize::Small);
+                self.add_hit(1166, sy, 99, sh, UiAction::Key(Key::Plus));
             }
             Screen::Palico => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
@@ -4840,7 +4829,21 @@ impl GuiState {
                 if ed.progress_view() == PROGRESS_QUESTS {
                     c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                    btn_text(c, 1108, sy, 158, sh, "既読にする", t.text_primary, FontSize::Small);
+                    // The press is a toggle, so the label follows the bit: it
+                    // said "既読にする" on a row that was already seen and the
+                    // press then took the bit off. The row is the state
+                    // machine's answer (Editor::progress_seen_label), the same
+                    // one the press writes.
+                    btn_text(
+                        c,
+                        1108,
+                        sy,
+                        158,
+                        sh,
+                        ed.progress_seen_label(),
+                        t.text_primary,
+                        FontSize::Small,
+                    );
                     self.add_hit(1108, sy, 158, sh, UiAction::ProgressSeen);
                 }
             }
@@ -4870,20 +4873,23 @@ impl GuiState {
             // that has a row.
             Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick => {
                 if ed.screen == Screen::EquipPick {
-                    c.round_rect(964, sy, 112, sh, 5, t.bg_btn);
-                    c.round_rect_border(964, sy, 112, sh, 5, 1, t.border_subtle);
-                    btn_text(c, 964, sy, 112, sh, "[Y] 検索", t.text_primary, FontSize::Small);
-                    self.add_hit(964, sy, 112, sh, UiAction::Key(Key::Y));
+                    // Three pills in 302px, sized to their labels: 94 + 6 + 96
+                    // + 6 + 100 = 302. "[X] クリア" is 87px and had 82 - the
+                    // one pill of the three that drew as "[X] クリ..".
+                    c.round_rect(964, sy, 94, sh, 5, t.bg_btn);
+                    c.round_rect_border(964, sy, 94, sh, 5, 1, t.border_subtle);
+                    btn_text(c, 964, sy, 94, sh, "[Y] 検索", t.text_primary, FontSize::Small);
+                    self.add_hit(964, sy, 94, sh, UiAction::Key(Key::Y));
 
-                    c.round_rect(1082, sy, 96, sh, 5, t.bg_btn);
-                    c.round_rect_border(1082, sy, 96, sh, 5, 1, t.border_subtle);
-                    btn_text(c, 1082, sy, 96, sh, "[ZR] 種別", t.text_secondary, FontSize::Small);
-                    self.add_hit(1082, sy, 96, sh, UiAction::Key(Key::Z));
+                    c.round_rect(1064, sy, 96, sh, 5, t.bg_btn);
+                    c.round_rect_border(1064, sy, 96, sh, 5, 1, t.border_subtle);
+                    btn_text(c, 1064, sy, 96, sh, "[ZR] 種別", t.text_secondary, FontSize::Small);
+                    self.add_hit(1064, sy, 96, sh, UiAction::Key(Key::Z));
 
-                    c.round_rect(1184, sy, 82, sh, 5, t.bg_btn_primary);
-                    c.round_rect_border(1184, sy, 82, sh, 5, 1, t.accent_primary);
-                    btn_text(c, 1184, sy, 82, sh, "[X] クリア", t.text_primary, FontSize::Small);
-                    self.add_hit(1184, sy, 82, sh, UiAction::Key(Key::X));
+                    c.round_rect(1166, sy, 100, sh, 5, t.bg_btn_primary);
+                    c.round_rect_border(1166, sy, 100, sh, 5, 1, t.accent_primary);
+                    btn_text(c, 1166, sy, 100, sh, "[X] クリア", t.text_primary, FontSize::Small);
+                    self.add_hit(1166, sy, 100, sh, UiAction::Key(Key::X));
                 } else {
                     c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                     c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -5362,11 +5368,16 @@ impl GuiState {
         let body_y = CONTENT_Y + 30;
         let body_h = FOOTER_Y - body_y - 10;
         const ROW_H: i32 = 50;
-        const VIS: usize = 9;
+        // The window is the shared arithmetic, not a typed 9: the row count
+        // follows the body height and the measured caption height, so a font
+        // change moves it instead of drawing the last row over the panel's
+        // edge (hbedit::list_window_rows; the strip is empty on this screen).
+        let line_h = c.line_height_sized(FontSize::Small).max(16);
+        let vis = mhnx_core::hbedit::list_window_rows(body_h, ROW_H, 0, line_h);
         let list_w = V1_LIST_W;
         let insp_x = V1_INSP_X; // 832
         let insp_w = V1_INSP_W; // 428
-        let start = window_start(ed.map_cursor, total, VIS);
+        let start = window_start(ed.map_cursor, total, vis);
         // The same 40px rule as the wide list: the row's tap area and its
         // right-hand text stop before the bar's touch area.
         let track = scroll_track(MAIN_X, list_w);
@@ -5376,7 +5387,7 @@ impl GuiState {
         c.round_rect_border(MAIN_X, body_y, list_w, body_h, t.corner_r, 1, t.border_subtle);
         c.hline(MAIN_X + 12, body_y + 30, list_w - 24, t.border_subtle);
 
-        for i in 0..VIS {
+        for i in 0..vis {
             let pos = start + i;
             if pos >= total {
                 break;
@@ -5468,8 +5479,8 @@ impl GuiState {
             MAIN_X,
             list_w,
             body_y + 34,
-            (VIS as i32) * ROW_H,
-            ScrollBar::new(total, VIS, start),
+            (vis as i32) * ROW_H,
+            ScrollBar::new(total, vis, start),
             &ids,
             false,
         );
