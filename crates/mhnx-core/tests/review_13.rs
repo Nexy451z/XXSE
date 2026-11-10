@@ -499,10 +499,16 @@ fn the_quest_basic_button_follows_the_row() {
         "増減は [◀/▶]",
         "the last row is the time limit, not a button"
     );
-    // The footer says which row the [◀/▶] pair is for.
+    // The footer follows the row as well: a text row names [A], the time row
+    // names the arrows, and neither key is promised on a row that refuses it.
     ed.quest_edit_cursor = 0;
     let hint = ed.footer_hint();
+    assert!(hint.contains("[A] テキスト編集"), "{hint}");
+    assert!(!hint.contains("[◀/▶] 制限時間"), "{hint}");
+    ed.quest_edit_cursor = ed.quest_value_rows() - 1;
+    let hint = ed.footer_hint();
     assert!(hint.contains("[◀/▶] 制限時間"), "{hint}");
+    assert!(!hint.contains("[A] テキスト編集"), "{hint}");
     // And the console draws the answer (ui.rs draw_quest_edit).
     let body = fn_body(ui_src(), "fn draw_quest_edit");
     assert!(body.contains("ed.quest_basic_a_label()"), "{body}");
@@ -656,12 +662,25 @@ fn minus_is_the_delete_key_and_nothing_else() {
     assert!(!ed.minus_rescans());
     // The console's dispatch asks the state machine where ZR belongs.
     assert!(editor_src().contains("mhnx_core::hbedit::ZrJob::Screen"));
-    // And every guide that names [-] names it as the delete.
-    for screen in [Screen::Charms, Screen::Equip, Screen::SaveQuests] {
+    // And every line that names [-] names it as the delete. The quest list's
+    // footer names [ZR] 一括 instead (the strip has 763px and one of the two
+    // had to go - the delete is drawn on the deck's own button and named by the
+    // guide), so it is checked through those two routes.
+    for screen in [Screen::Charms, Screen::Equip] {
         ed.screen = screen;
         let hint = ed.footer_hint();
         assert!(hint.contains("[-] 削除（2回）"), "{screen:?}: {hint}");
     }
+    ed.screen = Screen::SaveQuests;
+    ed.set_quest_tab(0);
+    if Editor::bundled_quests_available() {
+        let guide = ed.screen_guide();
+        assert!(guide.contains("[-] で削除（2回）"), "{guide}");
+    }
+    assert!(
+        ui_src().contains("[-] 選択中のクエストを削除（2回）"),
+        "the deck's button names the delete"
+    );
 }
 
 // ---------------------------------------------------------------------------

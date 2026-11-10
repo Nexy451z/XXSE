@@ -104,7 +104,7 @@ fn every_row_says_what_a_really_does() {
     // +0x08 / +0x0A): they used to be edited on the equipment form, which
     // stopped opening on a talisman.
     let expected = [
-        (0usize, CharmAction::WriteToBox, "BOXへ反映"),
+        (0usize, CharmAction::WriteToBox, "書き込み"),
         (1, CharmAction::CycleKind, "種類を切替"),
         (2, CharmAction::CycleSlots, "スロットを切替"),
         (3, CharmAction::PickSkill, "スキルを選ぶ"),

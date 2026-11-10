@@ -464,8 +464,21 @@ fn a_slot_change_puts_every_open_form_away() {
     assert!(ed.charm_edit.is_none(), "the talisman form was closed");
     assert_eq!(ed.screen, Screen::Charms, "and the screen is its list");
 
-    // 装備編集: the same rule.
-    ed.equip_edit = Some(EquipEdit::default());
+    // 装備編集: the same rule. The form holds the creator's own starting
+    // values, which is the one form that is clean by construction
+    // (equip_draft_dirty compares a new form with exactly these): a form with an
+    // edit in it asks before the switch drops it, which
+    // a_slot_change_asks_before_it_drops_a_draft covers.
+    ed.equip_edit = Some(EquipEdit {
+        new: true,
+        kind: 1,
+        id: 1,
+        level: 1,
+        transmog_id: 0,
+        transmog_level: 1,
+        decorations: [0; 3],
+        ..EquipEdit::default()
+    });
     ed.screen = Screen::EquipEdit;
     assert!(ed.switch_slot(first));
     assert!(ed.equip_edit.is_none());
@@ -487,9 +500,16 @@ fn a_slot_change_puts_every_open_form_away() {
     assert_eq!(ed.screen, Screen::Equip);
 
     // The modes that sit on top of a screen: both set forms, the item bulk
-    // menu and the two palico panels.
+    // menu and the two palico panels. The two forms hold the parts their
+    // records hold (an empty box is all zeroes, and SetEdit::default picks
+    // myset::NONE per row), so neither holds a draft and the switch goes
+    // through; a form with an edit in it asks first, which
+    // a_slot_change_asks_before_it_drops_a_draft covers.
     ed.screen = Screen::Sets;
-    ed.set_edit = Some(SetEdit::default());
+    ed.set_edit = Some(SetEdit {
+        pick: [0; mhnx_core::myset::EQUIP_SET_PARTS],
+        ..SetEdit::default()
+    });
     ed.item_set_edit = Some(ItemSetEdit::default());
     ed.open_item_menu();
     ed.palico_equip = Some(PalicoEquip {

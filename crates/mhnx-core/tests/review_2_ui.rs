@@ -295,17 +295,19 @@ fn the_quest_row_survives_the_item_pick_and_the_item_tabs_can_be_searched() {
     ed.enter_quest_edit_from(Screen::SaveQuests);
     assert_eq!(ed.quest_edit_cursor, 3, "the row is kept, not reset");
 
-    // [ZR] on 報酬 walks 個数 -> 確率% -> 検索, and the search narrows the list.
-    // The cycle does not open the keyboard (the third review's finding 5): it
-    // used to, every other press, which left no way back to 個数.
+    // [ZR] on 報酬 walks the two values a reward row holds (個数 ⇄ 確率%), and
+    // the search narrows the list. The cycle does not open the keyboard (the
+    // third review's finding 5): it used to, every other press, which left no
+    // way back to 個数. It no longer has a 検索 stop either - a value switch
+    // whose third stop holds no value (the fourth review's finding 17).
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     ed.input(Key::Z);
     assert!(ed.quest_edit_chance(), "the first stop is the chance column");
     ed.input(Key::Z);
     assert_eq!(
         ed.quest_reward_field,
-        mhnx_core::hbedit::QUEST_REWARD_SEARCH,
-        "the third stop is the item-name search"
+        mhnx_core::hbedit::QUEST_REWARD_COUNT,
+        "two stops: back to the count"
     );
     assert_eq!(ed.take_text_request(), None, "the cycle opens no keyboard");
     // The search is its own press: [R] on the same tab.
@@ -313,7 +315,7 @@ fn the_quest_row_survives_the_item_pick_and_the_item_tabs_can_be_searched() {
     assert_eq!(
         ed.take_text_request(),
         Some((TEXT_QUEST_ITEM, String::new())),
-        "the third stop is the item-name search"
+        "the search is [R], not a stop of the cycle"
     );
     ed.apply_quest_item_filter(String::from("zzz"));
     assert!(ed.quest_rewards().is_empty(), "the search narrows the list");

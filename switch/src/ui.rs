@@ -42,14 +42,16 @@
 //!     quest list and the three pickers) or `空きも表示` on the item box; on a
 //!     screen with no list it is that screen's own second action and the footer
 //!     names it (刻み on the byte screens, 列切替 on 狩猟記録, 項目切替 on オトモ,
-//!     タブ on マイセット). No screen deletes on `Y`: the two-press delete is
-//!     `[-]` everywhere.
+//!     タブ on マイセット and on 進行状況). No screen deletes on `Y`: the
+//!     two-press delete is `[-]` everywhere.
+//!   - `R`: the number key where the footer promises `[R] 数値入力`, and the
+//!     second bit of 進行状況's quest view (既読). The footer names it on both.
 //!
 //! The words are one vocabulary, not one screen's habit: 検索 opens a name
 //! search everywhere, 刻み is the step size, 削除 removes a record and 解除
 //! empties a slot. 絞る / 絞り込み / 外す / 刻み幅 are the old synonyms and are
 //! gone from the drawn labels (the key table lives in editor::actions).
-//!   - 護石の `[A]` は行ごとの操作（種類/スロット/スキル選択/数値/BOXへ反映）で、
+//!   - 護石の `[A]` は行ごとの操作（種類/スロット/スキル選択/数値/書き込み）で、
 //!     フッターと `[A]` ボタンの文言はその行の動作と同じ値から作られる
 //!     （`mhnx_core::hbedit::CharmAction`）。
 //!   - `B`: Back / Cancel.
@@ -469,9 +471,9 @@ pub enum UiAction {
     /// 進行状況's name search.
     ///
     /// The quest view lists 1,508 rows and the request view 380, and the screen
-    /// has no key left to give it: [A] toggles the bit, [Y] is the second bit,
-    /// the four directions move and L / R walk the views. So it is a pill, the
-    /// same answer the item box's search got.
+    /// has no key left to give it: [A] toggles the bit, [Y] walks the views, [R]
+    /// is the quest view's second bit, the four directions move and [L] is the
+    /// tab. So it is [ZR] and a pill, the same answer the item box's search got.
     FilterProgress,
     InstallAllPalicoes,
     TogglePalicoLang,
@@ -1280,12 +1282,12 @@ impl GuiState {
         // the whole jump below, which put the list's cursor back at the top
         // (護石 / 装備 / マイセット / オトモ / 狩猟記録) - so a tap on the tab the
         // user was already on threw away the row they had reached. Nothing
-        // happens now. The two screens that keep their own tabs (進行状況 and
-        // クエスト改造) are exempt: their bar is the same state machine and a
-        // press there is already a no-op.
-        if !matches!(ed.screen, Screen::Progress | Screen::QuestEdit)
-            && idx == self.sub_tabs_for(ed).1
-        {
+        // happens now, on every screen. 進行状況 and クエスト改造 used to be
+        // exempt because their bar is the same state machine; the exemption is
+        // what made a tap on the lit クエスト改造 tab reset its cursor
+        // (hbedit::Editor::quest_set_tab is a no-op on the tab that is showing
+        // now, and this returns before any of the jump's work).
+        if idx == self.sub_tabs_for(ed).1 {
             return;
         }
         // A tab press that would leave a form asks first, exactly as [B] does:
@@ -1488,30 +1490,32 @@ impl GuiState {
                 // record the list was on, and says so when there is none - and
                 // the tab stays lit in that case, because the press was still
                 // the press (hbedit::Editor::charm_tab).
-                1 => ed.open_charm_form_selected(),
-                2 => {
-                    ed.screen = Screen::Equip;
-                    ed.equip_edit = None;
-                    ed.equip_cursor = 0;
-                }
+                // 護石編集: the tab lights and the list stays. It used to call
+                // the form opener, so [R] - the shoulder that walks
+                // the tab strip - opened an edit form on whatever row the
+                // cursor was on. The form opens from [A] on the row it edits
+                // (hbedit::Editor::charm_a_press); a tab press is navigation.
+                1 => ed.charm_tab_press(),
+                // The row the box was on is kept: a tab step used to put the
+                // list back at the top, so crossing to 装備BOX and back cost
+                // the row the user had reached (hbedit::Editor::open_equip_box).
+                2 => ed.open_equip_box(),
                 _ => {
                     ed.screen = Screen::Sets;
                     self.sets_cursor = 0;
                 }
             },
             MainSection::PalicoRecord => match idx {
-                0 => {
-                    ed.screen = Screen::Roster;
-                    ed.roster_cursor = 0;
-                }
+                // The three lists keep their rows across a tab step: a tab is
+                // navigation, and putting the cursor back at the top made
+                // crossing to 狩猟記録 and back cost the row the user had
+                // reached. Each screen clamps its own cursor when it draws.
+                0 => ed.open_roster(),
                 1 => {
                     ed.screen = Screen::Palico;
                     ed.cursor = ed.palico_cursor;
                 }
-                2 => {
-                    ed.screen = Screen::Hunts;
-                    ed.hunt_cursor = 0;
-                }
+                2 => ed.open_hunts(),
                 3 => {
                     ed.screen = Screen::Guild;
                     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_CARD);
@@ -1940,11 +1944,13 @@ impl GuiState {
         true
     }
 
-    /// Open the equipment form's 種別 list: the twenty kinds a box holds.
+    /// Open the equipment form's 種別 list: the kinds a box holds.
     ///
     /// The row used to step one kind per press, so reaching 弓 from 頭 cost
     /// fourteen presses; the list is one press and the same modal the .mib and
-    /// エリア choosers use.
+    /// エリア choosers use. The count in the title is the table's own length
+    /// (equip::BOX_KINDS): it said 20 over a list of 19, and "Twenty-one kinds"
+    /// in the core's comment, so three numbers described one table.
     fn open_equip_kind_picker(&mut self, ed: &mut Editor) -> bool {
         let Some(e) = ed.equip_edit else {
             return false;
@@ -1964,7 +1970,10 @@ impl GuiState {
         self.equip_kind_picker = true;
         self.mib_picker = Some(MibPickerState {
             field_idx: usize::MAX,
-            title: String::from("種別を選ぶ（ハンターの箱に入る 20 種）"),
+            title: alloc::format!(
+                "種別を選ぶ（ハンターの箱に入る {} 種）",
+                mhnx_core::equip::BOX_KINDS.len()
+            ),
             items,
             cursor,
         });
@@ -2442,8 +2451,11 @@ impl GuiState {
                 Key::Minus => {
                     ed.input(Key::Minus);
                 }
+                // [＋] starts a new talisman in the first free slot. It used to
+                // call open_charms() first, which put the list cursor back at
+                // the top - the equipment box's [＋] has always kept its row,
+                // and the two now answer the same way.
                 Key::Plus => {
-                    ed.open_charms();
                     ed.input(Key::L);
                 }
                 other => ed.input(other),
@@ -2954,6 +2966,9 @@ impl GuiState {
                 | UiAction::SetRowMax(_)
                 | UiAction::InstallAllPalicoes
                 | UiAction::InstallArcRow(_)
+                // The 終了 pill is the second press of its own offer: taking
+                // the offer back here would make the pill ask forever.
+                | UiAction::Quit
         ) {
             self.undo_press.clear();
             self.roster_max.clear();
@@ -2962,6 +2977,12 @@ impl GuiState {
             // card press or any other action takes the offer back, so a badge
             // tap a minute later cannot switch the hunter on its own.
             self.slot_press.clear();
+            // The same rule for the [＋] quit offer: the pad drops it on every
+            // key that is not [＋] (hbedit::Editor::input), and a touch action
+            // is a key - so a tap on a deck button or a tab takes the offer
+            // back too. It used to survive, and a 終了 tapped once then re-tapped
+            // a minute later quit without asking again.
+            ed.clear_quit_arm();
         }
         match action {
             UiAction::Key(k) => self.handle_pad_key(ed, k, 0),
@@ -4577,17 +4598,19 @@ impl GuiState {
                 let chip = if ed.quest_edit_tab == QUEST_TAB_MONSTERS {
                     format!("[ZR] {}", ed.quest_field_label())
                 } else if ed.quest_edit_tab == QUEST_TAB_REWARDS {
-                    // The three stops [ZR] walks, named on the key that walks
-                    // them (hbedit::QUEST_REWARD_*). The chip used to have two
-                    // words because the third press opened a keyboard instead
-                    // of a third stop.
+                    // The two values [ZR] walks, named on the key that walks
+                    // them (hbedit::QUEST_REWARD_*). The third stop held no
+                    // value at all - it was the search - so the chip said 検索
+                    // next to a key whose arrows could only refuse.
                     match ed.quest_reward_field {
                         mhnx_core::hbedit::QUEST_REWARD_CHANCE => String::from("[ZR] 確率%"),
-                        mhnx_core::hbedit::QUEST_REWARD_SEARCH => String::from("[ZR] 検索"),
                         _ => String::from("[ZR] 個数"),
                     }
                 } else {
-                    String::from("[ZR] 項目")
+                    // 支給品 has one value and nothing to switch, so [ZR] there
+                    // is the search itself. The chip said 項目 - a value switch
+                    // on a tab with no second value.
+                    String::from("[ZR] 検索")
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -4805,13 +4828,12 @@ impl GuiState {
                 btn_text(c, 1108, sy, 158, sh, "[Y] 列切替", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
             }
-            // 進行状況: the search has no key of its own on this screen ([A]
-            // toggles the bit, [Y] is the second bit, the four directions move
-            // and L / R walk the views), so it is a pill - the same answer the
-            // item box and the talisman list got. The quest view's [Y] (既読)
-            // keeps its pill beside it; on the other two views that key only
-            // walks the views, which the tab bar above already does for a
-            // finger.
+            // 進行状況: the search is [ZR] on every view, and the pill sends the
+            // same key ([A] toggles the bit, [Y] walks the views, [R] is the
+            // quest view's second bit, the four directions move and [L] is the
+            // tab). The quest view's [R] (既読) keeps its pill beside it; on the
+            // other two views that key walks the views, which the tab bar above
+            // already does for a finger.
             Screen::Progress => {
                 let label = if ed.progress_filter.trim().is_empty() {
                     String::from("[ZR] 検索")
@@ -4823,9 +4845,10 @@ impl GuiState {
                 btn_text(c, 964, sy, 136, sh, &label, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::FilterProgress);
                 // 既読 is the quest view's second bit. [Y] moves the tab on all
-                // three views now, so the write is this pill and nothing else:
-                // a key that wrote the save on one view and moved the tab on
-                // the other two was the review's finding.
+                // three views, so the write has a key of its own: [R], which
+                // the console takes back from the sub-tab rule on this view
+                // (hbedit::Editor::shoulder_job). The pill names it and sends
+                // the same method, so a finger and the pad write one bit.
                 if ed.progress_view() == PROGRESS_QUESTS {
                     c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
@@ -4834,16 +4857,8 @@ impl GuiState {
                     // press then took the bit off. The row is the state
                     // machine's answer (Editor::progress_seen_label), the same
                     // one the press writes.
-                    btn_text(
-                        c,
-                        1108,
-                        sy,
-                        158,
-                        sh,
-                        ed.progress_seen_label(),
-                        t.text_primary,
-                        FontSize::Small,
-                    );
+                    let seen = format!("[R] {}", ed.progress_seen_label());
+                    btn_text(c, 1108, sy, 158, sh, &seen, t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::ProgressSeen);
                 }
             }
@@ -6654,7 +6669,10 @@ impl GuiState {
             let sw = ((iw - 40 - gap * 4) / 5).max(40);
             let mut sx = ix + 20;
             for (s_idx, &step_val) in steps.iter().enumerate() {
-                let is_s = ed.step == s_idx;
+                // The lit pill is the step the arrows really take: a form's
+                // table is shorter than the shared one (FORM_STEPS), so the
+                // index is clamped the same way the writer clamps it.
+                let is_s = ed.step.min(steps.len().saturating_sub(1)) == s_idx;
                 let sbg = if is_s { t.bg_selected } else { t.bg_btn };
                 let sbd = if is_s { t.accent_primary } else { t.border_subtle };
                 let sfg = if is_s { t.accent_primary } else { t.text_secondary };

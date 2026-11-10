@@ -1203,6 +1203,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "編集/導入(解除は2回)"),
             ("-", "削除(2回)"),
             ("Y", "検索"),
+            ("ZR", "一括導入"),
             ("L/R", "サブタブ"),
             ("X", "保存"),
             ("B", "SD(.arc)"),
@@ -1227,6 +1228,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "選択"),
             ("Y", "刻み"),
             ("ZR", "項目"),
+            ("R", "検索"),
             ("X", "保存"),
             ("B", "戻る"),
         ],
@@ -1251,7 +1253,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("A", "アイテム/値変更"),
             ("Y", "刻み"),
             ("ZR", "個数/確率"),
-            ("R", "数値"),
+            ("R", "数値入力"),
             ("X", ".arc 保存"),
             ("B", "戻る"),
         ],
@@ -1291,9 +1293,14 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("X", "保存"),
             ("B", "戻る"),
         ],
+        // [Y] walks the three views and [R] is the quest view's second bit
+        // (既読): the console takes [R] back from the sub-tab rule on that view
+        // only (hbedit::Editor::shoulder_job), so the chip names it there. [ZR]
+        // is the search on every view.
         Progress => &[
             ("A", "ビット切替"),
-            ("Y", "タブ/既読"),
+            ("R", "既読"),
+            ("Y", "タブ"),
             ("</>", "±50行"),
             ("ZR", "検索"),
             ("L/R", "タブ"),

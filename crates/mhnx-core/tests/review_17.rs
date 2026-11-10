@@ -579,6 +579,49 @@ const ASCII_ALLOWED: &[&str] = &[
     "ON",
 ];
 
+/// The ASCII words a Japanese sentence may still carry.
+///
+/// A word here is a name this interface has no Japanese spelling for: a file
+/// extension, a unit, a key, the game's own title. It is never an English word
+/// standing in for a Japanese one - which is what "この tab は" was, and what
+/// the old test could not see: the sentence had a Japanese word in it, so the
+/// "at least one non-ASCII character" check passed.
+const ASCII_WORDS_ALLOWED: &[&str] = &[
+    // Keys and units.
+    "ZR", "ID", "Lv", "HR", "EXP", "MAX", "Slot",
+    // File formats and folders.
+    "arc", "mib", "gmd", "sem", "sup", "bak", "CSV", "DLC", "SD",
+    // The game and the two machines.
+    "MHXX", "MHGU", "Switch", "DS",
+    // A flag's two states, and the two keyboards' own words.
+    "ON", "OFF", "YES", "UTF", "English",
+    // Field names the game's own tables spell in English.
+    "Wave", "Flag", "QDP", "BOX",
+    // The shapes a typed value is asked for in.
+    "xFFFF", "ss", "cc", "MM", "rec",
+];
+
+/// Every ASCII word of two or more letters in a string.
+fn ascii_words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    for c in text.chars() {
+        if c.is_ascii_alphabetic() {
+            word.push(c);
+        } else {
+            if word.len() >= 2 {
+                out.push(core::mem::take(&mut word));
+            } else {
+                word.clear();
+            }
+        }
+    }
+    if word.len() >= 2 {
+        out.push(word);
+    }
+    out
+}
+
 #[test]
 fn every_status_message_speaks_japanese() {
     let mut checked = 0;
@@ -601,9 +644,28 @@ fn every_status_message_speaks_japanese() {
                 lit.chars().any(|c| !c.is_ascii()),
                 "{name}:{line} prints an English status message: {lit:?}"
             );
+            // One Japanese word is not enough: an English word mixed into the
+            // sentence is the same bug with a Japanese alibi ("この tab は").
+            for word in ascii_words(&lit) {
+                assert!(
+                    ASCII_WORDS_ALLOWED.contains(&word.as_str()),
+                    "{name}:{line} mixes the English word {word:?} into a status \
+                     message: {lit:?}"
+                );
+            }
         }
     }
     assert!(checked > 100, "the scan found only {checked} messages");
+
+    // The check has teeth: the sentence this review found is made of one
+    // Japanese word and one English one, and the word list refuses it.
+    let found = "検索は 報酬 / 支給品 タブで使います（この tab は [A] で編集）";
+    assert!(found.chars().any(|c| !c.is_ascii()), "the old check passed it");
+    assert_eq!(ascii_words(found), vec![String::from("tab")], "{found}");
+    assert!(
+        !ASCII_WORDS_ALLOWED.contains(&"tab"),
+        "tab is not a name this interface has"
+    );
 }
 
 // ---------------------------------------------------------------------------

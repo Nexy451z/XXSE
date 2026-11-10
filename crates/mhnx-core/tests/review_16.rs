@@ -15,7 +15,7 @@ use mhnx_core::equip;
 use mhnx_core::equipops::{self, EquipError};
 use mhnx_core::hbedit::{
     self, Editor, EquipScope, Key, Request, Screen, TextSentinel, GMD_TEXT_MAX, QUEST_REWARD_CHANCE,
-    QUEST_REWARD_COUNT, QUEST_REWARD_FIELDS, QUEST_REWARD_SEARCH, QUEST_TAB_BASIC,
+    QUEST_REWARD_COUNT, QUEST_REWARD_FIELDS, QUEST_TAB_BASIC,
     QUEST_TAB_MONSTERS, QUEST_TAB_REWARDS, QUEST_TAB_SUPPLIES,
 };
 use mhnx_core::save::{self, Save};
@@ -389,13 +389,18 @@ fn the_extract_button_writes_the_quest_the_list_shows() {
 // 5: [ZR] opened a keyboard every other press on 報酬
 // ---------------------------------------------------------------------------
 
-/// Three stops that cycle, and no keyboard on any of them.
+/// Two values that cycle, and no keyboard on either of them.
+///
+/// The cycle used to have a third stop (検索) that held no value at all: the
+/// arrows there could only say "this stop is for the search", which is a stop
+/// of a *value* switch with no value. The search is [R] and the 検索 pill.
 #[test]
-fn zr_walks_the_three_reward_stops_without_a_keyboard() {
+fn zr_walks_the_two_reward_values_without_a_keyboard() {
     let mut ed = editor_on_a_blank_save();
     ed.screen = Screen::QuestEdit;
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     assert_eq!(ed.quest_reward_field, QUEST_REWARD_COUNT);
+    assert_eq!(QUEST_REWARD_FIELDS, 2, "個数 and 確率%, and nothing else");
     let mut seen = Vec::new();
     for _ in 0..QUEST_REWARD_FIELDS {
         ed.input(Key::Z);
@@ -408,17 +413,20 @@ fn zr_walks_the_three_reward_stops_without_a_keyboard() {
     }
     assert_eq!(
         seen,
-        vec![QUEST_REWARD_CHANCE, QUEST_REWARD_SEARCH, QUEST_REWARD_COUNT],
-        "個数 → 確率% → 検索 → 個数"
+        vec![QUEST_REWARD_CHANCE, QUEST_REWARD_COUNT],
+        "個数 → 確率% → 個数"
     );
-    // The search is the explicit press: [R] on the same tab.
+    // The search is the explicit press: [R] on the same tab, and it is not one
+    // of the stops.
     ed.input(Key::R);
     let (idx, _) = ed.take_text_request().expect("[R] opens the search");
     assert_eq!(idx, hbedit::TEXT_QUEST_ITEM);
-    // On the 検索 stop the arrows say what the stop is for instead of writing.
-    ed.quest_reward_field = QUEST_REWARD_SEARCH;
-    assert!(!ed.quest_adjust(1), "the search stop holds no number");
-    assert!(ed.message.contains("検索"), "{}", ed.message);
+    assert!(
+        ed.quest_reward_field == QUEST_REWARD_COUNT
+            || ed.quest_reward_field == QUEST_REWARD_CHANCE,
+        "the search is not a stop: {}",
+        ed.quest_reward_field
+    );
     // 支給品 has one value and nothing to switch, so [ZR] is still the search.
     ed.quest_set_tab(QUEST_TAB_SUPPLIES);
     ed.input(Key::Z);
