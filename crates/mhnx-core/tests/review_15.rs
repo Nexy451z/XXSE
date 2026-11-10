@@ -373,7 +373,15 @@ fn the_save_key_does_not_close_the_talisman_form() {
         ed.message
     );
     assert!(ed.charm_edit.is_some(), "the form is still the one on screen");
+    // A new talisman that [A] has not written is not in the box: the file
+    // still goes out, and the line says what is missing (the fifth review's
+    // #8: it said 保存しました about a talisman that was never added).
     assert!(ed.take_write().is_some(), "the save still goes out");
+    assert!(
+        ed.message.contains("まだ書き込まれていません"),
+        "the save key must say what is missing: {}",
+        ed.message
+    );
 
     // [A] on the write row: a write that cannot land (this box holds no
     // talisman to copy a shape from) keeps the form and says why, rather than
@@ -735,9 +743,9 @@ fn the_quit_key_asks_about_a_forms_draft() {
 fn the_back_key_names_the_screen_it_goes_to() {
     let mut ed = open_blank();
     ed.screen = Screen::Equip;
-    assert!(ed.footer_hint().contains("[B] 枠選択"), "{}", ed.footer_hint());
+    assert!(ed.footer_hint().contains("[B] キャラ"), "{}", ed.footer_hint());
     ed.open_charms();
-    assert!(ed.footer_hint().contains("[B] 枠選択"), "{}", ed.footer_hint());
+    assert!(ed.footer_hint().contains("[B] キャラ"), "{}", ed.footer_hint());
     ed.screen = Screen::Sets;
     assert!(ed.footer_hint().contains("[B] 護石一覧"), "{}", ed.footer_hint());
     ed.screen = Screen::SaveQuests;

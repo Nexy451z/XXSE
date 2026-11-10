@@ -493,7 +493,9 @@ fn the_talisman_a_word_follows_the_list() {
     let mut ed = editor_with(save_with_charms(3), Screen::Charms);
     ed.open_charms();
     ed.charm_filter = String::from("zzzznothing");
-    assert_eq!(ed.charm_a_label(), "0件");
+    // 解除, not 0件: the word is the press, not the count (the fifth review's
+    // #12 - the press drops the search).
+    assert_eq!(ed.charm_a_label(), "解除");
 }
 
 // ---------------------------------------------------------------------------
@@ -654,14 +656,17 @@ fn the_guild_bar_names_all_four_views_and_lights_the_one_showing() {
 fn the_guild_b_is_one_level_and_the_guide_says_so() {
     let mut ed = editor_with(blank_save(), Screen::Guild);
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_CARD);
-    assert!(ed.footer_hint().contains("[B] 枠選択"), "{}", ed.footer_hint());
+    assert!(ed.footer_hint().contains("[B] キャラ"), "{}", ed.footer_hint());
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_COUNTS);
     assert!(ed.footer_hint().contains("[B] カード"), "{}", ed.footer_hint());
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_ARENA);
     assert!(ed.footer_hint().contains("[B] カードへ"), "{}", ed.footer_hint());
     let guide = ed.screen_guide();
     assert!(guide.contains("1段ずつ"), "{guide}");
-    assert!(guide.contains("枠選択"), "{guide}");
+    // The guide names [L] for the four views and never the shoulder pair: [R]
+    // is 数値入力 on three of them (the fifth review's #10).
+    assert!(guide.contains("[L]"), "{guide}");
+    assert!(!guide.contains("[L/R]"), "{guide}");
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +808,13 @@ fn a_cancelled_keyboard_and_a_failed_one_say_different_things() {
     let ed_src = switch_editor_src();
     assert!(ed_src.contains("キャンセルしました"), "cancel keeps its sentence");
     assert!(
-        ed_src.contains("システムキーボードを開けませんでした"),
+        ed_src.contains("システムキーボードを開けなかったため"),
         "a keyboard that never opened must not claim the user cancelled"
+    );
+    // And the press falls back to the built-in keyboard instead of sending the
+    // user to one nothing on the screen can open (the fifth review's #14).
+    assert!(
+        ed_src.contains("open_osk_with_note"),
+        "the failed answer must open the built-in keyboard"
     );
 }

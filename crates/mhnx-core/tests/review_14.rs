@@ -666,7 +666,7 @@ fn the_talisman_list_says_where_b_goes() {
     let mut ed = open_blank();
     ed.open_charms();
     let hint = ed.footer_hint();
-    assert!(hint.contains("[B] 枠選択"), "{hint}");
+    assert!(hint.contains("[B] キャラ"), "{hint}");
     assert!(!hint.contains("[B] 戻る"), "{hint}");
     // And the guide is telling the truth.
     ed.input(Key::B);

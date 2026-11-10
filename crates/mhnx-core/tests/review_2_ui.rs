@@ -540,7 +540,7 @@ fn the_guild_card_footer_names_the_way_out() {
     ed.screen = Screen::Guild;
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_CARD);
     let hint = ed.footer_hint();
-    assert!(hint.contains("[B] 枠選択"), "the footer names [B] and where it goes: {hint}");
+    assert!(hint.contains("[B] キャラ"), "the footer names [B] and where it goes: {hint}");
     assert!(
         hbedit::caption_width(&hint) <= hbedit::FOOTER_HINT_ROOM,
         "the guide still fits: {}px",

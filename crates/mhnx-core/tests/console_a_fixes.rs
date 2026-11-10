@@ -140,6 +140,23 @@ fn the_save_key_on_the_talisman_form_only_saves() {
     let mut ed = Editor::new();
     open_blank(&mut ed);
     ed.open_charms();
+    // A record in the box: a form that names a slot the save does not hold is
+    // a new talisman nobody has written, and [X] says so instead of saving
+    // (Editor::charm_draft_in_box).
+    {
+        let b = ed
+            .save
+            .as_mut()
+            .expect("a save")
+            .equipment_box_mut(0)
+            .expect("the box");
+        let mut rec = [0u8; mhnx_core::charm::CHARM_RECORD];
+        rec[0x00] = 0x06;
+        rec[0x02] = 10;
+        rec[0x12] = 100;
+        rec[0x13] = 1;
+        b[..mhnx_core::charm::CHARM_RECORD].copy_from_slice(&rec);
+    }
     let mut form = CharmEdit::default();
     form.field = 3; // スキル1: the row whose [A] opens the skill list
     ed.charm_edit = Some(form);

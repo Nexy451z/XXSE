@@ -7894,7 +7894,7 @@ impl Editor {
             // edit - the press creates the first talisman - and the button said
             // 編集 over it.
             Screen::Charms => format!(
-                "[A] {}  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 枠選択",
+                "[A] {}  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] キャラ",
                 self.charm_a_label()
             ),
             // .mib: [ZR] walks a monster slot's eight values and has nothing to
@@ -7934,7 +7934,7 @@ impl Editor {
             // missing: the card view is the only screen in the section whose
             // way out was named nowhere - not in the footer, not on the deck.
             Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => format!(
-                "[R] 数値入力  [Y] 回数/武器  [A] {}  [ZR] 進行状況  [X] 保存  [B] 枠選択",
+                "[R] 数値入力  [Y] 回数/武器  [A] {}  [ZR] 進行状況  [X] 保存  [B] キャラ",
                 self.guild_a_label()
             ),
             // 進行状況's quest view has a second bit per row, and [R] is the key
@@ -8031,7 +8031,7 @@ impl Editor {
             // character select, and the guide has to say which screen it goes
             // to rather than 戻る (which read as "the screen you came from").
             Screen::Charms => {
-                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 枠選択"
+                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] キャラ"
             }
             // Built by the form, not here: see footer_hint.
             Screen::CharmEdit => "",
@@ -8039,7 +8039,7 @@ impl Editor {
             // from: the guide names the destination rather than saying 戻る and
             // sending the user somewhere else.
             Screen::Equip => {
-                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 枠選択"
+                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] キャラ"
             }
             // [A] is the row's own action (hbedit::EquipFormAction): the two
             // rows that name the record open the picker, the sockets open the
@@ -8388,7 +8388,15 @@ impl Editor {
             // クエスト改造 answers [Y] again: the ▸詳細 rows moved to the deck
             // and the 詳細 row's [A], which is what gave the key back.
             Screen::QuestEdit => (&STEPS[..], "Y"),
-            Screen::Items | Screen::Guild | Screen::Options => (&STEPS[..], ""),
+            // オトモ spends [Y] on 項目切替 and クエスト装備 does not answer it
+            // at all, so neither names a key: the five pills are the only
+            // route there, and the label used to name a key that switched a
+            // column (or did nothing).
+            Screen::Items
+            | Screen::Guild
+            | Screen::Options
+            | Screen::Roster
+            | Screen::QuestEquip => (&STEPS[..], ""),
             // 護石編集 / 装備編集: [Y] opens the picker on the rows that have
             // one (スキル / 装飾品 / 種別 / ID), so the pills name no key at
             // all - the same honest answer the item box and the card give. The
@@ -9394,7 +9402,12 @@ impl Editor {
                 let cur_val = if chance { row.chance as i64 } else { row.count as i64 };
                 self.entry = entry;
                 self.entry_row_cursor = index;
-                self.entry_field = u8::from(chance);
+                // The cell cursor, not a bool: 0 アイテム / 1 個数 / 2 確率%
+                // (entry_field_count). Writing 1 for the chance cell left the
+                // cursor on 個数 after a chance step, so the next [A] wrote a
+                // count the user never asked for on a row whose chance they
+                // had just stepped.
+                self.entry_field = if chance { 2 } else { 1 };
                 self.store_entry_number(cur_val + delta, chance).is_some()
             }
             _ => {
@@ -10855,6 +10868,26 @@ impl Editor {
         self.charm_edit.map(|e| e.dirty()).unwrap_or(false)
     }
 
+    /// Is the record the talisman form names really in the box?
+    ///
+    /// A new talisman starts as a clean copy of a template, so its draft is
+    /// *not* dirty (nothing has been changed yet) while the box has no such
+    /// record. [X] looked at the draft alone and said 保存しました about a save
+    /// that did not hold the talisman on screen. This answers the other half:
+    /// the record at the form's index is a talisman in the open slot's box.
+    pub fn charm_draft_in_box(&self) -> bool {
+        let Some(e) = self.charm_edit else {
+            return false;
+        };
+        let Some(b) = self.save.as_ref().and_then(|s| s.equipment_box(self.slot)) else {
+            return false;
+        };
+        let o = e.index * crate::charm::CHARM_RECORD;
+        b.get(o..o + crate::charm::CHARM_RECORD)
+            .map(crate::charm::is_talisman)
+            .unwrap_or(false)
+    }
+
     /// Does the equipment form hold an edit the box does not have yet?
     ///
     /// A new form is compared with the values [Editor::open_equip_creator]
@@ -12026,12 +12059,39 @@ impl Editor {
         let list = self.charms();
         // The box also holds weapons and armour. Never pick one of those: ask
         // the charm module for a record that is empty or already a talisman.
-        let free = self
-            .save
-            .as_ref()
-            .and_then(|s| s.equipment_box(self.slot))
-            .and_then(charm::first_writable)
-            .unwrap_or(CHARM_COUNT - 1);
+        //
+        // A *new* talisman needs a record that holds nothing. first_writable
+        // falls back to the first talisman when the box has no free record,
+        // which is right for an edit (it has somewhere to point) and wrong for
+        // a new one: [＋] on a full box silently aimed the form at a talisman
+        // the user already had, and the write replaced it. A full box says so
+        // now and opens nothing.
+        let free = if fresh {
+            let free = self
+                .save
+                .as_ref()
+                .and_then(|s| s.equipment_box(self.slot))
+                .and_then(charm::first_free);
+            match free {
+                Some(i) => i,
+                None => {
+                    self.message = if self.save.is_none() {
+                        String::from("先にセーブを開いてください")
+                    } else {
+                        String::from(
+                            "空き枠がありません（護石を [-] 2回で削除するか、既存の護石を [A] で編集してください）",
+                        )
+                    };
+                    return;
+                }
+            }
+        } else {
+            self.save
+                .as_ref()
+                .and_then(|s| s.equipment_box(self.slot))
+                .and_then(charm::first_writable)
+                .unwrap_or(CHARM_COUNT - 1)
+        };
         let base = if fresh {
             Charm {
                 index: free,
@@ -12047,11 +12107,16 @@ impl Editor {
         // Inventing "Poison +1 at rarity 100" produced a record the game's
         // per-rarity skill ranges do not allow; copying keeps it legal until
         // the user actually changes a field.
-        let seed = if fresh {
+        let template = if fresh {
             self.save
                 .as_ref()
                 .and_then(|s| s.equipment_box(self.slot))
                 .and_then(charm::template_from_box)
+        } else {
+            None
+        };
+        let seed = if fresh {
+            template
                 .map(|t| Charm {
                     index: free,
                     slots: t[0x10],
@@ -12067,30 +12132,38 @@ impl Editor {
         } else {
             base
         };
+        // The grade, the kind and the three sockets are read from the record
+        // the form was *seeded from*, which for a new talisman is the template
+        // and not the slot it will be written to. Reading them from the write
+        // target found an empty record every time - rarity 0, kind 0 - so every
+        // new talisman opened on 天 (rarity 100) whatever the box held, which is
+        // exactly what the comment below claimed it did not do.
+        let seed_record: Option<[u8; crate::charm::CHARM_RECORD]> = match template {
+            Some(t) => Some(t),
+            None => self
+                .save
+                .as_ref()
+                .and_then(|s| s.equipment_box(self.slot))
+                .and_then(|b| {
+                    let o = seed.index * crate::charm::CHARM_RECORD;
+                    let rec = b.get(o..o + crate::charm::CHARM_RECORD)?;
+                    let mut out = [0u8; crate::charm::CHARM_RECORD];
+                    out.copy_from_slice(rec);
+                    Some(out)
+                }),
+        };
         // New talismans start on the grade of the record they were seeded
         // from, so the console stops defaulting every one to rarity 100.
-        let grade = self
-            .save
+        let grade = seed_record
             .as_ref()
-            .and_then(|s| s.equipment_box(self.slot))
-            .and_then(|b| {
-                let o = seed.index * crate::charm::CHARM_RECORD;
-                b.get(o..o + crate::charm::CHARM_RECORD)
-                    .and_then(crate::charm::rarity_of_record)
-            })
+            .and_then(|rec| crate::charm::rarity_of_record(rec))
             .unwrap_or_default();
         // The kind is what names the talisman, so it is read from the record
         // the form is seeded from rather than assumed: a 龍の護石 edited here
         // must stay a 龍の護石, and a fresh one must not silently become 天.
-        let kind = self
-            .save
+        let kind = seed_record
             .as_ref()
-            .and_then(|s| s.equipment_box(self.slot))
-            .and_then(|b| {
-                let o = seed.index * crate::charm::CHARM_RECORD;
-                b.get(o..o + crate::charm::CHARM_RECORD)
-                    .and_then(crate::charm::kind_of_record)
-            })
+            .and_then(|rec| crate::charm::kind_of_record(rec))
             .unwrap_or_else(|| {
                 crate::charm::canonical_kind(grade.rarity()).unwrap_or(10)
             });
@@ -12098,15 +12171,9 @@ impl Editor {
         // from, the same way the skills and the kind do: a talisman that holds
         // something in a socket must show it, and a fresh one must not invent
         // one (charm::template_from_box already prefers a clean record).
-        let decorations = self
-            .save
+        let decorations = seed_record
             .as_ref()
-            .and_then(|s| s.equipment_box(self.slot))
-            .and_then(|b| {
-                let o = seed.index * crate::charm::CHARM_RECORD;
-                b.get(o..o + crate::charm::CHARM_RECORD)
-                    .map(|rec| crate::equip::Equipment::decorations(seed.index, rec))
-            })
+            .map(|rec| crate::equip::Equipment::decorations(seed.index, rec))
             .unwrap_or([0; 3]);
         let mut form = CharmEdit {
             index: seed.index,
@@ -12157,10 +12224,18 @@ impl Editor {
         if !self.charm_filter.trim().is_empty() {
             // A filtered list with no hits is not an empty box: creating here
             // would write a record the user never asked for, on a list whose
-            // heading says the search found nothing.
+            // heading says the search found nothing. The press is not wasted
+            // either - it drops the search and shows the whole box again, which
+            // is the one action a list with no rows can offer, and the word the
+            // button prints is that action (charm_a_label).
+            let was = self.charm_filter.trim().to_string();
+            self.charm_filter.clear();
+            self.cursor = 0;
+            self.charm_delete_armed = None;
             self.message = alloc::format!(
-                "検索「{}」に一致する護石がありません（[Y] で変える・空で解除 / 新規は [＋]）",
-                self.charm_filter.trim()
+                "検索「{}」に一致する護石がありませんでした。検索を解除しました（{} 件）",
+                was,
+                self.charms().len()
             );
             return;
         }
@@ -12182,10 +12257,25 @@ impl Editor {
         } else if self.charm_filter.trim().is_empty() {
             "作成"
         } else {
-            // "該当なし" is the honest word but it is 34px wider than 編集, and
-            // the line is already 743 of its 763: "0件" says the same thing in
-            // the width the strip has.
-            "0件"
+            // The word is the action, not the count: "0件" said how many rows
+            // the search found, and a button's word is what its press does.
+            // The press drops the search (charm_a_press), so it says 解除.
+            // (検索解除 is the clearer word but it is 34px wider, and this
+            // line already carries the [＋]-is-a-tool sentence.)
+            "解除"
+        }
+    }
+
+    /// The [A] button the inspector draws when the list under it has no row.
+    ///
+    /// A list with nothing in it is still a screen with an [A]: the talisman
+    /// list's press creates the first record (or says why it cannot). The
+    /// panel skipped the button whenever the list was empty, so the word
+    /// 作成 was computed, printed by the footer, and never drawn as a button.
+    pub fn empty_a_label(&self) -> Option<&'static str> {
+        match self.screen {
+            Screen::Charms => Some(self.charm_a_label()),
+            _ => None,
         }
     }
 
@@ -12209,9 +12299,14 @@ impl Editor {
             // heading and its status lines already said "[Y] で変更" while [Y]
             // opened the form. Neither key deletes - [-] does, twice - and the
             // form has its own [A] in the deck.
+            // The same press the console's [A] runs (ui.rs handle_pad_key ->
+            // Editor::charm_a_press). This arm used to call open_charm_editor
+            // directly, so the headless build created a talisman on a filtered
+            // list that said "no matches" while the console refused - one key,
+            // two answers, and only one of them was on the glass.
             Key::A => {
                 self.charm_delete_armed = None;
-                self.open_charm_editor(false);
+                self.charm_a_press();
             }
             Key::Y => {
                 self.charm_delete_armed = None;
@@ -12515,6 +12610,12 @@ impl Editor {
             skill2: e.skill2,
             points2: e.points2,
         };
+        // The undo step is pushed *before* the write (it is the snapshot of
+        // what the save looks like now) and taken back when the write is
+        // refused: a slot with a weapon in it, or a box with no talisman to
+        // copy a shape from, used to leave a step behind that restored a save
+        // nothing had changed.
+        let depth = self.undo.len();
         self.push_undo("護石の書き込み");
         let kind_name = crate::charm::kind_name(e.kind).unwrap_or("?");
         let written = match &mut self.save {
@@ -12542,6 +12643,9 @@ impl Editor {
             }
         }
         if !written {
+            if self.undo.len() > depth {
+                self.undo.pop();
+            }
             self.message = String::from(
                 "この枠には護石を書き込めません（武器が入っているか、護石がありません）",
             );
@@ -13422,6 +13526,14 @@ impl Editor {
                 });
                 self.message = String::from("セーブに書き込み中...");
             }
+        } else {
+            // No path means no save: the press used to do nothing at all, so a
+            // screen whose only button was 変更を保存 (an empty save list, a
+            // card with nothing open) answered with silence. It says what is
+            // missing and which key can change it.
+            self.message = String::from(
+                "書き込むセーブがありません（[Y] で再読込 / セーブ一覧で [A] で開く）",
+            );
         }
     }
 
@@ -13489,6 +13601,19 @@ impl Editor {
                     self.message = String::from(
                         "下書きが残っています（この枠には書き込めません）。保存はしていません",
                     );
+                    return;
+                }
+                // A clean draft whose record is not in the box is a new
+                // talisman nobody has written yet: there is nothing to commit,
+                // and the save used to answer 保存しました about a box that did
+                // not hold it. The file still goes out - the user's other edits
+                // are in it - and the line says what is missing instead of
+                // claiming the talisman is in the save.
+                if !self.charm_draft_in_box() {
+                    self.message = String::from(
+                        "この護石はまだ書き込まれていません（[A] で書き込み）",
+                    );
+                    self.request_write_save_keeping_message();
                     return;
                 }
                 self.request_write_save_keeping_message();
@@ -14745,6 +14870,33 @@ impl Editor {
                 .and_then(|t| t.records.get(row).map(|r| r.count as i64))
                 .unwrap_or(0);
             self.store_entry_number(cur + delta, false);
+        }
+    }
+
+    /// [MAX] on a reward / supply row: write the ceiling of the cell the
+    /// cursor is on.
+    ///
+    /// The console used to send [▶] ninety-nine times, which on the アイテム
+    /// cell is ninety-nine refusals and no write at all: the button promised a
+    /// maximum on a cell that has none. The cell decides now - the count goes
+    /// to 99, the chance to 100%, and the item cell says what [A] does instead.
+    pub fn entry_row_max(&mut self) {
+        if !self.entry_has_numbers() {
+            self.message = String::from("このエントリに編集できる項目はありません");
+            return;
+        }
+        match self.entry_action() {
+            EntryAction::PickItem => {
+                self.message = String::from(
+                    "アイテムの欄に最大値はありません（[A] で選ぶ / [ZR] で 個数・確率 に切り替え）",
+                );
+            }
+            EntryAction::RaiseCount => {
+                self.store_entry_number(99, false);
+            }
+            EntryAction::RaiseChance => {
+                self.store_entry_number(REWARD_PROB_MAX as i64, true);
+            }
         }
     }
 
@@ -17067,7 +17219,7 @@ impl Editor {
             // cards. One key, two depths - so the line says so instead of
             // leaving the reader to find out which one a press gets.
             Screen::Guild => {
-                "カード・回数・武器・闘技大会の4ビュー。[B] は1段ずつ（回数/武器→カード→枠選択）。"
+                "カード/回数/武器/闘技大会の4ビューは [L] で送り、[B] は1段ずつ戻ります。"
             }
             // The three places that name this screen's keys (this line, the
             // footer and the text build's key line) say the same thing: [Y]
@@ -18778,6 +18930,16 @@ impl Editor {
             // machine used to answer Slots, so the two layers disagreed about
             // the same key.
             Key::B => self.open_charms(),
+            // [-] is the 解除 key inside the form (twice, Editor::
+            // clear_set_part_under_cursor). The list has no part to take out,
+            // and the key answered nothing at all while the text build's table
+            // said 解除(2回): a key that is on the table and silent on the pad
+            // reads as a broken key.
+            Key::Minus => {
+                self.message = String::from(
+                    "解除する部位は編集中の画面にあります（[A] でセットを開き、部位の行で [-] で解除・2回）",
+                );
+            }
             Key::Plus => {
                 self.press_quit();
             }

@@ -490,6 +490,12 @@ pub enum UiAction {
     ExtractAllQuests,
     /// Switch the hunt list between 記録ありのみ and every monster.
     ToggleHuntShowAll,
+    /// 狩猟記録 from the guild card's deck.
+    ///
+    /// The card's bar is its own four views while that screen is showing, so
+    /// the section's 狩猟記録 tab is not on the glass: this is the touch route
+    /// to the screen the tab would have opened (hbedit::Editor::open_hunts).
+    OpenHunts,
     /// Drop the equipment box's name filter and show every record again.
     ClearEquipFilter,
     /// The item box's 所持品のみ <-> 空きも表示 toggle.
@@ -3194,6 +3200,7 @@ impl GuiState {
                 }
             }
             UiAction::Rescan => self.wants_rescan = true,
+            UiAction::OpenHunts => ed.open_hunts(),
             // The save itself lives in the state machine
             // (hbedit::Editor::quick_save): it was the console's copy of that
             // rule that ran the row's own [A] on the two forms, so [X] opened
@@ -3245,10 +3252,12 @@ impl GuiState {
             // wrote a whole record in one press, which is exactly the shape the
             // per-kind ceiling exists to prevent; the form edits one field at a
             // time and [A] acts on the row the cursor is on instead.
-            UiAction::NewCharm => {
-                ed.open_charms();
-                ed.input(Key::L);
-            }
+            // The same press the pad makes, and nothing else: open_charms()
+            // here put the list back at the top, so the touch button and the
+            // [＋] key did the same job with two different outcomes. The pill
+            // is only drawn on the talisman list, so the screen is already
+            // right (hbedit::Editor::open_charm_editor keeps the row).
+            UiAction::NewCharm => ed.input(Key::L),
             // The touch path and the pad press the same key: one delete rule,
             // one place that counts the presses.
             UiAction::DeleteCharmConfirm => ed.input(Key::Minus),
@@ -4037,12 +4046,13 @@ fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
                 // arms the preset must not write on the first press either.
                 ed.sem_preset_press(1);
             } else {
-                let prev = ed.entry_row_cursor;
+                // The cell decides (hbedit::Editor::entry_row_max): the count
+                // goes to 99, the chance to 100%, and the アイテム cell says
+                // what [A] does instead of refusing ninety-nine times. The
+                // loop here sent [▶] 99 times, which on the item cell wrote
+                // nothing at all and on the others was 99 undo-free steps.
                 ed.entry_row_cursor = idx;
-                for _ in 0..99 {
-                    ed.input(Key::Right);
-                }
-                ed.entry_row_cursor = prev;
+                ed.entry_row_max();
             }
         }
         // [MAX] on the second stage of the bulk add asks for a full stack.
@@ -6538,6 +6548,27 @@ impl GuiState {
                 FontSize::Small,
             );
             c.hline(ix + 16, iy + 98, iw - 32, t.border_subtle);
+            // A list with no rows is still a screen with an [A] where the state
+            // machine says so (hbedit::Editor::empty_a_label): the talisman
+            // list's press creates the first record. The button was drawn only
+            // under a row, so the word 作成 was computed, printed by the
+            // footer, and never drawn as a button.
+            if let Some(label) = ed.empty_a_label() {
+                let btn_y = iy + 168;
+                let a_txt = format!("[A] {}", label);
+                c.round_rect(ix + 20, btn_y, iw - 40, 42, 6, t.accent_primary);
+                btn_text(
+                    c,
+                    ix + 20,
+                    btn_y,
+                    iw - 40,
+                    42,
+                    &a_txt,
+                    white_or_dark(t.accent_primary),
+                    FontSize::Medium,
+                );
+                self.add_hit(ix + 20, btn_y, iw - 40, 42, UiAction::ActivateRow(0));
+            }
         } else {
         // Slot 2 (iy + 40): Selected Item Title
         // A name keeps its lines here too: the second line sits where the meta
@@ -7420,7 +7451,26 @@ impl GuiState {
                         "[-] 選択中のクエストを削除（2回）",
                         UiAction::Key(Key::Minus),
                     );
+                    cur_y += 44;
                 }
+                // The way out, which had no button on either list: [B] goes to
+                // the screen the list belongs to (SD(.arc) for the save's
+                // quests, the save list for the .arc list). A list with no rows
+                // - an empty save, a folder with no .arc - left the four bulk
+                // buttons as the only thing a finger could press.
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    if ed.screen == Screen::SaveQuests {
+                        "[B] SD(.arc) へ"
+                    } else {
+                        "[B] セーブ一覧へ"
+                    },
+                    UiAction::Key(Key::B),
+                );
             }
             Screen::Mib => {
                 let is_mob = questfields::MIB_FIELDS
@@ -7691,6 +7741,122 @@ impl GuiState {
                     UiAction::Key(Key::A),
                 );
             }
+            // セーブ一覧: the first screen, and the only one that can be empty
+            // with nowhere to go. [Y] is 再読込 and had no hit area at all, so
+            // a card with no saves offered exactly one button - 保存 - which
+            // wrote nothing because no save was open. The reload is the
+            // screen's own key and the only thing that can change the list, so
+            // it is drawn first and always; the save pill is drawn only when
+            // there is a save to write.
+            Screen::SaveList => {
+                c.text_sized(ix + 20, cur_y, "セーブの操作", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[Y] 再読込（カードを読み直す）",
+                    UiAction::Rescan,
+                );
+                cur_y += 44;
+                if ed.save.is_some() {
+                    self.draw_tool_button(
+                        c,
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        38,
+                        "[X] 変更を保存",
+                        UiAction::QuickSave,
+                    );
+                } else {
+                    c.text_clipped(
+                        ix + 20,
+                        cur_y,
+                        full_w,
+                        if ed.save_files.is_empty() {
+                            "セーブが見つかりません（switch/XXSE/saves/ に置いて [Y]）"
+                        } else {
+                            "開いているセーブはありません（[A] で開く）"
+                        },
+                        t.text_muted,
+                        FontSize::Small,
+                    );
+                }
+            }
+            // ギルドカード: the bar shows the card's four views while this
+            // screen is up, so the section's other tabs (狩猟記録 / 進行状況)
+            // are not on it at all. The two are one press away on the pad
+            // ([ZR] and the section tab) and there was no way for a finger to
+            // reach them: the deck carries both, and the card's way out.
+            Screen::Guild => {
+                c.text_sized(ix + 20, cur_y, "記録の操作", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    half_w,
+                    38,
+                    "[ZR] 進行状況",
+                    UiAction::Key(Key::Z),
+                );
+                self.draw_tool_button(
+                    c,
+                    ix + 28 + half_w,
+                    cur_y,
+                    half_w,
+                    38,
+                    "狩猟記録",
+                    UiAction::OpenHunts,
+                );
+                cur_y += 44;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    half_w,
+                    38,
+                    "[B] スロット",
+                    UiAction::Key(Key::B),
+                );
+                self.draw_tool_button(
+                    c,
+                    ix + 28 + half_w,
+                    cur_y,
+                    half_w,
+                    38,
+                    "[X] 変更を保存",
+                    UiAction::QuickSave,
+                );
+            }
+            // 検査: the list of findings has no rows when a quest is clean, and
+            // the only button was 保存. [B] goes back to the file list.
+            Screen::Check => {
+                c.text_sized(ix + 20, cur_y, "検査の操作", t.text_muted, FontSize::Small);
+                cur_y += 24;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[B] ファイル一覧へ",
+                    UiAction::Key(Key::B),
+                );
+                cur_y += 44;
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    "[X] .arc 保存",
+                    UiAction::QuickSave,
+                );
+            }
             _ => {
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
                 cur_y += 24;
@@ -7758,7 +7924,7 @@ impl GuiState {
 
     fn draw_slots(&mut self, c: &mut Canvas, ed: &Editor) {
         let t = theme();
-        c.text_sized(MAIN_X + 4, CONTENT_Y, "スロット選択", t.text_primary, FontSize::Medium);
+        c.text_sized(MAIN_X + 4, CONTENT_Y, "キャラ選択", t.text_primary, FontSize::Medium);
 
         let card_w = 396i32;
         let card_h = 460i32;
@@ -9207,8 +9373,12 @@ impl GuiState {
         // (sub_tabs_for), so [L/R] walks them and [B] unwinds one level at a
         // time - the line says both, because one key with two depths is the
         // kind of thing that reads as a bug until it is written down.
+        // [L] alone: [R] is 数値入力 on three of the four views (the footer
+        // says so, and hbedit::Editor::shoulder_job hands the key to the
+        // screen), so a line that promised the shoulder pair walked the views
+        // named the same key two different jobs on one screen.
         warnings.push(String::from(
-            "[L/R] 4ビュー: カード → 回数 → 武器 → 闘技大会（[B] は1段ずつ戻る）",
+            "[L] 4ビュー: カード → 回数 → 武器 → 闘技大会（闘技大会だけ [R] も / [B] は1段ずつ戻る）",
         ));
         let sub = format!(
             "HR 上限 {} / 時間 上限 {}h",

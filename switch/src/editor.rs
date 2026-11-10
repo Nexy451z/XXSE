@@ -1128,12 +1128,16 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         // delete. It said [Y] 削除 while [Y] opened the form and [-] deleted:
         // the one line that named the wrong key on the wrong action.
         Charms => &[
-            ("A", "編集"),
+            // The A word follows the list (hbedit::Editor::charm_a_label):
+            // 編集 / 作成 / 検索解除. This table is the text build's, and the
+            // console prints the state machine's word, so the two must not
+            // name two different jobs for one key.
+            ("A", "編集/作成/解除"),
             ("Y", "検索"),
             ("-", "削除(2回)"),
-            ("+", "新規"),
+            ("+", "新規（空き枠のみ）"),
             ("X", "保存"),
-            ("B", "枠選択"),
+            ("B", "キャラ"),
         ],
         // The form's [A] is the selected row's own action (hbedit::CharmAction),
         // so this line cannot name a single one; the drawn build prints the
@@ -1160,7 +1164,7 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
             ("+", "新規"),
             ("X", "保存"),
             ("L/R", "サブタブ"),
-            ("B", "枠選択"),
+            ("B", "キャラ"),
         ],
         // [A] is the row's own action (hbedit::EquipFormAction): the three
         // sockets open the decoration list, 種別 / ID the equipment list, the
@@ -1327,7 +1331,9 @@ pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static 
         Sets => &[
             ("A", "編集"),
             ("</>", "装備を巡回"),
-            ("-", "解除(2回)"),
+            // The minus key is the 解除 *inside* the form; the list says so
+            // instead of naming a key that answered nothing there.
+            ("-", "解除(編集で2回)"),
             ("Y", "警告/タブ切替"),
             ("X", "保存"),
             ("B", "護石一覧"),
@@ -1670,9 +1676,23 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
                         )
                     }
                     crate::swkbd::SwkbdAnswer::Failed => {
+                        // The sentence used to send the user to the built-in
+                        // keyboard, which nothing on this screen can open: a
+                        // one-line field only reaches it through
+                        // keyboard_route, and that answer was "system". The
+                        // press falls back the way the library-applet route
+                        // does - the keyboard opens, and both the modal and
+                        // the status row say why it is the built-in one.
+                        gui.open_osk_with_note(
+                            idx,
+                            &header,
+                            &initial,
+                            spec,
+                            "システムキーボードを開けなかったため、内蔵キーボードで入力します",
+                        );
                         ed.message = String::from(
-                            "システムキーボードを開けませんでした（内蔵キーボードで入力してください）",
-                        )
+                            "システムキーボードを開けなかったため内蔵キーボードで入力します（[+] で確定）",
+                        );
                     }
                 }
             }
@@ -1967,9 +1987,11 @@ pub fn run() -> i32 {
                 // tool: the equipment list opens its new-record form with it, and
                 // the roster opens the skill panel. While that panel is open Plus
                 // is the quit key again, like the equipment panel above it.
-                let plus_is_a_tool = ed.screen == mhnx_core::hbedit::Screen::Equip
-                    || ed.screen == mhnx_core::hbedit::Screen::Charms
-                    || (ed.screen == mhnx_core::hbedit::Screen::Roster && !ed.palico_skill_open());
+                // The state machine's answer, not a second copy of the rule:
+                // the footer is written from the same method
+                // (hbedit::Editor::plus_is_a_tool), so the line and the key
+                // cannot disagree about which screens spend [＋] on a tool.
+                let plus_is_a_tool = ed.plus_is_a_tool();
                 if down & BTN_PLUS != 0 && !plus_is_a_tool {
                     // A dirty save is not thrown away on one press: the first
                     // [＋] only says what would be lost, the second one quits.
