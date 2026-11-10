@@ -5,7 +5,7 @@ name = "mhnx-switch"
 # check compares it with the release tag, so the number a user sees in hbmenu,
 # the number compiled into the .nro and the number GitHub is asked about are one
 # number.
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 description = "XXSE - Monster Hunter XX (NX) Save Editor for Nintendo Switch (libnx homebrew)"
 license = "MIT OR Apache-2.0"
