@@ -67,7 +67,11 @@ fn a_press_on_an_empty_quest_list_installs_nothing() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Y);
+    // The quest section is a section, not a key: the save list's own [Y] is
+    // 再読込 now (the console's chip table is the reference), so the jump is
+    // made the way the console's section bar makes it.
+    ed.screen = Screen::ArcList;
+    ed.cursor = 0;
     ed.input(Key::X);
     assert_eq!(ed.screen, Screen::SaveQuests);
 
@@ -458,7 +462,11 @@ fn the_save_quest_list_deletes_on_the_second_press() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::Y);
+    // The quest section is a section, not a key: the save list's own [Y] is
+    // 再読込 now (the console's chip table is the reference), so the jump is
+    // made the way the console's section bar makes it.
+    ed.screen = Screen::ArcList;
+    ed.cursor = 0;
     ed.input(Key::X);
     assert_eq!(ed.screen, Screen::SaveQuests);
     ed.apply_quest_filter(String::new());

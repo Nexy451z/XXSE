@@ -54,10 +54,16 @@ fn open(ed: &mut Editor, copy: &Path) {
 }
 
 /// Slot screen -> character screen -> the my-sets screen.
+///
+/// マイセット is the 装備 section's fourth tab, and a section is not a
+/// state-machine key: the character screen's own [Y] is 刻み (the console's chip
+/// table is the reference for every key). The jump is made the way the
+/// console's section bar makes it.
 fn open_sets(ed: &mut Editor) {
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Char);
-    ed.input(Key::Y);
+    ed.screen = Screen::Sets;
+    ed.cursor = 0;
     assert_eq!(ed.screen, Screen::Sets);
 }
 

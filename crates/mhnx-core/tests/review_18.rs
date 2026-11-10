@@ -1242,7 +1242,9 @@ const STATES: &[(&str, Setup)] = &[
     // read as a dead key.
     ("ItemPick", |ed| {
         ed.screen = Screen::Items;
-        ed.input(Key::R);
+        // [A] is the picker on the item box (the console's chip table says
+        // "[A] 種類変更"); [R] is the count keyboard.
+        ed.input(Key::A);
         ed.item_pick_cursor = 20;
     }),
     ("SkillPick", |ed| {
@@ -1268,6 +1270,23 @@ const STATES: &[(&str, Setup)] = &[
         ed.equip_pick_cursor = 20;
     }),
     ("Charms", |ed| ed.open_charms()),
+    // The three answers the talisman list's [A] gives, as three states: the
+    // selected talisman's form, the first record of an empty box, and the
+    // refusal a search with no hits gets. The button said 編集 over all three.
+    ("Charms 空", |ed| {
+        ed.save = Some(save_with_charms(0));
+        ed.open_charms();
+    }),
+    ("Charms 検索0件", |ed| {
+        ed.open_charms();
+        ed.charm_filter = String::from("zzzznothing");
+    }),
+    // The item box with a search that hides every row: [A] and the arrows have
+    // nothing to act on, and both now say why instead of answering silence.
+    ("Items 検索0件", |ed| {
+        ed.screen = Screen::Items;
+        ed.item_box_filter = String::from("zzzznothing");
+    }),
     ("CharmEdit", |ed| {
         ed.open_charms();
         ed.charm_a_press();
@@ -1308,9 +1327,36 @@ const STATES: &[(&str, Setup)] = &[
         ed.open_quest_from_save(QUEST_ID);
         ed.screen = Screen::EntryView;
     }),
-    ("Mib", |ed| {
+    // The reward table: the row holds three cells and [A] is the cell's own
+    // action (hbedit::EntryAction), so the footer's [A] word follows the cell.
+    ("EntryView 報酬", |ed| {
+        ed.open_quest_from_save(QUEST_ID);
+        ed.entry = ed
+            .arc
+            .as_ref()
+            .and_then(|a| a.entries.iter().position(|e| e.name.contains("rem_")))
+            .expect("the reward table");
+        ed.entry_field = 0;
+        ed.entry_row_cursor = 0;
+        ed.screen = Screen::EntryView;
+    }),
+    // .mib on the two kinds of row: [ZR] walks a monster slot's eight values and
+    // has nothing to do on the other ninety, so the footer names it only there.
+    ("Mib モンスター行", |ed| {
         ed.open_quest_from_save(QUEST_ID);
         ed.screen = Screen::Mib;
+        ed.mib_cursor = mhnx_core::questfields::MIB_FIELDS
+            .iter()
+            .position(|f| f.key.starts_with("mob_slot["))
+            .expect("a monster row");
+    }),
+    ("Mib 通常行", |ed| {
+        ed.open_quest_from_save(QUEST_ID);
+        ed.screen = Screen::Mib;
+        ed.mib_cursor = mhnx_core::questfields::MIB_FIELDS
+            .iter()
+            .position(|f| !f.key.starts_with("mob_slot["))
+            .expect("a plain row");
     }),
     ("Gmd", |ed| {
         ed.open_quest_from_save(QUEST_ID);

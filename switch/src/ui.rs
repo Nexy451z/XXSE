@@ -1033,7 +1033,13 @@ impl GuiState {
             MainSection::Quest => {
                 // Entering the section lands on its first tab, and the bar says
                 // so: it used to land on the save's list with セーブ内 lit.
+                //
+                // The list has to move with the bar: the tab the jump lights is
+                // クエスト改造, and the list it lands on is セーブ内. Leaving the
+                // state machine's own tab where the last visit put it (公式 /
+                // 没クエ) lit one tab and showed another tab's rows.
                 self.quest_bar_tab = 0;
+                ed.set_quest_tab(0);
                 if ed.save.is_some() {
                     ed.refresh_quest_titles();
                     ed.screen = Screen::SaveQuests;
@@ -1085,6 +1091,22 @@ impl GuiState {
         if ed.screen == Screen::QuestEdit {
             let labels: &'static [&'static str] = &["基本", "モンスター", "報酬", "支給品"];
             return (Self::statics(labels), ed.quest_edit_tab.min(3));
+        }
+        // ギルドカード carries four views of its own, and the bar named two of
+        // them: 回数 and 武器 were reachable only with [Y], and while either was
+        // on screen the bar lit ギルドカード - a lit tab that is not the view
+        // showing, and a press on it did nothing at all (select_sub_tab returns
+        // early on the lit tab). The four are this screen's tabs now, the same
+        // shape 進行状況 and クエスト改造 already use.
+        if ed.screen == Screen::Guild {
+            let labels: &'static [&'static str] = &["カード", "回数", "武器", "闘技大会"];
+            let active = match ed.guild_view() {
+                GUILD_TAB_COUNTS => 1,
+                GUILD_TAB_WEAPONS => 2,
+                GUILD_TAB_ARENA => 3,
+                _ => 0,
+            };
+            return (Self::statics(labels), active);
         }
         if is_quest_inner(ed.screen) {
             let labels: &'static [&'static str] = &[
@@ -1505,6 +1527,25 @@ impl GuiState {
                     self.sets_cursor = 0;
                 }
             },
+            // The guild card's own four views are the bar's tabs while that
+            // screen is showing (sub_tabs_for): the card, the quest counters,
+            // the weapon grid and the arena log. A press on one of them is a
+            // view switch, and the lit tab is the view that is really on
+            // screen - it used to light ギルドカード over 回数 and 武器, two of
+            // the four views the bar did not name at all.
+            MainSection::PalicoRecord if ed.screen == Screen::Guild => {
+                if ed.save.is_none() {
+                    ed.message = String::from("先にセーブデータを開いてください");
+                    return;
+                }
+                let view = match idx {
+                    1 => GUILD_TAB_COUNTS,
+                    2 => GUILD_TAB_WEAPONS,
+                    3 => GUILD_TAB_ARENA,
+                    _ => mhnx_core::hbedit::GUILD_TAB_CARD,
+                };
+                ed.set_guild_view(view);
+            }
             MainSection::PalicoRecord => match idx {
                 // The three lists keep their rows across a tab step: a tab is
                 // navigation, and putting the cursor back at the top made
@@ -2378,10 +2419,12 @@ impl GuiState {
                 // A runs the highlighted row and every other key is the
                 // menu's (`-` / B close it, Up / Down move it).
                 Key::A if ed.item_menu_open => ed.input(Key::A),
-                Key::A => {
-                    // A opens the Item Picker for the selected slot!
-                    ed.input(Key::R);
-                }
+                // [A] is the picker and [R] the count keyboard - the same two
+                // jobs the state machine's own arms have (hbedit::input_items),
+                // so the pad and the headless build cannot swap them again.
+                // [A] used to be sent as [R] because the state machine had them
+                // the other way round.
+                Key::A => ed.input(Key::A),
                 // [Y] is the list's own state, as the footer promised all
                 // along: 所持品のみ <-> 空きも表示. It used to be the step here,
                 // which left the state machine's toggle unreachable - the one
@@ -2396,9 +2439,9 @@ impl GuiState {
                 // [R] types the count of the selected slot. It used to open the
                 // same picker [A] opens, so nothing was lost by giving it to the
                 // one number on this screen a user would rather type than step.
-                Key::R => {
-                    ed.request_item_count_text();
-                }
+                // The state machine answers the same key the same way now, so
+                // this is a fall-through rather than a second copy of the rule.
+                Key::R => ed.input(Key::R),
                 // [-] is the delete key and this screen has nothing to
                 // delete. [ZR] opens the bulk menu (hbedit::Editor::
                 // open_item_menu), and 元に戻す is one of its rows - the pill
@@ -2526,8 +2569,14 @@ impl GuiState {
             // Either set form owns every key while it is open: the equipment
             // one for its parts, the item one for its thirty-two entries.
             Screen::Sets if ed.set_editor_open() => match key {
+                // [R] is ポーチへ適用 on the item set form: the footer names it
+                // and hbedit::Editor::shoulder_job hands the key to the screen
+                // (Shoulder::Screen), so this list is the only thing that was
+                // dropping it - the one key the footer promised and the pad
+                // could not press. The equipment form has no [R] arm, so the
+                // key is a no-op there, exactly as every other unclaimed key.
                 Key::Up | Key::Down | Key::Left | Key::Right | Key::A | Key::Y | Key::Minus
-                | Key::Z | Key::B => ed.input(key),
+                | Key::R | Key::Z | Key::B => ed.input(key),
                 _ => {},
             },
             Screen::Sets => match key {
@@ -2743,9 +2792,19 @@ impl GuiState {
                             ed.entry_row_cursor = (ed.entry_row_cursor + 1) % len;
                         }
                     }
+                    // The step table is the screen's own (hbedit::step_table):
+                    // a reward / supply row holds a count and a chance, so its
+                    // table stops at ±100 and the pills draw exactly that. The
+                    // press used to cycle the shared five and then step by a
+                    // number the writer clamped to 10.
                     Key::Y => {
-                        ed.step = (ed.step + 1) % STEPS.len();
-                        ed.message = format!("刻みを ±{} に切り替えました", STEPS[ed.step]);
+                        let table = ed.step_table().0;
+                        let n = table.len().max(1);
+                        ed.step = (ed.step + 1) % n;
+                        ed.message = format!(
+                            "刻みを ±{} に切り替えました",
+                            table[ed.step.min(n - 1)]
+                        );
                     }
                     Key::Left | Key::Right
                         if matches!(ext, Some("sem") | Some("esl") | Some("qdp")) =>
@@ -6104,16 +6163,41 @@ impl GuiState {
         }
 
         if total == 0 {
-            c.round_rect(MAIN_X, body_y, MAIN_W, 120, t.corner_r, t.bg_panel);
-            c.round_rect_border(MAIN_X, body_y, MAIN_W, 120, t.corner_r, 1, t.border_subtle);
+            // No rows is a state of the list, not the absence of a screen: the
+            // inspector's deck is where a finger reaches 全モンスターを表示
+            // (hunt records), 検索を解除 and [＋] 新規 (equipment box), and the
+            // panel used to be skipped entirely - so the only way out of an
+            // empty list was a key the footer names, on a screen that had just
+            // said there was nothing to do.
+            c.round_rect(MAIN_X, body_y, V1_LIST_W, 120, t.corner_r, t.bg_panel);
+            c.round_rect_border(
+                MAIN_X,
+                body_y,
+                V1_LIST_W,
+                120,
+                t.corner_r,
+                1,
+                t.border_subtle,
+            );
             c.text_centered(
                 MAIN_X,
                 body_y,
-                MAIN_W,
+                V1_LIST_W,
                 120,
                 "データがありません",
                 t.text_secondary,
                 FontSize::Medium,
+            );
+            self.draw_studio_inspector(
+                c,
+                ed,
+                body_y,
+                body_h,
+                None,
+                0,
+                0,
+                false,
+                primary_a_label,
             );
             return;
         }
@@ -6278,19 +6362,21 @@ impl GuiState {
         }
 
         // Right Inspector Panel (x = 832, y = 132, w = 428, h = 526)
-        if let Some(sel_row) = rows.get(cur_pos) {
-            self.draw_studio_inspector(
-                c,
-                ed,
-                body_y,
-                body_h,
-                sel_row,
-                cur_pos,
-                total,
-                has_stepper,
-                primary_a_label,
-            );
-        }
+        //
+        // Drawn even when the list is empty (total == 0 returns above with no
+        // row): the deck under the row's own buttons is the screen's operations,
+        // and an empty list still has them.
+        self.draw_studio_inspector(
+            c,
+            ed,
+            body_y,
+            body_h,
+            rows.get(cur_pos),
+            cur_pos,
+            total,
+            has_stepper,
+            primary_a_label,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6300,7 +6386,7 @@ impl GuiState {
         ed: &Editor,
         iy: i32,
         ih: i32,
-        row: &(usize, String, String, String, String),
+        row: Option<&(usize, String, String, String, String)>,
         cur_pos: usize,
         total: usize,
         has_stepper: bool,
@@ -6309,23 +6395,46 @@ impl GuiState {
         let t = theme();
         let ix = V1_INSP_X; // 832
         let iw = V1_INSP_W; // 428
-        let (row_idx, ref title, ref meta, ref val, ref badge) = *row;
+        // No row is a state of the list, not the absence of the panel: every
+        // button in the deck below is a screen operation, and the two screens
+        // whose only way out of a narrowed / empty list lives there (狩猟記録's
+        // 全モンスターを表示, the equipment box's 検索を解除 and [＋] 新規) used
+        // to draw nothing at all.
+        let empty = row.is_none();
+        let (row_idx, title, meta, val, badge) = match row {
+            Some(r) => (r.0, r.1.clone(), r.2.clone(), r.3.clone(), r.4.clone()),
+            None => (
+                0usize,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+            ),
+        };
 
         c.round_rect(ix, iy, iw, ih, t.corner_r, t.bg_panel);
         c.round_rect_border(ix, iy, iw, ih, t.corner_r, 1, t.border_subtle);
 
         // Slot 1 (iy + 14): Badge on left, "#pos / total" on right
-        let top_tag = if badge.is_empty() { "選択項目" } else { badge.as_str() };
+        let top_tag = if empty {
+            "行がありません"
+        } else if badge.is_empty() {
+            "選択項目"
+        } else {
+            badge.as_str()
+        };
         c.text_clipped(ix + 20, iy + 14, 240, top_tag, t.accent_primary, FontSize::Small);
-        c.text_right(
-            ix + iw - 20,
-            iy + 14,
-            &format!("#{} / {}", cur_pos + 1, total),
-            t.text_muted,
-            FontSize::Small,
-        );
+        if !empty {
+            c.text_right(
+                ix + iw - 20,
+                iy + 14,
+                &format!("#{} / {}", cur_pos + 1, total),
+                t.text_muted,
+                FontSize::Small,
+            );
+        }
 
-        if ed.screen == Screen::Gmd {
+        if ed.screen == Screen::Gmd && !empty {
             let role_label = if meta.is_empty() { "クエスト文章" } else { meta.as_str() };
             c.text_clipped(ix + 20, iy + 40, iw - 40, role_label, t.text_primary, FontSize::Medium);
 
@@ -6407,6 +6516,29 @@ impl GuiState {
             return;
         }
 
+        // Slots 2..5 describe the selected row. With no rows there is nothing
+        // to describe - and the deck below is still the screen's operations, so
+        // the panel keeps its frame and says which state it is in.
+        let mut cur_y = iy + 168;
+        if empty {
+            c.text_clipped(
+                ix + 20,
+                iy + 40,
+                iw - 40,
+                "操作する行がありません",
+                t.text_secondary,
+                FontSize::Medium,
+            );
+            c.text_clipped(
+                ix + 20,
+                iy + 70,
+                iw - 40,
+                "下のボタンはこの画面の操作です（行は選べません）",
+                t.text_muted,
+                FontSize::Small,
+            );
+            c.hline(ix + 16, iy + 98, iw - 32, t.border_subtle);
+        } else {
         // Slot 2 (iy + 40): Selected Item Title
         // A name keeps its lines here too: the second line sits where the meta
         // line would be, so a two-line name does not hide its own last line.
@@ -6416,7 +6548,7 @@ impl GuiState {
                 ix + 20,
                 iy + 38,
                 iw - 40,
-                title,
+                &title,
                 2,
                 20,
                 t.text_primary,
@@ -6424,12 +6556,12 @@ impl GuiState {
             );
             let _ = used;
         } else {
-            c.text_clipped(ix + 20, iy + 40, iw - 40, title, t.text_primary, FontSize::Medium);
+            c.text_clipped(ix + 20, iy + 40, iw - 40, &title, t.text_primary, FontSize::Medium);
         }
 
         // Slot 3 (iy + 70): Concise Meta Info (if non-empty)
         if !meta.is_empty() {
-            c.text_clipped(ix + 20, iy + 70, iw - 40, meta, t.text_secondary, FontSize::Small);
+            c.text_clipped(ix + 20, iy + 70, iw - 40, &meta, t.text_secondary, FontSize::Small);
         }
 
         c.hline(ix + 16, iy + 98, iw - 32, t.border_subtle);
@@ -6483,7 +6615,8 @@ impl GuiState {
         );
         self.add_hit(ix + 20, btn_y, iw - 40, 42, UiAction::ActivateRow(row_idx));
 
-        let mut cur_y = btn_y + 52; // iy + 220
+        cur_y = btn_y + 52; // iy + 220
+        }
 
         // The skill panel is the other mode of the roster screen. A row is one
         // slot of a learned list, so the deck gives the candidate stepper (the
@@ -6593,7 +6726,7 @@ impl GuiState {
         }
 
         // Slot 6: Numeric Stepper & Step Size Selector
-        if has_stepper {
+        if has_stepper && !empty {
             let bw = (iw - 56) / 3; // 124px each
             // [◀ -]
             c.round_rect(ix + 20, cur_y, bw, 38, 5, t.bg_btn);
@@ -7189,6 +7322,20 @@ impl GuiState {
             Screen::Palico => {
                 c.text_sized(ix + 20, cur_y, "一括操作・プリセット", t.text_muted, FontSize::Small);
                 cur_y += 24;
+                // The language is the arrow pair on this build and had no touch
+                // route at all: the two keys were the only way to reach it and
+                // no line on the screen named them.
+                let lang = if ed.palico_lang == 0 { "日本語" } else { "英語" };
+                self.draw_tool_button(
+                    c,
+                    ix + 20,
+                    cur_y,
+                    full_w,
+                    38,
+                    &format!("[◀/▶] 名前の言語: {}", lang),
+                    UiAction::TogglePalicoLang,
+                );
+                cur_y += 44;
                 self.draw_tool_button(
                     c,
                     ix + 20,
@@ -8215,7 +8362,9 @@ impl GuiState {
             &rows,
             ed.cursor.min(rows.len().saturating_sub(1)),
             false,
-            "編集",
+            // 編集 / 作成 / 該当なし: the word is the state machine's
+            // (Editor::charm_a_label), so the button names the press it runs.
+            ed.charm_a_label(),
         );
     }
 
@@ -9054,8 +9203,12 @@ impl GuiState {
         warnings.push(String::from(
             "[Y] クエスト回数 → 武器使用数（15 種 × 3 会場、[R] で数値入力）",
         ));
+        // The bar names the four views while this screen is showing
+        // (sub_tabs_for), so [L/R] walks them and [B] unwinds one level at a
+        // time - the line says both, because one key with two depths is the
+        // kind of thing that reads as a bug until it is written down.
         warnings.push(String::from(
-            "[L/R] 闘技大会タブ: アリーナ 17 × 順位 5 のタイムを編集",
+            "[L/R] 4ビュー: カード → 回数 → 武器 → 闘技大会（[B] は1段ずつ戻る）",
         ));
         let sub = format!(
             "HR 上限 {} / 時間 上限 {}h",
@@ -9944,8 +10097,12 @@ impl GuiState {
                 let title = ed.quest_title(q.quest_id);
                 rows.push((
                     i,
+                    // The README's rule for a row the tables cannot name is
+                    // 「名前不明」, and the progress screen and the PC build
+                    // already print it. This list printed a bare "Quest 12345",
+                    // which reads like a title the game has.
                     if title.is_empty() {
-                        format!("Quest {}", q.quest_id)
+                        format!("クエスト {} 名前不明", q.quest_id)
                     } else {
                         title.to_string()
                     },
@@ -10632,7 +10789,9 @@ impl GuiState {
             &rows,
             ed.entry_row_cursor.min(rows.len().saturating_sub(1)),
             matches!(ext, "rem" | "sup" | "sem" | "esl" | "qdp"),
-            if is_table { "アイテム" } else { "変更" },
+            // The reward row's [A] is the cell's own action (hbedit::EntryAction),
+            // so the button is labelled with the word the footer prints.
+            if is_table { ed.entry_a_label() } else { "変更" },
             &[],
             &warnings,
         );

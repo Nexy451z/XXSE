@@ -142,7 +142,7 @@ pub enum Tab {
     Palico,
     Sets,
     Extras,
-    /// セーブマップ: every named stretch of the save, listed and dumped as hex.
+    /// 生データ: every named stretch of the save, listed and dumped as hex.
     /// Read-only - it names and shows bytes, it never writes them.
     SaveMap,
     /// The 変更一覧: every value that differs from the file on disk, one line
@@ -253,7 +253,7 @@ impl Tab {
             Tab::Palico => "オトモ",
             Tab::Sets => "マイセット",
             Tab::Extras => "設定/オトモ",
-            Tab::SaveMap => "セーブマップ",
+            Tab::SaveMap => "生データ",
             Tab::Review => "変更一覧",
             Tab::Database => "データベース",
             Tab::About => "情報",
@@ -356,7 +356,7 @@ struct RecordDump {
 /// Where a raw byte edit lands, when that place is one the save file itself
 /// uses.
 ///
-/// The セーブマップ edit mode changes one byte at a time inside the row the user
+/// The 生データ edit mode changes one byte at a time inside the row the user
 /// picked, and the body header is a row like any other - 画面の明るさ and 振動 are
 /// two of its bytes, and they are ordinary options the 設定/オトモ screen edits.
 /// None of these is forbidden (the whole point of the screen is that an expert
@@ -453,7 +453,7 @@ impl QuestWorkParts {
     }
 }
 
-/// One row of the セーブマップ list, with the text the table draws already
+/// One row of the 生データ list, with the text the table draws already
 /// copied out of the save.
 ///
 /// The field is borrowed from the crate's `&'static` table, so a frame copies
@@ -680,7 +680,7 @@ pub enum Confirm {
         /// without depending on the list still holding that index.
         line: String,
     },
-    /// One byte of the セーブマップ changed by hand: 「オフセット 0x… を 0x…
+    /// One byte of the 生データ changed by hand: 「オフセット 0x… を 0x…
     /// → 0x… に変えます」. The answer runs the same write the dialog described;
     /// the warning lines for a header or pointer byte are part of the body.
     RawByte {
@@ -1557,7 +1557,7 @@ pub struct MhnxEditor {
     /// Show only quests that are not cleared.
     pub quest_missing_only: bool,
 
-    // ---- save map (セーブマップ) ----
+    // ---- save map (生データ) ----
     /// Text filter of the save map list: a name, a region or an offset.
     pub savemap_filter: String,
     /// Row of the save map whose bytes the dump under the list shows.
@@ -1575,7 +1575,7 @@ pub struct MhnxEditor {
     pub savemap_cursor: usize,
     /// The two hex digits typed for the cursor byte.
     pub savemap_value: String,
-    /// Frames left to scroll the セーブマップ list back to the edited row.
+    /// Frames left to scroll the 生データ list back to the edited row.
     ///
     /// The list shrinks to four rows while the editor is open, and the row being
     /// edited is usually not one of them: the scroll is what puts the row and
@@ -4413,7 +4413,7 @@ impl MhnxEditor {
     ///
     /// 上段 is the everyday layer: the seven screens an ordinary edit session
     /// runs in. The record screens sit on their own line under it, and the
-    /// binary-level ones (クエストのファイル画面, セーブマップ, 変更一覧,
+    /// binary-level ones (クエストのファイル画面, 生データ, 変更一覧,
     /// データベース, 設定/オトモ, 情報) are folded away behind 詳細・ツール.
     ///
     /// Nothing was removed to do this. The shelf lists in [TabShelf::tabs] are
@@ -4458,8 +4458,8 @@ impl MhnxEditor {
                 ui.separator();
                 let on_tools = self.tab.shelf() == TabShelf::Tools;
                 let tools_open = self.show_tools || on_tools;
-                // The button says where the user is: "セーブマップ" behind a
-                // folded shelf and "詳細・ツール: セーブマップ" with it open.
+                // The button says where the user is: "生データ" behind a
+                // folded shelf and "詳細・ツール: 生データ" with it open.
                 let mut label = String::from(TabShelf::Tools.heading());
                 if on_tools {
                     label.push_str(": ");
@@ -4469,7 +4469,7 @@ impl MhnxEditor {
                 if ui
                     .selectable_label(on_tools, label)
                     .on_hover_text(
-                        "セーブマップ・変更一覧・データベースなど、生のバイトを扱う画面を開きます（もう一度押すと畳みます）",
+                        "生データ・変更一覧・データベースなど、生のバイトを扱う画面を開きます（もう一度押すと畳みます）",
                     )
                     .clicked()
                 {
@@ -4678,7 +4678,7 @@ impl MhnxEditor {
         let resp = ui
             .add_enabled(enabled, egui::Button::new("詳細（生データを見る）"))
             .on_hover_text(if enabled {
-                format!("この画面の生データをバイトで開きます（セーブマップの「{}」）", what)
+                format!("この画面の生データをバイトで開きます（生データの「{}」）", what)
             } else {
                 String::from("セーブを開くと詳細へ飛べます")
             });
@@ -4796,7 +4796,7 @@ impl MhnxEditor {
             return;
         };
         let Some(index) = Self::savemap_index_named(name) else {
-            self.message = format!("セーブマップに「{}」の行がありません", name);
+            self.message = format!("生データに「{}」の行がありません", name);
             return;
         };
         self.detail_return = Some(origin);
@@ -6278,7 +6278,7 @@ impl MhnxEditor {
             // bytes were decided when the list was built; the answer runs that
             // very row again rather than trusting the index alone
             // (restore_review_row re-checks the list is still current).
-            // One byte of the セーブマップ: the offset, both values, and - for a
+            // One byte of the 生データ: the offset, both values, and - for a
             // header or pointer byte - the reason it is worth a second look.
             // Not the red body on its own: an ordinary byte is an ordinary
             // question, and a dialog that always looks dangerous is one nobody
@@ -16121,7 +16121,7 @@ impl MhnxEditor {
         let selected = self.db_selected;
         let mut pick: Option<usize> = None;
         // The list gets most of the panel and the preview a fixed slice under
-        // it, the way the セーブマップ puts its dump under its table: a side by
+        // it, the way the 生データ puts its dump under its table: a side by
         // side split leaves neither half readable at 1180 px.
         const PREVIEW_H: f32 = 240.0;
         let table_h = (ui.available_height() - PREVIEW_H).max(120.0);
@@ -16260,7 +16260,7 @@ impl MhnxEditor {
         ui.horizontal_wrapped(|ui| {
             ui.radio_value(&mut self.recipe_mode, RecipeMode::Product, "生産物 → 必要素材");
             ui.radio_value(&mut self.recipe_mode, RecipeMode::Material, "素材 → 作れるもの");
-            // クリア, the word the セーブマップ and 狩猟記録 screens use for the
+            // クリア, the word the 生データ and 狩猟記録 screens use for the
             // same button.
             if !self.recipe_filter.is_empty() && ui.small_button("クリア").clicked() {
                 self.recipe_filter.clear();
@@ -16865,9 +16865,9 @@ impl MhnxEditor {
         ui.label(egui::RichText::new(status).weak().small());
     }
 
-    // ------------------------------------------------- save map (セーブマップ)
+    // ------------------------------------------------- save map (生データ)
 
-    /// セーブマップ: every named stretch of the save, listed, with a hex dump of
+    /// 生データ: every named stretch of the save, listed, with a hex dump of
     /// the selected one - and, behind the `編集` button, one byte at a time of
     /// that row changed by hand.
     ///
@@ -16882,7 +16882,7 @@ impl MhnxEditor {
     /// An MHGU save is refused ([MhnxEditor::save_map_refusal]) for the same
     /// reason 進行状況 / DLC / 変更一覧 refuse it: every row is an MHXX offset.
     fn tab_save_map(&mut self, ui: &mut egui::Ui) {
-        ui.heading("セーブマップ");
+        ui.heading("生データ");
         ui.label(
             egui::RichText::new(
                 "一覧と 16 進ダンプです。[編集] を押すと、選んだ行の中を 1 バイトずつ書き換えられます（確認のうえ、元に戻せます）。",
@@ -17286,7 +17286,7 @@ impl MhnxEditor {
     /// undo the very byte that was just changed.
     pub fn raw_byte_commit(&mut self, offset: usize, value: u8) -> bool {
         let Some(index) = self.savemap_selected else {
-            self.message = String::from("セーブマップの行を選んでください");
+            self.message = String::from("生データの行を選んでください");
             return false;
         };
         let Some((start, len)) = self.savemap_edit_range(index) else {
@@ -17381,7 +17381,7 @@ impl MhnxEditor {
         out
     }
 
-    /// The セーブマップ dump as an editor: one byte at a time, inside the row.
+    /// The 生データ dump as an editor: one byte at a time, inside the row.
     ///
     /// A page of the row is drawn - the same 512 bytes the read-only dump shows,
     /// and the page follows the cursor, so the whole row stays reachable without
@@ -17598,7 +17598,7 @@ impl MhnxEditor {
         u8::from_str_radix(text, 16).ok()
     }
 
-    /// Why the セーブマップ tab refuses this save, or `None` when the map applies.
+    /// Why the 生データ tab refuses this save, or `None` when the map applies.
     ///
     /// MHGU's slots are 0x1104 bytes longer than MHXX's and every row of the map
     /// was measured on MHXX saves, so the same relative offset names a different
@@ -17610,13 +17610,13 @@ impl MhnxEditor {
     fn save_map_refusal(save: &Save) -> Option<&'static str> {
         match save.kind() {
             SaveKind::Mhgu => Some(
-                "このセーブは MHGU です。セーブマップの位置は MHXX のセーブで確認したものなので、このタブでは表示もしません。",
+                "このセーブは MHGU です。生データの位置は MHXX のセーブで確認したものなので、このタブでは表示もしません。",
             ),
             _ => None,
         }
     }
 
-    /// The rows of the セーブマップ list the filter lets through.
+    /// The rows of the 生データ list the filter lets through.
     ///
     /// Its own method rather than a closure inside the tab so the filter can be
     /// tested without a window: the table needs a frame to draw and the harness
@@ -24275,7 +24275,7 @@ mod tests {
         assert!(!output.shapes.is_empty(), "the 設定 window drew nothing");
     }
 
-    /// The セーブマップ lists the crate's whole table, and its filter finds a
+    /// The 生データ lists the crate's whole table, and its filter finds a
     /// row by name, by region and by the offset the list prints.
     #[test]
     fn the_save_map_lists_the_whole_table() {
@@ -24316,7 +24316,7 @@ mod tests {
         );
     }
 
-    /// The セーブマップ tab draws a frame with a save and without one: a
+    /// The 生データ tab draws a frame with a save and without one: a
     /// duplicate table id, or a row the layout cannot fit, would panic here.
     #[test]
     fn the_save_map_tab_draws_a_frame() {
@@ -24354,7 +24354,7 @@ mod tests {
         assert!(!output.shapes.is_empty(), "the empty filter drew nothing");
     }
 
-    /// The セーブマップ tab refuses an MHGU save the way 進行状況, DLC and 変更一覧
+    /// The 生データ tab refuses an MHGU save the way 進行状況, DLC and 変更一覧
     /// do. Every row is an MHXX offset; an MHGU slot is 0x1104 bytes longer, so
     /// the same relative offset names other bytes there and the tab would show a
     /// wrong row with nothing to say it is wrong.
@@ -24661,7 +24661,7 @@ mod tests {
         );
     }
 
-    /// The セーブマップ dump is a viewer until 編集 is pressed and an editor
+    /// The 生データ dump is a viewer until 編集 is pressed and an editor
     /// after: the grid, the value field and the warning line are drawn on the
     /// same tab that used to say 読み取り専用.
     #[test]
@@ -27398,7 +27398,7 @@ mod tests {
         app.tab = Tab::SaveMap;
         let text = bar_text(&mut app, &ctx);
         assert!(
-            text.contains("詳細・ツール: セーブマップ"),
+            text.contains("詳細・ツール: 生データ"),
             "the bar does not say which tool is open: {text}"
         );
     }

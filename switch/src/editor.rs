@@ -1657,11 +1657,21 @@ fn service(ed: &mut Editor, gui: &mut crate::ui::GuiState) -> bool {
         //     keyboard is used and the modal says why.
         match mhnx_core::hbedit::keyboard_route(spec, crate::swkbd::is_available()) {
             mhnx_core::hbedit::KeyboardRoute::System => {
+                // Three answers, three sentences. Cancel and "the keyboard
+                // never opened" used to be one `None` and both printed
+                // キャンセルしました, so a failed launch read as a user who
+                // changed their mind - and the retry it invites fails the same
+                // way.
                 match crate::swkbd::input_text(&header, &initial, spec.capacity) {
-                    Some(s) => apply_text_result(ed, idx, s),
-                    None => {
+                    crate::swkbd::SwkbdAnswer::Text(s) => apply_text_result(ed, idx, s),
+                    crate::swkbd::SwkbdAnswer::Cancelled => {
                         ed.message = String::from(
                             "文字入力をキャンセルしました（もう一度押すとやり直せます）",
+                        )
+                    }
+                    crate::swkbd::SwkbdAnswer::Failed => {
+                        ed.message = String::from(
+                            "システムキーボードを開けませんでした（内蔵キーボードで入力してください）",
                         )
                     }
                 }

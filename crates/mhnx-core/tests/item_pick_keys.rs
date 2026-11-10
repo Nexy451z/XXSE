@@ -27,9 +27,13 @@ fn editor_on_the_item_box() -> Editor {
     ed
 }
 
-/// The item box route: [R] opens the picker for the slot under the cursor.
+/// The item box route: [A] opens the picker for the slot under the cursor.
+///
+/// [A] is the picker and [R] the count keyboard on this screen - the console's
+/// chip table says "[A] 種類変更" and the state machine answers the same key the
+/// same way (hbedit::input_items).
 fn open_item_picker(ed: &mut Editor) {
-    ed.input(Key::R);
+    ed.input(Key::A);
     assert_eq!(ed.screen, Screen::ItemPick);
 }
 

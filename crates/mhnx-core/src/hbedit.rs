@@ -1702,8 +1702,11 @@ impl CharmEdit {
         // [A] opens the row's own list on a skill row (the same key every
         // other screen uses for "choose"), so [Y] is the search shortcut rather
         // than the only way in.
+        // [B] goes to the talisman list, and the guide says the same word
+        // ("[B] で一覧へ"): it said 戻る here and 一覧へ there, which reads as two
+        // destinations for one key.
         format!(
-            "[A] {}  [◀/▶] 値  [X] 保存  [B] 戻る（下書きは2回）",
+            "[A] {}  [◀/▶] 値  [X] 保存  [B] 一覧へ（下書きは2回）",
             self.a_label()
         )
     }
@@ -1732,6 +1735,59 @@ impl CharmEdit {
     /// 「選択不可」 on that row instead of opening one.
     pub fn second_skill_available(&self) -> bool {
         charm::second_skill_available(self.kind)
+    }
+}
+
+/// What `[A]` does on one row of a reward / supply table.
+///
+/// The row holds three cells - アイテム, 個数 and 確率% - and `[ZR]` picks which
+/// one the key is on, the same shape the talisman and equipment forms have
+/// (CharmAction / EquipFormAction). `[A]` used to be アイテム選択 on every cell,
+/// which made these the only rows in the editor whose `[A]` was not the row's
+/// own action: the two number cells could only be stepped with the arrows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryAction {
+    /// アイテム: open the item picker on this row.
+    PickItem,
+    /// 個数: raise the count by one step.
+    RaiseCount,
+    /// 確率%: raise the chance by one step.
+    RaiseChance,
+}
+
+impl EntryAction {
+    /// The action the cell under the cursor takes.
+    ///
+    /// A supply box has no chance column, so its second cell is the count and
+    /// there is no third one ([Editor::entry_field_count]).
+    pub fn of_field(field: usize, has_chance: bool) -> Self {
+        match field {
+            1 => EntryAction::RaiseCount,
+            2 if has_chance => EntryAction::RaiseChance,
+            _ => EntryAction::PickItem,
+        }
+    }
+
+    /// The word the footer and the inspector `[A]` button print.
+    pub fn label(self) -> &'static str {
+        match self {
+            EntryAction::PickItem => "アイテム",
+            EntryAction::RaiseCount => "個数+1",
+            EntryAction::RaiseChance => "確率+1",
+        }
+    }
+
+    /// The hint the row draws after its name.
+    pub fn row_hint(self) -> &'static str {
+        match self {
+            EntryAction::PickItem => "▸ 選ぶ",
+            EntryAction::RaiseCount | EntryAction::RaiseChance => "▸ 増やす",
+        }
+    }
+
+    /// The key the console sends for this action.
+    pub fn key(self) -> Key {
+        Key::A
     }
 }
 
@@ -6913,6 +6969,15 @@ pub struct Editor {
     pub message: String,
 
     pending_request: Option<Request>,
+    /// A "read the card again" request from the save list's [Y].
+    ///
+    /// The console's chip table has said [Y] 再読込 on that screen all along and
+    /// the console answers the key before the state machine sees it, so the
+    /// state machine's own [Y] arm jumped to クエスト一覧 instead - one screen,
+    /// two meanings for one key. The flag is the state machine's half of the
+    /// console's answer: the host reads it and rescans, exactly as it does for
+    /// the pill.
+    rescan_requested: bool,
     pending_write: Option<Write>,
     pending_text: Option<TextRequest>,
     /// The CSV file the I/O layer should read and hand back.
@@ -7076,6 +7141,7 @@ impl Editor {
             review: None,
             message: String::new(),
             pending_request: None,
+            rescan_requested: false,
             pending_write: None,
             pending_text: None,
             pending_csv_read: None,
@@ -7103,6 +7169,22 @@ impl Editor {
     /// Take a pending I/O request.
     pub fn take_request(&mut self) -> Option<Request> {
         self.pending_request.take()
+    }
+
+    /// Ask the host to read the save list again.
+    ///
+    /// The console's [Y] on the save list is 再読込 and the console answers it
+    /// itself (ui::GuiState::wants_rescan); this is the state machine's own
+    /// answer for the same key, so the headless build and the host tests see
+    /// one meaning too (see [Editor::take_rescan]).
+    pub fn request_rescan(&mut self) {
+        self.rescan_requested = true;
+        self.message = String::from("セーブを読み直しています");
+    }
+
+    /// Did something ask for a rescan since the last call?
+    pub fn take_rescan(&mut self) -> bool {
+        core::mem::replace(&mut self.rescan_requested, false)
     }
 
     /// Take a pending write.
@@ -7790,20 +7872,48 @@ impl Editor {
             // The form's [A] is the row's own action, so the form writes the
             // line (CharmEdit::footer).
             Screen::CharmEdit => self.charm_edit.map(|c| c.footer()).unwrap_or_else(|| {
-                String::from("[A] 行ごとの操作  [◀/▶] 値  [X] 保存  [B] 戻る（下書きは2回）")
+                String::from("[A] 行ごとの操作  [◀/▶] 値  [X] 保存  [B] 一覧へ（下書きは2回）")
             }),
             // [A] installs on a row that is not in the save and releases on one
             // that is: the same key, two words, and the footer says which one
             // is waiting under the cursor (Editor::palico_row_action).
             // [ZR] opens the palico's equipment panel: [-] is the delete key,
             // and the panel's own [-] is the 解除 that deletes a worn record.
+            // [◀/▶] is the language on this build (UiAction::TogglePalicoLang)
+            // and was named nowhere: not in this line, not in the guide, not on
+            // the deck. The two arrows are the only key this screen answers
+            // that no line mentioned.
             Screen::Palico => {
                 let id = dlcats::all_ids().get(self.palico_cursor).copied().unwrap_or(0);
                 format!(
-                    "[A] {}  [Y] 全導入（2回）  [ZR] 装備  [X] 保存  [B] 戻る",
+                    "[A] {}  [◀/▶] 言語  [Y] 全導入2回  [ZR] 装備  [X] 保存  [B] 戻る",
                     self.palico_row_action(id)
                 )
             }
+            // 護石一覧: the [A] word follows the list. An empty box has no row to
+            // edit - the press creates the first talisman - and the button said
+            // 編集 over it.
+            Screen::Charms => format!(
+                "[A] {}  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] 枠選択",
+                self.charm_a_label()
+            ),
+            // .mib: [ZR] walks a monster slot's eight values and has nothing to
+            // do on the other rows, so the line names it only where it works -
+            // it used to promise 項目 on all ninety rows and the key answered
+            // with a refusal on most of them.
+            Screen::Mib if self.mib_row_is_monster() => String::from(
+                "[A] 一覧選択  [◀/▶] 増減  [ZR] 項目  [Y] 刻み  [X] 保存  [B] 戻る",
+            ),
+            Screen::Mib => String::from(
+                "[A] 一覧選択  [◀/▶] 増減  [Y] 刻み  [X] 保存  [B] 戻る",
+            ),
+            // A reward / supply row holds three cells and [ZR] picks which one
+            // [A] acts on, so the [A] word follows the cell the way the two
+            // forms' words follow their rows (CharmAction / EquipFormAction).
+            Screen::EntryView if self.entry_has_numbers() => format!(
+                "[◀/▶] 値  [ZR] 項目  [A] {}  [R] 数値入力  [Y] 刻み  [X] 保存",
+                self.entry_a_label()
+            ),
             // The card's [A] is the row's own action too: the comment opens the
             // keyboard and the two numbers take a step.
             // Three of the four views answer [A] differently, so the line is
@@ -8024,14 +8134,16 @@ impl Editor {
             Screen::ArcEntries => {
                 "[A] 開く  [Y] 検査  [ZR] 抽出  [X] 保存  [B] 改造へ"
             }
+            // footer_hint writes this screen's line, because [ZR] only works on
+            // a monster row; this is the row that has no sub-field.
             Screen::Mib => {
-                "[A] 一覧選択  [◀/▶] 増減  [ZR] 項目  [Y] 刻み  [X] 保存  [B] 戻る"
+                "[A] 一覧選択  [◀/▶] 増減  [Y] 刻み  [X] 保存  [B] 戻る"
             }
             Screen::Gmd => "[A] 文章編集  [X] 保存  [B] 戻る",
-            // A reward / supply row carries its numbers, so the guide names the
-            // key that picks which one and the key that types it.
+            // footer_hint writes the reward / supply line: its [A] word follows
+            // the cell the cursor is on (EntryAction).
             Screen::EntryView if self.entry_has_numbers() => {
-                "[◀/▶] 増減  [ZR] 個数/確率  [A] アイテム  [R] 数値入力  [Y] 刻み  [X] 保存"
+                "[◀/▶] 値  [ZR] 項目  [A] アイテム  [R] 数値入力  [Y] 刻み  [X] 保存"
             }
             Screen::EntryView => "[◀/▶] 座標・数値  [Y] 刻み  [X] 保存  [B] 戻る",
             // The arena editor's four directions mean one thing each: ◀/▶ walk
@@ -8283,8 +8395,25 @@ impl Editor {
             // table is [FORM_STEPS]: the arrows of both forms clamp the shared
             // one to 10, so the three bigger pills changed nothing.
             Screen::CharmEdit | Screen::EquipEdit => (&FORM_STEPS[..], ""),
+            // A reward / supply row holds a count (0..=99) and a chance
+            // (1..=100). The two big steps of the shared table are larger than
+            // either value can ever be, so a pill for them could only ever jump
+            // to the ceiling - the table stops at ±100, and the press uses the
+            // same slice (Editor::entry_step).
+            Screen::EntryView if self.entry_has_numbers() => (&STEPS[..3], "Y"),
             _ => (&STEPS[..], "Y"),
         }
+    }
+
+    /// The step the reward / supply row's arrows and [A] really take.
+    ///
+    /// The index is clamped to the table the pills draw ([Editor::step_table]),
+    /// so the lit pill, the number the press writes and the message it prints
+    /// are one value. It used to be `STEPS[self.step].min(10)` here and the
+    /// full table on the glass: the ±1000 / ±10000 pills did what ±10 did.
+    pub fn entry_step(&self) -> i64 {
+        let table = self.step_table().0;
+        table[self.step.min(table.len().saturating_sub(1))]
     }
 
     /// What [A] does on 環境設定: it saves.
@@ -11646,38 +11775,45 @@ impl Editor {
                 // and one on a supply box (個数). [-] picks which one, so the
                 // same key pair changes whichever the screen is showing.
                 Key::Left => {
-                    let d = STEPS[self.step].min(10).max(1);
+                    let d = self.entry_step().max(1);
                     self.adjust_entry_field(-d);
                 }
                 Key::Right => {
-                    let d = STEPS[self.step].min(10).max(1);
+                    let d = self.entry_step().max(1);
                     self.adjust_entry_field(d);
                 }
                 Key::Z => self.toggle_entry_field(),
                 Key::R => self.request_entry_number_text(),
-                // Only the reward and supply tables hold editable records.
+                // Only the reward and supply tables hold editable records, and
+                // there [A] is the cell's own action (EntryAction): アイテム opens
+                // the picker, the two number cells take one step - the same
+                // shape the talisman and equipment forms have.
                 Key::A => {
-                    let ext = self
-                        .arc
-                        .as_ref()
-                        .and_then(|a| a.entries.get(self.entry))
-                        .and_then(|e| extension_for(e.type_hash));
-                    if matches!(ext, Some("rem") | Some("sup")) {
-                        self.entry_item_row = self.entry_row_cursor;
-                        self.item_pick_mode = 1;
-                        // The file screen is where this picker was opened from,
-                        // so [B] and the pick itself come back here.
-                        self.item_pick_return = Screen::EntryView;
-                        self.item_pick_cursor = 0;
-                        self.item_pick_filter.clear();
-                        self.screen = Screen::ItemPick;
-                        self.message = alloc::format!(
-                            "{} 行目のアイテムを選んでください — {}",
-                            self.entry_row_cursor,
-                            self.pick_key_hint()
-                        );
-                    } else {
+                    if !self.entry_has_numbers() {
                         self.message = String::from("このエントリに編集できる項目はありません");
+                    } else {
+                        match self.entry_action() {
+                            EntryAction::PickItem => {
+                                self.entry_item_row = self.entry_row_cursor;
+                                self.item_pick_mode = 1;
+                                // The file screen is where this picker was
+                                // opened from, so [B] and the pick itself come
+                                // back here.
+                                self.item_pick_return = Screen::EntryView;
+                                self.item_pick_cursor = 0;
+                                self.item_pick_filter.clear();
+                                self.screen = Screen::ItemPick;
+                                self.message = alloc::format!(
+                                    "{} 行目のアイテムを選んでください — {}",
+                                    self.entry_row_cursor,
+                                    self.pick_key_hint()
+                                );
+                            }
+                            EntryAction::RaiseCount | EntryAction::RaiseChance => {
+                                let d = self.entry_step().max(1);
+                                self.adjust_entry_field(d);
+                            }
+                        }
                     }
                 }
                 // X was advertised on this screen but had no arm, so pressing
@@ -12031,6 +12167,26 @@ impl Editor {
         // An empty box: [A] still creates, which is what the empty list's own
         // message promises.
         self.open_charm_editor(true);
+    }
+
+    /// What the talisman list's `[A]` will do, as the word the footer and the
+    /// inspector button print.
+    ///
+    /// The three answers are the three arms of [Editor::charm_a_press]: the
+    /// selected talisman's form, the first record of an empty box, and the
+    /// refusal a search with no hits gets. The button said 編集 over all three,
+    /// so an empty box offered an edit of nothing.
+    pub fn charm_a_label(&self) -> &'static str {
+        if !self.charms().is_empty() {
+            "編集"
+        } else if self.charm_filter.trim().is_empty() {
+            "作成"
+        } else {
+            // "該当なし" is the honest word but it is 34px wider than 編集, and
+            // the line is already 743 of its 763: "0件" says the same thing in
+            // the width the strip has.
+            "0件"
+        }
     }
 
     fn input_charms(&mut self, key: Key) {
@@ -13728,11 +13884,13 @@ impl Editor {
                     self.pending_request = Some(Request::ReadSave(self.cursor));
                 }
             }
-            Key::Y => {
-                self.screen = Screen::ArcList;
-                self.cursor = 0;
-                self.message = String::from("クエスト編集");
-            }
+            // [Y] is 再読込 on this screen: the console's chip table
+            // (switch/src/editor.rs actions) has said so all along and the
+            // console answers the key before the state machine sees it, so this
+            // arm - which jumped to クエスト一覧 - was a second meaning for one
+            // key on one screen. The quest list is the クエスト section, one
+            // ZL away; the card read is what this screen's own line promises.
+            Key::Y => self.request_rescan(),
             Key::X => {
                 self.screen = Screen::Options;
                 self.cursor = 0;
@@ -13785,10 +13943,13 @@ impl Editor {
                 self.screen = Screen::SaveList;
                 self.cursor = 0;
             }
+            // [Y] is 一括MAX（2回） on this screen: the console answers it
+            // before the state machine (UiAction::CharMaxAll) and the chip
+            // table, the footer and the guide all name it. This arm jumped to
+            // クエスト一覧, which is the クエスト section's tab and no key of
+            // this screen at all.
             Key::Y => {
-                self.screen = Screen::ArcList;
-                self.cursor = 0;
-                self.message = String::from("クエスト編集");
+                self.char_max_all_press();
             }
             Key::Plus => {
                 self.press_quit();
@@ -13810,9 +13971,17 @@ impl Editor {
             }
             Key::L => self.slot = (self.slot + 2) % 3,
             Key::R => self.slot = (self.slot + 1) % 3,
-            // [-] is the delete key and nothing else. The hunt record it used
-            // to open is the オトモ・記録 section, one ZL away.
-            Key::Y => self.screen = Screen::Sets,
+            // [Y] is 刻み on this screen: the console answers it before the
+            // state machine and the chip table, the footer and the guide all
+            // name it. This arm opened マイセット, which is the 装備 section's
+            // tab and no key of this screen at all.
+            Key::Y => {
+                self.step = (self.step + 1) % STEPS.len();
+                self.message = alloc::format!("刻みを ±{} に切り替えました", STEPS[self.step]);
+            }
+            // [X] stays the step here: the console's global X answers QuickSave
+            // before the state machine sees it, so this arm is the headless
+            // build's only step key and the review's list does not touch it.
             Key::X => self.step = (self.step + 1) % STEPS.len(),
             Key::Left | Key::Right => {
                 if self.field == 0 {
@@ -13851,6 +14020,20 @@ impl Editor {
             Key::Up => self.move_cursor(n, -1),
             Key::Down => self.move_cursor(n, 1),
             Key::Left | Key::Right => {
+                if vis.get(self.cursor).is_none() {
+                    // A search that hides every row leaves nothing to step, and
+                    // the arrow keys used to answer with silence on a screen
+                    // whose footer names them.
+                    self.message = if self.item_box_filter.trim().is_empty() {
+                        String::from("この一覧に行が無いので増減できません（[Y] で空き枠も表示）")
+                    } else {
+                        alloc::format!(
+                            "検索「{}」に合う枠が無いので増減できません（[ZR] の検索を空に）",
+                            self.item_box_filter.trim()
+                        )
+                    };
+                    return;
+                }
                 if let Some(&idx) = vis.get(self.cursor) {
                     let step = if key == Key::Right {
                         STEPS[self.step]
@@ -13880,12 +14063,20 @@ impl Editor {
             // runs the same thing, and a tap and a press must not be able to
             // end up in different states.
             Key::Y => self.toggle_item_show_empty(),
-            // R opens the item picker for the slot under the cursor, so the
-            // type can be changed by name instead of only the count.
             // Replacing an item is the destructive step here, so it can be
             // taken back with L.
             Key::L => self.undo_item(),
-            Key::R => {
+            // [A] opens the item picker for the slot under the cursor, so the
+            // type can be changed by name instead of only the count: the
+            // console's chip table has said "[A] 種類変更" all along and the
+            // console sends [A] as the picker key. This arm used to be [R],
+            // which is the count keyboard on this screen - the two keys were
+            // swapped between the two layers.
+            //
+            // A search that hides every row leaves no slot to open, and the
+            // press used to do nothing at all - a key the footer names,
+            // answering silence. It says which state it is in now.
+            Key::A => {
                 if let Some(&idx) = vis.get(self.cursor) {
                     self.item_pick_mode = 0;
                     self.item_pick_return = Screen::Items;
@@ -13898,6 +14089,15 @@ impl Editor {
                         idx + 1,
                         self.pick_key_hint()
                     );
+                } else if !self.item_box_filter.trim().is_empty() {
+                    self.message = alloc::format!(
+                        "検索「{}」に合う枠が無いので選べません（[ZR] の検索を空にすると全枠が出ます）",
+                        self.item_box_filter.trim()
+                    );
+                } else {
+                    self.message = String::from(
+                        "この一覧に行が無いので選べません（[Y] で空き枠も表示できます）",
+                    );
                 }
             }
             // [ZR] opens the bulk operation menu. It used to be the name search
@@ -13908,7 +14108,13 @@ impl Editor {
             // search moved into the menu as a row (ITEM_OP_FIND) and the menu
             // took the key.
             Key::Z => self.open_item_menu(),
-            Key::A => self.request_write_save(),
+            // [R] types the count of the selected slot: the footer, the chip
+            // table and the inspector pill all say "[R] 数値入力", and the
+            // console sends the key straight here. It used to open the picker,
+            // which is [A]'s job on this screen.
+            Key::R => {
+                self.request_item_count_text();
+            }
             Key::B => {
                 self.screen = Screen::Slots;
                 self.cursor = 0;
@@ -14414,12 +14620,34 @@ impl Editor {
         self.entry_ext() == Some("rem")
     }
 
-    /// Which number the row cursor is on, as the label the screen prints.
-    pub fn entry_field_label(&self) -> &'static str {
-        if self.entry_has_chance() && self.entry_field == 1 {
-            "確率%"
+    /// How many cells `[ZR]` walks on this table.
+    ///
+    /// アイテム / 個数 / 確率% on a reward table, アイテム / 個数 on a supply box:
+    /// the two files really hold two and three columns (entries.rs).
+    pub fn entry_field_count(&self) -> usize {
+        if self.entry_has_chance() {
+            3
         } else {
-            "個数"
+            2
+        }
+    }
+
+    /// What `[A]` does on the cell the cursor is on.
+    pub fn entry_action(&self) -> EntryAction {
+        EntryAction::of_field(self.entry_field as usize, self.entry_has_chance())
+    }
+
+    /// The word the footer and the inspector `[A]` button print.
+    pub fn entry_a_label(&self) -> &'static str {
+        self.entry_action().label()
+    }
+
+    /// Which cell the row cursor is on, as the label the screen prints.
+    pub fn entry_field_label(&self) -> &'static str {
+        match self.entry_action() {
+            EntryAction::PickItem => "アイテム",
+            EntryAction::RaiseCount => "個数",
+            EntryAction::RaiseChance => "確率%",
         }
     }
 
@@ -14495,7 +14723,15 @@ impl Editor {
             self.message = String::from("このエントリに編集できる項目はありません");
             return;
         }
-        if self.entry_has_chance() && self.entry_field == 1 {
+        // The アイテム cell is chosen, not stepped: the arrows say so instead of
+        // moving a number the cursor is not on.
+        if self.entry_action() == EntryAction::PickItem {
+            self.message = String::from(
+                "アイテムの欄です（[A] で選ぶ / [ZR] で 個数・確率 に切り替え）",
+            );
+            return;
+        }
+        if self.entry_has_chance() && self.entry_field == 2 {
             let row = self.entry_row_cursor;
             let cur = self
                 .entry_table()
@@ -14512,21 +14748,27 @@ impl Editor {
         }
     }
 
-    /// Switch [-] between 個数 and 確率 on a reward row.
+    /// Switch [ZR] between the cells of a reward / supply row.
+    ///
+    /// アイテム -> 個数 -> 確率% -> アイテム on a reward table; a supply box has no
+    /// chance column, so its cycle is two long and the line says why.
     fn toggle_entry_field(&mut self) {
         if !self.entry_has_numbers() {
             self.message = String::from("このエントリに編集できる項目はありません");
             return;
         }
-        if !self.entry_has_chance() {
-            self.entry_field = 0;
-            self.message = String::from("支給品 (.sup) は確率を使いません（個数のみ編集できます）");
-            return;
-        }
-        self.entry_field = (self.entry_field + 1) % 2;
+        let n = self.entry_field_count() as u8;
+        self.entry_field = (self.entry_field + 1) % n;
+        let note = if self.entry_has_chance() {
+            ""
+        } else {
+            "（支給品 .sup は確率を使いません）"
+        };
         self.message = alloc::format!(
-            "編集中の項目を {} に切り替えました（[◀/▶] で増減）",
-            self.entry_field_label()
+            "編集中の項目を {} に切り替えました（[◀/▶] で増減 / [A] で {}）{}",
+            self.entry_field_label(),
+            self.entry_a_label(),
+            note
         );
     }
 
@@ -14621,7 +14863,15 @@ impl Editor {
             self.message = String::from("その記録はありません");
             return;
         };
-        if self.entry_has_chance() && self.entry_field == 1 {
+        // The アイテム cell is a name, not a number: the keyboard would have
+        // nothing to type into.
+        if self.entry_action() == EntryAction::PickItem {
+            self.message = String::from(
+                "アイテムの欄です（[A] で選ぶ / [ZR] で 個数・確率 に切り替え）",
+            );
+            return;
+        }
+        if self.entry_action() == EntryAction::RaiseChance {
             self.pending_text = Some((TEXT_REWARD_PROB, alloc::format!("{}", r.slot)));
         } else {
             self.pending_text = Some((TEXT_REWARD_COUNT, alloc::format!("{}", r.count)));
@@ -14643,7 +14893,7 @@ impl Editor {
             self.message = String::from("数字を入力してください");
             return false;
         };
-        let chance = self.entry_has_chance() && self.entry_field == 1;
+        let chance = self.entry_action() == EntryAction::RaiseChance;
         self.store_entry_number(v, chance).is_some()
     }
 
@@ -14972,10 +15222,32 @@ impl Editor {
                     self.hunt_cursor = (self.hunt_cursor + 1).min(n - 1);
                 }
             }
-            // X walks the four numbers of the highlighted monster.
-            Key::X | Key::R => self.hunt_field = (self.hunt_field + 1) % 4,
+            // [Y] walks the four numbers of the highlighted monster: the
+            // console's chip table, the footer and the guide all say "[Y] 列".
+            // This arm used to be the step, which is [A] here.
+            Key::Y => self.hunt_field = (self.hunt_field + 1) % 4,
             Key::L => self.hunt_field = (self.hunt_field + 3) % 4,
-            Key::Y => self.step = (self.step + 1) % STEPS.len(),
+            // [A] is the step on this screen ("[A] 刻み"): the console answers
+            // it before the state machine and the deck's pill sends the same
+            // press. This arm used to mark the save dirty and claim a write
+            // that never happened.
+            Key::A => {
+                self.step = (self.step + 1) % HUNT_STEPS.len();
+                self.message = alloc::format!(
+                    "狩猟記録 {} 番の刻みを {} に切り替えました",
+                    monster_label(&rows, self.hunt_cursor),
+                    if HUNT_STEPS[self.step] < 0 {
+                        String::from("反転（▶で減る）")
+                    } else {
+                        alloc::format!("±{}", HUNT_STEPS[self.step])
+                    }
+                );
+            }
+            // [R] types the number: the footer says "[R] 数値入力" and the
+            // console sends the key here.
+            Key::R => {
+                self.request_hunt_text();
+            }
             // Left/Right change the highlighted number.
             Key::Left | Key::Right => {
                 let Some(&(monster, slay, cap, lo, hi)) = rows.get(self.hunt_cursor) else {
@@ -15013,17 +15285,9 @@ impl Editor {
                     self.dirty = true;
                 }
             }
-            Key::A => {
-                if self.save.is_some() {
-                    self.dirty = true;
-                    self.message = alloc::format!(
-                        "狩猟記録 {} 番の値を変更しました",
-                        monster_label(&rows, self.hunt_cursor)
-                    );
-                } else {
-                    self.message = String::from("先にセーブを開いてください");
-                }
-            }
+            // [X] is the save key every screen has: the console answers it
+            // before the state machine and the footer names it.
+            Key::X => self.request_write_save(),
             // [ZR] switches the list. It used to be [-], which is the delete
             // key everywhere else; a hunt record has nothing to delete, so the
             // key is free there and the toggle moved to it.
@@ -16784,6 +17048,11 @@ impl Editor {
             Screen::Char => "行を選んで [◀/▶] で変更、[A] 2回で最大。[生データ] でこの画面のバイト。",
             Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[Y] で空き枠も表示。",
             Screen::ItemPick => "名前で検索して [A] で決定。[B] で元の画面へ。",
+            // The [A] word follows the list: an empty box creates the first
+            // talisman, which is not an edit of anything.
+            Screen::Charms if self.charms().is_empty() && self.charm_filter.trim().is_empty() => {
+                "護石がありません。[A] で最初の1個を作成（[＋] でも新規）。"
+            }
             Screen::Charms => "護石を選んで [A] で編集、[＋] で新規。[Y] で種類やスキル名を検索できます。",
             Screen::CharmEdit => "行ごとに [A] で操作（スキルは一覧）、[◀/▶] で値。[B] で一覧へ。",
             Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を検索できます。",
@@ -16793,7 +17062,13 @@ impl Editor {
             Screen::EquipPick => "装備を名前で選んで [A] で決定。[ZR] で種別を切り替え。",
             Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
             Screen::Hunts => "狩猟記録の行を選んで [◀/▶] で増減。[Y] で項目切替。",
-            Screen::Guild => "ギルドカードの行を [◀/▶] で変更、[ZR] で進行状況。[生データ] でこの画面のバイト。",
+            // The card carries four views and [B] unwinds one level at a time:
+            // 回数 / 武器 go back to the card, the card goes back to the slot
+            // cards. One key, two depths - so the line says so instead of
+            // leaving the reader to find out which one a press gets.
+            Screen::Guild => {
+                "カード・回数・武器・闘技大会の4ビュー。[B] は1段ずつ（回数/武器→カード→枠選択）。"
+            }
             // The three places that name this screen's keys (this line, the
             // footer and the text build's key line) say the same thing: [Y]
             // walks the views, [A] flips the bit, [R] is the quest view's
@@ -16802,7 +17077,12 @@ impl Editor {
                 "[A] でビット切替、[Y] でビット列切替、[R] はクエストの既読、[ZR] で名前を絞り込み。"
             }
             Screen::Roster => "オトモを選んで [A] で名前、[ZR] で装備、[＋] でスキル。",
-            Screen::Palico => "配信オトモを選んで [A] で導入/解除、[Y] 2回で全導入。",
+            // [◀/▶] is the language on this build and was named nowhere at all:
+            // the two arrows are the only key this screen answers that no line
+            // mentioned.
+            Screen::Palico => {
+                "配信オトモを選んで [A] で導入/解除、[◀/▶] で名前の言語、[Y] 2回で全導入。"
+            }
             // Only three keys answer here, so the line names those three and
             // nothing else: [X] saves the open save, not the converted file.
             Screen::Convert => "3DS と Switch の形式を変換します。[A] で変換出力、[Y] で出力名、[B] で戻る。",
@@ -16833,7 +17113,9 @@ impl Editor {
             Screen::ArcList => ".arc を選んで [A] で開きます。[Y] 2回でセーブへ導入、[ZR] で書き出し。",
             Screen::ArcEntries => "クエストの構成ファイルです。[A] で中身、[L/R] でタブ切替。",
             Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み。",
-            Screen::Mib => "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。",
+            Screen::Mib => {
+                "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。[ZR] はモンスター行の項目切替。"
+            }
             Screen::Gmd => "クエストの文章です。[A] でテキスト編集、[X] で保存。",
             Screen::Check => "クエストの検査結果です。[A] で直せる項目を修正します。",
             // 生データ is two modes and the line says which keys belong to the
@@ -17201,7 +17483,16 @@ impl Editor {
         let Some(row) = self.progress_row_under_cursor() else {
             return "既読にする";
         };
-        if self.progress_quest_state(row).1 {
+        let (cleared, seen, _) = self.progress_quest_state(row);
+        // A cleared quest is always also seen (questprogress::set writes both
+        // bits together and refuses to clear the seen bit while the cleared one
+        // is still set), so "既読を外す" on a cleared row was a label the press
+        // could never keep: it answered with a refusal every time. The pill
+        // says what the press will really do instead - nothing - and names the
+        // key that would make it possible.
+        if cleared {
+            "既読は外せません（[A] でクリア解除）"
+        } else if seen {
             "既読を外す"
         } else {
             "既読にする"
@@ -21234,6 +21525,17 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             }
             _ => {}
         }
+    }
+
+    /// Is the .mib row under the cursor one of the five monster slots?
+    ///
+    /// `[ZR]` walks the eight values of such a row and has nothing to switch on
+    /// any other, so the footer names the key only here ([Editor::footer_hint]).
+    pub fn mib_row_is_monster(&self) -> bool {
+        questfields::MIB_FIELDS
+            .get(self.mib_cursor)
+            .map(|f| f.key.starts_with("mob_slot["))
+            .unwrap_or(false)
     }
 
     fn input_mib(&mut self, key: Key) {

@@ -2,20 +2,25 @@
 //!
 //! Public surface (fixed, see the task/tests that call it):
 //!
-//!     swkbd::input_text(header, initial, max_len) -> Option<String>
+//!     swkbd::input_text(header, initial, max_len) -> SwkbdAnswer
 //!     swkbd::is_available()                       -> bool
 //!
 //! `input_text` shows the system keyboard (the `swkbd` LibraryApplet) and returns the
-//! text the user entered as a UTF-8 `String`.  It returns `None` when
+//! text the user entered as a UTF-8 `String`.  The three answers are separate
+//! because they are three different things to the user:
 //!
-//!   * the user pressed Cancel (libnx reports `LibnxError_LibAppletBadExit`),
-//!   * the applet could not be launched at all - typically because the process
-//!     is *not* running in application mode (hbmenu launched from the album runs
-//!     as `AppletType_LibraryApplet`, which cannot create library applets),
-//!   * the config/buffer allocation failed, or the returned bytes were not UTF-8.
+//!   * [`SwkbdAnswer::Text`] - the user confirmed (the text may be empty);
+//!   * [`SwkbdAnswer::Cancelled`] - the user pressed 取消 (`LibnxError_LibAppletBadExit`).
+//!     Nothing failed and nothing was typed;
+//!   * [`SwkbdAnswer::Failed`] - the applet could not be launched or answered
+//!     with anything else: the process is *not* running in application mode
+//!     (hbmenu launched from the album runs as `AppletType_LibraryApplet`, which
+//!     cannot create library applets), the config/buffer allocation failed, or
+//!     the returned bytes were not UTF-8.
 //!
-//! The caller is expected to fall back to some ASCII input path when this
-//! returns `None`.
+//! The two used to be one `None`, and the caller printed "キャンセルしました"
+//! for both - so a keyboard that never opened looked like a user who changed
+//! their mind.
 //!
 //! Everything below is a hand transcription of libnx' headers - no bindgen, no
 //! extra crates, exactly like `sys.rs`.  The layout of every struct that crosses
@@ -330,6 +335,14 @@ const fn succeeded(res: Result) -> bool {
     res == 0
 }
 
+/// `MAKERESULT(Module_Libnx, LibnxError_LibAppletBadExit)`.
+///
+/// `switch/result.h` builds a result as `(module & 0x1FF) | ((desc & 0x1FFF) << 9)`,
+/// `Module_Libnx` is 345, and `LibAppletBadExit` is the 46th `LibnxError`
+/// (`BadReloc = 1`). `swkbdShow` returns exactly this when the user presses
+/// 取消, which is why cancel and "the applet never ran" can be told apart at all.
+const LIBAPPLET_BAD_EXIT: Result = 345 | (46 << 9);
+
 /// UTF-8 -> NUL-terminated bytes, truncated on a character boundary so that the
 /// result never exceeds `max_units` UTF-16 code units.
 ///
@@ -378,6 +391,21 @@ pub fn is_available() -> bool {
     )
 }
 
+/// What the system keyboard answered.
+///
+/// See the module docs: cancel and "the applet never ran" are two different
+/// sentences to the user, so they are two different values here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwkbdAnswer {
+    /// The user confirmed; the text may be empty.
+    Text(String),
+    /// The user pressed 取消. Nothing was typed and nothing failed.
+    Cancelled,
+    /// The applet could not be shown, or answered with something that is not a
+    /// cancel. The reason is not the user's.
+    Failed,
+}
+
 /// Show the system software keyboard and return the entered text.
 ///
 /// * `header`  - text shown above the input field (truncated to 64 characters).
@@ -386,19 +414,20 @@ pub fn is_available() -> bool {
 /// * `max_len` - maximum number of characters the user may enter, passed to
 ///   the applet as `stringLenMax`; 0 means "as many as supported".
 ///
-/// Returns `Some(text)` (possibly empty - the user may confirm an empty string)
-/// on success and `None` on cancel/error.  Japanese and any other UTF-8 input
-/// works: swkbd uses UTF-16 internally and libnx converts both ways, so the
-/// returned `String` is plain UTF-8.
+/// Returns [`SwkbdAnswer::Text`] (possibly empty - the user may confirm an empty
+/// string) on success, [`SwkbdAnswer::Cancelled`] when the user pressed 取消, and
+/// [`SwkbdAnswer::Failed`] when the applet could not be shown at all.  Japanese
+/// and any other UTF-8 input works: swkbd uses UTF-16 internally and libnx
+/// converts both ways, so the returned `String` is plain UTF-8.
 ///
 /// This blocks until the applet is finished (the applet draws itself, no
 /// `appletMainLoop` call is needed while it runs), so it must be called from the
 /// main thread / the UI loop, not from an applet hook or a menu callback.
-pub fn input_text(header: &str, initial: &str, max_len: usize) -> Option<String> {
+pub fn input_text(header: &str, initial: &str, max_len: usize) -> SwkbdAnswer {
     // A library applet cannot be launched outside application mode; bail out
     // before touching libnx' applet machinery.
     if !is_available() {
-        return None;
+        return SwkbdAnswer::Failed;
     }
 
     // 0 -> "no explicit request": use the largest length that survives the
@@ -414,7 +443,7 @@ pub fn input_text(header: &str, initial: &str, max_len: usize) -> Option<String>
     let rc = unsafe { swkbdCreate(&mut cfg, 0) };
     if !succeeded(rc) {
         // Nothing was allocated and no applet was started -> nothing to close.
-        return None;
+        return SwkbdAnswer::Failed;
     }
 
     // 2. Configure.  The preset clears textCheckCb, so libnx never calls back
@@ -442,10 +471,21 @@ pub fn input_text(header: &str, initial: &str, max_len: usize) -> Option<String>
     let rc = unsafe { swkbdShow(&mut cfg, out.as_mut_ptr() as *mut c_char, out.len()) };
     unsafe { swkbdClose(&mut cfg) };
     if !succeeded(rc) {
-        return None;
+        // 取消 is the one failure that is not a failure: libnx reports it as
+        // LibAppletBadExit, and everything else is "the applet did not run".
+        return if rc == LIBAPPLET_BAD_EXIT {
+            SwkbdAnswer::Cancelled
+        } else {
+            SwkbdAnswer::Failed
+        };
     }
 
     // 5. libnx NUL-terminates the (UTF-8) result; cut there and hand it out.
     let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
-    core::str::from_utf8(&out[..end]).ok().map(String::from)
+    match core::str::from_utf8(&out[..end]) {
+        Ok(s) => SwkbdAnswer::Text(String::from(s)),
+        // The applet answered with bytes that are not UTF-8: that is a failure,
+        // not a cancel, and the caller says so.
+        Err(_) => SwkbdAnswer::Failed,
+    }
 }
