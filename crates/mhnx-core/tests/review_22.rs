@@ -444,7 +444,9 @@ fn the_reward_row_names_the_way_back() {
     ed.entry = 0;
     assert!(ed.entry_has_numbers());
     assert!(names(&ed, "B"), "{:?}", ed.key_facts());
-    assert_eq!(label(&ed, "B"), "戻る");
+    // The destination's name, not a verb: every [B] item names the screen it
+    // goes to (the sixth review's leftovers).
+    assert_eq!(label(&ed, "B"), "構成(.arc)");
     // The key really goes back to the file list.
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::ArcEntries);
@@ -675,12 +677,15 @@ fn no_key_is_pressable_without_a_line_in_the_table() {
 /// They borrow the word now, so a copy cannot drift.
 #[test]
 fn the_deck_borrows_the_tables_words() {
+    // The deck borrows the table's word through pill_word (or b_word for [B]),
+    // and prints no key: the footer is the one surface that names keys (the
+    // sixth review's leftovers).
     for needle in [
-        "ed.key_label_or(\"B\"",
-        "ed.key_label_or(\"◀/▶\"",
-        "ed.key_label_or(\"A\"",
-        "ed.key_label_or(\"Y\"",
-        "ed.key_label_or(\"R\"",
+        "ed.b_word()",
+        "pill_word(ed, \"◀/▶\"",
+        "pill_word(ed, \"A\"",
+        "pill_word(ed, \"Y\"",
+        "pill_word(ed, \"R\"",
     ] {
         assert!(UI_SRC.contains(needle), "the deck must borrow {needle}");
     }
@@ -690,7 +695,7 @@ fn the_deck_borrows_the_tables_words() {
     // The tables the buttons read really answer.
     let mut ed = editor(Screen::Guild);
     ed.set_guild_view(GUILD_TAB_CARD);
-    assert_eq!(ed.key_label("B").as_deref(), Some("キャラ"));
+    assert_eq!(ed.key_label("B").as_deref(), Some("スロット"));
     let ed = editor(Screen::Sets);
     assert_eq!(ed.key_label("◀/▶").as_deref(), Some("タブ"));
     let ed = editor(Screen::Items);
@@ -1010,8 +1015,10 @@ fn the_key_column_holds_only_keys() {
     ed.open_charms();
     ed.charm_a_press();
     assert!(ed.footer_hint().contains("（2回で破棄）"), "{}", ed.footer_hint());
-    // One name for the slot screen on both builds.
-    assert!(EDITOR_SRC.contains("\"キャラ選択\""), "the text build's title");
+    // One name for the slot screen on both builds, and it is the bar's word:
+    // the name table is the state machine's (hbedit::screen_name).
+    assert!(HBEDIT_SRC.contains("Screen::Slots => \"スロット\""), "the one name");
+    assert!(EDITOR_SRC.contains("mhnx_core::hbedit::screen_name"));
     assert!(!EDITOR_SRC.contains("キャラクター選択"), "the long name is gone");
     // The reward row's [ZR] reads as an action.
     let mut ed = editor(Screen::EntryView);

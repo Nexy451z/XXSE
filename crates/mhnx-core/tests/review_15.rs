@@ -741,17 +741,25 @@ fn the_quit_key_asks_about_a_forms_draft() {
 /// between each other and never left the section.
 #[test]
 fn the_back_key_names_the_screen_it_goes_to() {
+    // The word is the destination screen's name, and it is the name the
+    // sub-tab bar prints (hbedit::screen_name): スロット / 護石一覧 /
+    // SD(.arc) / クエスト改造. The sixth review's leftovers took the last
+    // verbs (改造へ, カードへ) out.
     let mut ed = open_blank();
     ed.screen = Screen::Equip;
-    assert!(ed.footer_hint().contains("[B] キャラ"), "{}", ed.footer_hint());
+    assert!(ed.footer_hint().contains("[B] スロット"), "{}", ed.footer_hint());
     ed.open_charms();
-    assert!(ed.footer_hint().contains("[B] キャラ"), "{}", ed.footer_hint());
+    assert!(ed.footer_hint().contains("[B] スロット"), "{}", ed.footer_hint());
     ed.screen = Screen::Sets;
     assert!(ed.footer_hint().contains("[B] 護石一覧"), "{}", ed.footer_hint());
     ed.screen = Screen::SaveQuests;
     assert!(ed.footer_hint().contains("[B] SD(.arc)"), "{}", ed.footer_hint());
     ed.screen = Screen::ArcEntries;
-    assert!(ed.footer_hint().contains("[B] 改造へ"), "{}", ed.footer_hint());
+    assert!(
+        ed.footer_hint().contains("[B] クエスト改造"),
+        "{}",
+        ed.footer_hint()
+    );
 
     // No [B] bounces: セーブ内 -> SD(.arc) -> セーブ一覧, and the section is left.
     ed.screen = Screen::SaveQuests;

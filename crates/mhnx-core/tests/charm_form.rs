@@ -134,7 +134,13 @@ fn every_row_says_what_a_really_does() {
         assert_eq!(form.a_key(), action.key(), "row {}", row);
 
         // The footer line and the inspector's [A] button carry that same word.
-        let footer = form.footer();
+        // The line is the editor's (Editor::footer_hint), which renders the
+        // form's table: the form's own copy of that line was a second renderer
+        // that no screen called, and the review asked for one path.
+        let mut ed = Editor::new();
+        ed.screen = Screen::CharmEdit;
+        ed.charm_edit = Some(form);
+        let footer = ed.footer_hint();
         assert!(
             footer.contains(&format!("[A] {}", label)),
             "row {}: the footer does not name the row's [A]: {}",
@@ -428,7 +434,10 @@ fn the_form_text_fits_the_columns_it_is_drawn_in() {
 
         // The footer line is right-aligned at 1262 and the status message is
         // clipped to whatever is left of it, so the guide has to leave room.
-        let footer = form.footer();
+        let mut ed = Editor::new();
+        ed.screen = Screen::CharmEdit;
+        ed.charm_edit = Some(form);
+        let footer = ed.footer_hint();
         let footer_w = line_px(&footer, 17, 9);
         assert!(
             footer_w <= 900,

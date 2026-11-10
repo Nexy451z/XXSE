@@ -4092,12 +4092,17 @@ impl MhnxEditor {
     ///
     /// One table so the line on screen and the test that reads it cannot drift
     /// apart: a key added here is listed and tested without a second edit.
+    ///
+    /// The words are the console's (mhnx_core::hbedit::WORD_*). The two builds
+    /// perform the same five operations, and the sixth review found their two
+    /// tables sharing no word at all: the PC said 上書き保存 where the console's
+    /// footer said 保存, and セーブを開く where the save list's [A] said 開く.
     const SHORTCUTS: &'static [(&'static str, &'static str)] = &[
-        ("Ctrl+S", "上書き保存"),
-        ("Ctrl+O", "セーブを開く"),
-        ("Ctrl+Z", "元に戻す（セーブ全体）"),
-        ("Ctrl+Shift+Z", "やり直す（セーブ全体）"),
-        ("Ctrl+F", "現在のタブの絞り込みへ"),
+        ("Ctrl+S", mhnx_core::hbedit::WORD_SAVE),
+        ("Ctrl+O", mhnx_core::hbedit::WORD_OPEN),
+        ("Ctrl+Z", mhnx_core::hbedit::WORD_UNDO),
+        ("Ctrl+Shift+Z", mhnx_core::hbedit::WORD_REDO),
+        ("Ctrl+F", mhnx_core::hbedit::WORD_SEARCH),
     ];
 
     /// The one-line list of shortcuts drawn at the top of the window.
@@ -22909,8 +22914,11 @@ mod tests {
         for key in ["Ctrl+S", "Ctrl+O", "Ctrl+Z", "Ctrl+F"] {
             assert!(line.contains(key), "{} missing from {}", key, line);
         }
-        assert!(line.contains("上書き保存"), "{}", line);
-        assert!(line.contains("現在のタブの絞り込みへ"), "{}", line);
+        // The words are the console's, not a second vocabulary: the sixth
+        // review found the two builds' tables sharing no word at all.
+        assert!(line.contains(mhnx_core::hbedit::WORD_SAVE), "{}", line);
+        assert!(line.contains(mhnx_core::hbedit::WORD_SEARCH), "{}", line);
+        assert!(!line.contains("上書き保存"), "{}", line);
     }
 
     /// Ctrl+F only claims to have moved the cursor where a filter exists, and

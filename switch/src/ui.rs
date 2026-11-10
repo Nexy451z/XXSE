@@ -4636,7 +4636,7 @@ impl GuiState {
         let next_step = (ed.step + 1) % STEPS.len();
         match ed.screen {
             Screen::Char => {
-                let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
+                let step_lbl = format!("刻み ±{}", ed.step_value());
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_primary, FontSize::Small);
@@ -4656,9 +4656,9 @@ impl GuiState {
                 // because a key for it would have to be taken from one of the
                 // six this screen already uses.
                 let empty_lbl = if ed.show_empty {
-                    String::from("[Y] 空きを隠す")
+                    String::from("空きを隠す")
                 } else {
-                    String::from("[Y] 空きも表示")
+                    String::from("空きも表示")
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -4672,10 +4672,10 @@ impl GuiState {
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
                 if ed.item_menu_open {
-                    btn_text(c, 1108, sy, 158, sh, "[B] 閉じる", t.text_primary, FontSize::Small);
+                    btn_text(c, 1108, sy, 158, sh, "閉じる", t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::B));
                 } else {
-                    btn_text(c, 1108, sy, 158, sh, "[ZR] 一括操作", t.text_primary, FontSize::Small);
+                    btn_text(c, 1108, sy, 158, sh, &pill_word(ed, "ZR", "一括"), t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::OpenItemMenu);
                 }
             }
@@ -4683,22 +4683,22 @@ impl GuiState {
             // button on the right that leads to the file-by-file screens.
             Screen::QuestEdit => {
                 let chip = if ed.quest_edit_tab == QUEST_TAB_MONSTERS {
-                    format!("[ZR] {}", ed.quest_field_label())
+                    String::from(ed.quest_field_label())
                 } else if ed.quest_edit_tab == QUEST_TAB_REWARDS {
                     // The two values [ZR] walks, named on the key that walks
                     // them (hbedit::QUEST_REWARD_*). The third stop held no
                     // value at all - it was the search - so the chip said 検索
                     // next to a key whose arrows could only refuse.
                     match ed.quest_reward_field {
-                        mhnx_core::hbedit::QUEST_REWARD_CHANCE => String::from("[ZR] 確率%"),
-                        mhnx_core::hbedit::QUEST_REWARD_COUNT => String::from("[ZR] 個数"),
-                        _ => String::from("[ZR] アイテム"),
+                        mhnx_core::hbedit::QUEST_REWARD_CHANCE => String::from("確率%"),
+                        mhnx_core::hbedit::QUEST_REWARD_COUNT => String::from("個数"),
+                        _ => String::from("個数"),
                     }
                 } else {
                     // 支給品 has one value and nothing to switch, so [ZR] there
                     // is the search itself. The chip said 項目 - a value switch
                     // on a tab with no second value.
-                    String::from("[ZR] 検索")
+                    String::from("検索")
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -4728,7 +4728,7 @@ impl GuiState {
             Screen::Sets if ed.item_set_edit.is_some() => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[ZR] セット名", t.text_primary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, "セット名", t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
             }
             Screen::Charms => {
@@ -4736,12 +4736,12 @@ impl GuiState {
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 // One word for the action on every screen: 検索. The pill
                 // says what it searches rather than a second verb.
-                btn_text(c, 964, sy, 136, sh, "[Y] 検索", t.text_primary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, "検索", t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::FilterCharms);
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[＋] 新規護石", t.text_primary, FontSize::Small);
+                btn_text(c, 1108, sy, 158, sh, "新規護石", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::NewCharm);
             }
             // The talisman form has no bulk chip and no preset chip any more:
@@ -4754,12 +4754,12 @@ impl GuiState {
             Screen::Roster if ed.palico_skill_open() => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[Y] タブ切替", t.accent_secondary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, "タブ切替", t.accent_secondary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Y));
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[A] 差し替え", t.text_primary, FontSize::Small);
+                btn_text(c, 1108, sy, 158, sh, "差し替え", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
             }
             // The equipment panel is a mode of both palico screens, so its two
@@ -4771,12 +4771,12 @@ impl GuiState {
                 // at) and "[A] 装着" is 70. 158 + 6 + 136 = 300 of the 302.
                 c.round_rect(964, sy, 158, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 158, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 158, sh, "[-] 解除（2回）", t.accent_secondary, FontSize::Small);
+                btn_text(c, 964, sy, 158, sh, "解除（2回）", t.accent_secondary, FontSize::Small);
                 self.add_hit(964, sy, 158, sh, UiAction::Key(Key::Minus));
 
                 c.round_rect(1128, sy, 136, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1128, sy, 136, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1128, sy, 136, sh, "[A] 装着", t.text_primary, FontSize::Small);
+                btn_text(c, 1128, sy, 136, sh, "装着", t.text_primary, FontSize::Small);
                 self.add_hit(1128, sy, 136, sh, UiAction::Key(Key::A));
             }
             Screen::Roster => {
@@ -4784,16 +4784,19 @@ impl GuiState {
                 // EXP) and was on neither the footer nor the deck: a touch-only
                 // player could not change the column at all.
                 //
-                // The pill names the column and nothing else. It said
-                // "[Y] 列: なつき" - 122px in a 96px pill, so it drew as
-                // "[Y] 列:.." - and the footer already says "[Y] 列" (the key
-                // and what it walks); the pill is the state.
+                // The pill names the column and nothing else. It used to print
+                // the key and the column - 122px in a 96px pill, so it drew as
+                // a clipped fragment - and the footer already names the key and
+                // what it walks; the pill is the state.
                 //
                 // Three pills in the 302px the deck has (964..1266), sized to
                 // their own labels: 99 + 6 + 91 + 6 + 99 = 301. The widest
                 // label of the three columns is "[Y] なつき" at 87px, and
                 // btn_text keeps 12px inside the pill.
-                let y_lbl = format!("[Y] {}", ed.roster_column_label());
+                // The table's word plus the state: 列 is what [Y] walks and
+                // なつき is where it is. The pill names no key - the footer
+                // does - and the word is the table's, so the two agree.
+                let y_lbl = format!("{} {}", pill_word(ed, "Y", "列"), ed.roster_column_label());
                 c.round_rect(964, sy, 99, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 99, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 99, sh, &y_lbl, t.accent_secondary, FontSize::Small);
@@ -4801,30 +4804,24 @@ impl GuiState {
 
                 c.round_rect(1069, sy, 91, sh, 5, t.bg_btn);
                 c.round_rect_border(1069, sy, 91, sh, 5, 1, t.border_subtle);
-                btn_text(c, 1069, sy, 91, sh, "[ZR] 装備", t.text_primary, FontSize::Small);
+                btn_text(c, 1069, sy, 91, sh, "装備", t.text_primary, FontSize::Small);
                 self.add_hit(1069, sy, 91, sh, UiAction::Key(Key::Z));
 
                 c.round_rect(1166, sy, 99, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1166, sy, 99, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1166, sy, 99, sh, "[+] スキル", t.text_primary, FontSize::Small);
+                btn_text(c, 1166, sy, 99, sh, "スキル", t.text_primary, FontSize::Small);
                 self.add_hit(1166, sy, 99, sh, UiAction::Key(Key::Plus));
             }
+            // One pill, not two: the bulk install is the deck's button (the
+            // panel below the list is where this screen's operations live, and
+            // it carries the language switch beside it). The bar drew the same
+            // action a second time, which is what the sixth review counted as
+            // "ボタン2つ" for one [Y].
             Screen::Palico => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[ZR] 装備", t.accent_secondary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, &pill_word(ed, "ZR", "装備"), t.accent_secondary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Z));
-
-                c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
-                c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                // The word is the key table's (全導入2回). The pill used to
-                // write its own sentence with the catalogue's count in it,
-                // which was both a second name for the key and 189px of label
-                // in a 158px pill - the count was clipped away anyway, and the
-                // list's own length is on the screen above it.
-                let bulk = format!("[Y] {}", ed.key_label_or("Y", "全導入2回"));
-                btn_text(c, 1108, sy, 158, sh, &bulk, t.text_primary, FontSize::Small);
-                self.add_hit(1108, sy, 158, sh, UiAction::InstallAllPalicoes);
             }
             Screen::Mib => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
@@ -4846,15 +4843,15 @@ impl GuiState {
             Screen::Guild if ed.guild_view() == GUILD_TAB_ARENA => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[Y] 直接入力", t.accent_secondary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, "直接入力", t.accent_secondary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Y));
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
                 let lbl = if ed.arena_edit {
-                    "[A] 編集終了"
+                    "編集終了"
                 } else {
-                    "[A] 編集開始"
+                    "編集開始"
                 };
                 btn_text(c, 1108, sy, 158, sh, lbl, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::A));
@@ -4864,10 +4861,10 @@ impl GuiState {
             // route to the same key, so the pad and a finger cannot disagree.
             Screen::Guild => {
                 let (label, action) = match ed.guild_view() {
-                    GUILD_TAB_CARD => (String::from("[Y] クエスト回数"), UiAction::Key(Key::Y)),
-                    GUILD_TAB_COUNTS => (String::from("[Y] 武器使用数"), UiAction::Key(Key::Y)),
-                    GUILD_TAB_WEAPONS => (String::from("[Y] カードへ"), UiAction::Key(Key::Y)),
-                    _ => (String::from("[B] カードへ"), UiAction::Key(Key::B)),
+                    GUILD_TAB_CARD => (String::from("クエスト回数"), UiAction::Key(Key::Y)),
+                    GUILD_TAB_COUNTS => (String::from("武器使用数"), UiAction::Key(Key::Y)),
+                    GUILD_TAB_WEAPONS => (String::from("カードへ"), UiAction::Key(Key::Y)),
+                    _ => (String::from("カードへ"), UiAction::Key(Key::B)),
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -4877,14 +4874,14 @@ impl GuiState {
                 // The step the ◀ / ▶ pair uses: the key it had on this screen
                 // ([Y]) now walks the views, so the deck carries it - the
                 // same solution the quest screen's step chip uses.
-                let step_lbl = format!("刻み ±{}", STEPS[ed.step]);
+                let step_lbl = format!("刻み ±{}", ed.step_value());
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
                 btn_text(c, 1108, sy, 158, sh, &step_lbl, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::SetStep(next_step));
             }
             Screen::EntryView => {
-                let step_lbl = format!("[Y] 刻み ±{}", STEPS[ed.step]);
+                let step_lbl = format!("刻み ±{}", ed.step_value());
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
                 btn_text(c, 964, sy, 136, sh, &step_lbl, t.text_primary, FontSize::Small);
@@ -4904,10 +4901,10 @@ impl GuiState {
             // there is one implementation of the action and not two.
             Screen::Hunts => {
                 // 狩猟記録: [Y] walks the four numbers of a monster.
-                let step_lbl = if HUNT_STEPS[ed.step] < 0 {
-                    String::from("[A] 刻み 反転")
+                let step_lbl = if ed.step_value() < 0 {
+                    String::from("刻み 反転")
                 } else {
-                    format!("[A] 刻み ±{}", HUNT_STEPS[ed.step])
+                    format!("刻み ±{}", ed.step_value())
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -4916,7 +4913,7 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[Y] 列切替", t.text_primary, FontSize::Small);
+                btn_text(c, 1108, sy, 158, sh, "列切替", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
             }
             // 進行状況: the search is [ZR] on every view, and the pill sends the
@@ -4927,9 +4924,9 @@ impl GuiState {
             // already does for a finger.
             Screen::Progress => {
                 let label = if ed.progress_filter.trim().is_empty() {
-                    String::from("[ZR] 検索")
+                    String::from("検索")
                 } else {
-                    format!("[ZR] {}", ed.progress_filter.trim())
+                    String::from(ed.progress_filter.trim())
                 };
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
@@ -4948,7 +4945,7 @@ impl GuiState {
                     // press then took the bit off. The row is the state
                     // machine's answer (Editor::progress_seen_label), the same
                     // one the press writes.
-                    let seen = format!("[R] {}", ed.progress_seen_label());
+                    let seen = String::from(ed.progress_seen_label());
                     btn_text(c, 1108, sy, 158, sh, &seen, t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::ProgressSeen);
                 }
@@ -4966,7 +4963,7 @@ impl GuiState {
                     sy,
                     302,
                     sh,
-                    "[Y] スナップショットへ戻す",
+                    "スナップショットへ戻す",
                     t.text_primary,
                     FontSize::Small,
                 );
@@ -4984,27 +4981,27 @@ impl GuiState {
                     // one pill of the three that drew as "[X] クリ..".
                     c.round_rect(964, sy, 94, sh, 5, t.bg_btn);
                     c.round_rect_border(964, sy, 94, sh, 5, 1, t.border_subtle);
-                    btn_text(c, 964, sy, 94, sh, "[Y] 検索", t.text_primary, FontSize::Small);
+                    btn_text(c, 964, sy, 94, sh, "検索", t.text_primary, FontSize::Small);
                     self.add_hit(964, sy, 94, sh, UiAction::Key(Key::Y));
 
                     c.round_rect(1064, sy, 96, sh, 5, t.bg_btn);
                     c.round_rect_border(1064, sy, 96, sh, 5, 1, t.border_subtle);
-                    btn_text(c, 1064, sy, 96, sh, "[ZR] 種別", t.text_secondary, FontSize::Small);
+                    btn_text(c, 1064, sy, 96, sh, "種別", t.text_secondary, FontSize::Small);
                     self.add_hit(1064, sy, 96, sh, UiAction::Key(Key::Z));
 
                     c.round_rect(1166, sy, 100, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1166, sy, 100, sh, 5, 1, t.accent_primary);
-                    btn_text(c, 1166, sy, 100, sh, "[X] クリア", t.text_primary, FontSize::Small);
+                    btn_text(c, 1166, sy, 100, sh, "クリア", t.text_primary, FontSize::Small);
                     self.add_hit(1166, sy, 100, sh, UiAction::Key(Key::X));
                 } else {
                     c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                     c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                    btn_text(c, 964, sy, 136, sh, "[Y] 検索", t.text_primary, FontSize::Small);
+                    btn_text(c, 964, sy, 136, sh, "検索", t.text_primary, FontSize::Small);
                     self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Y));
 
                     c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                    btn_text(c, 1108, sy, 158, sh, "[X] クリア", t.text_primary, FontSize::Small);
+                    btn_text(c, 1108, sy, 158, sh, "クリア", t.text_primary, FontSize::Small);
                     self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::X));
                 }
             }
@@ -5015,19 +5012,19 @@ impl GuiState {
             Screen::Csv => {
                 c.round_rect(964, sy, 136, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 136, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 136, sh, "[Y] 書き出し", t.text_primary, FontSize::Small);
+                btn_text(c, 964, sy, 136, sh, "書き出し", t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::Key(Key::Y));
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[ZR] 再読込", t.text_primary, FontSize::Small);
+                btn_text(c, 1108, sy, 158, sh, "再読込", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Z));
             }
             // セーブ内クエスト / 公式 / 没: [Y] is the search box.
             Screen::SaveQuests => {
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                btn_text(c, 1108, sy, 158, sh, "[Y] 検索", t.text_primary, FontSize::Small);
+                btn_text(c, 1108, sy, 158, sh, "検索", t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
             }
             // 生データ: the list is about a hundred named stretches, three of
@@ -5036,9 +5033,9 @@ impl GuiState {
             // it rather than leaving the shortened list unexplained.
             Screen::SaveMap if !ed.map_edit_open() => {
                 let label = if ed.map_filter.trim().is_empty() {
-                    String::from("[Y] 領域を検索")
+                    String::from("領域を検索")
                 } else {
-                    format!("[Y] 「{}」", ed.map_filter)
+                    format!("「{}」", ed.map_filter)
                 };
                 c.round_rect(964, sy, 302, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 302, sh, 5, 1, t.border_subtle);
@@ -5050,7 +5047,7 @@ impl GuiState {
             Screen::Review => {
                 c.round_rect(964, sy, 302, sh, 5, t.bg_btn);
                 c.round_rect_border(964, sy, 302, sh, 5, 1, t.border_subtle);
-                btn_text(c, 964, sy, 302, sh, "[Y] 一覧を作り直す", t.text_primary, FontSize::Small);
+                btn_text(c, 964, sy, 302, sh, "一覧を作り直す", t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 302, sh, UiAction::Key(Key::Y));
             }
             _ => {}
@@ -5612,7 +5609,7 @@ impl GuiState {
         let a_label = if pending.is_some() {
             "[A] 決定"
         } else if editing {
-            "[A] 編集終了"
+            "編集終了"
         } else {
             "[A] 編集する"
         };
@@ -6583,7 +6580,7 @@ impl GuiState {
                 btn_y,
                 iw - 40,
                 44,
-                "[A] テキスト編集",
+                &pill_word(ed, "A", "文章編集"),
                 white_or_dark(t.accent_primary),
                 FontSize::Medium,
             );
@@ -6596,7 +6593,7 @@ impl GuiState {
                 save_y,
                 iw - 40,
                 40,
-                "[X] 変更を保存",
+                &pill_word(ed, "X", "保存"),
                 UiAction::QuickSave,
             );
             return;
@@ -6631,7 +6628,7 @@ impl GuiState {
             // footer, and never drawn as a button.
             if let Some(label) = ed.empty_a_label() {
                 let btn_y = iy + 168;
-                let a_txt = format!("[A] {}", label);
+                let a_txt = pill_word(ed, "A", label);
                 c.round_rect(ix + 20, btn_y, iw - 40, 42, 6, t.accent_primary);
                 btn_text(
                     c,
@@ -6708,7 +6705,7 @@ impl GuiState {
 
         // Slot 5 (iy + 168, h = 42): Primary [A] Button
         let btn_y = iy + 168;
-        let a_txt = format!("[A] {}", primary_a_label);
+        let a_txt = pill_word(ed, "A", primary_a_label);
         c.round_rect(ix + 20, btn_y, iw - 40, 42, 6, t.accent_primary);
         btn_text(
             c,
@@ -6763,7 +6760,7 @@ impl GuiState {
                 cur_y,
                 full_w,
                 38,
-                "[Y] スキル / サポート行動",
+                &pill_word(ed, "Y", "タブ"),
                 UiAction::Key(Key::Y),
             );
             cur_y += 44;
@@ -6773,7 +6770,7 @@ impl GuiState {
                 cur_y,
                 full_w,
                 38,
-                "[B] 一覧に戻る",
+                &ed.b_word(),
                 UiAction::Key(Key::B),
             );
             return;
@@ -6816,7 +6813,7 @@ impl GuiState {
             let clear_lbl = if armed {
                 "もう一度タップで解除"
             } else {
-                "[-] 解除（2回）"
+                &pill_word(ed, "-", "解除（2回）")
             };
             self.draw_tool_button(c, ix + 20, cur_y, full_w, 38, clear_lbl, UiAction::Key(Key::Minus));
             cur_y += 44;
@@ -6826,13 +6823,18 @@ impl GuiState {
                 cur_y,
                 full_w,
                 38,
-                "[B] 一覧に戻る",
+                &ed.b_word(),
                 UiAction::Key(Key::B),
             );
             return;
         }
 
         // Slot 6: Numeric Stepper & Step Size Selector
+        //
+        // The pills are drawn only where the arrows read the table they draw
+        // (Editor::step_pills_live): オトモ moves by one and 環境設定's flags are
+        // 0 or 1, so the five pills there changed nothing at all. The stepper
+        // row itself stays on those screens because [MAX] lives in it.
         if has_stepper && !empty {
             let bw = (iw - 56) / 3; // 124px each
             // [◀ -]
@@ -6879,16 +6881,20 @@ impl GuiState {
 
             // Step size selector pills. The table is the one this screen really
             // steps by (the hunt screen's fifth entry is a direction flip, not
-            // a size) and the key named beside it is the key that cycles it.
-            // The table and the key are the state machine's (Editor::step_table):
-            // a copy here named [Y] on screens that spend it elsewhere.
+            // a size). The table is the state machine's (Editor::step_table),
+            // and the number the arrows take is its clamped entry
+            // (Editor::step_value) - the sub-bar's chip reads the same pair, so
+            // the strip above the list and the press below it cannot print two
+            // different steps for one pill.
+            //
+            // A screen whose arrows do not read the table draws no pills at all
+            // (Editor::step_pills_live): オトモ moves by one and 環境設定's
+            // flags are 0 or 1, so the five buttons there changed nothing.
             let (steps, _step_key) = ed.step_table();
-            // The label is the state machine's (Editor::step_pill_label): on
-            // the two forms every pad key is spent elsewhere, so the pills are
-            // the only route and the label says so instead of leaving the
-            // reader to look for a key that does not exist.
             let step_lbl = ed.step_pill_label();
-            c.text_sized(ix + 20, cur_y + 4, &step_lbl, t.text_secondary, FontSize::Small);
+            if ed.step_pills_live() {
+                c.text_sized(ix + 20, cur_y + 4, &step_lbl, t.text_secondary, FontSize::Small);
+            }
             // [R] 数値入力: the three screens that hold a number a user would
             // rather type than step (個数 / HR / 時間 / 狩猟数).
             //
@@ -6900,7 +6906,7 @@ impl GuiState {
             if ed.direct_input_available(row_idx) {
                 let rw = 116i32;
                 let rx = ix + iw - 20 - rw;
-                let r_lbl = format!("[R] {}", ed.key_label_or("R", "数値入力"));
+                let r_lbl = pill_word(ed, "R", "数値入力");
                 c.round_rect(rx, cur_y, rw, 24, 4, t.bg_btn);
                 c.round_rect_border(rx, cur_y, rw, 24, 4, 1, t.border_subtle);
                 btn_text(c, rx, cur_y, rw, 24, &r_lbl, t.text_primary, FontSize::Small);
@@ -6909,6 +6915,7 @@ impl GuiState {
             // Two short lines (label, then pills) so all five pills fit inside
             // the panel, and 24 + 34 in total: the tool deck below still ends
             // above the panel's bottom edge on every screen that draws it.
+            if ed.step_pills_live() {
             cur_y += 26;
             // Five pills, inside the panel: (428 - 40 of side margin - 4 gaps of
             // 6) / 5 = 72 wide, so the last one ends at ix+404 of ix+428.
@@ -6931,6 +6938,7 @@ impl GuiState {
                 sx += sw + gap;
             }
             cur_y += 34;
+            }
         }
 
         // Slot 7: Clean Tool Actions (No `★`, concise labels)
@@ -6986,7 +6994,7 @@ impl GuiState {
                             ix + 20,
                             cur_y,
                             full_w,
-                            "もう一度 [A] で実行（2回）",
+                            "もう一度で実行（2回）",
                             t.accent_warn,
                             FontSize::Small,
                         );
@@ -6997,7 +7005,7 @@ impl GuiState {
                             ix + 20,
                             cur_y,
                             full_w,
-                            "この画面では [X] が保存、[A] が実行です",
+                            "この画面では保存と実行が別のキーです",
                             t.text_muted,
                             FontSize::Small,
                         );
@@ -7009,7 +7017,7 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[B] メニューを閉じる",
+                        &ed.b_word(),
                         UiAction::Key(Key::B),
                     );
                 } else {
@@ -7034,7 +7042,7 @@ impl GuiState {
                         row_y(0),
                         full_w,
                         row_h(0),
-                        "[ZR] 一括操作メニュー",
+                        &pill_word(ed, "ZR", "一括"),
                         UiAction::OpenItemMenu,
                     );
                     self.draw_tool_button(
@@ -7078,9 +7086,9 @@ impl GuiState {
                     // [R] the count, [X] the save, and [-] is the delete key),
                     // so this pill sends the same key the pad does.
                     let search_lbl = if ed.item_box_filter.trim().is_empty() {
-                        "[ZR] 検索"
+                        "検索"
                     } else {
-                        "[ZR] 検索中"
+                        "検索中"
                     };
                     self.draw_tool_button(
                         c,
@@ -7097,9 +7105,9 @@ impl GuiState {
                     // five step pills in the stepper above are the control, and
                     // this screen has no key for it.
                     let empty_lbl = if ed.show_empty {
-                        "[Y] 空きを隠す"
+                        "空きを隠す"
                     } else {
-                        "[Y] 空きも表示"
+                        "空きも表示"
                     };
                     self.draw_tool_button(
                         c,
@@ -7125,7 +7133,7 @@ impl GuiState {
                 let del_label = if armed {
                     "もう一度タップで削除"
                 } else {
-                    "[-] 選択中の護石を削除（2回）"
+                    "選択中の護石を削除（2回）"
                 };
                 self.draw_tool_button(
                     c,
@@ -7138,9 +7146,9 @@ impl GuiState {
                 );
                 cur_y += 44;
                 let filter_lbl = if ed.charm_filter.trim().is_empty() {
-                    "[Y] 検索"
+                    "検索"
                 } else {
-                    "[Y] 検索を変更 / 空で解除"
+                    "検索を変更（空で解除）"
                 };
                 self.draw_tool_button(
                     c,
@@ -7166,7 +7174,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[Y] 名前で検索",
+                    "名前で検索",
                     UiAction::Key(Key::Y),
                 );
                 cur_y += 44;
@@ -7177,7 +7185,7 @@ impl GuiState {
                     // send [-] while its own label said [ZR], so the pad did
                     // nothing and the touch button did the one job [-] no
                     // longer has.
-                    let kind_lbl = format!("[ZR] 種別: {}", ed.equip_pick_kind_label());
+                    let kind_lbl = format!("{}: {}", pill_word(ed, "ZR", "種別"), ed.equip_pick_kind_label());
                     self.draw_tool_button(
                         c,
                         ix + 20,
@@ -7195,7 +7203,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[X] 検索をクリア",
+                    "検索をクリア",
                     UiAction::Key(Key::X),
                 );
             }
@@ -7210,7 +7218,7 @@ impl GuiState {
                 let del_label = if armed {
                     "削除する? もう一度タップ"
                 } else {
-                    "[-] 選択中の装備を削除（2回）"
+                    "選択中の装備を削除（2回）"
                 };
                 self.draw_tool_button(
                     c,
@@ -7235,9 +7243,9 @@ impl GuiState {
                 // The filter is on the heading, and this is the way out of it
                 // for a finger: [X] used to be the clear key and [X] is save.
                 let filter_lbl = if ed.equip_filter.trim().is_empty() {
-                    "[Y] 検索"
+                    "検索"
                 } else {
-                    "[Y] 検索を変更 / 空で解除"
+                    "検索を変更（空で解除）"
                 };
                 self.draw_tool_button(
                     c,
@@ -7296,7 +7304,7 @@ impl GuiState {
                     let from_lbl = if ed.item_set_armed == Some(ItemSetOp::FromPouch) {
                         "もう一度タップで取り込む"
                     } else {
-                        "[Y] ポーチから取り込む（2回）"
+                        "ポーチから取り込む（2回）"
                     };
                     self.draw_tool_button(
                         c,
@@ -7314,7 +7322,7 @@ impl GuiState {
                         // [R] is the same operation on the pad
                         // (hbedit::Editor::shoulder_job): the pill and the key
                         // run one method, so they cannot disagree.
-                        "[R] ポーチへ適用（2回）"
+                        "ポーチへ適用（2回）"
                     };
                     self.draw_tool_button(
                         c,
@@ -7332,7 +7340,7 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[B] 一覧に戻る",
+                        &ed.b_word(),
                         UiAction::Key(Key::B),
                     );
                 } else if ed.set_edit.is_some() {
@@ -7347,14 +7355,14 @@ impl GuiState {
                         // This sent X, and X is the save key (QuickSave): a
                         // tap on "re-read the warnings" opened the save review
                         // instead. The state machine answers Y on this screen.
-                        "[Y] 警告を読み直す",
+                        "警告を読み直す",
                         UiAction::Key(Key::Y),
                     );
                     cur_y += 44;
                     let clear_label = if ed.set_clear_armed.is_some() {
                         "もう一度タップで部位を解除"
                     } else {
-                        "[-] 部位を解除（2回）"
+                        "部位を解除（2回）"
                     };
                     self.draw_tool_button(
                         c,
@@ -7372,7 +7380,7 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[B] 一覧に戻る",
+                        &ed.b_word(),
                         UiAction::Key(Key::B),
                     );
                 } else {
@@ -7386,7 +7394,7 @@ impl GuiState {
                         38,
                         // The table's word (タブ), not a second one: the
                         // footer said タブ and this button said 切替.
-                        &format!("[◀/▶] {}", ed.key_label_or("◀/▶", "タブ")),
+                        &pill_word(ed, "◀/▶", "タブ"),
                         UiAction::Key(Key::Right),
                     );
                 }
@@ -7412,7 +7420,7 @@ impl GuiState {
                     1 => "なつき度",
                     _ => "EXP",
                 };
-                let col_lbl = format!("[Y] 編集列: {}", col);
+                let col_lbl = format!("編集列: {}", col);
                 self.draw_tool_button(
                     c,
                     ix + 20,
@@ -7431,7 +7439,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[+] スキル / サポート行動",
+                    &pill_word(ed, "＋", "スキル"),
                     UiAction::Key(Key::Plus),
                 );
             }
@@ -7450,7 +7458,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    &format!("[◀/▶] {}", ed.palico_lang_label()),
+                    &ed.palico_lang_label(),
                     UiAction::TogglePalicoLang,
                 );
                 cur_y += 44;
@@ -7462,7 +7470,7 @@ impl GuiState {
                     38,
                     // The key table's word, not a second sentence: the footer
                     // says 全導入2回 and this button said 全84匹を一括導入.
-                    &format!("[Y] {}", ed.key_label_or("Y", "全導入2回")),
+                    &pill_word(ed, "Y", "全導入2回"),
                     UiAction::InstallAllPalicoes,
                 );
             }
@@ -7537,7 +7545,7 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[-] 選択中のクエストを削除（2回）",
+                        "選択中のクエストを削除（2回）",
                         UiAction::Key(Key::Minus),
                     );
                     cur_y += 44;
@@ -7547,17 +7555,17 @@ impl GuiState {
                 // quests, the save list for the .arc list). A list with no rows
                 // - an empty save, a folder with no .arc - left the four bulk
                 // buttons as the only thing a finger could press.
+                // The word is the state machine's (Editor::b_word): the
+                // destination's name, which on these two lists is SD(.arc) for
+                // the save's quests and セーブ一覧 for the .arc list.
+                let out_word = ed.b_word();
                 self.draw_tool_button(
                     c,
                     ix + 20,
                     cur_y,
                     full_w,
                     38,
-                    if ed.screen == Screen::SaveQuests {
-                        "[B] SD(.arc) へ"
-                    } else {
-                        "[B] セーブ一覧へ"
-                    },
+                    &out_word,
                     UiAction::Key(Key::B),
                 );
             }
@@ -7570,7 +7578,7 @@ impl GuiState {
                     c.text_sized(
                         ix + 20,
                         cur_y,
-                        "モンスター個別パラメータ ([ZR] またはタッチで選択)",
+                        "モンスター個別パラメータ（タップで選択）",
                         t.text_muted,
                         FontSize::Small,
                     );
@@ -7670,13 +7678,13 @@ impl GuiState {
                         cur_y,
                         full_w,
                         34,
-                        &format!("[ZR] 編集する項目: {}", field),
+                        &format!("編集する項目: {}", field),
                         UiAction::Key(Key::Z),
                     );
                     cur_y += 38;
                     // The word is the key table's (Editor::key_label_or): this
                     // panel and the footer name one key.
-                    let r_lbl = format!("[R] {}", ed.key_label_or("R", "数値入力"));
+                    let r_lbl = pill_word(ed, "R", "数値入力");
                     self.draw_tool_button(
                         c,
                         ix + 20,
@@ -7692,7 +7700,7 @@ impl GuiState {
                         cur_y,
                         half_w,
                         34,
-                        "[X] 保存",
+                        &pill_word(ed, "X", "保存"),
                         UiAction::QuickSave,
                     );
                 } else {
@@ -7702,7 +7710,7 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[X] 変更を保存",
+                        &pill_word(ed, "X", "保存"),
                         UiAction::QuickSave,
                     );
                 }
@@ -7757,7 +7765,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[X] 変更を保存",
+                    &pill_word(ed, "X", "保存"),
                     UiAction::QuickSave,
                 );
             }
@@ -7788,7 +7796,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[X] 変更を保存",
+                    &pill_word(ed, "X", "保存"),
                     UiAction::QuickSave,
                 );
             }
@@ -7805,7 +7813,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[Y] 2つの BOX を書き出す",
+                    "2つの BOX を書き出す",
                     UiAction::Key(Key::Y),
                 );
                 cur_y += 44;
@@ -7815,7 +7823,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[ZR] フォルダを読み直す",
+                    "フォルダを読み直す",
                     UiAction::Key(Key::Z),
                 );
                 cur_y += 44;
@@ -7826,9 +7834,9 @@ impl GuiState {
                     full_w,
                     38,
                     if ed.csv_armed.is_some() {
-                        "[A] もう一度で適用"
+                        "もう一度で適用"
                     } else {
-                        "[A] 選んだ CSV を適用（2回）"
+                        "選んだ CSV を適用（2回）"
                     },
                     UiAction::Key(Key::A),
                 );
@@ -7849,7 +7857,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[Y] 再読込（カードを読み直す）",
+                    "再読込（カードを読み直す）",
                     UiAction::Rescan,
                 );
                 cur_y += 44;
@@ -7860,7 +7868,7 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[X] 変更を保存",
+                        &pill_word(ed, "X", "保存"),
                         UiAction::QuickSave,
                     );
                 } else {
@@ -7869,9 +7877,9 @@ impl GuiState {
                         cur_y,
                         full_w,
                         if ed.save_files.is_empty() {
-                            "セーブが見つかりません（switch/XXSE/saves/ に置いて [Y]）"
+                            "セーブが見つかりません（switch/XXSE/saves/ に置いて再読込）"
                         } else {
-                            "開いているセーブはありません（[A] で開く）"
+                            "開いているセーブはありません（一覧から開いてください）"
                         },
                         t.text_muted,
                         FontSize::Small,
@@ -7892,7 +7900,7 @@ impl GuiState {
                     cur_y,
                     half_w,
                     38,
-                    "[ZR] 進行状況",
+                    &pill_word(ed, "ZR", "進行状況"),
                     UiAction::Key(Key::Z),
                 );
                 self.draw_tool_button(
@@ -7914,7 +7922,7 @@ impl GuiState {
                     // The word is the key table's (Editor::key_label_or): the
                     // footer says キャラ and this button said スロット for the
                     // same press - two names for one destination.
-                    &format!("[B] {}", ed.key_label_or("B", "キャラ")),
+                    &ed.b_word(),
                     UiAction::Key(Key::B),
                 );
                 self.draw_tool_button(
@@ -7923,7 +7931,7 @@ impl GuiState {
                     cur_y,
                     half_w,
                     38,
-                    "[X] 変更を保存",
+                    &pill_word(ed, "X", "保存"),
                     UiAction::QuickSave,
                 );
             }
@@ -7938,7 +7946,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[B] ファイル一覧へ",
+                    &ed.b_word(),
                     UiAction::Key(Key::B),
                 );
                 cur_y += 44;
@@ -7948,7 +7956,7 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[X] .arc 保存",
+                    ".arc 保存",
                     UiAction::QuickSave,
                 );
             }
@@ -7961,13 +7969,26 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    "[X] 変更を保存",
+                    &pill_word(ed, "X", "保存"),
                     UiAction::QuickSave,
                 );
             }
         }
     }
 
+    /// The word a pill prints for the key that runs it.
+    ///
+    /// A pill is a button, not a key. The footer is the one surface that names
+    /// keys, and every pill that printed "[ZR]" was a second surface claiming
+    /// one: the sixth review counted four wordings for one [ZR] press on the
+    /// item box alone (一括操作 on the bar, 一括操作メニュー and 検索 in the deck,
+    /// 一括 on the footer), and the 検索 pill named a key that does not search
+    /// at all - the search is a row *inside* the menu [ZR] opens.
+    ///
+    /// The word is the table's (Editor::key_label_or), so a pill and the footer
+    /// cannot describe one action two ways. A pill whose action the table does
+    /// not carry (the two-stage add, an armed confirmation, a state toggle)
+    /// keeps its own word and still names no key.
     fn draw_tool_button(
         &mut self,
         c: &mut Canvas,
@@ -8130,7 +8151,7 @@ impl GuiState {
                     btn_y,
                     card_w - 40,
                     42,
-                    "[A] このキャラを編集",
+                    &pill_word(ed, "A", "このキャラを編集"),
                     btn_fg,
                     FontSize::Medium,
                 );
@@ -8219,7 +8240,7 @@ impl GuiState {
                 let btn_y = by + 216;
                 c.round_rect(MAIN_X + 28, btn_y, 200, 44, 6, t.bg_btn);
                 c.round_rect_border(MAIN_X + 28, btn_y, 200, 44, 6, 1, t.border_subtle);
-                btn_text(c, MAIN_X + 28, btn_y, 200, 44, "[Y] 出力名変更", t.text_primary, FontSize::Small);
+                btn_text(c, MAIN_X + 28, btn_y, 200, 44, &pill_word(ed, "Y", "出力名変更"), t.text_primary, FontSize::Small);
                 self.add_hit(MAIN_X + 28, btn_y, 200, 44, UiAction::Key(Key::Y));
 
                 c.round_rect(MAIN_X + 244, btn_y, 220, 44, 6, t.accent_primary);
@@ -8229,7 +8250,7 @@ impl GuiState {
                     btn_y,
                     220,
                     44,
-                    "[A] 変換出力",
+                    &pill_word(ed, "A", "変換出力"),
                     white_or_dark(t.accent_primary),
                     FontSize::Medium,
                 );
@@ -8292,7 +8313,7 @@ impl GuiState {
             mhnx_core::hbedit::OPTION_BRIGHTNESS_MAX
         );
         // The two words the panel used to print were both wrong: "[A] 切替"
-        // named a key that saves the card, and "刻み [Y]" named a key that
+        // named a key that saves the card, and the step label named a key that
         // restores the snapshot. [A]'s word is the state machine's now
         // (options_a_label), and the step label names no key (step_table) - the
         // five pills are the only step control here. The stepper row stays
@@ -9825,8 +9846,9 @@ impl GuiState {
         let half = (iw - 48) / 2; // 190
         // The card's [R] word is the table's: the card view says 数値 (its line
         // is full) and the other three views say 数値入力, so a copy written
-        // here would be wrong on one of them.
-        let r_lbl = format!("[R] {}", ed.key_label_or("R", "数値入力"));
+        // here would be wrong on one of them. The button prints no key: the
+        // footer names it (the sixth review's leftovers).
+        let r_lbl = pill_word(ed, "R", "数値入力");
         self.draw_tool_button(c, ix + 20, iy + 322, half, 40, &r_lbl, UiAction::Key(Key::R));
         self.draw_tool_button(
             c,
@@ -9834,7 +9856,7 @@ impl GuiState {
             iy + 322,
             half,
             40,
-            "[X] 保存",
+            &pill_word(ed, "X", "保存"),
             UiAction::QuickSave,
         );
         self.draw_tool_button(
@@ -9843,7 +9865,7 @@ impl GuiState {
             iy + 372,
             iw - 40,
             40,
-            "[B] ギルドカードへ",
+            &ed.b_word(),
             UiAction::Key(Key::B),
         );
 
@@ -10147,14 +10169,14 @@ impl GuiState {
         self.add_hit(ix + 20, iy + 268, iw - 40, 44, UiAction::Key(Key::A));
 
         let half = (iw - 48) / 2; // 190
-        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, "[Y] 直接入力", UiAction::Key(Key::Y));
+        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, &pill_word(ed, "Y", "直接入力"), UiAction::Key(Key::Y));
         self.draw_tool_button(
             c,
             ix + 28 + half,
             iy + 322,
             half,
             40,
-            "[X] 保存",
+            &pill_word(ed, "X", "保存"),
             UiAction::QuickSave,
         );
         self.draw_tool_button(
@@ -10163,7 +10185,7 @@ impl GuiState {
             iy + 372,
             iw - 40,
             40,
-            "[B] ギルドカードへ",
+            &ed.b_word(),
             UiAction::Key(Key::B),
         );
 
@@ -11258,14 +11280,45 @@ impl GuiState {
                 FontSize::Small,
             );
         }
-        // The key legend names the line-break key, because a player who is not
-        // told about it will never find it. A one-line field says so instead.
-        let legend = if osk.spec.multiline {
-            "[A] 入力  [B] 削除  [X] 全消去（2回）  [ZR] 改行  [L/R] 文字種  [+] 確定"
+        // The key row, one table for the buttons at the bottom and the legend
+        // here. The legend's word for [B] was the short one while the button's
+        // was 1字削除, it called the clear key 全消去 where the button said
+        // クリア, and it
+        // named neither [Y] nor [-] while the row carried both: the two were
+        // written twice and had drifted. The legend is this table rendered, so a
+        // key added here is on both surfaces.
+        let newline_bg = if osk.spec.multiline {
+            t.bg_btn_primary
         } else {
-            "[A] 入力  [B] 削除  [X] 全消去（2回）  [L/R] 文字種  [+] 確定（改行不可）"
+            t.bg_btn
         };
-        c.text_right(mx + mw - 24, my + 20, legend, t.text_secondary, FontSize::Small);
+        let actions: [(&str, &str, i32, Color, Color, UiAction); 7] = [
+            ("B", "1字削除", 128, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
+            ("X", "クリア（2回）", 150, t.bg_danger, t.accent_danger, UiAction::OskClear),
+            ("Y", "濁点/小字", 148, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
+            (
+                if osk.spec.multiline { "ZR" } else { "" },
+                if osk.spec.multiline { "改行" } else { "改行不可" },
+                124,
+                newline_bg,
+                t.accent_primary,
+                UiAction::OskNewline,
+            ),
+            ("", "空白", 84, t.bg_btn, t.border_subtle, UiAction::OskSpace),
+            ("-", "取消", 128, t.bg_btn, t.border_subtle, UiAction::OskCancel),
+            ("＋", "確定", 180, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
+        ];
+        // The two keys that are not buttons: [A] presses the selected cell and
+        // the shoulders walk the four character tabs.
+        let mut legend = String::from("[A] 入力  [L/R] 文字種");
+        for &(key, word, ..) in actions.iter() {
+            if key.is_empty() {
+                continue;
+            }
+            legend.push_str("  ");
+            legend.push_str(&osk_key_label(key, word));
+        }
+        c.text_right(mx + mw - 24, my + 20, &legend, t.text_secondary, FontSize::Small);
 
         let ib_x = mx + 24;
         let ib_y = my + 56;
@@ -11381,40 +11434,15 @@ impl GuiState {
         // Bottom Action Buttons Row
         let by = my + 560;
         let bh = 48;
-        // The line-break key sits in the footer, next to the rest: ZR inserts
-        // U+000A, which a name field stores as one byte (UTF-8) or the unit
-        // 0x000A (the two guild card fields).
-        let newline_bg = if osk.spec.multiline {
-            t.bg_btn_primary
-        } else {
-            t.bg_btn
-        };
-        let actions: &[(&str, i32, Color, Color, UiAction)] = &[
-            ("[B] 1字削除", 128, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
-            (
-                "[X] クリア（2回）",
-                150,
-                t.bg_danger,
-                t.accent_danger,
-                UiAction::OskClear,
-            ),
-            ("[Y] 濁点/小字", 148, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
-            (
-                if osk.spec.multiline { "[ZR] 改行" } else { "改行不可" },
-                124,
-                newline_bg,
-                t.accent_primary,
-                UiAction::OskNewline,
-            ),
-            ("空白", 84, t.bg_btn, t.border_subtle, UiAction::OskSpace),
-            ("[-] 取消", 128, t.bg_btn, t.border_subtle, UiAction::OskCancel),
-            ("[+] 確定", 180, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
-        ];
+        // The same table the legend above is built from: a button prints the
+        // key and the word the legend prints, so the two cannot describe one
+        // press two ways.
         let mut bx = ib_x;
-        for &(label, bw, bg, border, act) in actions {
+        for &(key, word, bw, bg, border, act) in actions.iter() {
+            let label = osk_key_label(key, word);
             c.round_rect(bx, by, bw, bh, 6, bg);
             c.round_rect_border(bx, by, bw, bh, 6, 1, border);
-            btn_text(c, bx, by, bw, bh, label, white_or_dark(bg), FontSize::Small);
+            btn_text(c, bx, by, bw, bh, &label, white_or_dark(bg), FontSize::Small);
             self.add_hit(bx, by, bw, bh, act);
             bx += bw + 12;
         }
@@ -11465,6 +11493,25 @@ fn draw_name_box(
 /// One word describes a narrowed list on every screen: 検索. The verbs 絞る /
 /// 絞り込み used to appear here, on the talisman pill and in two headings for
 /// the same thing, which is the drift the review found.
+/// The word a pill prints for the key that runs it: the table's, never a key
+/// name. See the note above `GuiState::draw_tool_button`.
+fn pill_word(ed: &Editor, key: &str, fallback: &str) -> String {
+    ed.key_label_or(key, fallback)
+}
+
+/// One button of the software keyboard's key row, as the legend and the button
+/// both print it.
+///
+/// A keyless entry ("空白") is a button and not a key: it prints its word and
+/// the legend leaves it out, because the legend is a list of keys.
+fn osk_key_label(key: &str, word: &str) -> String {
+    if key.is_empty() {
+        String::from(word)
+    } else {
+        format!("[{}] {}", key, word)
+    }
+}
+
 fn filter_chip(ed: &Editor) -> Option<String> {
     match ed.screen {
         // The item box's hide-empty toggle. The name search has its own line:

@@ -42,6 +42,11 @@ fn readme() -> &'static str {
     include_str!("../../../README.md")
 }
 
+/// The state machine's source: the one table of screen names and key words.
+fn hbedit_src() -> &'static str {
+    include_str!("../src/hbedit.rs")
+}
+
 /// The body of one fn in a source text, from its signature to its closing
 /// brace (depth counting, the same way tests/key_hints.rs cuts a handler out).
 fn fn_body<'a>(src: &'a str, needle: &str) -> &'a str {
@@ -1462,10 +1467,24 @@ fn an_empty_list_keeps_its_way_out_on_the_deck() {
     assert!(arm_of("Screen::SaveList =>").contains("UiAction::Rescan"));
     assert!(arm_of("Screen::Guild =>").contains("UiAction::Key(Key::B)"));
     assert!(arm_of("Screen::Check =>").contains("UiAction::Key(Key::B)"));
+    // The button prints the destination's name and no key: the footer is the
+    // one surface that names keys (the sixth review's leftovers), and the word
+    // is the state machine's (Editor::b_word).
     let quests = arm_of("Screen::SaveQuests | Screen::ArcList =>");
     assert!(
-        quests.contains("[B] SD(.arc) へ") && quests.contains("[B] セーブ一覧へ"),
+        quests.contains("ed.b_word()") && quests.contains("UiAction::Key(Key::B)"),
         "both quest lists need their way out: {quests}"
+    );
+    // Only the code lines are read: the comments in this arm explain the keys
+    // (they say why each button exists).
+    let code: String = quests
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !code.contains("[B] "),
+        "the deck's buttons must not name keys: {code}"
     );
     // The keys those buttons send are the keys the dispatch answers.
     for (screen, key) in [
@@ -1867,12 +1886,14 @@ fn the_slot_word_is_the_one_the_screen_prints() {
             ed.open_charms();
         }
         let footer = ed.footer_hint();
-        assert!(footer.contains("[B] キャラ"), "{screen:?}: {footer}");
+        // The slot list's name on the bar is スロット, and that is the word the
+        // [B] item prints (hbedit::screen_name).
+        assert!(footer.contains("[B] スロット"), "{screen:?}: {footer}");
         assert!(!footer.contains("枠選択"), "{screen:?}: {footer}");
     }
     let ed = editor_with(blank_save(), Screen::Guild);
     let footer = ed.footer_hint();
-    assert!(footer.contains("[B] キャラ"), "{footer}");
+    assert!(footer.contains("[B] スロット"), "{footer}");
     // The guide prints the same table's first items, so it cannot name a
     // different destination for [B] than the footer does.
     let guide = ed.screen_guide();
@@ -1885,8 +1906,10 @@ fn the_slot_word_is_the_one_the_screen_prints() {
         !switch_editor_src().contains("枠選択"),
         "the text build still says 枠選択"
     );
-    // The destination screen prints the same word.
-    assert!(ui_src().contains("\"キャラ選択\""));
+    // The destination screen prints the same word: one table of names
+    // (hbedit::screen_name), read by the bar, the header and every [B].
+    assert!(hbedit_src().contains("Screen::Slots => \"スロット\""));
+    assert!(ui_src().contains("\"スロット\""));
 }
 
 // ---------------------------------------------------------------------------

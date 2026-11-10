@@ -995,9 +995,7 @@ impl Painter {
                     if !bar.is_empty() {
                         bar.push_str("   ");
                     }
-                    bar.push_str(k);
-                    bar.push(' ');
-                    bar.push_str(&label);
+                    bar.push_str(&chip_text(k, &label));
                 }
                 sys::log_line(&bar);
                 unsafe { sys::consoleUpdate(core::ptr::null_mut()) };
@@ -1010,45 +1008,14 @@ impl Painter {
 }
 
 /// Screen title shown in the header.
+///
+/// The name is the state machine's (hbedit::screen_name), and it is the same
+/// name every [B] item of the key table prints: a screen cannot be セーブを開く
+/// in the header and セーブ一覧 on the key that goes back to it. The sixth
+/// review counted twelve words for [B] across the app, three of them on the
+/// guild card alone for two destinations.
 pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
-    use mhnx_core::hbedit::Screen::*;
-    match screen {
-        SaveList => "セーブを開く",
-        Convert => "3DS <-> Switch 変換",
-        Slots => "キャラ選択",
-        Char => "キャラクター編集",
-        Items => "アイテムボックス",
-        ItemPick => "アイテムを選ぶ",
-        Charms => "護石",
-        CharmEdit => "護石編集",
-        SkillPick => "スキルを選ぶ",
-        Equip => "装備",
-        EquipEdit => "装備編集",
-        JewelPick => "装飾品を選ぶ",
-        EquipPick => "装備を名前で選ぶ",
-        QuestEquip => "クエスト装備",
-        SaveQuests => "クエスト (セーブ内)",
-        ArcList => "クエスト (.arc)",
-        QuestEdit => "クエスト改造",
-        ArcEntries => "クエストの中身",
-        EntryView => "エントリ",
-        Mib => "クエスト条件",
-        Gmd => "クエスト本文",
-        Check => "クエスト検査",
-        Hunts => "狩猟記録",
-        Guild => "ギルドカード",
-        Progress => "進行状況",
-        Roster => "オトモ",
-        Sets => "マイセット",
-        Palico => "配信オトモ",
-        Options => "設定",
-        Csv => "CSV 入出力",
-        // 詳細: the bytes behind the screen 詳細 was pressed on.
-        SaveMap => "生データ",
-        // 変更一覧: what the open save differs from the card in, one value a
-        // line, each one restorable on its own.
-        Review => "変更一覧",
-    }
+    mhnx_core::hbedit::screen_name(screen)
 }
 
 /// The buttons that do something on this screen, as (key, label).
@@ -1063,11 +1030,27 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
 /// named different jobs for one key - the .mib [ZR] on every row, the reward
 /// [ZR] with two stops instead of three, the talisman form's [B] as 戻る.
 pub(crate) fn actions(ed: &Editor) -> Vec<(&'static str, String)> {
+    // Every item, with no filter: the table has no keyless notes any more, and
+    // the two it used to have (the section pair and the way out of a screen
+    // whose [＋] is a tool) were dropped here and by the guide - so the note
+    // that says how to leave appeared on the footer and nowhere else.
     ed.key_facts()
         .into_iter()
-        .filter(|fact| !fact.key.is_empty())
         .map(|fact| (fact.key, fact.label))
         .collect()
+}
+
+/// One chip of the text build's key row, as the row prints it.
+///
+/// The note items name no key, so they print their sentence and no bracket: the
+/// row used to drop them, and the one line that says how to leave a screen whose
+/// [＋] is a tool was on the canvas footer and nowhere else.
+pub(crate) fn chip_text(key: &str, label: &str) -> String {
+    if key.is_empty() {
+        alloc::string::String::from(label)
+    } else {
+        alloc::format!("{} {}", key, label)
+    }
 }
 
 // ---------------------------------------------------------------------------

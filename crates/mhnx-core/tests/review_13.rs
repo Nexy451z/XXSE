@@ -362,7 +362,10 @@ fn the_way_out_is_on_every_guide_that_has_one() {
     ed.screen = Screen::Sets;
     assert!(ed.open_set_editor(0), "{}", ed.message);
     assert!(
-        ed.footer_hint().contains("[B] 一覧（2回で破棄）"),
+        // The destination's name, not a verb: the form's [B] goes to the
+        // my-sets list and the word says so (the sixth review's leftovers
+        // unified every [B] to the screen it goes to).
+        ed.footer_hint().contains("[B] マイセット（2回で破棄）"),
         "{}",
         ed.footer_hint()
     );
@@ -440,7 +443,9 @@ fn the_item_box_search_is_a_key_and_both_footers_name_the_way_back() {
     // The list's own line names the key; the menu has a line of its own.
     let hint = ed.footer_hint();
     assert!(hint.contains("[ZR] 一括"), "{hint}");
-    assert!(hint.contains("[B] 戻る"), "{hint}");
+    // [B] names the screen it goes to: the item box's way back is the slot
+    // list, and the word is that screen's name.
+    assert!(hint.contains("[B] スロット"), "{hint}");
     ed.input(Key::Z);
     assert!(ed.item_menu_open, "[ZR] opens the bulk menu: {}", ed.message);
     // The search is one of its rows, and it is the row that asks for a name.
@@ -465,7 +470,9 @@ fn the_item_box_search_is_a_key_and_both_footers_name_the_way_back() {
     );
     let hint = ed.footer_hint();
     assert!(hint.contains("[Y] 検索"), "{hint}");
-    assert!(hint.contains("[B] キャラ"), "{hint}");
+    // The destination's name (the sixth review's leftovers): the slot list is
+    // スロット on the bar, and every [B] says where it goes.
+    assert!(hint.contains("[B] スロット"), "{hint}");
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::Slots, "and the word is true");
 }
@@ -682,7 +689,10 @@ fn minus_is_the_delete_key_and_nothing_else() {
         assert!(guide.contains("[-] で削除（2回）"), "{guide}");
     }
     assert!(
-        ui_src().contains("[-] 選択中のクエストを削除（2回）"),
+        // The deck's button names the delete without naming the key: the
+        // footer is the one surface that prints a key, and the button prints
+        // the action (the sixth review's leftovers).
+        ui_src().contains("選択中のクエストを削除（2回）"),
         "the deck's button names the delete"
     );
 }

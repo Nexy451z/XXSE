@@ -300,20 +300,21 @@ fn the_quest_row_survives_the_item_pick_and_the_item_tabs_can_be_searched() {
     // third review's finding 5): it used to, every other press, which left no
     // way back to 個数. Its stops are cells, not the search (the fourth
     // review's finding 17, and the fifth's #4).
+    // The sixth review's leftovers: 個数 ⇄ 確率% is the whole cycle. The item
+    // cell is [A]'s, so [ZR] never lands on it - the third stop could only
+    // refuse the arrows.
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     ed.input(Key::Z);
     assert!(ed.quest_edit_chance(), "the first stop is the chance column");
     ed.input(Key::Z);
     assert_eq!(
         ed.quest_reward_field,
-        mhnx_core::hbedit::QUEST_REWARD_ITEM,
-        "the item cell is a stop of its own"
-    );
-    ed.input(Key::Z);
-    assert_eq!(
-        ed.quest_reward_field,
         mhnx_core::hbedit::QUEST_REWARD_COUNT,
-        "three stops: back to the count"
+        "two stops: back to the count"
+    );
+    assert!(
+        ed.quest_reward_field != mhnx_core::hbedit::QUEST_REWARD_ITEM,
+        "the item cell is not a stop"
     );
     assert_eq!(ed.take_text_request(), None, "the cycle opens no keyboard");
     // The search is its own press: [R] on the same tab.
@@ -534,8 +535,14 @@ fn the_roster_names_its_column_key() {
         "the guide still fits: {}px",
         hbedit::caption_width(&hint)
     );
+    // The pill prints the table's word and the state, and no key: the footer is
+    // the one surface that names keys (the sixth review's leftovers).
     let deck = fn_body(ui_src(), "fn draw_sub_bar_quick_tools");
-    assert!(deck.contains("[Y] 列"), "the deck names it too");
+    assert!(
+        deck.contains("pill_word(ed, \"Y\", \"列\")"),
+        "the pill borrows the table's word"
+    );
+    assert!(!deck.contains("[Y] 列"), "and prints no key");
 }
 
 // ---------------------------------------------------------------------------
@@ -549,7 +556,9 @@ fn the_guild_card_footer_names_the_way_out() {
     ed.screen = Screen::Guild;
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_CARD);
     let hint = ed.footer_hint();
-    assert!(hint.contains("[B] キャラ"), "the footer names [B] and where it goes: {hint}");
+    // The destination's name: the card's [B] goes to the slot list, and the
+    // bar calls it スロット (hbedit::screen_name).
+    assert!(hint.contains("[B] スロット"), "the footer names [B] and where it goes: {hint}");
     assert!(
         hbedit::caption_width(&hint) <= hbedit::FOOTER_HINT_ROOM,
         "the guide still fits: {}px",

@@ -434,9 +434,16 @@ fn the_name_keyboards_clear_key_asks_twice() {
         "the clear must not run on the first press: {body}"
     );
     // The legend names the key and the second press, so the rule is not a
-    // secret the user has to discover.
+    // secret the user has to discover. The legend and the button row are one
+    // table now (the sixth review's leftovers): the word is クリア（2回） on
+    // both, where the legend used to say 全消去 over a button that said クリア.
     let draw = fn_body(ui_src(), "fn draw_osk");
-    assert!(draw.contains("[X] 全消去（2回）"), "{draw}");
+    assert!(
+        draw.contains("(\"X\", \"クリア（2回）\""),
+        "{draw}"
+    );
+    assert!(!draw.contains("[X] 全消去"), "{draw}");
+    assert!(draw.contains("osk_key_label"), "the legend is the row: {draw}");
     // The touch button takes the same two presses: a finger and a key must not
     // cost a different number of presses for the same delete.
     let touch = fn_body(ui_src(), "UiAction::OskClear =>");
@@ -650,9 +657,15 @@ fn the_item_set_name_is_a_key_the_pad_can_press() {
         "ZR has to open the set-name keyboard"
     );
     // The touch route: the deck's pill sends the same key.
+    // The pill prints the action and no key: the footer is the one surface
+    // that names keys (the sixth review's leftovers).
     assert!(
-        ui_src().contains("[ZR] セット名"),
+        ui_src().contains("\"セット名\""),
         "the item set form needs a pill a finger can press"
+    );
+    assert!(
+        !ui_src().contains("[ZR] セット名"),
+        "the pill must not name the key"
     );
 }
 
@@ -667,7 +680,8 @@ fn the_talisman_list_says_where_b_goes() {
     let mut ed = open_blank();
     ed.open_charms();
     let hint = ed.footer_hint();
-    assert!(hint.contains("[B] キャラ"), "{hint}");
+    // The destination's name, and the slot list's name on the bar is スロット.
+    assert!(hint.contains("[B] スロット"), "{hint}");
     assert!(!hint.contains("[B] 戻る"), "{hint}");
     // And the guide is telling the truth.
     ed.input(Key::B);

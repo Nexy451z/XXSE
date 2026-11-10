@@ -568,9 +568,11 @@ fn the_quest_footer_follows_the_row() {
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     let rewards = ed.footer_hint();
     assert!(rewards.contains("[R] 検索"), "{rewards}");
+    // Two stops: アイテム is [A]'s cell, so [ZR] walks 個数 ⇄ 確率% (the sixth
+    // review's leftovers - the third stop could only refuse the arrows).
     assert!(
-        rewards.contains("[ZR] 段送り（3段）"),
-        "the three cells are named: {rewards}"
+        rewards.contains("[ZR] 段送り（2段）"),
+        "the two cells are named: {rewards}"
     );
     ed.quest_set_tab(QUEST_TAB_SUPPLIES);
     let supplies = ed.footer_hint();
@@ -812,21 +814,21 @@ fn a_tab_step_keeps_the_row() {
 /// D17: the 報酬 tab's [ZR] walks the row's three cells - アイテム / 個数 /
 /// 確率% - the same count the row's own screen walks.
 #[test]
-fn the_reward_value_switch_has_three_stops() {
+fn the_reward_value_switch_has_two_stops() {
     let mut ed = editor_with_quest();
     ed.open_quest_from_save(QUEST_ID);
     ed.quest_set_tab(QUEST_TAB_REWARDS);
-    assert_eq!(QUEST_REWARD_FIELDS, 3, "アイテム / 個数 / 確率%, and nothing else");
+    // The row still holds three cells; [ZR] walks the two the arrows can move.
+    assert_eq!(QUEST_REWARD_FIELDS, 3, "アイテム / 個数 / 確率%");
     assert_eq!(ed.quest_reward_field, QUEST_REWARD_COUNT);
     ed.input(Key::Z);
     assert_eq!(ed.quest_reward_field, QUEST_REWARD_CHANCE);
     ed.input(Key::Z);
-    assert_eq!(ed.quest_reward_field, QUEST_REWARD_ITEM);
-    ed.input(Key::Z);
     assert_eq!(
         ed.quest_reward_field, QUEST_REWARD_COUNT,
-        "three stops, and back to the count"
+        "two stops, and back to the count - アイテム is [A]'s"
     );
+    assert!(ed.quest_reward_field != QUEST_REWARD_ITEM);
     // The search is its own press on both tabs.
     ed.input(Key::R);
     assert_eq!(
@@ -835,7 +837,7 @@ fn the_reward_value_switch_has_three_stops() {
     );
     let hint = ed.footer_hint();
     assert!(hint.contains("[R] 検索"), "{hint}");
-    assert!(hint.contains("[ZR] 段送り（3段）"), "{hint}");
+    assert!(hint.contains("[ZR] 段送り（2段）"), "{hint}");
 }
 
 /// D18: the two record forms' pills offered the shared table's ±100 / ±1000 /
@@ -942,11 +944,21 @@ fn the_number_key_has_one_name() {
     let ui = ui_src();
     // Every [R] the console draws borrows the table's word: the inspector pill,
     // the reward / supply panel's button and the card's button.
+    // The sixth review's leftovers: the buttons name no key at all, so they
+    // borrow the word through pill_word (the table's word, no bracket).
     assert_eq!(
-        ui.matches("ed.key_label_or(\"R\"").count(),
+        ui.matches("pill_word(ed, \"R\"").count(),
         3,
         "every [R] button borrows the table's word"
     );
+    // Only the code lines: the comments explain the key (they say why each
+    // button exists).
+    let code: String = ui
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!code.contains("[R] 数値入力\""), "no button prints the key");
     assert!(
         !hbedit_src().contains("[R] 数値  "),
         "and the footers do not carry two of them"

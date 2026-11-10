@@ -36,6 +36,11 @@ fn gui_src() -> &'static str {
     include_str!("../../mhnx-gui/src/app.rs")
 }
 
+/// The state machine's source: the one table of screen names and key words.
+fn hbedit_src() -> &'static str {
+    include_str!("../src/hbedit.rs")
+}
+
 /// The body of one function, from its declaration to the next item.
 fn fn_body<'a>(src: &'a str, decl: &str) -> &'a str {
     let start = src
@@ -406,8 +411,10 @@ fn zr_walks_the_three_reward_values_without_a_keyboard() {
         QUEST_REWARD_FIELDS, 3,
         "アイテム / 個数 / 確率%, and nothing else"
     );
+    // The sixth review's leftovers: the tab walks the two cells the arrows can
+    // move. アイテム is [A]'s, so a third stop could only refuse the arrows.
     let mut seen = Vec::new();
-    for _ in 0..QUEST_REWARD_FIELDS {
+    for _ in 0..2 {
         ed.input(Key::Z);
         seen.push(ed.quest_reward_field);
         assert_eq!(
@@ -418,8 +425,12 @@ fn zr_walks_the_three_reward_values_without_a_keyboard() {
     }
     assert_eq!(
         seen,
-        vec![QUEST_REWARD_CHANCE, QUEST_REWARD_ITEM, QUEST_REWARD_COUNT],
-        "個数 → 確率% → アイテム → 個数"
+        vec![QUEST_REWARD_CHANCE, QUEST_REWARD_COUNT],
+        "個数 ⇄ 確率%"
+    );
+    assert!(
+        ed.quest_reward_field != QUEST_REWARD_ITEM,
+        "アイテム is [A]'s cell, not a stop"
     );
     // The search is the explicit press: [R] on the same tab, and it is not one
     // of the stops.
@@ -634,7 +645,10 @@ fn the_save_map_screen_has_one_name() {
         "the title does not print both names"
     );
     assert!(!editor.contains("生データ（セーブマップ）"));
-    assert!(editor.contains("SaveMap => \"生データ\""));
+    // The name is the state machine's now (hbedit::screen_name), so the text
+    // build's title is one table with the footer's [B] words.
+    assert!(editor.contains("mhnx_core::hbedit::screen_name"));
+    assert!(hbedit_src().contains("Screen::SaveMap => \"生データ\""));
 }
 
 // ---------------------------------------------------------------------------

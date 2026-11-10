@@ -154,10 +154,13 @@ fn the_footer_is_the_key_table_rendered() {
         ed.screen = screen;
         let facts = ed.key_facts();
         assert!(!facts.is_empty(), "{screen:?} has no key table");
+        // One space between items: the strip is 763px and the [B] items name
+        // the screen they go to (the sixth review's leftovers), which costs a
+        // glyph or three on every line.
         let mut want = String::new();
         for fact in &facts {
             if !want.is_empty() {
-                want.push_str("  ");
+                want.push(' ');
             }
             want.push_str(&fact.render());
         }
@@ -304,11 +307,13 @@ fn the_supply_tab_names_the_search_on_zr() {
         ed.take_text_request().is_some(),
         "[ZR] must open the item search"
     );
-    // The pill on the bar says the same word.
+    // The pill on the bar says the same word and names no key: the footer is
+    // the one surface that names keys (the sixth review's leftovers).
     assert!(
-        UI_SRC.contains("String::from(\"[ZR] 検索\")"),
+        UI_SRC.contains("String::from(\"検索\")"),
         "the bar's pill says 検索"
     );
+    assert!(!UI_SRC.contains("\"[ZR] 検索\""), "and not the key");
 }
 
 /// ギルドカード's 闘技大会 view: [R] is the sub-tab there, so no line names it.
@@ -390,7 +395,9 @@ fn the_talisman_form_b_names_the_list() {
     ed.charm_a_press();
     assert_eq!(ed.screen, Screen::CharmEdit);
     let footer = ed.footer_hint();
-    assert!(footer.contains("[B] 一覧へ"), "{footer}");
+    // The destination's name plus what the press costs (a draft): the sixth
+    // review's leftovers took the verb 一覧へ out of every [B].
+    assert!(footer.contains("[B] 護石一覧（2回で破棄）"), "{footer}");
     assert!(!footer.contains("[B] 戻る"), "{footer}");
     let guide = ed.screen_guide();
     for fact in ed.guide_facts() {
@@ -461,9 +468,15 @@ fn the_palico_language_is_one_word_on_every_surface() {
     assert_eq!(ed.palico_lang_label(), "言語: 日本語");
     ed.toggle_palico_lang();
     assert_eq!(ed.palico_lang_label(), "言語: 英語");
+    // The deck prints the core's label and no key: the footer is the one
+    // surface that names keys (the sixth review's leftovers).
     assert!(
-        UI_SRC.contains("format!(\"[◀/▶] {}\", ed.palico_lang_label())"),
+        UI_SRC.contains("&ed.palico_lang_label()"),
         "the deck prints the same label"
+    );
+    assert!(
+        !UI_SRC.contains("[◀/▶] \"") && !UI_SRC.contains("format!(\"[◀/▶]"),
+        "and no key"
     );
     assert!(!UI_SRC.contains("名前の言語"), "the old wording is gone");
 }
@@ -560,22 +573,20 @@ fn the_reward_zr_walks_three_cells() {
 /// The クエスト改造 報酬 tab's [ZR] walks the same three cells, and the footer
 /// names them.
 #[test]
-fn the_quest_reward_tab_names_three_cells() {
+fn the_quest_reward_tab_names_two_cells() {
     let mut ed = editor_with(blank_save(), Screen::QuestEdit);
     ed.quest_set_tab(hbedit::QUEST_TAB_REWARDS);
     assert_eq!(ed.quest_reward_field, hbedit::QUEST_REWARD_COUNT);
     ed.input(Key::Z);
     assert_eq!(ed.quest_reward_field, hbedit::QUEST_REWARD_CHANCE);
     ed.input(Key::Z);
-    assert_eq!(ed.quest_reward_field, hbedit::QUEST_REWARD_ITEM);
-    ed.input(Key::Z);
+    // Two stops: アイテム is [A]'s cell and the arrows cannot move it, so [ZR]
+    // never lands on it (the sixth review's leftovers).
     assert_eq!(ed.quest_reward_field, hbedit::QUEST_REWARD_COUNT);
     let footer = ed.footer_hint();
-    assert!(footer.contains("[ZR] 段送り（3段）"), "{footer}");
-    // The item cell is a cell, not a number: the tab knows which one it is on.
-    ed.quest_reward_field = hbedit::QUEST_REWARD_ITEM;
-    assert!(ed.quest_edit_item_cell());
-    assert!(!ed.quest_edit_chance());
+    assert!(footer.contains("[ZR] 段送り（2段）"), "{footer}");
+    // The item cell is never a stop on this tab.
+    assert!(!ed.quest_edit_item_cell());
     ed.quest_reward_field = hbedit::QUEST_REWARD_CHANCE;
     assert!(ed.quest_edit_chance());
     assert!(!ed.quest_edit_item_cell());
@@ -732,13 +743,17 @@ fn the_step_pill_says_touch_only_where_no_key_cycles() {
     ed.open_charms();
     ed.charm_a_press();
     assert_eq!(ed.screen, Screen::CharmEdit);
-    assert_eq!(ed.step_pill_label(), "刻み（タッチのみ）");
+    // The label names no key on any screen now: the deck is not a key surface
+    // (the sixth review's leftovers), and the footer names the key that cycles
+    // the table where one exists. The label is the same word everywhere.
+    assert_eq!(ed.step_pill_label(), "刻み");
     ed.screen = Screen::EquipEdit;
     ed.equip_edit = Some(hbedit::EquipEdit::default());
-    assert_eq!(ed.step_pill_label(), "刻み（タッチのみ）");
-    // A screen with a key names it.
+    assert_eq!(ed.step_pill_label(), "刻み");
     ed.screen = Screen::Char;
-    assert_eq!(ed.step_pill_label(), "刻み [Y]");
+    assert_eq!(ed.step_pill_label(), "刻み");
+    assert_eq!(ed.step_table().1, "Y", "the footer names [Y] here");
+    assert!(!UI_SRC.contains("刻み ["));
     // And the console prints the core's label.
     assert!(UI_SRC.contains("ed.step_pill_label()"));
 }
@@ -837,10 +852,13 @@ fn the_slot_word_is_carried_everywhere() {
     ] {
         assert!(!src.contains("枠選択"), "{name} still says 枠選択");
     }
-    // One name on both builds: the canvas said キャラ選択 and the text build
-    // said キャラクター選択 for the same screen.
-    assert!(UI_SRC.contains("\"キャラ選択\""), "the canvas title");
-    assert!(EDITOR_SRC.contains("\"キャラ選択\""), "the text build's title");
+    // One name on both builds, and it is the bar's own word: the canvas said
+    // キャラ選択 and the text build said キャラクター選択 for the same screen.
+    // The name lives in one table now (hbedit::screen_name) and both builds
+    // read it, so the text build's title is the state machine's answer.
+    assert!(HBEDIT_SRC.contains("Screen::Slots => \"スロット\""), "the one name");
+    assert!(UI_SRC.contains("\"スロット\""), "the canvas bar prints it");
+    assert!(EDITOR_SRC.contains("mhnx_core::hbedit::screen_name"));
     assert!(
         !EDITOR_SRC.contains("キャラクター選択"),
         "the long name is gone from the text build"

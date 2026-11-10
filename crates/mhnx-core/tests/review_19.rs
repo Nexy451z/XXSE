@@ -516,7 +516,9 @@ fn the_talisman_form_names_one_destination_for_b() {
     assert_eq!(ed.screen, Screen::CharmEdit);
     let footer = ed.footer_hint();
     let guide = ed.screen_guide();
-    assert!(footer.contains("[B] 一覧へ"), "{footer}");
+    // The destination's name plus what the press costs (a draft): the sixth
+    // review's leftovers took the verb 一覧へ out of every [B].
+    assert!(footer.contains("[B] 護石一覧（2回で破棄）"), "{footer}");
     // The guide prints the same table's first items, so it cannot name a
     // second destination for the key.
     for fact in ed.guide_facts() {
@@ -678,12 +680,25 @@ fn the_guild_bar_names_all_four_views_and_lights_the_one_showing() {
 #[test]
 fn the_guild_b_is_one_level_and_the_guide_says_so() {
     let mut ed = editor_with(blank_save(), Screen::Guild);
+    // One word per destination, and it is the destination's name: the card's
+    // [B] goes to the slot list (スロット) and the three record views' [B] goes
+    // to the card (ギルドカード). The three words the review counted - カード /
+    // カードへ / キャラ - are gone.
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_CARD);
-    assert!(ed.footer_hint().contains("[B] キャラ"), "{}", ed.footer_hint());
+    assert!(ed.footer_hint().contains("[B] スロット"), "{}", ed.footer_hint());
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_COUNTS);
-    assert!(ed.footer_hint().contains("[B] カード"), "{}", ed.footer_hint());
+    assert!(
+        ed.footer_hint().contains("[B] ギルドカード"),
+        "{}",
+        ed.footer_hint()
+    );
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_ARENA);
-    assert!(ed.footer_hint().contains("[B] カードへ"), "{}", ed.footer_hint());
+    assert!(
+        ed.footer_hint().contains("[B] ギルドカード"),
+        "{}",
+        ed.footer_hint()
+    );
+    assert!(!ed.footer_hint().contains("カードへ"), "{}", ed.footer_hint());
     let guide = ed.screen_guide();
     for fact in ed.guide_facts() {
         assert!(guide.contains(&fact.render()), "{guide}");
