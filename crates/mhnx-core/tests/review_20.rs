@@ -1684,22 +1684,30 @@ fn the_guild_guide_names_one_key_for_the_four_views() {
     // inspector's pill borrows it (Editor::key_label_or), so the two agree.
     assert!(footer.contains("[R] 数値"), "{footer}");
     let src = ui_src();
+    // The warning strip names no key any more (the seventh review: the footer
+    // is the one surface that names keys), and it never claimed [R] walks the
+    // views - that was the finding this test was written for.
     assert!(
-        src.contains("[L] 4ビュー"),
-        "the guide must name the key that really walks the views"
+        !src.contains("[L] 4ビュー") && !src.contains("[L/R] 4ビュー"),
+        "the warning strip names no key"
     );
     assert!(
-        !src.contains("[L/R] 4ビュー"),
-        "the guide claims [R] walks the views while the footer says it types a number"
+        src.contains("4ビュー: カード → 回数 → 武器 → 闘技大会"),
+        "the strip still says where the four views are"
     );
-    // The guide prints the same table's first items as the footer, so it names
-    // the view walk the same way (Y 回数/武器) and never the shoulder pair.
+    // The guide prints the same table's first items as the footer, and the one
+    // key that walks the views is 表示 on all three of them.
     let guide = ed.screen_guide();
     for fact in ed.guide_facts() {
         assert!(guide.contains(&fact.render()), "{guide}");
     }
     assert!(!guide.contains("[L/R]"), "{guide}");
     assert!(!guide.contains("[L]"), "{guide}");
+    assert_eq!(
+        ed.key_label("Y").as_deref(),
+        Some("表示"),
+        "one word for the view walk"
+    );
 }
 
 // ---------------------------------------------------------------------------

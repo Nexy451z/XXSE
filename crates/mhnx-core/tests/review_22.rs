@@ -622,7 +622,11 @@ fn no_key_is_pressable_without_a_line_in_the_table() {
     // Keys a handler answers with a refusal rather than a job: the press says
     // why it cannot do anything, which is the honest answer, and a line has no
     // word for a key that does nothing.
-    const SILENT: &[(&str, &str)] = &[("Sets", "Minus")];
+    //
+    // The second list is the seventh review's one-item rule: two keys that run
+    // the *same* write get one item, so the second key is answered and unnamed
+    // on purpose ([A] and [X] both end in request_write_save on 環境設定).
+    const SILENT: &[(&str, &str)] = &[("Sets", "Minus"), ("Options", "A")];
     let anywhere = named_anywhere();
     let mut checked = 0usize;
     for (screen, keys) in &anywhere {
@@ -1002,11 +1006,15 @@ fn the_draft_error_names_the_next_key() {
 /// The key column holds keys, and the words that are not keys say what they are.
 #[test]
 fn the_key_column_holds_only_keys() {
-    // The way-out note names no key of its own, so it is marked as a note.
+    // The way-out note names no key at all: the [B] item beside it already says
+    // where that press goes, and [＋] is the tool on this line (the seventh
+    // review: naming either glyph twice is what the fourth review found).
     let mut ed = editor(Screen::Charms);
     let hint = ed.footer_hint();
-    assert!(hint.contains("※終了は [B]"), "{hint}");
-    assert!(!hint.contains(" 終了は [B] の後"), "{hint}");
+    assert!(hint.contains("終了は一覧から"), "{hint}");
+    assert!(!hint.contains("[B] の後"), "{hint}");
+    assert_eq!(hint.matches("[＋]").count(), 1, "{hint}");
+    assert!(!hint.contains("[B] 終了"), "{hint}");
     // 進行状況's pair moves rows, and the word says so.
     ed.screen = Screen::Progress;
     assert!(ed.footer_hint().contains("[◀/▶] ±50行"), "{}", ed.footer_hint());

@@ -918,8 +918,11 @@ fn the_plus_key_has_one_meaning_on_the_line() {
         );
         // The note is bracketed off the key column now: it sat where the
         // chips' words sit and read as one more key.
+        // The note names no key at all: the [B] item beside it already says
+        // where that press goes, and [＋] is the tool on this line (the seventh
+        // review: a note that named [B] read as "press [B] to quit").
         assert!(
-            hint.contains("※終了は [B]"),
+            hint.contains("終了は一覧から"),
             "{screen:?} does not name the way out: {hint}"
         );
         assert!(
@@ -1000,8 +1003,10 @@ fn the_guide_tail_is_measured_once() {
     // the whole strip and drawing in the rest.
     let body = fn_body(ui_src(), "fn draw_guide");
     assert!(body.contains("tail_room"), "{body}");
+    // The tail is the *state's* tail: the keys are dropped before the state is
+    // cut (the seventh review: a banner must not delete the position).
     assert!(
-        body.contains("guide_tail(&guide, tail_room"),
+        body.contains("guide_tail(&state, tail_room"),
         "the tail is measured against the room it is drawn in: {body}"
     );
 }

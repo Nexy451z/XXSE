@@ -229,7 +229,12 @@ fn the_text_build_renders_the_state_machines_table() {
     // And the four surfaces the review counted all read it.
     assert!(HBEDIT_SRC.contains("pub fn key_facts"));
     assert!(UI_SRC.contains("ed.footer_hint()"), "the footer draws the table");
-    assert!(UI_SRC.contains("ed.screen_guide()"), "the guide draws the table");
+    // The guide draws the table's state and its first two keys (the seventh
+    // review split the two halves so a banner can drop the keys and keep the
+    // state); the text build prints the whole line.
+    assert!(UI_SRC.contains("ed.guide_state()"), "the guide draws the state");
+    assert!(UI_SRC.contains("ed.guide_keys()"), "and the keys");
+    assert!(EDITOR_SRC.contains("ed.screen_guide()"), "the text build draws it");
     assert!(UI_SRC.contains("ed.guide_facts()") || UI_SRC.contains("screen_guide"));
 }
 
@@ -298,8 +303,12 @@ fn the_mib_zr_is_named_only_on_a_monster_row() {
 fn the_supply_tab_names_the_search_on_zr() {
     let mut ed = editor_with(blank_save(), Screen::QuestEdit);
     ed.quest_set_tab(hbedit::QUEST_TAB_SUPPLIES);
+    // One search item, not two: [ZR] and [R] open the same keyboard on this
+    // tab, so the line names the key the two item tabs share (the seventh
+    // review's D14).
     let footer = ed.footer_hint();
-    assert!(footer.contains("[ZR] 検索"), "{footer}");
+    assert!(footer.contains("[R] 検索"), "{footer}");
+    assert_eq!(footer.matches("検索").count(), 1, "{footer}");
     assert!(!footer.contains("[ZR] 項目"), "{footer}");
     // The key really opens the search.
     ed.input(Key::Z);

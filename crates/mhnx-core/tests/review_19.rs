@@ -269,7 +269,12 @@ fn an_empty_list_still_draws_the_inspector_and_its_buttons() {
     let deck = fn_body(src, "fn draw_studio_inspector(");
     assert!(deck.contains("全モンスターを表示"), "the hunt toggle must stay");
     assert!(deck.contains("検索を解除（全件）"), "the filter clear must stay");
-    assert!(deck.contains("[＋] 新規装備を追加"), "the new-record button must stay");
+    // The button stays; its label borrows the table's word for [＋] now (the
+    // seventh review: a deck button names no key).
+    assert!(
+        deck.contains("装備を追加") && deck.contains("pill_word(ed, \"＋\""),
+        "the new-record button must stay"
+    );
 }
 
 // ---------------------------------------------------------------------------

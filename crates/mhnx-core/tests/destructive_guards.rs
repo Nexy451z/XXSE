@@ -190,24 +190,29 @@ fn the_set_editor_re_reads_its_warnings_on_y_and_says_so() {
     );
     // The panel's own line and the key have to agree: the console chip sends Y
     // since X is the save key, and this line used to advertise X.
+    //
+    // The body names no key any more (the seventh review: the chip row under
+    // it is the table, and a second copy in the body drifted), so the panel
+    // line says how many warnings it has and the chip row names the key.
     let lines = ed.lines();
     let warn_line = lines
         .iter()
-        .find(|l| l.text.contains("で読み直す"))
+        .find(|l| l.text.contains("警告"))
         .map(|l| l.text.clone())
         .unwrap_or_default();
     assert!(
-        warn_line.contains("[Y] で読み直す"),
-        "the panel line has to name the key that works: {}",
+        warn_line.contains("警告") && !warn_line.contains("[Y]"),
+        "the panel line counts the warnings and names no key: {}",
         warn_line
     );
-    let key_line = lines
-        .iter()
-        .find(|l| l.text.contains("Y 警告"))
-        .map(|l| l.text.clone())
+    let key_line = ed
+        .key_facts()
+        .into_iter()
+        .find(|f| f.key == "Y")
+        .map(|f| f.label)
         .unwrap_or_default();
-    assert!(
-        !key_line.is_empty(),
+    assert_eq!(
+        key_line, "警告",
         "the key guide has to name Y for the warnings"
     );
 }

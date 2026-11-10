@@ -4932,9 +4932,11 @@ fn audit_the_entry_view_x_writes_the_archive() {
     }
     ed.input(Key::Y);
     assert_eq!(ed.screen, Screen::EntryView);
-    let footer = ed.lines().last().map(|l| l.text.clone()).unwrap_or_default();
+    // The body of the text build names no key any more (the seventh review):
+    // the chip row under it is the table, so the key is read from there.
+    let footer = ed.footer_hint();
     assert!(
-        footer.contains("X write .arc"),
+        footer.contains("[X] 保存"),
         "the footer advertises the key: {}",
         footer
     );
@@ -5173,11 +5175,11 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     // on this build, so the line must not name them.
     let mut ed = Editor::new();
     open_save(&mut ed);
-    let footer = ed.lines().last().map(|l| l.text.clone()).unwrap_or_default();
-    assert!(footer.contains("A char edit"), "{}", footer);
-    assert!(footer.contains("Y max all"), "{}", footer);
-    assert!(footer.contains("X save"), "{}", footer);
-    for k in ["L", "R", "-"] {
+    // The body names no key any more; the table is the one surface that does.
+    let footer = ed.footer_hint();
+    assert!(footer.contains("[A] このキャラを編集"), "{}", footer);
+    assert!(footer.contains("[Y] 一括MAX（2回）"), "{}", footer);
+    for k in ["[L]", "[R]", "[-]"] {
         assert!(
             !footer.contains(k),
             "the slot footer now names {}: {}",

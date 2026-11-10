@@ -1787,7 +1787,10 @@ pub fn run() -> i32 {
                         // The tap was this press: the release owes nothing.
                         r_tap.spend();
                     } else {
-                        r_target = Some(ed.detail_target(painter.gui.sets_tab));
+                        // The my-sets tab lives in the state machine now (Editor::sets_tab):
+                            // the guide strip prints its row, so the console may
+                            // not keep a second copy of it.
+                            r_target = Some(ed.detail_target(ed.sets_tab));
                     }
                     need_draw = true;
                 }
@@ -1841,7 +1844,7 @@ pub fn run() -> i32 {
                         | mhnx_core::confirm::HoldAction::Run => {
                             r_tap.clear_arm();
                             let target = r_target
-                                .unwrap_or_else(|| ed.detail_target(painter.gui.sets_tab));
+                                .unwrap_or_else(|| ed.detail_target(ed.sets_tab));
                             // 詳細 has nothing to show on the start screen, so
                             // the hold is the settings door of the updater there:
                             // it is the one way in when the start-up check is off

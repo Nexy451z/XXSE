@@ -4711,6 +4711,13 @@ pub fn csv_kind_label(path: &str) -> &'static str {
     }
 }
 
+/// The field the 外見 tab starts at: rows 0..10 are 基本, 10..17 are 外見.
+///
+/// The console's `draw_char` draws one tab at a time and its heading counts the
+/// rows of that tab ("3 / 7 件"), so the guide strip has to count the same list.
+/// The split lives here because both readers do.
+pub const CHAR_APPEARANCE_START: usize = 10;
+
 /// The editable character fields, in menu order.
 pub const CHAR_FIELDS: &[(&str, &str)] = &[
     ("name", "名前"),
@@ -6573,6 +6580,119 @@ impl KeyFact {
     }
 }
 
+/// The built-in keyboard's keys, as its legend, its buttons and the footer print
+/// them.
+///
+/// Three surfaces, one table. The modal's legend prints every item (it has
+/// 884px), the buttons under the character grid take their words from it, and
+/// the footer - which names the keys of the screen *under* the modal otherwise,
+/// so it said "[X] 保存" over a key that empties the field - prints what fits of
+/// [Editor::osk_hint].
+pub fn osk_facts(multiline: bool) -> Vec<KeyFact> {
+    let mut out = alloc::vec![
+        KeyFact::new("A", "入力"),
+        KeyFact::new("L/R", "文字種"),
+        KeyFact::new("B", "1字削除"),
+        KeyFact::new("X", "クリア（2回）"),
+        KeyFact::new("Y", "濁点/小字"),
+    ];
+    if multiline {
+        out.push(KeyFact::new("ZR", "改行"));
+    }
+    out.push(KeyFact::new("-", "取消"));
+    out.push(KeyFact::new("＋", "確定"));
+    out
+}
+
+/// The word one key of the keyboard carries, "" when the key is not one of its
+/// own (the newline key on a one-line field).
+pub fn osk_word(multiline: bool, key: &str) -> String {
+    osk_facts(multiline)
+        .into_iter()
+        .find(|f| f.key == key)
+        .map(|f| f.label)
+        .unwrap_or_default()
+}
+
+/// The keyboard's line for the footer: the same words, most important first,
+/// stopping when the 763px strip is full.
+///
+/// [＋] 確定 comes second because it is the one key a user must not have to
+/// guess (it ends the entry, and on every other screen [＋] ends the session);
+/// the two the modal draws on the glass itself ([L/R] 文字種 on the tab row)
+/// are last, so they are what a narrow line loses.
+pub fn osk_hint(multiline: bool) -> String {
+    const PRIORITY: [&str; 8] = ["A", "＋", "B", "X", "Y", "-", "ZR", "L/R"];
+    let facts = osk_facts(multiline);
+    let mut out = String::new();
+    for key in PRIORITY {
+        let Some(fact) = facts.iter().find(|f| f.key == key) else {
+            continue;
+        };
+        let candidate = if out.is_empty() {
+            fact.render()
+        } else {
+            alloc::format!("{} {}", out, fact.render())
+        };
+        if caption_width(&candidate) > FOOTER_HINT_ROOM {
+            break;
+        }
+        out = candidate;
+    }
+    out
+}
+
+/// The monster picker's keys, for its own legend and the footer under it.
+///
+/// The picker is a modal: it owns the pad, so the footer names these and not
+/// the screen's line. One table for the two surfaces, the same rule the
+/// keyboard's row follows.
+pub fn mib_picker_facts() -> Vec<KeyFact> {
+    alloc::vec![
+        KeyFact::new("▲/▼", "選択"),
+        KeyFact::new("L/R", "±10"),
+        KeyFact::new("A", "決定"),
+        KeyFact::new("B", "閉じる"),
+    ]
+}
+
+/// One line of the table above, for the footer.
+pub fn mib_picker_hint() -> String {
+    render_facts(&mib_picker_facts())
+}
+
+/// The save-review dialog's keys, for the footer under it.
+///
+/// The dialog answers two writes (the save key's and a snapshot restore), so
+/// the [A] word is the one its own button prints.
+pub fn review_hint(restoring: bool) -> String {
+    alloc::format!(
+        "[A] {}  [B] 中止  [▲/▼] 1行  [◀/▶] 10行",
+        if restoring {
+            "この内容で戻す"
+        } else {
+            "この内容で保存"
+        }
+    )
+}
+
+/// The update dialog's keys, for the footer under it.
+pub fn update_hint(primary: &str) -> String {
+    alloc::format!("[A] {}  [B] あとで  [Y] 起動時の確認", primary)
+}
+
+/// A list of key facts as one line, the way the footer joins them.
+pub fn render_facts(facts: &[KeyFact]) -> String {
+    let mut out = String::new();
+    for fact in facts {
+        if !out.is_empty() {
+            out.push_str("  ");
+        }
+        out.push_str(&fact.render());
+    }
+    out
+}
+
 /// How many key facts the guide strip prints beside the state it shows.
 ///
 /// The strip is one line and the footer already carries the whole list, so the
@@ -6992,6 +7112,18 @@ pub struct Editor {
     /// Collected when the form opens and after every write, never while
     /// drawing: the check decodes the whole record.
     pub item_set_warnings: Vec<String>,
+    /// Which tab of the my-sets list is showing: 0 アイテム, 1 装備.
+    ///
+    /// The tab and the row live here rather than in the console for the same
+    /// reason the quest list's do (see `quest_tab`): the guide strip under the
+    /// bar prints the selected row's place, and while the console kept them the
+    /// strip printed "6 / 64" over a list the screen was drawing zero rows of -
+    /// the count added both tabs and the row was a field no key wrote.
+    /// [Editor::active_cursor] / [Editor::active_list_len] answer for this
+    /// screen now, and the console's list, its scrollbar and its strip read them.
+    pub sets_tab: usize,
+    /// Row under the cursor in the my-sets list (a row, not the record index).
+    pub sets_cursor: usize,
     /// Cursor inside the save's own quest list.
     pub save_quest_cursor: usize,
     /// Which of the quest section's list tabs is showing: 0 セーブ内, 1 公式,
@@ -7272,6 +7404,8 @@ impl Editor {
             item_set_edit: None,
             item_set_armed: None,
             item_set_warnings: Vec::new(),
+            sets_tab: 0,
+            sets_cursor: 0,
             save_quest_cursor: 0,
             quest_tab: 0,
             quest_cat_cursor: [0; 3],
@@ -8084,7 +8218,13 @@ impl Editor {
             // both keys, and every surface renders it: the guide and the text
             // build's chip row used to filter it out, so the one sentence that
             // says how to leave appeared on the footer and nowhere else.
-            KeyFact::note("※終了は [B]")
+            // The way out is one screen back, and the note names neither key:
+            // the [B] item beside it already says where that press goes, and
+            // [＋] is the tool on this line (naming it here would give one glyph
+            // two meanings, which is what the fourth review's finding was
+            // about). "終了は [B]" read as "press [B] to quit" and [B] only
+            // went back one screen, so the session stayed open.
+            KeyFact::note("終了は一覧から")
         } else {
             KeyFact::new("＋", WORD_QUIT)
         });
@@ -8226,8 +8366,14 @@ impl Editor {
     /// Does [B] ask before it leaves, because a form holds a draft?
     fn b_asks_before_leaving(&self) -> bool {
         match self.screen {
-            Screen::CharmEdit | Screen::EquipEdit => true,
-            Screen::Sets => self.set_edit.is_some() || self.item_set_edit.is_some(),
+            // Only while the form holds something the save does not have. The
+            // word promised a second press on a form with no draft, and the
+            // second press then ran the [B] of the screen underneath: 護石編集
+            // closed to 護石一覧 on the first press and 護石一覧 went to スロット
+            // on the second.
+            Screen::CharmEdit => self.charm_draft_dirty(),
+            Screen::EquipEdit => self.equip_draft_dirty(),
+            Screen::Sets => self.set_draft_dirty() || self.item_set_draft_dirty(),
             _ => false,
         }
     }
@@ -8359,11 +8505,14 @@ impl Editor {
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
+            // The short words the card view uses: 数値 / 進行 are the same two
+            // jobs, and the counts line carries eight items on a 763px strip.
             Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => alloc::vec![
                 KeyFact::new("◀/▶", "増減"),
-                KeyFact::new("R", "数値入力"),
+                KeyFact::new("R", "数値"),
                 KeyFact::new("A", "+刻み"),
-                KeyFact::new("ZR", "進行状況"),
+                KeyFact::new("Y", "表示"),
+                KeyFact::new("ZR", "進行"),
                 KeyFact::new("B", self.b_word()),
                 KeyFact::new("X", WORD_SAVE),
             ],
@@ -8378,10 +8527,14 @@ impl Editor {
                     ]
                 } else {
                     alloc::vec![
-                        KeyFact::new("▲/▼", "武器"),
+                        // 行, not 武器: the row *is* a weapon, and the eight
+                        // items of this line are four pixels over the strip
+                        // with the long word in it.
+                        KeyFact::new("▲/▼", "行"),
                         KeyFact::new("◀/▶", "会場"),
                         KeyFact::new("A", "編集"),
-                        KeyFact::new("R", "数値入力"),
+                        KeyFact::new("R", "数値"),
+                        KeyFact::new("Y", "表示"),
                         KeyFact::new("B", self.b_word()),
                         KeyFact::new("X", WORD_SAVE),
                     ]
@@ -8392,7 +8545,10 @@ impl Editor {
             // way out was named nowhere - not in the footer, not on the deck.
             Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => alloc::vec![
                 KeyFact::new("R", "数値入力"),
-                KeyFact::new("Y", "回数/武器"),
+                // The same word the card view prints: [Y] walks the three views
+                // that hold the card's numbers (Editor::guild_next_view), so one
+                // key had three words (表示 / 回数/武器 / 武器) for one press.
+                KeyFact::new("Y", "表示"),
                 KeyFact::new("A", self.guild_a_label()),
                 KeyFact::new("ZR", "進行状況"),
                 KeyFact::new("X", WORD_SAVE),
@@ -8609,10 +8765,16 @@ impl Editor {
                 KeyFact::new("X", "クリア"),
                 KeyFact::new("B", self.b_word()),
             ],
+            // [Y] re-reads the set's warnings (Editor::refresh_set_warnings):
+            // the deck's button and the message named it, and the footer - the
+            // one surface that names keys - did not.
+            // No [◀/▶] item: the pair is the two buttons the deck draws on this
+            // form (前の候補 / 次の候補), and the line carries seven items on a
+            // 763px strip already.
             Screen::Sets if self.set_edit.is_some() => alloc::vec![
                 KeyFact::new("A", "決定"),
-                KeyFact::new("◀/▶", "装備"),
                 KeyFact::new("-", "解除（2回）"),
+                KeyFact::new("Y", "警告"),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
@@ -8646,12 +8808,12 @@ impl Editor {
                 KeyFact::new("ZR", "再読込"),
                 KeyFact::new("B", self.b_word()),
             ],
-            // [A] writes the file on this screen too (Editor::input_options
-            // answers it with request_write_save), so the line names it: a
-            // screen where two keys save is a screen whose line has to say so.
+            // One save item, not two: [A] and [X] both end in
+            // request_write_save, so the line said 保存 twice and a reader could
+            // not tell the two apart. The global save key is the one named; [A]
+            // keeps working and the message on the press says what it did.
             Screen::Options => alloc::vec![
                 KeyFact::new("◀/▶", "値変更"),
-                KeyFact::new("A", "保存"),
                 KeyFact::new("Y", "スナップショットへ戻す"),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
@@ -8877,27 +9039,27 @@ impl Editor {
                     ]
                 }
             }
-            // 報酬: [ZR] walks the row's three cells - アイテム / 個数 / 確率% -
-            // and the line says all three. It said 項目 while the chip beside it
-            // said 個数/確率, so the two places named two different key counts.
-            // The arrow pair is not in this line either: the strip has 763px
-            // and the three stops are the fact this tab has to state.
+            // 報酬: [ZR] walks the two cells the arrows can move (個数 ⇄ 確率%)
+            // and [A] is the item cell on both stops, so the line names the
+            // pair that changes a number - it was missing, and the tab that
+            // exists to change 個数 / 確率% named no key that changes one. The
+            // strip had 132px to spare (631 of 763).
             QUEST_TAB_REWARDS => alloc::vec![
                 KeyFact::new("A", "アイテム"),
+                KeyFact::new("◀/▶", "値"),
                 KeyFact::new("ZR", "段送り（2段）"),
-                KeyFact::new("R", "検索"),
+                KeyFact::new("R", WORD_SEARCH),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
-            // 支給品 has one value and nothing to switch, so [ZR] there is the
-            // search itself - the same word the pill on the bar prints. The
-            // line used to omit the key while the chip said 項目 and the pill
-            // said 検索: three answers for one press.
+            // 支給品: one search item, not two. [ZR] and [R] both open the same
+            // keyboard on this tab (it has one value and nothing to switch), so
+            // the line printed 検索 twice for one job; [R] is the key the two
+            // item tabs share and the one the line names.
             _ => alloc::vec![
                 KeyFact::new("A", "アイテム"),
                 KeyFact::new("◀/▶", "値"),
-                KeyFact::new("ZR", "検索"),
-                KeyFact::new("R", "検索"),
+                KeyFact::new("R", WORD_SEARCH),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
@@ -9924,13 +10086,22 @@ impl Editor {
     }
 
     /// The 報酬 / 支給品 tab's header, with the item filter on it.
+    ///
+    /// The header names the search and what it left, and no key: the footer
+    /// names the key ([R] 検索 on both tabs), and the heading said "[ZR] で変更"
+    /// on the 支給品 tab, where [ZR] opens the same search and changes nothing.
     pub fn quest_item_heading(&self) -> String {
         let base = QUEST_TAB_LABELS[self.quest_edit_tab.min(QUEST_TABS - 1)];
         let needle = self.quest_item_filter.trim();
         if needle.is_empty() {
             alloc::format!("クエスト改造 {}", base)
         } else {
-            alloc::format!("クエスト改造 {}（検索: {}）[ZR] で変更", base, needle)
+            alloc::format!(
+                "クエスト改造 {}（検索: {} / {} 件）",
+                base,
+                needle,
+                self.quest_value_rows()
+            )
         }
     }
 
@@ -13104,6 +13275,12 @@ impl Editor {
             Screen::SkillPick => self.skill_pick_filter.as_str(),
             Screen::JewelPick => self.jewel_pick_filter.as_str(),
             Screen::EquipPick => self.equip_pick_filter.as_str(),
+            // 進行状況 and 生データ both narrow their list and both name the key
+            // that does it ([ZR] / [Y]) in the footer, so the strip has to say
+            // which search is on: a filtered list of 1,508 rows that says
+            // nothing reads as a save with one row.
+            Screen::Progress => self.progress_filter.as_str(),
+            Screen::SaveMap => self.map_filter.as_str(),
             _ => "",
         };
         let needle = needle.trim();
@@ -18223,14 +18400,32 @@ impl Editor {
         // is narrowing the list, whether a draft is waiting - and the screen's
         // own sentence only appears when there is no state to show (the title
         // above the strip already names the screen).
+        alloc::format!("{}{}", self.guide_state(), self.guide_keys())
+    }
+
+    /// The strip's state half: what is true now, with no key in it.
+    ///
+    /// Split from the key half because the two are not worth the same when the
+    /// strip runs out of room: the update banner takes the right end of the
+    /// line, and the old renderer cut the *front* of the whole sentence - which
+    /// is the state, the only part the footer cannot say. The console drops the
+    /// keys first now and keeps this.
+    pub fn guide_state(&self) -> String {
         let state = self.status_parts();
-        let mut out = if state.is_empty() {
+        if state.is_empty() {
             String::from(self.guide_lead())
         } else {
             state.join(" ・ ")
-        };
-        let facts = self.guide_facts();
-        for fact in &facts {
+        }
+    }
+
+    /// The strip's key half: the two keys that act on the state.
+    ///
+    /// The leading space is part of it, so `guide_state() + guide_keys()` is the
+    /// one line the strip draws.
+    pub fn guide_keys(&self) -> String {
+        let mut out = String::new();
+        for fact in self.guide_facts() {
             out.push(' ');
             out.push_str(&fact.render());
             out.push('、');
@@ -18257,112 +18452,291 @@ impl Editor {
         if let Some(needle) = self.active_search() {
             out.push(alloc::format!("検索「{}」", needle));
         }
+        // Both, not either: the talisman form's overwrite offer is only ever
+        // armed *while* the form holds a draft, so an `else if` made the one
+        // state this part exists for unreachable on that screen.
         if let Some(form) = self.draft_form_name() {
             out.push(alloc::format!("下書きあり（{}）", form));
-        } else if self.armed_offer().is_some() {
-            out.push(String::from("2回目待ち"));
         }
-        if self.dirty {
-            out.push(String::from("未保存"));
+        if let Some(what) = self.armed_offer() {
+            // What is waiting, not only that something is: "2回目待ち" alone
+            // left the reader to guess which of the offers was armed, and the
+            // message that armed it is the footer's second line - which a long
+            // message pushes out of sight.
+            out.push(alloc::format!("2回目待ち（{}）", what));
         }
+        // 未保存 is not repeated here: the header pill and the footer's dot both
+        // say it, and the strip is 28px of the list's height.
         out
     }
 
-    /// The selected row's place in the list, "3 / 12".
+    /// The selected row's place in the list the screen is drawing, "3 / 12".
     ///
-    /// The count is the list the screen really draws ([Editor::visible_items],
-    /// [Editor::charms], ...), so a narrowed list cannot say 3 / 12 over 300
-    /// rows. A screen with no list, or a list with no rows, has no place to
-    /// print and the strip says something else.
+    /// The two numbers are the ones the console draws from
+    /// ([Editor::active_cursor] / [Editor::active_list_len]), mapped into the
+    /// window the heading above the list counts. It used to be a second
+    /// implementation of both, and it was wrong on three screens: 進行状況
+    /// printed "1 / 132" wherever the cursor was (the row came from a field no
+    /// key wrote), マイセット printed "6 / 64" over a list of zero rows (both
+    /// tabs added, the console's row ignored) and キャラ printed "13 / 17"
+    /// beside a heading that said "3 / 7 件" (the whole field table against the
+    /// tab's seven rows).
     pub fn status_position(&self) -> Option<String> {
-        let total = self.status_row_count()?;
+        let (row, total) = self.active_position()?;
         if total == 0 {
             return None;
         }
-        let cur = self.status_cursor().min(total - 1);
-        Some(alloc::format!("{} / {}", cur + 1, total))
+        Some(alloc::format!("{} / {}", row.min(total - 1) + 1, total))
     }
 
-    /// How many rows the screen's list holds, or None when it has no list.
+    /// (row, total) of the list the screen is drawing, 0 based.
     ///
-    /// Every count is the list the screen really draws, so a narrowed list
-    /// cannot print 3 / 12 over three hundred rows. The guild card and the
-    /// conversion screen have no list of their own (their rows are fields of a
-    /// record, and the conversion screen has none at all), and they return
-    /// None: the strip then says what else it knows.
-    fn status_row_count(&self) -> Option<usize> {
-        Some(match self.screen {
-            Screen::SaveList => self.save_files.len(),
-            Screen::Slots => crate::save::MAX_SLOTS,
-            Screen::Char => CHAR_FIELDS.len(),
-            Screen::Items => self.visible_items().len(),
-            Screen::ItemPick => self.item_pick_matches().len(),
-            Screen::SkillPick => self.skill_pick_matches().len(),
-            Screen::JewelPick => self.jewel_pick_matches().len(),
-            Screen::EquipPick => self.equip_pick_choices().len(),
-            Screen::Charms => self.charms().len(),
-            Screen::CharmEdit => CHARM_EDIT_ROWS,
-            Screen::Equip => self.equip_rows().len(),
-            Screen::EquipEdit => EQUIP_EDIT_ROWS,
-            Screen::QuestEquip => self.quest_equipment().len(),
-            Screen::SaveQuests => self.save_quests().len(),
-            Screen::ArcList => self.arc_files.len(),
-            Screen::QuestEdit => self.quest_row_count(),
-            Screen::ArcEntries => self.arc.as_ref().map(|a| a.entries.len()).unwrap_or(0),
-            Screen::EntryView => self.entry_record_count(),
-            Screen::Mib => crate::questfields::MIB_FIELDS.len(),
-            Screen::Gmd => self.gmd.as_ref().map(|g| g.strings.len()).unwrap_or(0),
-            Screen::Check => self.findings.len(),
-            Screen::Hunts => self.hunt_rows().len(),
-            Screen::Progress => self.progress_rows().len(),
-            Screen::Roster => self.palicos().len(),
-            Screen::Palico => crate::dlcats::all_ids().len(),
-            Screen::Sets => self.equip_sets().len() + self.item_sets().len(),
-            Screen::Csv => self.csv_files.len(),
-            Screen::Options => 4,
-            Screen::SaveMap => self.save_map_rows().len(),
-            Screen::Review => self.rev_list.as_ref().map(|l| l.rows.len()).unwrap_or(0),
-            Screen::Guild | Screen::Convert => return None,
-        })
-    }
-
-    /// Where the cursor is inside the list [Editor::status_row_count] counted.
-    fn status_cursor(&self) -> usize {
+    /// Two screens draw a *window* over a longer table and their heading counts
+    /// the window, so the strip has to count it too: キャラ shows the seven 外見
+    /// rows or the ten 基本 rows, and 進行状況 shows the rows the search left.
+    /// Everything else is the console's own pair, unchanged.
+    pub fn active_position(&self) -> Option<(usize, usize)> {
         match self.screen {
-            Screen::SaveList => self.cursor,
-            Screen::Slots => self.slot,
-            Screen::Char => self.field,
-            Screen::Items => self.cursor,
-            Screen::ItemPick => self.item_pick_cursor,
-            Screen::SkillPick => self.skill_pick_cursor,
-            Screen::JewelPick => self.jewel_pick_cursor,
-            Screen::EquipPick => self.equip_pick_cursor,
-            Screen::Charms => self.charm_cursor,
-            Screen::CharmEdit => self.charm_edit.map(|e| e.field).unwrap_or(0),
-            Screen::Equip => self.equip_cursor,
-            Screen::EquipEdit => self.equip_edit.map(|e| e.field).unwrap_or(0),
-            Screen::QuestEquip => self.cursor,
-            Screen::SaveQuests => self.cursor,
-            Screen::ArcList => self.cursor,
-            Screen::QuestEdit => self.quest_edit_cursor,
-            Screen::ArcEntries => self.cursor,
-            Screen::EntryView => self.entry_row_cursor,
-            Screen::Mib => self.mib_cursor,
-            Screen::Gmd => self.gmd_cursor,
-            Screen::Check => self.check_cursor,
-            Screen::Hunts => self.hunt_cursor,
-            Screen::Guild => self.cursor,
-            Screen::Progress => self.cursor,
-            Screen::Roster => self.roster_cursor,
-            Screen::Palico => self.palico_cursor,
-            Screen::Sets => self.cursor,
-            Screen::Csv => self.cursor,
-            Screen::Options => self.option_cursor,
-            Screen::SaveMap => self.map_cursor,
-            Screen::Review => self.rev_cursor,
-            Screen::Convert => 0,
+            Screen::Char => {
+                let (start, end) = self.char_window();
+                let total = end.saturating_sub(start);
+                if total == 0 {
+                    return None;
+                }
+                Some((self.field.saturating_sub(start).min(total - 1), total))
+            }
+            Screen::Progress => {
+                let rows = self.progress_rows();
+                if rows.is_empty() {
+                    return None;
+                }
+                let cur = self.progress_cursor();
+                let row = rows.iter().position(|r| *r == cur).unwrap_or(0);
+                Some((row, rows.len()))
+            }
+            _ => {
+                let total = self.active_list_len();
+                if total == 0 {
+                    return None;
+                }
+                Some((self.active_cursor().min(total - 1), total))
+            }
         }
     }
+
+    /// The character screen's two tabs, as the range of fields each draws.
+    ///
+    /// The console's `draw_char` builds its rows from this and the guide's
+    /// position is measured in it, so the heading's "3 / 7 件" and the strip's
+    /// "3 / 7" are the same two numbers by construction.
+    pub fn char_window(&self) -> (usize, usize) {
+        if self.field >= CHAR_APPEARANCE_START {
+            (CHAR_APPEARANCE_START, CHAR_FIELDS.len())
+        } else {
+            (0, CHAR_APPEARANCE_START.min(CHAR_FIELDS.len()))
+        }
+    }
+
+    /// The my-sets list's rows: the non-empty records of the showing tab.
+    ///
+    /// The console's list skips the empty records, so the row count is not the
+    /// array length (40 / 24) and the row is not the record index.
+    pub fn sets_rows(&self) -> usize {
+        let Some(save) = self.save.as_ref() else {
+            return 0;
+        };
+        if self.sets_tab == 0 {
+            crate::myset::item_sets(save, self.slot)
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .count()
+        } else {
+            crate::myset::equip_sets(save, self.slot)
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .count()
+        }
+    }
+
+    /// Where the cursor is in the list the screen is drawing.
+    ///
+    /// The console used to answer this itself (`active_cursor_of`) and the guide
+    /// answered it a second time (`status_cursor`), which is how the two came to
+    /// disagree. One answer now: the console's navigation, its scrollbar, its
+    /// tap targets and the strip all read this.
+    pub fn active_cursor(&self) -> usize {
+        match self.screen {
+            Screen::Slots => self.slot,
+            Screen::Char => self.field,
+            Screen::CharmEdit => self.charm_edit.map(|c| c.field).unwrap_or(0),
+            Screen::Items => {
+                if self.item_menu_open {
+                    self.item_menu_cursor
+                } else {
+                    self.cursor
+                }
+            }
+            Screen::ItemPick => self.item_pick_cursor,
+            Screen::SkillPick => self.skill_pick_cursor,
+            Screen::Equip => self.equip_cursor,
+            Screen::EquipEdit => self.equip_edit.map(|e| e.field).unwrap_or(0),
+            Screen::JewelPick => self.jewel_pick_cursor,
+            Screen::EquipPick => self.equip_pick_cursor,
+            Screen::Hunts => self.hunt_cursor,
+            Screen::Guild => match self.guild_view() {
+                GUILD_TAB_ARENA => self.arena_row,
+                GUILD_TAB_COUNTS => self.guild_count_selected(),
+                GUILD_TAB_WEAPONS => self.guild_weapon_selected().0,
+                _ => self.guild_field,
+            },
+            // One cursor per view: the screen swaps the list under it.
+            Screen::Progress => self.progress_cursor(),
+            // A mode's row while one is open, the list's row otherwise.
+            Screen::Roster => match self.palico_skill {
+                Some(state) => state.field,
+                None => match self.palico_equip {
+                    Some(state) => state.field,
+                    None => self.roster_cursor,
+                },
+            },
+            // The list's row while the list is showing, and the form's row while
+            // the set editor is open: the editor is a mode of this screen.
+            Screen::Sets => match self.set_edit {
+                Some(e) => e.field,
+                None => match self.item_set_edit {
+                    Some(e) => e.field,
+                    None => self.sets_cursor,
+                },
+            },
+            Screen::Csv => self.csv_cursor,
+            // The tab on screen owns the cursor, so a page turn, a tap and the
+            // scrollbar all move the same row.
+            Screen::SaveQuests => self.quest_list_cursor(),
+            Screen::QuestEquip => {
+                if self.qe_open {
+                    self.qe_item_cursor
+                } else {
+                    self.cursor
+                }
+            }
+            Screen::Mib => self.mib_cursor,
+            Screen::QuestEdit => self.quest_edit_cursor,
+            Screen::Gmd => self.gmd_cursor,
+            Screen::Check => self.check_cursor,
+            Screen::EntryView => self.entry_row_cursor,
+            Screen::Palico => match self.palico_equip {
+                Some(state) => state.field,
+                None => self.palico_cursor,
+            },
+            Screen::Options => self.option_cursor,
+            // 生データ: a position in the filtered save map, not a body offset.
+            Screen::SaveMap => self.map_cursor,
+            // 変更一覧: a position in the value list.
+            Screen::Review => self.rev_cursor,
+            _ => self.cursor,
+        }
+    }
+
+    /// How many rows the screen's list holds.
+    ///
+    /// The console's `list_len_of` used to answer this and the guide answered it
+    /// a second time; one answer now, so a list and the strip under the bar
+    /// cannot count different tables.
+    pub fn active_list_len(&self) -> usize {
+        match self.screen {
+            Screen::SaveList => self.save_files.len(),
+            Screen::Slots => 3,
+            Screen::Char => CHAR_FIELDS.len(),
+            Screen::Items => {
+                if self.item_menu_open {
+                    ITEM_OPS.len()
+                } else {
+                    self.visible_items().len()
+                }
+            }
+            Screen::ItemPick => self.item_pick_matches().len(),
+            Screen::Charms => self.charms().len(),
+            Screen::CharmEdit => CHARM_EDIT_ROWS,
+            Screen::SkillPick => self.skill_pick_matches().len(),
+            Screen::Equip => self.equip_rows().len(),
+            // The form has two shapes: 9 rows for an existing record and 3 for a
+            // new one. The count comes from the form itself so the cursor and
+            // the renderer can never disagree about it.
+            Screen::EquipEdit => self.equip_edit.map(|e| e.rows()).unwrap_or(0),
+            Screen::JewelPick => self.jewel_pick_matches().len(),
+            Screen::EquipPick => self.equip_pick_choices().len(),
+            Screen::Hunts => self.hunt_rows().len(),
+            Screen::Guild => match self.guild_view() {
+                GUILD_TAB_ARENA => ARENA_ROWS,
+                GUILD_TAB_COUNTS => GUILD_COUNT_ROWS,
+                GUILD_TAB_WEAPONS => GUILD_WEAPON_ROWS,
+                // The card's four rows: HR, clock, comment, card name.
+                _ => GUILD_FIELDS,
+            },
+            Screen::Progress => self.progress_len(),
+            Screen::Roster => match self.palico_skill {
+                Some(_) => self.palico_skill_list_len(),
+                None => match self.palico_equip {
+                    Some(_) => PALICO_EQUIP_ROWS,
+                    None => self.palicos().len(),
+                },
+            },
+            Screen::Sets => {
+                if self.set_edit.is_some() {
+                    SET_EDIT_ROWS
+                } else if self.item_set_edit.is_some() {
+                    ITEM_SET_EDIT_ROWS
+                } else {
+                    self.sets_rows()
+                }
+            }
+            Screen::Csv => self.csv_files.len(),
+            Screen::SaveQuests => self.quest_list_len(),
+            Screen::QuestEquip => {
+                if self.qe_open {
+                    self.quest_equip_items().len()
+                } else {
+                    self.quest_equipment().len()
+                }
+            }
+            Screen::ArcList => self.arc_files.len(),
+            Screen::ArcEntries => self.arc.as_ref().map(|a| a.entries.len()).unwrap_or(0),
+            Screen::EntryView => {
+                let entry = self.arc.as_ref().and_then(|a| a.entries.get(self.entry));
+                match entry {
+                    Some(e) => match extension_for(e.type_hash) {
+                        Some("rem") | Some("sup") => self.entry_record_count(),
+                        Some("sem") => self.sem_entry_indices().len() * 6,
+                        Some("esl") => 1,
+                        Some("qdp") => crate::entries::Qdp::parse(&e.data)
+                            .map(|q| q.flags().len())
+                            .unwrap_or(0),
+                        Some("qdl") | Some("qlv") => crate::entries::QuestLink::parse(&e.data)
+                            .map(|q| q.refs.len())
+                            .unwrap_or(0),
+                        _ => 0,
+                    },
+                    None => 0,
+                }
+            }
+            Screen::Mib => crate::questfields::MIB_FIELDS.len(),
+            // One row list per tab; the core answers for the tab it is on.
+            Screen::QuestEdit => self.quest_row_count(),
+            Screen::Gmd => self.gmd.as_ref().map(|g| g.strings.len()).unwrap_or(0),
+            Screen::Check => self.findings.len(),
+            Screen::Palico => match self.palico_equip {
+                Some(_) => PALICO_EQUIP_ROWS,
+                None => crate::dlcats::all_ids().len(),
+            },
+            Screen::Options => 4,
+            Screen::Convert => 0,
+            Screen::SaveMap => self.save_map_rows().len(),
+            // 変更一覧: one row per value that differs, so an empty list is a save
+            // identical to the card and the length is 0 rather than a placeholder.
+            Screen::Review => self.review_len(),
+        }
+    }
+
 
     /// The two-press offer that is waiting, if one is.
     ///
@@ -18390,6 +18764,25 @@ impl Editor {
         }
         if self.set_clear_armed.is_some() {
             return Some("部位の解除");
+        }
+        // The five that were missing: each of them is a two-press offer the
+        // screen can show, and the strip said nothing while one was armed - so
+        // the only place the second press was named was a message that the next
+        // key overwrites.
+        if self.equip_kind_armed.is_some() {
+            return Some("装備の種別変更");
+        }
+        if self.item_set_armed.is_some() {
+            return Some("アイテムセットの操作");
+        }
+        if self.palico_equip.and_then(|s| s.clear_armed).is_some() {
+            return Some("部位の解除");
+        }
+        if self.mib_preset_armed.is_some() {
+            return Some(".mib プリセット");
+        }
+        if self.sem_preset_armed.is_some() {
+            return Some(".sem プリセット");
         }
         if self.csv_armed.is_some() {
             return Some("CSV の適用");
@@ -23297,12 +23690,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                 false,
                 false,
             );
-            push(
-                &mut out,
-                String::from("  Up/Down 部位  Left/Right 候補  A 装着  - x2 解除  X save  B back"),
-                false,
-                false,
-            );
+            
             return out;
         }
 
@@ -23363,18 +23751,8 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             for warning in self.palico_skill_warnings().iter().take(2) {
                 push(&mut out, format!("  !! {}", warning), false, false);
             }
-            push(
-                &mut out,
-                String::from("  Up/Down 枠  Left/Right 候補  L/R ±10  Y タブ  A 差し替え"),
-                false,
-                false,
-            );
-            push(
-                &mut out,
-                String::from("  X save   B back   (x = 修得枠の外)"),
-                false,
-                false,
-            );
+            
+            push(&mut out, String::from("  (x = 修得枠の外)"), false, false);
             return out;
         }
 
@@ -23434,12 +23812,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         );
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down slot   A char edit   Y max all   X save"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Char => {
                 push(&mut out, format!("CHARACTER  slot {}", self.slot + 1), false, false);
@@ -23482,7 +23855,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                                 "  {:<12} {}{}",
                                 label,
                                 stats.value(i),
-                                if armed { "  << press A again" } else { "" }
+                                if armed { "  << press again" } else { "" }
                             ),
                             true,
                             i == self.item_menu_cursor,
@@ -23501,12 +23874,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         false,
                         false,
                     );
-                    push(
-                        &mut out,
-                        String::from("  Up/Down row  A run  B close"),
-                        false,
-                        false,
-                    );
+                    
                     return out;
                 }
                 let vis = self.visible_items();
@@ -23545,14 +23913,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         false,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from(
-                        "  Up/Down row  Left/Right count  A item  R count  Y empty  X save  B back",
-                    ),
-                    false,
-                    false,
-                );
+                
             }
             Screen::EntryView => {
                 use crate::entries::{Esl, ItemTable, Qdp, QuestLink, SemEntry};
@@ -23610,14 +23971,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                                     for w in self.entry_reward_warnings() {
                                         push(&mut out, format!("  ! {}", w), false, false);
                                     }
-                                    push(
-                                        &mut out,
-                                        String::from(
-                                            "  Up/Down row  Left/Right value  ZR count/chance  A item  R number  Y step  X write .arc  B back",
-                                        ),
-                                        false,
-                                        false,
-                                    );
+                                    
                                 }
                                 Err(_) => push(
                                     &mut out,
@@ -23746,12 +24100,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                             i == self.item_pick_cursor,
                         );
                     }
-                    push(
-                        &mut out,
-                        String::from("  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back"),
-                        false,
-                        false,
-                    );
+                    
                     return out;
                 }
                 if self.item_pick_mode == 3 {
@@ -23784,16 +24133,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                             i == self.item_pick_cursor,
                         );
                     }
-                    push(
-                        &mut out,
-                        if self.item_pick_stage == 0 {
-                            String::from("  A choose  Y filter  X clear  Up/Down 1  Left/Right 10  B back")
-                        } else {
-                            String::from("  Left/Right +-10  Up/Down +-1  A add  B choose again")
-                        },
-                        false,
-                        false,
-                    );
+                    
                     return out;
                 }
                 let cur = self.save
@@ -23826,12 +24166,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.item_pick_cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from("  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::SaveQuests => {
                 let list = self.filtered_quests();
@@ -23872,12 +24207,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                     }
                     push(&mut out, line, true, i == self.save_quest_cursor);
                 }
-                push(
-                    &mut out,
-                    String::from("  A edit this quest  - delete(2)  Y search  X save  B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::ArcList => {
                 push(&mut out, format!("QUEST FILES  ({} found)", self.arc_files.len()), false, false);
@@ -23918,12 +24248,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         );
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  A open  Y check  ZR extract this  X save  B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Mib => {
                 push(&mut out, String::from("クエスト条件 (.mib)"), false, false);
@@ -23987,7 +24312,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         push(&mut out, format!("  {}: {}", label, s), true, i == self.gmd_cursor);
                     }
                 }
-                push(&mut out, String::from("  A edit text  X write .arc  B back"), false, false);
+                
             }
             Screen::Check => {
                 push(
@@ -24013,12 +24338,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         push(&mut out, format!("        {} +0x{:X}", name, off), false, false);
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  A fix the selected item   X write .arc   B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::QuestEdit => {
                 let heading = self.quest_heading();
@@ -24097,16 +24417,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         }
                     }
                 }
-                push(
-                    &mut out,
-                    String::from(if self.map_edit_open() {
-                        "  Up/Down byte  Left/Right value  A confirm  B cancel/back"
-                    } else {
-                        "  Up/Down row  Left/Right 10 rows  A edit  B back"
-                    }),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Charms => {
                 let list = self.charms();
@@ -24144,14 +24455,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from(
-                        "  - delete(2)  A edit  Y search  + new  X write save  B back",
-                    ),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Hunts => {
                 let rows = self.hunt_rows();
@@ -24205,7 +24509,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                 push(
                     &mut out,
                     alloc::format!(
-                        "  変更中: {}   刻み {}   R 直接入力   上限 {}",
+                        "  変更中: {}   刻み {}   上限 {}",
                         ["討伐数", "捕獲数", "最小サイズ", "最大サイズ"][self.hunt_field.min(3)],
                         HUNT_STEPS[self.step],
                         if self.hunt_field <= 1 {
@@ -24280,22 +24584,8 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                     false,
                     false,
                 );
-                push(
-                    &mut out,
-                    String::from(
-                        "  Up/Down アリーナ  Left/Right 順位  A 編集  Y 直接入力  X save  B カードへ",
-                    ),
-                    false,
-                    false,
-                );
-                push(
-                    &mut out,
-                    String::from(
-                        "  編集中: Left/Right 分・秒・1/100  Up/Down 増減  A 終了  Y 直接入力",
-                    ),
-                    false,
-                    false,
-                );
+                
+                
             }
             Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => {
                 push(
@@ -24334,12 +24624,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                     false,
                     false,
                 );
-                push(
-                    &mut out,
-                    String::from("  Up/Down 項目  Left/Right 増減  A +刻み  R 数値入力  X save  B カードへ"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Guild if self.guild_view() == GUILD_TAB_WEAPONS => {
                 push(
@@ -24396,18 +24681,8 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                     false,
                     false,
                 );
-                push(
-                    &mut out,
-                    String::from("  Up/Down 武器  Left/Right 会場  A 編集  R 数値入力  X save  B カードへ"),
-                    false,
-                    false,
-                );
-                push(
-                    &mut out,
-                    String::from("  編集中: Up/Down ±刻み  Left/Right ±10  A 終了  R 数値入力"),
-                    false,
-                    false,
-                );
+                
+                
             }
             Screen::Guild => {
                 push(
@@ -24452,7 +24727,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                 );
                 push(
                     &mut out,
-                    String::from("  R で HR / プレイ時間を直接入力"),
+                    String::from("  HR / プレイ時間は数値で直接入力できます"),
                     false,
                     false,
                 );
@@ -24482,12 +24757,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         false,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from("  comment / name は [A] で入力（name はカード側の写し）"),
-                    false,
-                    false,
-                );
+                push(&mut out, String::from("  comment / name は一覧から入力（name はカード側の写し）"), false, false);
                 push(&mut out, String::from("  ARENA"), false, false);
                 let log = crate::guildcard::arena(save, self.slot);
                 for a in 0..crate::guildcard::ARENA_COUNT {
@@ -24509,7 +24779,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         false,
                     );
                 }
-                push(&mut out, String::from("  B back"), false, false);
+                
             }
             Screen::Sets => {
                 // The editor is a mode of this screen, so it replaces the two
@@ -24535,7 +24805,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         } else {
                             let part = row - 1;
                             let armed = if self.set_clear_armed == Some(part) {
-                                "  << もう一度 [-] で確定"
+                                "  << もう一度で確定"
                             } else {
                                 ""
                             };
@@ -24556,12 +24826,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                             row == e.field,
                         );
                     }
-                    push(
-                        &mut out,
-                        alloc::format!("  警告 {} 件 ([Y] で読み直す)", self.set_warnings.len()),
-                        false,
-                        false,
-                    );
+                    push(&mut out, alloc::format!("  警告 {} 件", self.set_warnings.len()), false, false);
                     if self.set_warnings.is_empty() {
                         push(&mut out, String::from("    (なし)"), false, false);
                     } else {
@@ -24574,14 +24839,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                             );
                         }
                     }
-                    push(
-                        &mut out,
-                        String::from(
-                            "  Up/Down 行  Left/Right 装備  A 決定  - 解除(2回)  Y 警告  B 一覧",
-                        ),
-                        false,
-                        false,
-                    );
+                    
                     return out;
                 }
                 // The item set form, the twin of the equipment one above.
@@ -24613,7 +24871,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         // console, and the row already holds a name and a
                         // count.
                         let armed = if self.item_set_armed == Some(ItemSetOp::FromPouch) {
-                            "  << [Y] で取込確定"
+                            "  << もう一度で取込確定"
                         } else if self.item_set_armed == Some(ItemSetOp::ToPouch) {
                             "  << もう一度で確定"
                         } else {
@@ -24644,14 +24902,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                             );
                         }
                     }
-                    push(
-                        &mut out,
-                        String::from(
-                            "  Up/Down 枠  Left/Right アイテム  A 決定  Y 取込(2回)  B 一覧",
-                        ),
-                        false,
-                        false,
-                    );
+                    
                     return out;
                 }
                 push(
@@ -24688,12 +24939,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         false,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from("  A 編集(アイテム/装備セット)   B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Roster => {
                 let list = self.palicos();
@@ -24727,21 +24973,8 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.roster_cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    alloc::format!(
-                        "  変更中: {}   A で名前変更",
-                        ["レベル", "なつき度", "経験値"][self.roster_field.min(2)]
-                    ),
-                    false,
-                    false,
-                );
-                push(
-                    &mut out,
-                    String::from("  Y 項目切替   ZR 装備/解除(2回)   X save   B back"),
-                    false,
-                    false,
-                );
+                push(&mut out, alloc::format!("  変更中: {}", ["レベル", "なつき度", "経験値"][self.roster_field.min(2)]), false, false);
+                
             }            Screen::QuestEquip => {
                 let list = self.quest_equipment();
                 let used = list.iter().filter(|e| e.occupied).count();
@@ -24799,12 +25032,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                             i == self.qe_item_cursor,
                         );
                     }
-                    push(
-                        &mut out,
-                        String::from("  A アイテム変更   B 戻る"),
-                        false,
-                        false,
-                    );
+                    
                 } else {
                     for (i, e) in list.iter().enumerate().skip(start).take(16) {
                         let id = if e.occupied {
@@ -24820,12 +25048,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         );
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down row   B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Equip => {
                 let all = self.equip_rows();
@@ -24869,31 +25092,11 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                 // is two presses, and the first one names what still points at
                 // the record.
                 if let Some((idx, refs, _)) = self.equip_delete_pending() {
-                    push(
-                        &mut out,
-                        format!(
-                            "  削除の確認中: 枠 #{} / 参照 {} 件 / もう一度 [-] で{}",
-                            idx,
-                            refs,
-                            if refs == 0 { "削除" } else { "強制削除" }
-                        ),
-                        false,
-                        false,
-                    );
+                    push(&mut out, alloc::format!("  削除の確認中: 枠 #{} / 参照 {} 件 / もう一度で{}", idx, refs, if refs == 0 { "削除" } else { "強制削除" }), false, false);
                 } else {
-                    push(
-                        &mut out,
-                        String::from("  [-] 2回で削除 / [＋] 新規追加 / [A] 編集（種別・IDを変えると差し替え）"),
-                        false,
-                        false,
-                    );
+                    push(&mut out, String::from("  種別・IDを変えると差し替えになります"), false, false);
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down row  A 編集  Y 検索  X save  B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::EquipEdit => {
                 let e = self.equip_edit.unwrap_or_default();
@@ -24918,14 +25121,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                     for (i, (k, v)) in rows.iter().enumerate() {
                         push(&mut out, format!("  {:<14} {}", k, v), true, i == e.field);
                     }
-                    push(
-                        &mut out,
-                        String::from(
-                            "  Up/Down row  Left/Right 10件  A 種別/IDは一覧・レベル行で作成  Y 検索  R ID入力  B 戻る",
-                        ),
-                        false,
-                        false,
-                    );
+                    
                 } else {
                     push(&mut out, String::from("装備の編集"), false, false);
                     // Nine rows, the same shape as the talisman form, so the
@@ -24983,14 +25179,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                     for (i, (k, v)) in rows.iter().enumerate() {
                         push(&mut out, format!("  {:<14} {}", k, v), true, i == e.field);
                     }
-                    push(
-                        &mut out,
-                        String::from(
-                            "  Up/Down row  Left/Right 10件(ID)/値  A 行の操作（一覧/値/書き込み）  Y 検索  R ID入力  B 戻る",
-                        ),
-                        false,
-                        false,
-                    );
+                    
                 }
             }
             Screen::JewelPick => {
@@ -25021,14 +25210,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.jewel_pick_cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from(
-                        "  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back",
-                    ),
-                    false,
-                    false,
-                );
+                
             }
             Screen::EquipPick => {
                 let choices = self.equip_pick_choices();
@@ -25060,14 +25242,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.equip_pick_cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from(
-                        "  A choose  Y name filter  ZR type filter  X clear  Up/Down 1  Left/Right 10  B back",
-                    ),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Convert => {
                 push(&mut out, String::from("セーブ形式の変換"), false, false);
@@ -25109,12 +25284,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         );
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  A convert and write   Y name   B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::SkillPick => {
                 let matches = self.skill_pick_matches();
@@ -25159,12 +25329,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.skill_pick_cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from("  A choose  Y name filter  X clear  Up/Down 1  Left/Right 10  B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::CharmEdit => {
                 push(&mut out, String::from("護石の編集"), false, false);
@@ -25304,12 +25469,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         push(&mut out, line, false, false);
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down row  Left/Right value  Y pick skill  A row  X save  B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Palico => {
                 let lang = if self.palico_lang == 0 { Lang::Jp } else { Lang::En };
@@ -25346,12 +25506,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.palico_cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from("  A add/remove   ZR 装備/解除(2回)   Left/Right language   X write save   B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Csv => {
                 push(
@@ -25361,16 +25516,11 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                     false,
                 );
                 if self.csv_files.is_empty() {
-                    push(
-                        &mut out,
-                        String::from("  (CSV ファイルがありません - Y で書き出します)"),
-                        false,
-                        false,
-                    );
+                    push(&mut out, String::from("  (CSV ファイルがありません)"), false, false);
                 }
                 for (i, path) in self.csv_files.iter().enumerate() {
                     let armed = if self.csv_armed == Some(i) {
-                        "  << [A] で適用確定"
+                        "  << もう一度で適用確定"
                     } else {
                         ""
                     };
@@ -25398,12 +25548,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         );
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down 行  A 適用(2回)  Y 書き出し  ZR 再読込  B back"),
-                    false,
-                    false,
-                );
+                
             }
             Screen::Progress => {
                 let tab = self.progress_view();
@@ -25568,21 +25713,9 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         }
                     }
                 }
-                // The same keys the footer names: [Y] walks the views, [ZR] is
-                // the search, and [R] is the quest view's second bit. This line
-                // said "Y 既読" long after [Y] became the tab key.
-                let keys = match tab {
-                    PROGRESS_AWARDS => {
-                        "  Up/Down 行  Left/Right ±50  A 取得切替  Y タブ  ZR 検索  X 保存  B back"
-                    }
-                    PROGRESS_REQUESTS => {
-                        "  Up/Down 行  Left/Right ±50  A フラグ切替  Y タブ  ZR 検索  X 保存  B back"
-                    }
-                    _ => {
-                        "  Up/Down 行  Left/Right ±50  A クリア  R 既読  Y タブ  ZR 検索  X 保存  B back"
-                    }
-                };
-                push(&mut out, String::from(keys), false, false);
+                // No key line here: the chip row under the body is the table
+                // (Editor::key_facts), and a second copy in the body drifted -
+                // it said "Y 既読" long after [Y] became the tab key.
             }
             Screen::Options => {
                 push(&mut out, String::from("設定"), false, false);
@@ -25614,12 +25747,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         i == self.option_cursor,
                     );
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down row  Left/Right value  A open  X save  B back"),
-                    false,
-                    false,
-                );
+                
             }
             // 変更一覧: the values the save differs from the file in, one line
             // each. The console draws its own list (ui.rs); this is the text
@@ -25650,12 +25778,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                         push(&mut out, alloc::format!("  {}", note), false, false);
                     }
                 }
-                push(
-                    &mut out,
-                    String::from("  Up/Down row  Left/Right 10  A restore (2)  Y rebuild  X save  B back"),
-                    false,
-                    false,
-                );
+                
             }
         }
         out

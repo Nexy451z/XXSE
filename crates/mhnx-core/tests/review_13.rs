@@ -361,10 +361,23 @@ fn the_way_out_is_on_every_guide_that_has_one() {
     // say what the second press does, not just that there are two of them.
     ed.screen = Screen::Sets;
     assert!(ed.open_set_editor(0), "{}", ed.message);
+    // The destination's name, not a verb: the form's [B] goes to the my-sets
+    // list and the word says so (the sixth review's leftovers unified every
+    // [B] to the screen it goes to).
     assert!(
-        // The destination's name, not a verb: the form's [B] goes to the
-        // my-sets list and the word says so (the sixth review's leftovers
-        // unified every [B] to the screen it goes to).
+        ed.footer_hint().contains("[B] マイセット"),
+        "{}",
+        ed.footer_hint()
+    );
+    // The second press exists only while the form holds a draft, and the word
+    // follows the draft: a form nobody changed leaves on one press (the
+    // seventh review - the second press used to run the list's own [B]).
+    let form = ed.set_edit.expect("a form");
+    let mut pick = form.pick;
+    pick[0] = if pick[0] == 0 { 1 } else { 0 };
+    ed.set_edit = Some(mhnx_core::hbedit::SetEdit { pick, ..form });
+    assert!(ed.set_draft_dirty(), "the form holds a draft now");
+    assert!(
         ed.footer_hint().contains("[B] マイセット（2回で破棄）"),
         "{}",
         ed.footer_hint()

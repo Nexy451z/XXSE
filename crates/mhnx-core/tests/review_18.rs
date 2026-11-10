@@ -737,17 +737,18 @@ fn the_progress_keys_agree_in_all_three_places() {
     }
     assert!(!guide.contains("[L/R]"), "the guide names no shoulder pair: {guide}");
 
-    // 3. The text build's key line.
-    let keys = ed
-        .lines()
+    // 3. The text build's key row: the body names no key any more (the seventh
+    // review), so the row under it - the table - is what the console prints.
+    let keys: String = ed
+        .key_facts()
         .into_iter()
-        .map(|l| l.text)
-        .find(|t| t.contains("Up/Down"))
-        .expect("the key line");
-    assert!(keys.contains("R 既読"), "{keys}");
-    assert!(keys.contains("Y タブ"), "{keys}");
-    assert!(keys.contains("ZR 検索"), "{keys}");
-    assert!(!keys.contains("Y 既読"), "{keys}");
+        .map(|f| f.render())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(keys.contains("[R] 既読"), "{keys}");
+    assert!(keys.contains("[Y] タブ"), "{keys}");
+    assert!(keys.contains("[ZR] 検索"), "{keys}");
+    assert!(!keys.contains("[Y] 既読"), "{keys}");
 
     // The award view names the tab key and not the second bit.
     ed.progress_tab = PROGRESS_AWARDS;
@@ -946,9 +947,11 @@ fn the_number_key_has_one_name() {
     // the reward / supply panel's button and the card's button.
     // The sixth review's leftovers: the buttons name no key at all, so they
     // borrow the word through pill_word (the table's word, no bracket).
+    // Four: the card's inspector, the reward / supply panel, the arena
+    // inspector and the weapon inspector (the seventh review added the last).
     assert_eq!(
         ui.matches("pill_word(ed, \"R\"").count(),
-        3,
+        4,
         "every [R] button borrows the table's word"
     );
     // Only the code lines: the comments explain the key (they say why each

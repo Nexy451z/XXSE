@@ -438,10 +438,14 @@ fn the_name_keyboards_clear_key_asks_twice() {
     // table now (the sixth review's leftovers): the word is クリア（2回） on
     // both, where the legend used to say 全消去 over a button that said クリア.
     let draw = fn_body(ui_src(), "fn draw_osk");
-    assert!(
-        draw.contains("(\"X\", \"クリア（2回）\""),
-        "{draw}"
+    // The word comes from the table now (the seventh review: no draw function
+    // writes a key name), so the table is what carries クリア（2回）.
+    assert_eq!(
+        mhnx_core::hbedit::osk_word(false, "X"),
+        "クリア（2回）",
+        "the clear's word is the table's"
     );
+    assert!(draw.contains("word(\"X\")"), "{draw}");
     assert!(!draw.contains("[X] 全消去"), "{draw}");
     assert!(draw.contains("osk_key_label"), "the legend is the row: {draw}");
     // The touch button takes the same two presses: a finger and a key must not
@@ -701,15 +705,25 @@ fn the_update_banner_names_no_key_it_cannot_keep() {
     assert!(!text.contains("[A]"), "the line must not promise [A]: {text}");
     assert!(text.contains("v0.4.1"), "{text}");
 
-    // The console adds the pad's route where the pad really has one.
+    // The banner names no key at all now (the seventh review): the pill is a
+    // tap target on every screen, so it says what a tap does and the footer
+    // names the key. There is no "where does [A] work" question left to ask.
+    let banner = fn_body(ui_src(), "fn draw_update_banner");
+    // The body slice runs into the next item's doc comment, so only the code
+    // lines are read.
+    let code: String = banner
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!code.contains("[A]"), "{code}");
+    assert!(!code.contains("a_opens_it"), "{code}");
+    assert!(code.contains("タップで詳細"), "{code}");
     let guide = fn_body(ui_src(), "fn draw_guide");
     assert!(
-        guide.contains("ed.screen == Screen::SaveList"),
-        "the banner has to know where [A] works: {guide}"
+        !guide.contains("a_opens_it"),
+        "the banner no longer needs the screen's [A]: {guide}"
     );
-    let banner = fn_body(ui_src(), "fn draw_update_banner");
-    assert!(banner.contains("a_opens_it"), "{banner}");
-    assert!(banner.contains("タップで詳細"), "{banner}");
 }
 
 // ---------------------------------------------------------------------------

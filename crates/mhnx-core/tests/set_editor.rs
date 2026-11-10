@@ -291,7 +291,15 @@ fn the_list_still_offers_the_editor_and_leaving_returns_to_it() {
         .join("\n");
     assert!(text.contains("MY SETS"), "{}", text);
     assert!(text.contains("EQUIPMENT SETS"), "{}", text);
-    assert!(text.contains("編集"), "the list must say A edits: {}", text);
+    // The body names no key any more (the seventh review): the chip row under
+    // it is the table, and that is where [A] 編集 is said.
+    assert!(
+        ed.key_facts()
+            .iter()
+            .any(|f| f.key == "A" && f.label == "編集"),
+        "the list must say A edits: {:?}",
+        ed.key_facts()
+    );
 
     open_editor(&mut ed);
     ed.input(Key::B);

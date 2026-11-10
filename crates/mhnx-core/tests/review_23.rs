@@ -416,10 +416,11 @@ fn the_guide_shows_state_the_footer_cannot() {
     assert!(guide.contains("下書きあり"), "{guide}");
     assert!(guide.contains("護石編集"), "{guide}");
 
-    // A dirty save: the strip says so.
+    // A dirty save: the header pill and the footer's dot say so, and the strip
+    // does not repeat it (the seventh review: three surfaces for one fact).
     let mut ed = editor(Screen::Char);
     ed.dirty = true;
-    assert!(ed.screen_guide().contains("未保存"), "{}", ed.screen_guide());
+    assert!(!ed.screen_guide().contains("未保存"), "{}", ed.screen_guide());
 
     // And the row's place, which the footer never prints.
     let ed = editor(Screen::Char);
@@ -763,18 +764,36 @@ fn the_osk_legend_is_the_button_row() {
     );
     assert!(!draw.contains("[B] 削除"), "the old legend word is gone");
     assert!(!draw.contains("[X] 全消去"), "the old legend word is gone");
+    // The two keys that are not buttons are table entries now: the legend
+    // prints them like every other item, and no draw function writes a key
+    // name (the seventh review's A1).
+    let facts = hbedit::osk_facts(true);
     assert!(
-        draw.contains("[A] 入力") && draw.contains("[L/R] 文字種"),
+        facts.iter().any(|f| f.key == "A" && f.label == "入力"),
         "the two keys that are not buttons are still named"
     );
-    // The table itself.
-    for pair in [
-        "(\"B\", \"1字削除\"",
-        "(\"X\", \"クリア（2回）\"",
-        "(\"Y\", \"濁点/小字\"",
-        "(\"-\", \"取消\"",
+    assert!(
+        facts.iter().any(|f| f.key == "L/R" && f.label == "文字種"),
+        "and the shoulder pair is too"
+    );
+    assert!(
+        draw.contains("hbedit::osk_facts"),
+        "the legend is the table rendered"
+    );
+    // The table itself: the row takes each word from it, so the pair is
+    // checked there and the row is checked to read it.
+    for (key, word) in [
+        ("B", "1字削除"),
+        ("X", "クリア（2回）"),
+        ("Y", "濁点/小字"),
+        ("-", "取消"),
+        ("＋", "確定"),
     ] {
-        assert!(draw.contains(pair), "the row carries {pair}");
+        assert_eq!(hbedit::osk_word(true, key), word, "the table carries {key}");
+        assert!(
+            draw.contains(&format!("word(\"{key}\")")),
+            "the row reads the table for {key}"
+        );
     }
 }
 
@@ -822,7 +841,7 @@ fn no_surface_drops_a_note() {
         let ed = editor(screen);
         assert!(ed.plus_is_a_tool(), "{screen:?}: [＋] is a tool here");
         assert!(
-            ed.footer_hint().contains("※終了は [B]"),
+            ed.footer_hint().contains("終了は一覧から"),
             "{screen:?}: {}",
             ed.footer_hint()
         );

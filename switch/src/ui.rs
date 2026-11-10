@@ -682,8 +682,6 @@ pub struct GuiState {
     pub osk: Option<OskState>,
     pub osk_result: Option<(usize, String)>,
     pub osk_cancelled: bool,
-    pub sets_cursor: usize,
-    pub sets_tab: usize,
     /// The snapshot a review is waiting on. Set by the [Y] press on the options
     /// screen through the same dialog a save write uses, and taken by the
     /// second press: restoring is a write like any other and must not happen
@@ -742,8 +740,6 @@ impl GuiState {
             osk: None,
             osk_result: None,
             osk_cancelled: false,
-            sets_cursor: 0,
-            sets_tab: 0,
             pending_snapshot: None,
             review_scroll: 0,
             undo_press: mhnx_core::confirm::ConfirmPress::new(),
@@ -1533,7 +1529,10 @@ impl GuiState {
                 2 => ed.open_equip_box(),
                 _ => {
                     ed.screen = Screen::Sets;
-                    self.sets_cursor = 0;
+                    // The row lives in the state machine now (Editor::sets_cursor):
+                    // the guide strip under the bar prints it, and a copy here
+                    // made the strip and the list disagree.
+                    ed.sets_cursor = 0;
                 }
             },
             // The guild card's own four views are the bar's tabs while that
@@ -1670,10 +1669,10 @@ impl GuiState {
             if ed.set_editor_open() {
                 return;
             }
-            let len = sets_len(ed, self.sets_tab);
+            let len = ed.sets_rows();
             if len > 0 {
-                let next = (self.sets_cursor as i32 + delta).clamp(0, len as i32 - 1) as usize;
-                self.sets_cursor = next;
+                let next = (ed.sets_cursor as i32 + delta).clamp(0, len as i32 - 1) as usize;
+                ed.sets_cursor = next;
             }
             return;
         }
@@ -1716,11 +1715,11 @@ impl GuiState {
             ed.map_edit_page(dir);
             return;
         }
-        let len = list_len_of(ed, self);
+        let len = ed.active_list_len();
         if len == 0 {
             return;
         }
-        let cur = active_cursor_of(ed, self);
+        let cur = ed.active_cursor();
         let next = page_move(cur, len, self.page_rows(), dir);
         if next != cur {
             set_active_cursor(ed, self, next);
@@ -1745,12 +1744,12 @@ impl GuiState {
             ed.map_edit_jump(forward);
             return;
         }
-        let len = list_len_of(ed, self);
+        let len = ed.active_list_len();
         if len == 0 {
             return;
         }
         let next = list_end(len, forward);
-        if next != active_cursor_of(ed, self) {
+        if next != ed.active_cursor() {
             set_active_cursor(ed, self, next);
         }
     }
@@ -1853,7 +1852,7 @@ impl GuiState {
         // is not a page button, so that case does nothing).
         let landed = ty - bar.track_y - off;
         let grab = landed.clamp(0, (thumb - 1).max(0));
-        let cur = active_cursor_of(ed, self);
+        let cur = ed.active_cursor();
         let inside = bar
             .ids
             .iter()
@@ -1886,7 +1885,7 @@ impl GuiState {
         let cur = if drag.picker {
             self.mib_picker.as_ref().map(|p| p.cursor).unwrap_or(0)
         } else {
-            active_cursor_of(ed, self)
+            ed.active_cursor()
         };
         Some((target, cur))
     }
@@ -2213,7 +2212,7 @@ impl GuiState {
     /// without a destination per screen. The screens that already *are* a
     /// detail view answer with a message rather than leaving a dead button.
     pub fn open_detail(&mut self, ed: &mut Editor) {
-        let target = ed.detail_target(self.sets_tab);
+        let target = ed.detail_target(ed.sets_tab);
         self.open_detail_at(ed, target);
     }
 
@@ -2608,32 +2607,32 @@ impl GuiState {
             },
             Screen::Sets => match key {
                 Key::Up => {
-                    self.sets_cursor = self.sets_cursor.saturating_sub(1);
+                    ed.sets_cursor = ed.sets_cursor.saturating_sub(1);
                 }
                 Key::Down => {
-                    let len = sets_len(ed, self.sets_tab);
+                    let len = ed.sets_rows();
                     if len > 0 {
-                        self.sets_cursor = (self.sets_cursor + 1).min(len - 1);
+                        ed.sets_cursor = (ed.sets_cursor + 1).min(len - 1);
                     }
                 }
                 Key::A => {
                     // Both tabs have a form now, and each takes the record its
                     // own list is showing: the two arrays are unrelated.
-                    if self.sets_tab == 0 {
-                        if let Some(set) = item_set_at(ed, self.sets_cursor) {
+                    if ed.sets_tab == 0 {
+                        if let Some(set) = item_set_at(ed, ed.sets_cursor) {
                             ed.open_item_set_editor(set);
                         } else {
                             ed.message = String::from("編集できるアイテムセットがありません");
                         }
-                    } else if let Some(set) = equip_set_at(ed, self.sets_cursor) {
+                    } else if let Some(set) = equip_set_at(ed, ed.sets_cursor) {
                         ed.open_set_editor(set);
                     } else {
                         ed.message = String::from("編集できる装備セットがありません");
                     }
                 }
                 Key::Left | Key::Right | Key::Y => {
-                    self.sets_tab = 1 - self.sets_tab;
-                    self.sets_cursor = 0;
+                    ed.sets_tab = 1 - ed.sets_tab;
+                    ed.sets_cursor = 0;
                 }
                 // [B] leaves for the talisman list, which is the destination
                 // the footer names. The state machine answers the same way
@@ -2807,7 +2806,7 @@ impl GuiState {
                     .as_ref()
                     .and_then(|a| a.entries.get(ed.entry))
                     .and_then(|e| extension_for(e.type_hash));
-                let len = list_len_of(ed, self);
+                let len = ed.active_list_len();
                 match key {
                     Key::Up => {
                         if len > 0 {
@@ -2941,7 +2940,7 @@ impl GuiState {
                                 ed.set_quest_list_cursor(idx);
                                 changed = true;
                             }
-                        } else if active_cursor_of(ed, self) == idx {
+                        } else if ed.active_cursor() == idx {
                             self.pending_activate_row = Some(idx);
                         } else {
                             set_active_cursor(ed, self, idx);
@@ -3555,188 +3554,7 @@ fn item_set_at(ed: &Editor, row: usize) -> Option<usize> {
         .map(|s| s.index)
 }
 
-fn sets_len(ed: &Editor, tab: usize) -> usize {
-    let Some(save) = &ed.save else { return 0 };
-    if tab == 0 {
-        mhnx_core::myset::item_sets(save, ed.slot)
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .count()
-    } else {
-        mhnx_core::myset::equip_sets(save, ed.slot)
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .count()
-    }
-}
-
-fn active_cursor_of(ed: &Editor, gui: &GuiState) -> usize {
-    match ed.screen {
-        Screen::Slots => ed.slot,
-        Screen::Char => ed.field,
-        Screen::CharmEdit => ed.charm_edit.map(|c| c.field).unwrap_or(0),
-        Screen::Items => {
-            if ed.item_menu_open {
-                ed.item_menu_cursor
-            } else {
-                ed.cursor
-            }
-        }
-        Screen::ItemPick => ed.item_pick_cursor,
-        Screen::SkillPick => ed.skill_pick_cursor,
-        Screen::Equip => ed.equip_cursor,
-        Screen::EquipEdit => ed.equip_edit.map(|e| e.field).unwrap_or(0),
-        Screen::JewelPick => ed.jewel_pick_cursor,
-        Screen::EquipPick => ed.equip_pick_cursor,
-        Screen::Hunts => ed.hunt_cursor,
-        Screen::Guild => match ed.guild_view() {
-            GUILD_TAB_ARENA => ed.arena_row,
-            GUILD_TAB_COUNTS => ed.guild_count_selected(),
-            GUILD_TAB_WEAPONS => ed.guild_weapon_selected().0,
-            _ => ed.guild_field,
-        },
-        // One cursor per view: the screen swaps the list under it.
-        Screen::Progress => ed.progress_cursor(),
-        // A mode's row while one is open, the list's row otherwise.
-        Screen::Roster => match ed.palico_skill {
-            Some(state) => state.field,
-            None => match ed.palico_equip {
-                Some(state) => state.field,
-                None => ed.roster_cursor,
-            },
-        },
-        // The list's row while the list is showing, and the form's row while
-        // the set editor is open: the editor is a mode of this screen.
-        Screen::Sets => match ed.set_edit {
-            Some(e) => e.field,
-            None => match ed.item_set_edit {
-                Some(e) => e.field,
-                None => gui.sets_cursor,
-            },
-        },
-        Screen::Csv => ed.csv_cursor,
-        // The tab on screen owns the cursor (hbedit::Editor::quest_list_cursor),
-        // so a page turn, a tap and the scrollbar all move the same row.
-        Screen::SaveQuests => ed.quest_list_cursor(),
-        Screen::QuestEquip => {
-            if ed.qe_open {
-                ed.qe_item_cursor
-            } else {
-                ed.cursor
-            }
-        }
-        Screen::Mib => ed.mib_cursor,
-        Screen::QuestEdit => ed.quest_edit_cursor,
-        Screen::Gmd => ed.gmd_cursor,
-        Screen::Check => ed.check_cursor,
-        Screen::EntryView => ed.entry_row_cursor,
-        Screen::Palico => match ed.palico_equip {
-            Some(state) => state.field,
-            None => ed.palico_cursor,
-        },
-        Screen::Options => ed.option_cursor,
-        // 生データ: a position in the filtered save map, not a body offset.
-        Screen::SaveMap => ed.map_cursor,
-        // 変更一覧: a position in the value list.
-        Screen::Review => ed.rev_cursor,
-        _ => ed.cursor,
-    }
-}
-
-fn list_len_of(ed: &Editor, gui: &GuiState) -> usize {
-    match ed.screen {
-        Screen::SaveList => ed.save_files.len(),
-        Screen::Slots => 3,
-        Screen::Char => CHAR_FIELDS.len(),
-        Screen::Items => {
-            if ed.item_menu_open {
-                ITEM_OPS.len()
-            } else {
-                ed.visible_items().len()
-            }
-        }
-        Screen::ItemPick => ed.item_pick_matches().len(),
-        Screen::Charms => ed.charms().len(),
-        Screen::CharmEdit => CHARM_EDIT_ROWS,
-        Screen::SkillPick => ed.skill_pick_matches().len(),
-        Screen::Equip => ed.equip_rows().len(),
-        // The form has two shapes: 9 rows for an existing record and 3 for a
-        // new one. The count comes from the form itself so the cursor and the
-        // renderer can never disagree about it.
-        Screen::EquipEdit => ed.equip_edit.map(|e| e.rows()).unwrap_or(0),
-        Screen::JewelPick => ed.jewel_pick_matches().len(),
-        Screen::EquipPick => ed.equip_pick_choices().len(),
-        Screen::Hunts => ed.hunt_rows().len(),
-        Screen::Guild => match ed.guild_view() {
-            GUILD_TAB_ARENA => ARENA_ROWS,
-            GUILD_TAB_COUNTS => mhnx_core::hbedit::GUILD_COUNT_ROWS,
-            GUILD_TAB_WEAPONS => mhnx_core::hbedit::GUILD_WEAPON_ROWS,
-            // The card's four rows: HR, clock, comment, card name.
-            _ => mhnx_core::hbedit::GUILD_FIELDS,
-        },
-        Screen::Progress => ed.progress_len(),
-        Screen::Roster => match ed.palico_skill {
-            Some(_) => ed.palico_skill_list_len(),
-            None => match ed.palico_equip {
-                Some(_) => PALICO_EQUIP_ROWS,
-                None => ed.palicos().len(),
-            },
-        },
-        Screen::Sets => {
-            if ed.set_edit.is_some() {
-                SET_EDIT_ROWS
-            } else if ed.item_set_edit.is_some() {
-                ITEM_SET_EDIT_ROWS
-            } else {
-                sets_len(ed, gui.sets_tab)
-            }
-        }
-        Screen::Csv => ed.csv_files.len(),
-        Screen::SaveQuests => ed.quest_list_len(),
-        Screen::QuestEquip => {
-            if ed.qe_open {
-                ed.quest_equip_items().len()
-            } else {
-                ed.quest_equipment().len()
-            }
-        }
-        Screen::ArcList => ed.arc_files.len(),
-        Screen::ArcEntries => ed.arc.as_ref().map(|a| a.entries.len()).unwrap_or(0),
-        Screen::EntryView => {
-            let entry = ed.arc.as_ref().and_then(|a| a.entries.get(ed.entry));
-            match entry {
-                Some(e) => match extension_for(e.type_hash) {
-                    Some("rem") | Some("sup") => ed.entry_record_count(),
-                    Some("sem") => ed.sem_entry_indices().len() * 6,
-                    Some("esl") => 1,
-                    Some("qdp") => Qdp::parse(&e.data).map(|q| q.flags().len()).unwrap_or(0),
-                    Some("qdl") | Some("qlv") => {
-                        QuestLink::parse(&e.data).map(|q| q.refs.len()).unwrap_or(0)
-                    }
-                    _ => 0,
-                },
-                None => 0,
-            }
-        }
-        Screen::Mib => questfields::MIB_FIELDS.len(),
-        // One row list per tab; the core answers for the tab it is on.
-        Screen::QuestEdit => ed.quest_row_count(),
-        Screen::Gmd => ed.gmd.as_ref().map(|g| g.strings.len()).unwrap_or(0),
-        Screen::Check => ed.findings.len(),
-        Screen::Palico => match ed.palico_equip {
-            Some(_) => PALICO_EQUIP_ROWS,
-            None => dlcats::all_ids().len(),
-        },
-        Screen::Options => 4,
-        Screen::Convert => 0,
-        Screen::SaveMap => ed.save_map_rows().len(),
-        // 変更一覧: one row per value that differs, so an empty list is a save
-        // identical to the card and the length is 0 rather than a placeholder.
-        Screen::Review => ed.review_len(),
-    }
-}
-
-fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
+fn set_active_cursor(ed: &mut Editor, _gui: &mut GuiState, idx: usize) {
     if ed.screen == Screen::SaveQuests && ed.quest_tab > 0 {
         ed.set_quest_list_cursor(idx);
         return;
@@ -3757,9 +3575,9 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
             ed.item_set_armed = None;
             return;
         }
-        let n = sets_len(ed, gui.sets_tab);
+        let n = ed.sets_rows();
         if n > 0 {
-            gui.sets_cursor = idx.min(n - 1);
+            ed.sets_cursor = idx.min(n - 1);
         }
         return;
     }
@@ -3776,7 +3594,7 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
         }
         return;
     }
-    let len = list_len_of(ed, gui);
+    let len = ed.active_list_len();
     if len == 0 {
         return;
     }
@@ -3922,15 +3740,17 @@ fn set_active_cursor(ed: &mut Editor, gui: &mut GuiState, idx: usize) {
 }
 
 fn scroll_active_cursor(ed: &mut Editor, delta: i32) {
-    let dummy = GuiState::new();
-    let len = list_len_of(ed, &dummy);
+    // No dummy GuiState any more: the row and the count are the state
+    // machine's (Editor::active_cursor / active_list_len), so the keyboard
+    // walk and the touch walk cannot land on different rows.
+    let len = ed.active_list_len();
     if len == 0 {
         return;
     }
-    let cur = active_cursor_of(ed, &dummy) as i32;
+    let cur = ed.active_cursor() as i32;
     let next = (cur + delta).clamp(0, len as i32 - 1) as usize;
-    let mut dummy_mut = GuiState::new();
-    set_active_cursor(ed, &mut dummy_mut, next);
+    let mut gui = GuiState::new();
+    set_active_cursor(ed, &mut gui, next);
 }
 
 fn apply_row_max(ed: &mut Editor, mib_mob_sub: usize, idx: usize) {
@@ -4361,12 +4181,10 @@ impl GuiState {
         // is shown, which is the right trade: the note is a hint about a key,
         // the banner is new information.
         if self.update.banner_visible() {
-            // [A] opens the dialog on the start screen and nowhere else (every
-            // other screen's [A] is its own key), so the banner only names the
-            // key where the key is true. The pill itself is a tap target on
-            // every screen, which is why the line can be drawn anywhere.
-            let a_opens_it = ed.screen == Screen::SaveList;
-            right = self.draw_update_banner(c, right, a_opens_it);
+            // The banner names no key: the pill is a tap target on every
+            // screen, so it says what a tap does (the seventh review) - and a
+            // key it named would be the screen's own [A] on twenty of them.
+            right = self.draw_update_banner(c, right);
         }
         // Not on 生データ itself: the note would advertise the screen that is
         // already showing. It names the pill by the word the pill itself
@@ -4384,10 +4202,14 @@ impl GuiState {
         }
         let room = (right - (MAIN_X + 4)).max(120);
         // While the update banner is up the strip is narrower than the guide,
-        // and a clipped guide loses its *end* - which is where the way out
-        // ([B] / [＋]) is named. The tail is drawn instead, prefixed with an
-        // ellipsis, so the last item survives the banner.
-        let guide = ed.screen_guide();
+        // and something has to go. It is the *keys* that go, not the state: the
+        // strip exists because the footer cannot say which row is selected or
+        // what is narrowing the list, and the old renderer took the tail of the
+        // whole sentence - so a banner deleted the position and the search word
+        // and kept "[A] 変更、[B] スロット", which the footer already prints.
+        let state = ed.guide_state();
+        let keys = ed.guide_keys();
+        let guide = format!("{}{}", state, keys);
         // The tail is measured against the room the marker leaves, not against
         // the whole strip. It used to be measured against `room` and then drawn
         // in `room - marker_w`, so text_clipped cut it a second time - and the
@@ -4406,8 +4228,18 @@ impl GuiState {
                 t.text_secondary,
                 FontSize::Medium,
             );
+        } else if width(&state) <= room {
+            // The keys go first: the state is the half the footer cannot say.
+            c.text_clipped(
+                MAIN_X + 4,
+                GUIDE_Y + 3,
+                room,
+                &state,
+                t.text_secondary,
+                FontSize::Medium,
+            );
         } else {
-            let tail = mhnx_core::hbedit::guide_tail(&guide, tail_room, &mut width);
+            let tail = mhnx_core::hbedit::guide_tail(&state, tail_room, &mut width);
             if !tail.is_empty() {
                 c.text_clipped(
                     MAIN_X + 4,
@@ -4529,27 +4361,45 @@ impl GuiState {
         }
         self.add_hit(slot_x, 4, slot_w, 40, UiAction::SlotBadge((ed.slot + 1) % 3));
 
-        // [X] Save Button
-        let save_x = 1116;
-        let save_w = 150;
-        let (save_bg, save_bd, save_txt) = if ed.dirty {
-            (t.accent_warn, t.text_primary, "[X] 未保存")
-        } else {
-            (t.accent_ok, t.border_subtle, "[X] 保存")
-        };
-        c.round_rect(save_x, 8, save_w, 32, t.corner_r, save_bg);
-        c.round_rect_border(save_x, 8, save_w, 32, t.corner_r, 1, save_bd);
-        btn_text(
-            c,
-            save_x,
-            8,
-            save_w,
-            32,
-            save_txt,
-            white_or_dark(save_bg),
-            FontSize::Small,
+        // Save Button
+        //
+        // Two lies are gone from this pill. It printed the key it runs ("[X]
+        // 保存"), and the footer is the one surface that names keys; and it was
+        // drawn on the four pick lists, where [X] clears the search - a tap on
+        // the pill ran quick_save and answered 書き込むセーブがありません while
+        // the key beside it emptied the filter. The pickers do not draw it.
+        let picker_screen = matches!(
+            ed.screen,
+            Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick
         );
-        self.add_hit(save_x, 8, save_w, 32, UiAction::QuickSave);
+        if !picker_screen {
+            let save_x = 1116;
+            let save_w = 150;
+            // The word is the table's; the state (未保存) is the pill's own.
+            let save_txt = if ed.dirty {
+                String::from("未保存")
+            } else {
+                ed.key_label_or("X", "保存")
+            };
+            let (save_bg, save_bd) = if ed.dirty {
+                (t.accent_warn, t.text_primary)
+            } else {
+                (t.accent_ok, t.border_subtle)
+            };
+            c.round_rect(save_x, 8, save_w, 32, t.corner_r, save_bg);
+            c.round_rect_border(save_x, 8, save_w, 32, t.corner_r, 1, save_bd);
+            btn_text(
+                c,
+                save_x,
+                8,
+                save_w,
+                32,
+                &save_txt,
+                white_or_dark(save_bg),
+                FontSize::Small,
+            );
+            self.add_hit(save_x, 8, save_w, 32, UiAction::QuickSave);
+        }
 
         // Tier 2: Sub-Tabs [L] ... [R] (y = SUB_TAB_Y..SUB_TAB_Y + SUB_TAB_H)
         c.rect(0, SUB_TAB_Y, 1280, SUB_TAB_H, t.bg_subbar);
@@ -4558,10 +4408,12 @@ impl GuiState {
         let sy = SUB_TAB_Y + 6;
         let sh = 32;
 
-        // [L] Sub-Tab Prev
+        // Sub-Tab Prev. It printed "L" - a key name on a button, which is the
+        // one thing the bar may not do (the footer names the key). The button
+        // is a tap target, so it says what the tap does.
         c.round_rect(14, sy, 40, sh, 6, t.bg_btn);
         c.round_rect_border(14, sy, 40, sh, 6, 1, t.border_subtle);
-        btn_text(c, 14, sy, 40, sh, "L", t.accent_primary, FontSize::Small);
+        btn_text(c, 14, sy, 40, sh, "前", t.accent_primary, FontSize::Small);
         self.add_hit(14, sy, 40, sh, UiAction::CycleSubTab(false));
 
         let (subs, active_sub) = self.sub_tabs_for(ed);
@@ -4587,10 +4439,10 @@ impl GuiState {
             sub_x += w + 6;
         }
 
-        // [R] Sub-Tab Next
+        // Sub-Tab Next (the same rule as the 前 button above).
         c.round_rect(sub_x + 2, sy, 40, sh, 6, t.bg_btn);
         c.round_rect_border(sub_x + 2, sy, 40, sh, 6, 1, t.border_subtle);
-        btn_text(c, sub_x + 2, sy, 40, sh, "R", t.accent_primary, FontSize::Small);
+        btn_text(c, sub_x + 2, sy, 40, sh, "次", t.accent_primary, FontSize::Small);
         self.add_hit(sub_x + 2, sy, 40, sh, UiAction::CycleSubTab(true));
 
         // [詳細] - the one button every screen carries.
@@ -5067,6 +4919,12 @@ impl GuiState {
         c.rect(0, FOOTER_Y, 1280, FOOTER_H, t.bg_footer);
         c.hline(0, FOOTER_Y, 1280, t.border_subtle);
 
+        // A modal owns the pad while it is open, so the footer is the modal's
+        // footer: it printed the *screen's* keys under the keyboard, so "[X]
+        // 保存" sat over a key that empties the field. The undo and 終了 pills go
+        // with it - neither key does its usual job there.
+        let modal = self.modal_hint(ed);
+
         // Line 1, left: the whole-save undo. The key is L held down; a plain L
         // is the sub-tab key everywhere.
         // Two holds run the undo (the first one only offers it), so the pill
@@ -5081,18 +4939,24 @@ impl GuiState {
         // and the pill promised it anyway. The tap route is the same on every
         // screen, so only the key half of the label changes.
         let undo = ed.undo_pill_label();
-        let undo_w = (c.text_width_sized(&undo, FontSize::Small) + 22).min(470);
-        let has_undo = ed.undo_depth() > 0;
-        let (undo_bg, undo_fg) = if has_undo {
-            (t.bg_btn_primary, t.text_primary)
+        let undo_w = if modal.is_some() {
+            0
         } else {
-            (t.bg_btn, t.text_muted)
+            (c.text_width_sized(&undo, FontSize::Small) + 22).min(470)
         };
-        let undo_bd = if has_undo { t.accent_primary } else { t.border_subtle };
-        c.round_rect(14, FOOTER_Y + 4, undo_w, 26, 5, undo_bg);
-        c.round_rect_border(14, FOOTER_Y + 4, undo_w, 26, 5, 1, undo_bd);
-        c.text_clipped(24, FOOTER_Y + 9, undo_w - 12, &undo, undo_fg, FontSize::Small);
-        self.add_hit(14, FOOTER_Y + 2, undo_w, 30, UiAction::Undo);
+        if modal.is_none() {
+            let has_undo = ed.undo_depth() > 0;
+            let (undo_bg, undo_fg) = if has_undo {
+                (t.bg_btn_primary, t.text_primary)
+            } else {
+                (t.bg_btn, t.text_muted)
+            };
+            let undo_bd = if has_undo { t.accent_primary } else { t.border_subtle };
+            c.round_rect(14, FOOTER_Y + 4, undo_w, 26, 5, undo_bg);
+            c.round_rect_border(14, FOOTER_Y + 4, undo_w, 26, 5, 1, undo_bd);
+            c.text_clipped(24, FOOTER_Y + 9, undo_w - 12, &undo, undo_fg, FontSize::Small);
+            self.add_hit(14, FOOTER_Y + 2, undo_w, 30, UiAction::Undo);
+        }
 
         // Line 1, right: the key guide, built by the state machine
         // (hbedit::Editor::footer_hint). A key guide is a claim about what the
@@ -5100,8 +4964,11 @@ impl GuiState {
         // writes it. It is measured before it is drawn: a guide longer than the
         // room the pill leaves is clipped at the pill's edge instead of being
         // drawn over it, which is what a bare right-aligned draw did.
-        let hint = ed.footer_hint();
-        let hint_left = 14 + undo_w + 12;
+        let hint = match &modal {
+            Some(hint) => hint.clone(),
+            None => ed.footer_hint(),
+        };
+        let hint_left = if modal.is_some() { 14 } else { 14 + undo_w + 12 };
         // The way out, as a button. [＋] ends the session on every screen, and
         // it was the one operation a finger could not reach at all: the pad's
         // key is not on the glass. It sits at the right end of the key line,
@@ -5114,19 +4981,27 @@ impl GuiState {
         // under it.
         let quit_w = mhnx_core::hbedit::FOOTER_QUIT_W;
         let quit_x = footer_quit_x();
-        c.round_rect(quit_x, FOOTER_Y + 4, quit_w, 26, 5, t.bg_btn);
-        c.round_rect_border(quit_x, FOOTER_Y + 4, quit_w, 26, 5, 1, t.border_subtle);
-        c.text_centered(
-            quit_x,
-            FOOTER_Y + 8,
-            quit_w,
-            22,
-            "終了",
-            t.text_primary,
-            FontSize::Small,
-        );
-        self.add_hit(quit_x, FOOTER_Y + 2, quit_w, 30, UiAction::Quit);
-        let guide_right = footer_guide_right();
+        if modal.is_none() {
+            c.round_rect(quit_x, FOOTER_Y + 4, quit_w, 26, 5, t.bg_btn);
+            c.round_rect_border(quit_x, FOOTER_Y + 4, quit_w, 26, 5, 1, t.border_subtle);
+            c.text_centered(
+                quit_x,
+                FOOTER_Y + 8,
+                quit_w,
+                22,
+                "終了",
+                t.text_primary,
+                FontSize::Small,
+            );
+            self.add_hit(quit_x, FOOTER_Y + 2, quit_w, 30, UiAction::Quit);
+        }
+        // A modal's line takes the whole strip: there is no 終了 pill under it,
+        // because [＋] is the modal's key there.
+        let guide_right = if modal.is_some() {
+            mhnx_core::hbedit::FOOTER_RIGHT
+        } else {
+            footer_guide_right()
+        };
         let hint_room = guide_right - hint_left;
         let hint_w = c.text_width_sized(&hint, FontSize::Small);
         if hint_room > 120 {
@@ -5170,6 +5045,34 @@ impl GuiState {
         let max_msg_w = (1262 - tap_w - 60).max(160);
         c.circle(22, FOOTER_Y + 38, 4, if ed.dirty { t.accent_warn } else { t.accent_primary });
         c.text_clipped(36, FOOTER_Y + 30, max_msg_w, msg, t.text_primary, FontSize::Small);
+    }
+
+    /// The key line of the panel that owns the pad, if one is open.
+    ///
+    /// One surface names keys - this footer - so it has to name the keys that
+    /// are really live. While a modal is up the screen's line describes a
+    /// screen nobody can press: the keyboard's [X] empties the field where the
+    /// footer said 保存, the picker's [B] closes the list, and the two dialogs
+    /// answer [A] / [B] / [Y] with their own jobs. Each line comes from the
+    /// table that panel's own buttons print (hbedit::osk_hint and friends).
+    fn modal_hint(&self, ed: &Editor) -> Option<String> {
+        if let Some(osk) = self.osk.as_ref() {
+            return Some(mhnx_core::hbedit::osk_hint(osk.spec.multiline));
+        }
+        if self.mib_picker.is_some() {
+            return Some(mhnx_core::hbedit::mib_picker_hint());
+        }
+        if ed.review_open() {
+            return Some(mhnx_core::hbedit::review_hint(
+                self.pending_snapshot.is_some(),
+            ));
+        }
+        if self.update.dialog {
+            return Some(mhnx_core::hbedit::update_hint(
+                self.update.primary_label(),
+            ));
+        }
+        None
     }
 
     /// The save review: what a write would change, and the two answers.
@@ -5287,7 +5190,7 @@ impl GuiState {
                 }
                 note.push_str(&format!("▼ 下に {} 行", below));
             }
-            note.push_str("（[▲/▼] 1行・[◀/▶] 10行・下のボタン）");
+            note.push_str("（▲▼ 1行・◀▶ 10行・下のボタン）");
             c.text_clipped(mx + 30, y, mw - 60, &note, t.text_secondary, FontSize::Small);
         }
         // The scrollbar, in the panel's right-hand padding: a thumb that shows
@@ -5353,9 +5256,9 @@ impl GuiState {
             a_w,
             42,
             if restoring {
-                "[A] この内容で戻す"
+                "この内容で戻す"
             } else {
-                "[A] この内容で保存"
+                "この内容で保存"
             },
             white_or_dark(t.accent_primary),
             FontSize::Small,
@@ -5366,7 +5269,7 @@ impl GuiState {
         let b_x = a_x - 12 - b_w;
         c.round_rect(b_x, foot_y, b_w, 42, 6, t.bg_btn);
         c.round_rect_border(b_x, foot_y, b_w, 42, 6, 1, t.border_subtle);
-        btn_text(c, b_x, foot_y, b_w, 42, "[B] 中止", t.text_primary, FontSize::Small);
+        btn_text(c, b_x, foot_y, b_w, 42, "中止", t.text_primary, FontSize::Small);
         self.add_hit(b_x, foot_y, b_w, 42, UiAction::CancelReview);
     }
 
@@ -5607,11 +5510,11 @@ impl GuiState {
         let a_x = insp_x + 20;
         let b_x = a_x + btn_w + 8;
         let a_label = if pending.is_some() {
-            "[A] 決定"
+            "決定"
         } else if editing {
             "編集終了"
         } else {
-            "[A] 編集する"
+            "編集する"
         };
         let (a_bg, a_fg) = if pending.is_some() {
             (t.accent_warn, white_or_dark(t.accent_warn))
@@ -5626,9 +5529,9 @@ impl GuiState {
         self.add_hit(a_x, btn_y, btn_w, 34, UiAction::Key(Key::A));
 
         let b_label = if pending.is_some() {
-            "[B] 取消"
+            "取消"
         } else {
-            "[B] 元の画面へ"
+            "元の画面へ"
         };
         c.round_rect(b_x, btn_y, btn_w, 34, 5, t.bg_btn);
         c.round_rect_border(b_x, btn_y, btn_w, 34, 5, 1, t.border_subtle);
@@ -5771,7 +5674,7 @@ impl GuiState {
                 insp_x + 20,
                 body_y + body_h - 70,
                 insp_w - 40,
-                &format!("{} / {} 行（[A] でこの領域を編集）", ed.map_cursor + 1, total),
+                &format!("{} / {} 行（この領域を編集できます）", ed.map_cursor + 1, total),
                 t.text_muted,
                 FontSize::Small,
             );
@@ -5875,7 +5778,7 @@ impl GuiState {
             let (badge, bcol) = if !ed.review_can_restore(pos) {
                 (String::from("戻せません"), t.text_muted)
             } else if armed == Some(pos) {
-                (String::from("[A] 2回目"), t.accent_warn)
+                (String::from("2回目"), t.accent_warn)
             } else {
                 (String::from("戻せます"), t.accent_secondary)
             };
@@ -5886,7 +5789,7 @@ impl GuiState {
                 MAIN_X + 20,
                 body_y + 44,
                 list_w - 40,
-                "保存した内容との違いはありません（[Y] で作り直せます）",
+                "保存した内容との違いはありません（下のボタンで作り直せます）",
                 t.text_muted,
                 FontSize::Small,
             );
@@ -5935,7 +5838,10 @@ impl GuiState {
 
         c.round_rect(b_x, btn_y, btn_w, 34, 5, t.bg_btn);
         c.round_rect_border(b_x, btn_y, btn_w, 34, 5, 1, t.border_subtle);
-        btn_text(c, b_x, btn_y, btn_w, 34, "[B] 戻る", t.text_primary, FontSize::Small);
+        // The destination's name, from the table: the panel is a button, and a
+        // button prints the action ([B] 戻る named the key and the verb).
+        let b_word = ed.b_word();
+        btn_text(c, b_x, btn_y, btn_w, 34, &b_word, t.text_primary, FontSize::Small);
         self.add_hit(b_x, btn_y, btn_w, 34, UiAction::Key(Key::B));
 
         // [Y] sits above the pair: the list is built once, so the key that
@@ -5943,13 +5849,14 @@ impl GuiState {
         let y_y = btn_y - 42;
         c.round_rect(a_x, y_y, insp_w - 40, 34, 5, t.bg_btn);
         c.round_rect_border(a_x, y_y, insp_w - 40, 34, 5, 1, t.border_subtle);
+        let y_word = pill_word(ed, "Y", "再読込");
         btn_text(
             c,
             a_x,
             y_y,
             insp_w - 40,
             34,
-            "[Y] 一覧を作り直す",
+            &y_word,
             t.text_primary,
             FontSize::Small,
         );
@@ -6023,7 +5930,7 @@ impl GuiState {
             insp_x + 20,
             y_y - 26,
             insp_w - 40,
-            &format!("{} / {} 件（[▲/▼] 行）", row + 1, total),
+            &format!("{} / {} 件", row + 1, total),
             t.text_muted,
             FontSize::Small,
         );
@@ -7230,13 +7137,17 @@ impl GuiState {
                     UiAction::Key(Key::Minus),
                 );
                 cur_y += 44;
+                // The table's word for [＋] here is 新規, so the button prints
+                // the action and borrows the word: a deck button that names a
+                // key is the one thing the deck may not do.
+                let new_lbl = format!("{}装備を追加", pill_word(ed, "＋", "新規"));
                 self.draw_tool_button(
                     c,
                     ix + 20,
                     cur_y,
                     full_w,
                     38,
-                    "[＋] 新規装備を追加",
+                    &new_lbl,
                     UiAction::Key(Key::Plus),
                 );
                 cur_y += 44;
@@ -8334,12 +8245,13 @@ impl GuiState {
     }
 
     fn draw_char(&mut self, c: &mut Canvas, ed: &Editor) {
-        let is_appearance = ed.field >= 10;
-        let range = if is_appearance {
-            10..CHAR_FIELDS.len()
-        } else {
-            0..10.min(CHAR_FIELDS.len())
-        };
+        // The two tabs are a window over one field table, and the range comes
+        // from the state machine (Editor::char_window) because the guide strip
+        // prints the selected row's place in the same window: the heading said
+        // "3 / 7 件" while the strip said "13 / 17" for the same row.
+        let (start, end) = ed.char_window();
+        let is_appearance = start > 0;
+        let range = start..end;
 
         let mut rows = Vec::new();
         for f in range {
@@ -8482,7 +8394,14 @@ impl GuiState {
         }
         let armed = ed.item_armed == Some(ed.item_menu_cursor);
         let hdr = if armed {
-            String::from("アイテム一括操作 — もう一度 [A] で実行（[B] 中止）")
+            // The words are the table's and the keys are the footer's: the
+            // heading named [A] and [B] in its own words, over a footer that
+            // said 実行（2回） and アイテムBOX.
+            format!(
+                "アイテム一括操作 — もう一度で{}（{}で取りやめ）",
+                ed.key_label_or("A", "実行"),
+                ed.b_word()
+            )
         } else {
             format!(
                 "アイテム一括操作  (使用 {} 枠 / 空き {} 枠)",
@@ -8732,9 +8651,9 @@ impl GuiState {
                 index, refs
             ));
             warnings.push(if refs == 0 {
-                String::from("もう一度 [-] で削除確定 / [B] で取りやめ")
+                String::from("もう一度で削除確定 / 他のキーで取りやめ")
             } else {
-                String::from("もう一度 [-] で強制削除 / 参照は下のメッセージ")
+                String::from("もう一度で強制削除 / 参照は下のメッセージ")
             });
         } else if let Some((_, _, text)) = ed.equip_kind_pending() {
             // The second [A] writes; anything else (a cursor move, [B]) drops
@@ -8805,7 +8724,7 @@ impl GuiState {
             // sentence that matters (the last [A] creates the record) is the
             // one that stays.
             let notice = alloc::vec![String::from(
-                "最後の [A] で空き枠に作成します（[B] で中止・種別と ID は [A] で一覧）",
+                "最後の決定で空き枠に作成します（種別と ID は一覧から）",
             )];
             self.draw_adaptive_rows_warn(
                 c,
@@ -8839,9 +8758,9 @@ impl GuiState {
                 // A type change asks once more before it writes: the first [A]
                 // only says what the change costs (hbedit::Editor::
                 // equip_kind_pending).
-                String::from("種別が変わります: もう一度 [A] で実行 / [B] で取りやめ")
+                String::from("種別が変わります: もう一度で実行 / 他のキーで取りやめ")
             } else {
-                String::from("名前行は [A] で一覧、書き込みは「装備枠」の行の [A] です")
+                String::from("名前行は一覧から、書き込みは「装備枠」の行です")
             });
             (Vec::new(), w)
         } else {
@@ -8957,7 +8876,7 @@ impl GuiState {
             return;
         };
         let mut rows = Vec::new();
-        if self.sets_tab == 0 {
+        if ed.sets_tab == 0 {
             for (i, s) in mhnx_core::myset::item_sets(save, ed.slot).into_iter().enumerate() {
                 if !s.is_empty() {
                     let n = s.used_items().len();
@@ -8992,7 +8911,7 @@ impl GuiState {
                 }
             }
         }
-        let hdr = if self.sets_tab == 0 {
+        let hdr = if ed.sets_tab == 0 {
             "マイセット (アイテム)"
         } else {
             "マイセット (装備)"
@@ -9003,7 +8922,7 @@ impl GuiState {
             hdr,
             "",
             &rows,
-            self.sets_cursor.min(rows.len().saturating_sub(1)),
+            ed.sets_cursor.min(rows.len().saturating_sub(1)),
             false,
             "編集",
         );
@@ -9029,7 +8948,7 @@ impl GuiState {
         rows.push((
             SET_ROW_NAME,
             String::from("名前"),
-            String::from("最大31バイト / 改行可（[A] で入力）"),
+            String::from("最大31バイト / 改行可"),
             shown_name,
             String::from("#01"),
         ));
@@ -9039,7 +8958,7 @@ impl GuiState {
             let meta = if idx == mhnx_core::myset::NONE {
                 String::from("◀ ▶ で装備BOX の使用中を巡回")
             } else {
-                format!("枠 #{:04} / ◀ ▶ で巡回  [A] で決定", idx)
+                format!("枠 #{:04} / ◀ ▶ で巡回", idx)
             };
             let armed = ed.set_clear_armed == Some(part);
             rows.push((
@@ -9120,7 +9039,7 @@ impl GuiState {
                 if empty {
                     String::from("◀ ▶ でアイテムBOX の使用中を巡回")
                 } else {
-                    format!("ID {} / ◀ ▶ で巡回  [A] で決定", item.id)
+                    format!("ID {} / ◀ ▶ で巡回", item.id)
                 },
                 if empty {
                     String::new()
@@ -9171,7 +9090,7 @@ impl GuiState {
                 String::from(name),
                 format!("{} / {}", kind, CSV_DIR),
                 if armed {
-                    String::from("もう一度 [A]")
+                    String::from("もう一度")
                 } else {
                     String::from(kind)
                 },
@@ -9484,8 +9403,10 @@ impl GuiState {
         let mut warnings: Vec<String> = Vec::new();
         // The two record views are one [Y] away, and the bar cannot name them:
         // the guide line is where a user finds out.
+        // The warning names the two views and no key: the footer names the key
+        // that walks them (one word, 表示, on all three views that walk it).
         warnings.push(String::from(
-            "[Y] クエスト回数 → 武器使用数（15 種 × 3 会場、[R] で数値入力）",
+            "クエスト回数 → 武器使用数（15 種 × 3 会場）",
         ));
         // The bar names the four views while this screen is showing
         // (sub_tabs_for), so [L/R] walks them and [B] unwinds one level at a
@@ -9496,7 +9417,7 @@ impl GuiState {
         // screen), so a line that promised the shoulder pair walked the views
         // named the same key two different jobs on one screen.
         warnings.push(String::from(
-            "[L] 4ビュー: カード → 回数 → 武器 → 闘技大会（闘技大会だけ [R] も / [B] は1段ずつ戻る）",
+            "4ビュー: カード → 回数 → 武器 → 闘技大会（闘技大会だけ数値入力も）",
         ));
         let sub = format!(
             "HR 上限 {} / 時間 上限 {}h",
@@ -9546,7 +9467,7 @@ impl GuiState {
             mhnx_core::guildcard::QUEST_TOTAL_CAP
         );
         let warnings = alloc::vec![
-            String::from("[Y] 武器使用数へ / [R] で数値を直接入力"),
+            String::from("武器使用数へ / 数値は直接入力できます"),
             String::from("合計はセーブに入りません（カードが表示のため足す値）"),
         ];
         self.draw_adaptive_rows_warn(
@@ -9812,23 +9733,36 @@ impl GuiState {
         }
 
         c.hline(ix + 16, iy + 232, iw - 32, t.border_subtle);
+        // The words are the table's (Editor::key_label), so the line above the
+        // button and the footer cannot name one press two ways - and neither of
+        // them names a key.
+        let edit_line = if ed.guild_wpn_edit {
+            format!(
+                "編集中: {}  {}  {}",
+                pill_word(ed, "▲/▼", "±刻み"),
+                pill_word(ed, "◀/▶", "±10"),
+                pill_word(ed, "A", "終了")
+            )
+        } else {
+            format!(
+                "{}（値の増減）/ {}",
+                pill_word(ed, "A", "編集"),
+                pill_word(ed, "R", "数値入力")
+            )
+        };
         c.text_clipped(
             ix + 20,
             iy + 242,
             iw - 40,
-            if ed.guild_wpn_edit {
-                "編集中: [▲/▼] ±刻み  [◀/▶] ±10  [A] 終了"
-            } else {
-                "[A] で編集開始（値の増減）/ [R] で数値入力"
-            },
+            &edit_line,
             if ed.guild_wpn_edit { t.accent_warn } else { t.text_muted },
             FontSize::Small,
         );
 
         let a_label = if ed.guild_wpn_edit {
-            "[A] 編集を終了"
+            pill_word(ed, "A", "終了")
         } else {
-            "[A] 編集を開始"
+            pill_word(ed, "A", "編集")
         };
         c.round_rect(ix + 20, iy + 268, iw - 40, 44, 6, t.accent_primary);
         btn_text(
@@ -9837,7 +9771,7 @@ impl GuiState {
             iy + 268,
             iw - 40,
             44,
-            a_label,
+            &a_label,
             white_or_dark(t.accent_primary),
             FontSize::Medium,
         );
@@ -9859,13 +9793,21 @@ impl GuiState {
             &pill_word(ed, "X", "保存"),
             UiAction::QuickSave,
         );
+        // While the cell is being stepped [B] closes the step and stays on the
+        // view, so the destination's name would be a lie: the footer does not
+        // name [B] in that mode either.
+        let b_lbl = if ed.guild_wpn_edit {
+            String::from("編集を終了")
+        } else {
+            ed.b_word()
+        };
         self.draw_tool_button(
             c,
             ix + 20,
             iy + 372,
             iw - 40,
             40,
-            &ed.b_word(),
+            &b_lbl,
             UiAction::Key(Key::B),
         );
 
@@ -10137,23 +10079,29 @@ impl GuiState {
         // The arrow that steps the parts is the one the footer names; the label
         // above the boxes says which part is under it while editing.
         c.hline(ix + 16, iy + 232, iw - 32, t.border_subtle);
+        let edit_line = if ed.arena_edit {
+            format!(
+                "編集中: {}  {}  {}",
+                pill_word(ed, "◀/▶", "項目"),
+                pill_word(ed, "▲/▼", "増減"),
+                pill_word(ed, "A", "終了")
+            )
+        } else {
+            format!("{}（分・秒・1/100 を増減）", pill_word(ed, "A", "編集"))
+        };
         c.text_clipped(
             ix + 20,
             iy + 242,
             iw - 40,
-            if ed.arena_edit {
-                "編集中: [◀/▶] 項目  [▲/▼] 増減  [A] 終了"
-            } else {
-                "[A] で編集開始（分・秒・1/100 を増減）"
-            },
+            &edit_line,
             if ed.arena_edit { t.accent_warn } else { t.text_muted },
             FontSize::Small,
         );
 
         let a_label = if ed.arena_edit {
-            String::from("[A] 編集を終了")
+            pill_word(ed, "A", "終了")
         } else {
-            String::from("[A] 編集を開始")
+            pill_word(ed, "A", "編集")
         };
         c.round_rect(ix + 20, iy + 268, iw - 40, 44, 6, t.accent_primary);
         btn_text(
@@ -10179,13 +10127,18 @@ impl GuiState {
             &pill_word(ed, "X", "保存"),
             UiAction::QuickSave,
         );
+        let b_lbl = if ed.arena_edit {
+            String::from("編集を終了")
+        } else {
+            ed.b_word()
+        };
         self.draw_tool_button(
             c,
             ix + 20,
             iy + 372,
             iw - 40,
             40,
-            &ed.b_word(),
+            &b_lbl,
             UiAction::Key(Key::B),
         );
 
@@ -10341,7 +10294,7 @@ impl GuiState {
                 // by the strip if a font metric makes them wider than the
                 // panel, so they are ordered by importance.
                 warnings.push(format!(
-                    "ページ {} / {}（[◀/▶] {}件ずつ）・クリアで既読も立つ",
+                    "ページ {} / {}（{} 件ずつ）・クリアで既読も立つ",
                     page,
                     pages,
                     mhnx_core::hbedit::PROGRESS_JUMP
@@ -10527,8 +10480,8 @@ impl GuiState {
                     .enumerate()
                     .map(|(i, r)| {
                         let meta = match r.text_index {
-                            Some(idx) => format!("[A] テキスト編集（.gmd {}）", idx),
-                            None => String::from("[◀/▶] で増減（.mib 制限時間）"),
+                            Some(idx) => format!("テキスト編集（.gmd {}）", idx),
+                            None => String::from("◀▶ で増減（.mib 制限時間）"),
                         };
                         (
                             i,
@@ -10584,7 +10537,7 @@ impl GuiState {
                 let a_label = if ed.quest_edit_field == QUEST_MON_AREA {
                     "エリア選択"
                 } else if ed.quest_edit_field >= mhnx_core::hbedit::QUEST_MON_SEM_X {
-                    "増減は [◀/▶]"
+                    "増減は ◀▶"
                 } else {
                     "モンスター選択"
                 };
@@ -11137,10 +11090,14 @@ impl GuiState {
         c.round_rect_border(mx, my, mw, mh, 12, 2, t.border_focus);
 
         c.text_clipped(mx + 24, my + 16, mw - 380, &picker.title, t.text_primary, FontSize::Medium);
+        // The same table the footer under the modal prints (hbedit::
+        // mib_picker_facts): the picker owns the pad while it is up, so the two
+        // surfaces have to name the same keys.
+        let legend = mhnx_core::hbedit::mib_picker_hint();
         c.text_right(
             mx + mw - 24,
             my + 20,
-            "[▲/▼] 選択  [L/R] ±10  [A] 決定  [B] 閉じる",
+            &legend,
             t.text_secondary,
             FontSize::Small,
         );
@@ -11202,7 +11159,9 @@ impl GuiState {
                     ry + 6,
                     bw,
                     34,
-                    "[A] 決定",
+                    // A button prints the action; the legend above and the
+                    // footer under the modal name the key.
+                    "決定",
                     white_or_dark(t.accent_primary),
                     FontSize::Small,
                 );
@@ -11244,7 +11203,7 @@ impl GuiState {
         let close_x = mx + mw - 180;
         c.round_rect(close_x, foot_y, 156, 38, 6, t.bg_btn);
         c.round_rect_border(close_x, foot_y, 156, 38, 6, 1, t.border_subtle);
-        btn_text(c, close_x, foot_y, 156, 38, "[B] 閉じる", t.text_primary, FontSize::Small);
+        btn_text(c, close_x, foot_y, 156, 38, "閉じる", t.text_primary, FontSize::Small);
         self.add_hit(close_x, foot_y, 156, 38, UiAction::MibPickerClose);
     }
 
@@ -11266,15 +11225,18 @@ impl GuiState {
         if let Some(c) = osk.refused {
             title.push_str(&format!(" / その文字は使えません（U+{:04X}）", c as u32));
         }
-        c.text_clipped(mx + 24, my + 16, 640, &title, t.text_primary, FontSize::Medium);
-        // The fallback note sits under the title: it only exists when the
-        // system keyboard could not be launched, and it is the answer to "why
-        // am I looking at this instead of the console's own keyboard?".
+        c.text_clipped(mx + 24, my + 14, 640, &title, t.text_primary, FontSize::Medium);
+        // The fallback note shares the title's line, right of it: it only exists
+        // when the system keyboard could not be launched, and it is the answer
+        // to "why am I looking at this instead of the console's own keyboard?".
+        // It used to sit on the line below, which is where the key row goes now.
         if !osk.note.is_empty() {
+            let title_w = c.text_width_sized(&title, FontSize::Medium).min(640);
+            let note_x = mx + 24 + title_w + 16;
             c.text_clipped(
-                mx + 24,
-                my + 38,
-                760,
+                note_x,
+                my + 20,
+                (mx + mw - 24 - note_x).max(0),
                 &osk.note,
                 t.accent_warn,
                 FontSize::Small,
@@ -11292,33 +11254,36 @@ impl GuiState {
         } else {
             t.bg_btn
         };
-        let actions: [(&str, &str, i32, Color, Color, UiAction); 7] = [
-            ("B", "1字削除", 128, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
-            ("X", "クリア（2回）", 150, t.bg_danger, t.accent_danger, UiAction::OskClear),
-            ("Y", "濁点/小字", 148, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
+        // The words are the state machine's table (hbedit::osk_facts), so the
+        // legend, the buttons and the footer under the modal print one word per
+        // key. The geometry stays here: it is the panel's, not the table's.
+        let word = |key: &str| mhnx_core::hbedit::osk_word(osk.spec.multiline, key);
+        let actions: [(&str, String, i32, Color, Color, UiAction); 7] = [
+            ("B", word("B"), 128, t.bg_btn, t.border_subtle, UiAction::OskBackspace),
+            ("X", word("X"), 150, t.bg_danger, t.accent_danger, UiAction::OskClear),
+            ("Y", word("Y"), 148, t.bg_btn_primary, t.accent_primary, UiAction::OskModify),
             (
                 if osk.spec.multiline { "ZR" } else { "" },
-                if osk.spec.multiline { "改行" } else { "改行不可" },
+                if osk.spec.multiline {
+                    word("ZR")
+                } else {
+                    String::from("改行不可")
+                },
                 124,
                 newline_bg,
                 t.accent_primary,
                 UiAction::OskNewline,
             ),
-            ("", "空白", 84, t.bg_btn, t.border_subtle, UiAction::OskSpace),
-            ("-", "取消", 128, t.bg_btn, t.border_subtle, UiAction::OskCancel),
-            ("＋", "確定", 180, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
+            ("", String::from("空白"), 84, t.bg_btn, t.border_subtle, UiAction::OskSpace),
+            ("-", word("-"), 128, t.bg_btn, t.border_subtle, UiAction::OskCancel),
+            ("＋", word("＋"), 180, t.accent_ok, t.accent_ok, UiAction::OskConfirm),
         ];
-        // The two keys that are not buttons: [A] presses the selected cell and
-        // the shoulders walk the four character tabs.
-        let mut legend = String::from("[A] 入力  [L/R] 文字種");
-        for &(key, word, ..) in actions.iter() {
-            if key.is_empty() {
-                continue;
-            }
-            legend.push_str("  ");
-            legend.push_str(&osk_key_label(key, word));
-        }
-        c.text_right(mx + mw - 24, my + 20, &legend, t.text_secondary, FontSize::Small);
+        // The legend is the table rendered, on its own row under the title: it
+        // grew to 884px and started at 272, so it was drawn over the title.
+        let legend = mhnx_core::hbedit::render_facts(&mhnx_core::hbedit::osk_facts(
+            osk.spec.multiline,
+        ));
+        c.text_right(mx + mw - 24, my + 38, &legend, t.text_secondary, FontSize::Small);
 
         let ib_x = mx + 24;
         let ib_y = my + 56;
@@ -11438,13 +11403,13 @@ impl GuiState {
         // key and the word the legend prints, so the two cannot describe one
         // press two ways.
         let mut bx = ib_x;
-        for &(key, word, bw, bg, border, act) in actions.iter() {
+        for (key, word, bw, bg, border, act) in actions.iter() {
             let label = osk_key_label(key, word);
-            c.round_rect(bx, by, bw, bh, 6, bg);
-            c.round_rect_border(bx, by, bw, bh, 6, 1, border);
-            btn_text(c, bx, by, bw, bh, &label, white_or_dark(bg), FontSize::Small);
-            self.add_hit(bx, by, bw, bh, act);
-            bx += bw + 12;
+            c.round_rect(bx, by, *bw, bh, 6, *bg);
+            c.round_rect_border(bx, by, *bw, bh, 6, 1, *border);
+            btn_text(c, bx, by, *bw, bh, &label, white_or_dark(*bg), FontSize::Small);
+            self.add_hit(bx, by, *bw, bh, *act);
+            bx += *bw + 12;
         }
     }
 }
@@ -11919,13 +11884,12 @@ impl GuiState {
     /// The pill is the tap target; the pad route to the same dialog is [A] on
     /// the start screen (and [R] held there at any time). Its width is capped so
     /// that a long version string cannot eat the guide line it sits beside.
-    fn draw_update_banner(&mut self, c: &mut Canvas, right: i32, a_opens_it: bool) -> i32 {
+    fn draw_update_banner(&mut self, c: &mut Canvas, right: i32) -> i32 {
         let t = theme();
-        let text = if a_opens_it {
-            format!("{}  [A] 詳細", self.update.banner)
-        } else {
-            format!("{}  タップで詳細", self.update.banner)
-        };
+        // The pill is a tap target on every screen, so it says what a tap does
+        // and names no key: it printed a key name on the one screen where that
+        // key opens the dialog, and the footer under it already names the key.
+        let text = format!("{}  タップで詳細", self.update.banner);
         let w = (c.text_width_sized(&text, FontSize::Small) + 24).clamp(200, 640);
         let x = (right - w).max(MAIN_X);
         let h = GUIDE_H - 4;
@@ -12009,7 +11973,7 @@ impl GuiState {
                 bx,
                 by + 54,
                 bw,
-                "中止すると元のファイルはそのまま残ります（[A] 中止）",
+                "中止すると元のファイルはそのまま残ります（中止は下のボタン）",
                 t.text_muted,
                 FontSize::Small,
             );
@@ -12056,7 +12020,7 @@ impl GuiState {
             by,
             primary_w,
             40,
-            &format!("[A] {}", self.update.primary_label()),
+            &self.update.primary_label().to_string(),
             fg,
             FontSize::Medium,
         );
@@ -12066,7 +12030,7 @@ impl GuiState {
         let later_x = mx + 26 + primary_w + 12;
         c.round_rect(later_x, by, later_w, 40, 6, t.bg_btn);
         c.round_rect_border(later_x, by, later_w, 40, 6, 1, t.border_subtle);
-        btn_text(c, later_x, by, later_w, 40, "[B] あとで", t.text_secondary, FontSize::Medium);
+        btn_text(c, later_x, by, later_w, 40, "あとで", t.text_secondary, FontSize::Medium);
         self.add_hit(later_x, by, later_w, 40, UiAction::UpdateLater);
 
         let check_w = 320;
@@ -12074,7 +12038,7 @@ impl GuiState {
         c.round_rect(check_x, by, check_w, 40, 6, t.bg_btn);
         c.round_rect_border(check_x, by, check_w, 40, 6, 1, t.border_subtle);
         let check = format!(
-            "[Y] 起動時の確認: {}",
+            "起動時の確認: {}",
             if self.update.settings.check_on_start { "オン" } else { "オフ" }
         );
         btn_text(c, check_x, by, check_w, 40, &check, t.text_secondary, FontSize::Small);

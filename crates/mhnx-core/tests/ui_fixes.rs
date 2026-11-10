@@ -359,10 +359,20 @@ fn the_screens_that_use_plus_say_how_to_quit() {
         // The exit is its own item, not a parenthesis on the [＋] one: the
         // third review found the same key on one line with two meanings
         // ("[＋] 新規 …（[＋]は[B]の後）"). The line still has to say how to
-        // leave, and it says it without reusing the glyph.
+        // leave, and it says it without reusing either glyph: the [B] item
+        // beside it already names that press's destination, and [＋] is the
+        // tool here (the seventh review: "※終了は [B]" read as "press [B] to
+        // quit" over a key that only went back one screen).
         assert!(
-            hint.contains("※終了は [B]"),
+            hint.contains("終了は一覧から"),
             "{:?} spends [＋], so its footer must name the way out: {}",
+            screen,
+            hint
+        );
+        assert_eq!(
+            hint.matches("[＋]").count(),
+            1,
+            "{:?} gives [＋] two meanings on one line: {}",
             screen,
             hint
         );
