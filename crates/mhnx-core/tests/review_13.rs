@@ -380,13 +380,16 @@ fn the_equipment_strip_keeps_the_warning_colour_for_warnings() {
     let body = fn_body(src, "fn draw_adaptive_rows_warn");
     assert!(body.contains("notice: &[String]"), "the strip takes two lists");
     assert!(body.contains("warnings: &[String]"));
-    // Warnings are drawn in the warning colour, the explanation is not.
-    assert!(
-        body.contains("if *is_warning { t.accent_warn } else { t.text_secondary }"),
-        "{body}"
-    );
     // A warning is never pushed off by the explanation.
     assert!(body.contains("warnings.len().min(2) + notice.len().min(1)"), "{body}");
+    // The strip itself is one function now (draw_list_strip), and the empty
+    // list draws it too: warnings are drawn in the warning colour, the
+    // explanation is not.
+    let strip = fn_body(src, "fn draw_list_strip");
+    assert!(
+        strip.contains("if *is_warning { t.accent_warn } else { t.text_secondary }"),
+        "{strip}"
+    );
     // The equipment box passes warnings only: its permanent operating note was
     // the third review's finding 10 (a strip that is always drawn costs the
     // list a row), so the keys it named are the footer's job now.

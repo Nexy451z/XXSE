@@ -295,19 +295,25 @@ fn the_quest_row_survives_the_item_pick_and_the_item_tabs_can_be_searched() {
     ed.enter_quest_edit_from(Screen::SaveQuests);
     assert_eq!(ed.quest_edit_cursor, 3, "the row is kept, not reset");
 
-    // [ZR] on 報酬 walks the two values a reward row holds (個数 ⇄ 確率%), and
+    // [ZR] on 報酬 walks the row's three cells (アイテム → 個数 → 確率%), and
     // the search narrows the list. The cycle does not open the keyboard (the
     // third review's finding 5): it used to, every other press, which left no
-    // way back to 個数. It no longer has a 検索 stop either - a value switch
-    // whose third stop holds no value (the fourth review's finding 17).
+    // way back to 個数. Its stops are cells, not the search (the fourth
+    // review's finding 17, and the fifth's #4).
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     ed.input(Key::Z);
     assert!(ed.quest_edit_chance(), "the first stop is the chance column");
     ed.input(Key::Z);
     assert_eq!(
         ed.quest_reward_field,
+        mhnx_core::hbedit::QUEST_REWARD_ITEM,
+        "the item cell is a stop of its own"
+    );
+    ed.input(Key::Z);
+    assert_eq!(
+        ed.quest_reward_field,
         mhnx_core::hbedit::QUEST_REWARD_COUNT,
-        "two stops: back to the count"
+        "three stops: back to the count"
     );
     assert_eq!(ed.take_text_request(), None, "the cycle opens no keyboard");
     // The search is its own press: [R] on the same tab.
@@ -455,9 +461,12 @@ fn the_pressed_quest_tab_is_the_lit_one() {
     let arm = fn_body(src, "fn select_sub_tab");
     assert!(arm.contains("self.quest_bar_tab = 0"), "{arm}");
     assert!(arm.contains("self.quest_bar_tab = idx"), "{arm}");
-    // Entering the section lands on its first tab, and the bar says so.
+    // Entering the section lands on the save's list, and the bar lights the tab
+    // that list belongs to (セーブ内) - one list, one tab. With no save it lands
+    // on SD(.arc), which is that tab's own index.
     let jump = fn_body(src, "fn goto_section");
-    assert!(jump.contains("self.quest_bar_tab = 0"), "{jump}");
+    assert!(jump.contains("self.quest_bar_tab = 1"), "{jump}");
+    assert!(jump.contains("self.quest_bar_tab = 4"), "{jump}");
     // The bar itself reads that field rather than deriving 1 + quest_tab.
     let bar = fn_body(src, "fn sub_tabs_for");
     assert!(bar.contains("Screen::SaveQuests => self.quest_bar_tab.min(3)"), "{bar}");

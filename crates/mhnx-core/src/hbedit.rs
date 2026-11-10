@@ -362,17 +362,20 @@ pub const QUEST_TAB_SUPPLIES: usize = 3;
 /// The four tab labels, in tab order.
 pub const QUEST_TAB_LABELS: [&str; QUEST_TABS] = ["基本", "モンスター", "報酬", "支給品"];
 
-/// The two values [ZR] walks on the 報酬 tab, in the order it walks them.
+/// The three cells [ZR] walks on the 報酬 tab, in the order it walks them.
 ///
-/// Two, not three: the cycle used to end on a 検索 stop that holds no value, so
-/// the arrows there could only say "this stop is for the search" - a stop of a
-/// *value* switch with no value. The search is its own press ([R] and the 検索
-/// pill), which is what the third stop was standing in for.
-pub const QUEST_REWARD_COUNT: usize = 0;
+/// Three, because a reward row really holds three cells: アイテム / 個数 / 確率%.
+/// The cycle used to end on a 検索 stop that holds no value, and the fix then
+/// was to drop to two - but the item cell is a real cell with its own action
+/// ([A] opens the picker), so the row's own screen walks three and this tab
+/// does too. The search is its own press ([R] and the 検索 pill).
+pub const QUEST_REWARD_ITEM: usize = 0;
+/// The count column of a reward row.
+pub const QUEST_REWARD_COUNT: usize = 1;
 /// The chance column of a reward row.
-pub const QUEST_REWARD_CHANCE: usize = 1;
-/// How many values the 報酬 tab's [ZR] walks.
-pub const QUEST_REWARD_FIELDS: usize = 2;
+pub const QUEST_REWARD_CHANCE: usize = 2;
+/// How many cells the 報酬 tab's [ZR] walks.
+pub const QUEST_REWARD_FIELDS: usize = 3;
 
 /// Monster slots a .mib carries (13 bytes each, from offset 100).
 pub const QUEST_MON_SLOTS: usize = 5;
@@ -1692,23 +1695,41 @@ impl CharmEdit {
         self.a_action().key()
     }
 
-    /// The footer line for this row: the `[A]` chip is the row's own word, the
-    /// rest are the keys the form always has.
+    /// The form's key table: the `[A]` item is the row's own word, the rest
+    /// are the keys the form always has.
+    ///
+    /// [X] is the save key on every non-picker screen (the console's global
+    /// X -> QuickSave), which on this form writes the record into the box and
+    /// then saves the file. It used to be advertised as 刻み here, which the
+    /// pad never sent the state machine.
+    /// [A] opens the row's own list on a skill row (the same key every other
+    /// screen uses for "choose"), so [Y] is the search shortcut rather than the
+    /// only way in.
+    /// [B] goes to the talisman list, and the guide says the same word
+    /// ("[B] 一覧へ"): it said 戻る here and 一覧へ there, which reads as two
+    /// destinations for one key.
+    pub fn facts(&self) -> Vec<KeyFact> {
+        alloc::vec![
+            KeyFact::new("A", self.a_label()),
+            KeyFact::new("◀/▶", "値"),
+            KeyFact::new("X", "保存"),
+            KeyFact::new("B", "一覧へ（下書きは2回）"),
+        ]
+    }
+
+    /// The same table as one line: what the footer prints for this form.
+    ///
+    /// The console renders [Editor::key_facts], which for this screen is this
+    /// form's list, so the two are the same words by construction.
     pub fn footer(&self) -> String {
-        // [X] is the save key on every non-picker screen (the console's global
-        // X -> QuickSave), which on this form writes the record into the box and
-        // then saves the file. It used to be advertised as 刻み here, which the
-        // pad never sent the state machine.
-        // [A] opens the row's own list on a skill row (the same key every
-        // other screen uses for "choose"), so [Y] is the search shortcut rather
-        // than the only way in.
-        // [B] goes to the talisman list, and the guide says the same word
-        // ("[B] で一覧へ"): it said 戻る here and 一覧へ there, which reads as two
-        // destinations for one key.
-        format!(
-            "[A] {}  [◀/▶] 値  [X] 保存  [B] 一覧へ（下書きは2回）",
-            self.a_label()
-        )
+        let mut out = String::new();
+        for fact in self.facts() {
+            if !out.is_empty() {
+                out.push_str("  ");
+            }
+            out.push_str(&fact.render());
+        }
+        out
     }
 
     /// The line the form prints beside its header: the measured ceiling of the
@@ -6418,6 +6439,58 @@ pub enum BulkAction {
     QuestRemove(i32),
 }
 
+/// One item of a screen's key line: a key and what the press does.
+///
+/// The footer, the ASCII build's chip row, the guide strip and the console's
+/// deck all print key meanings, and until the fifth review each of them wrote
+/// its own words: the .mib line named [ZR] on every row while the key answered
+/// only on monster rows, the reward chip said two stops where the writer had
+/// three, the talisman form's [B] said 戻る in one place and 一覧へ in another.
+/// The words live here now: [Editor::key_facts] is the only table, and every
+/// surface renders it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyFact {
+    /// The key as the footer brackets it ("A", "ZR", "◀/▶", "＋"). Empty for a
+    /// note that names no key of this screen (the section bar).
+    pub key: &'static str,
+    /// What the press does, in the one wording every surface prints.
+    pub label: String,
+}
+
+impl KeyFact {
+    /// A key and its action.
+    pub fn new(key: &'static str, label: impl Into<String>) -> Self {
+        KeyFact {
+            key,
+            label: label.into(),
+        }
+    }
+
+    /// A note that names no key of this screen (the section bar).
+    pub fn note(label: impl Into<String>) -> Self {
+        KeyFact {
+            key: "",
+            label: label.into(),
+        }
+    }
+
+    /// The line the footer prints for this item.
+    pub fn render(&self) -> String {
+        if self.key.is_empty() {
+            self.label.clone()
+        } else {
+            format!("[{}] {}", self.key, self.label)
+        }
+    }
+}
+
+/// How many key facts the guide strip prints.
+///
+/// The strip is one line and the footer already carries the whole list, so the
+/// guide shows the screen's first two keys: enough to start, and short enough
+/// that the tail (the way out) is never clipped away.
+pub const GUIDE_FACT_COUNT: usize = 2;
+
 /// The editor.
 pub struct Editor {
     /// Current screen.
@@ -6446,6 +6519,12 @@ pub struct Editor {
     pub charm_cursor: usize,
     /// The charm being edited, if the editor form is open.
     pub charm_edit: Option<CharmEdit>,
+    /// The talisman draft a second [A] would write over an existing record.
+    ///
+    /// The form can name any box slot, and moving the slot row onto a record
+    /// the box already holds is the one write this form can do that destroys
+    /// something - a delete costs two presses, so an overwrite does too.
+    pub charm_write_armed: Option<CharmSeed>,
     /// Which of the two talisman screens the section bar should light: 0
     /// 護石一覧, 1 護石編集.
     ///
@@ -7011,6 +7090,7 @@ impl Editor {
             findings: Vec::new(),
             charm_cursor: 0,
             charm_edit: None,
+            charm_write_armed: None,
             charm_tab: 0,
             quest_titles: Vec::new(),
             item_undo: Vec::new(),
@@ -7865,105 +7945,228 @@ impl Editor {
     /// only thing that can answer it. The console draws this string verbatim
     /// (see the Switch layer's `draw_footer`), so the chips and the dispatch
     /// cannot disagree - the review found three screens where they did.
+    ///
+    /// The line is [Editor::key_facts] rendered, and nothing else: the footer,
+    /// the ASCII build's chip row (`switch/src/editor.rs actions`) and the
+    /// guide strip all print that one table, so the fifth review's seven "two
+    /// places say different things" findings cannot come back without a test
+    /// failing.
     pub fn footer_hint(&self) -> String {
-        // The talisman form's [A] is the row's own action, so its line comes
-        // from the form (CharmEdit::footer) rather than from the table.
-        let base: String = match self.screen {
+        let mut out = String::new();
+        for fact in self.key_facts() {
+            if !out.is_empty() {
+                out.push_str("  ");
+            }
+            out.push_str(&fact.render());
+        }
+        out
+    }
+
+    /// The one table of key meanings for the screen that is showing.
+    ///
+    /// Everything that prints a key reads this: the footer line, the ASCII
+    /// build's chip row, the guide strip's key sentence, and the labels the
+    /// console's deck borrows. A key's meaning is written once, here.
+    ///
+    /// The last item is the way out, because [＋] is the quit key everywhere
+    /// except the three screens that give it a tool of their own - and there
+    /// the line has to name the key that does end the session.
+    pub fn key_facts(&self) -> Vec<KeyFact> {
+        let mut out = self.screen_facts();
+        out.push(if self.plus_is_a_tool() {
+            KeyFact::note("終了は [B] の後")
+        } else {
+            KeyFact::new("＋", "終了")
+        });
+        out
+    }
+
+    /// The screen's own keys, without the way out.
+    ///
+    /// One arm per screen, in the order the footer prints them. A screen whose
+    /// keys follow the row (the talisman form, the reward table, the card's
+    /// four views) builds its list from the same value its [A] button prints,
+    /// so the two cannot name different jobs.
+    fn screen_facts(&self) -> Vec<KeyFact> {
+        // The two panels that own every key while they are open come first: a
+        // guarded arm after an unguarded one for the same screen would never be
+        // reached (the Palico screen opens the equipment panel too).
+        if self.palico_equip_open() {
+            return alloc::vec![
+                KeyFact::new("◀/▶", "候補"),
+                KeyFact::new("A", "装着"),
+                KeyFact::new("-", "解除（2回）"),
+                KeyFact::new("B", "一覧"),
+                KeyFact::new("X", "保存"),
+            ];
+        }
+        if self.palico_skill_open() {
+            return alloc::vec![
+                KeyFact::new("▲/▼", "枠"),
+                KeyFact::new("◀/▶", "候補"),
+                KeyFact::new("Y", "タブ"),
+                KeyFact::new("A", "差し替え"),
+                KeyFact::new("B", "一覧"),
+                KeyFact::new("X", "保存"),
+            ];
+        }
+        match self.screen {
             // The form's [A] is the row's own action, so the form writes the
-            // line (CharmEdit::footer).
-            Screen::CharmEdit => self.charm_edit.map(|c| c.footer()).unwrap_or_else(|| {
-                String::from("[A] 行ごとの操作  [◀/▶] 値  [X] 保存  [B] 一覧へ（下書きは2回）")
+            // line (CharmEdit::facts).
+            Screen::CharmEdit => self.charm_edit.map(|c| c.facts()).unwrap_or_else(|| {
+                alloc::vec![
+                    KeyFact::new("A", "行ごとの操作"),
+                    KeyFact::new("◀/▶", "値"),
+                    KeyFact::new("X", "保存"),
+                    KeyFact::new("B", "一覧へ（下書きは2回）"),
+                ]
             }),
             // [A] installs on a row that is not in the save and releases on one
             // that is: the same key, two words, and the footer says which one
             // is waiting under the cursor (Editor::palico_row_action).
             // [ZR] opens the palico's equipment panel: [-] is the delete key,
             // and the panel's own [-] is the 解除 that deletes a worn record.
-            // [◀/▶] is the language on this build (UiAction::TogglePalicoLang)
-            // and was named nowhere: not in this line, not in the guide, not on
-            // the deck. The two arrows are the only key this screen answers
-            // that no line mentioned.
+            // [◀/▶] is the language, and the console sends the pair to the same
+            // state machine method the deck button calls.
             Screen::Palico => {
                 let id = dlcats::all_ids().get(self.palico_cursor).copied().unwrap_or(0);
-                format!(
-                    "[A] {}  [◀/▶] 言語  [Y] 全導入2回  [ZR] 装備  [X] 保存  [B] 戻る",
-                    self.palico_row_action(id)
-                )
+                alloc::vec![
+                    KeyFact::new("A", self.palico_row_action(id)),
+                    KeyFact::new("◀/▶", "言語"),
+                    KeyFact::new("Y", "全導入2回"),
+                    KeyFact::new("ZR", "装備"),
+                    KeyFact::new("X", "保存"),
+                    KeyFact::new("B", "戻る"),
+                ]
             }
             // 護石一覧: the [A] word follows the list. An empty box has no row to
-            // edit - the press creates the first talisman - and the button said
-            // 編集 over it.
-            Screen::Charms => format!(
-                "[A] {}  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] キャラ",
-                self.charm_a_label()
-            ),
+            // edit - the press creates the first talisman - and a search with no
+            // hits drops the search, so the button says which one is waiting.
+            Screen::Charms => alloc::vec![
+                KeyFact::new("A", self.charm_a_label()),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("-", "削除（2回）"),
+                KeyFact::new("＋", "新規"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "キャラ"),
+            ],
             // .mib: [ZR] walks a monster slot's eight values and has nothing to
             // do on the other rows, so the line names it only where it works -
             // it used to promise 項目 on all ninety rows and the key answered
             // with a refusal on most of them.
-            Screen::Mib if self.mib_row_is_monster() => String::from(
-                "[A] 一覧選択  [◀/▶] 増減  [ZR] 項目  [Y] 刻み  [X] 保存  [B] 戻る",
-            ),
-            Screen::Mib => String::from(
-                "[A] 一覧選択  [◀/▶] 増減  [Y] 刻み  [X] 保存  [B] 戻る",
-            ),
+            Screen::Mib if self.mib_row_is_monster() => alloc::vec![
+                KeyFact::new("A", "一覧選択"),
+                KeyFact::new("◀/▶", "増減"),
+                KeyFact::new("ZR", "項目"),
+                KeyFact::new("Y", "刻み"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
+            Screen::Mib => alloc::vec![
+                KeyFact::new("A", "一覧選択"),
+                KeyFact::new("◀/▶", "増減"),
+                KeyFact::new("Y", "刻み"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // A reward / supply row holds three cells and [ZR] picks which one
             // [A] acts on, so the [A] word follows the cell the way the two
             // forms' words follow their rows (CharmAction / EquipFormAction).
-            Screen::EntryView if self.entry_has_numbers() => format!(
-                "[◀/▶] 値  [ZR] 項目  [A] {}  [R] 数値入力  [Y] 刻み  [X] 保存",
-                self.entry_a_label()
-            ),
-            // The card's [A] is the row's own action too: the comment opens the
-            // keyboard and the two numbers take a step.
-            // Three of the four views answer [A] differently, so the line is
+            // The stop count is the file's own: .rem has アイテム / 個数 / 確率%
+            // and .sup has no chance column, so the line names what the key
+            // really walks instead of the two-word "個数/確率" the chip said.
+            // The arrow pair is not in this line: the strip has 763px and the
+            // three-stage [ZR] - the fact this screen cannot state anywhere
+            // else - is worth more than the universal step pair.
+            Screen::EntryView if self.entry_has_numbers() => alloc::vec![
+                KeyFact::new(
+                    "ZR",
+                    if self.entry_has_chance() {
+                        "アイテム→個数→確率"
+                    } else {
+                        "アイテム→個数"
+                    },
+                ),
+                KeyFact::new("A", self.entry_a_label()),
+                KeyFact::new("R", "数値入力"),
+                KeyFact::new("Y", "刻み"),
+                KeyFact::new("X", "保存"),
+            ],
+            // The card's four views answer [A] differently, so the line is
             // written per view rather than once for the screen.
-            Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => String::from(
-                "[◀/▶] 増減  [R] 数値入力  [A] +刻み  [ZR] 進行状況  [B] カード  [X] 保存",
-            ),
+            Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => alloc::vec![
+                KeyFact::new("◀/▶", "増減"),
+                KeyFact::new("R", "数値入力"),
+                KeyFact::new("A", "+刻み"),
+                KeyFact::new("ZR", "進行状況"),
+                KeyFact::new("B", "カード"),
+                KeyFact::new("X", "保存"),
+            ],
             Screen::Guild if self.guild_view() == GUILD_TAB_WEAPONS => {
                 if self.guild_wpn_edit {
-                    String::from("[▲/▼] ±刻み  [◀/▶] ±10  [R] 数値入力  [A] 終了  [X] 保存")
+                    alloc::vec![
+                        KeyFact::new("▲/▼", "±刻み"),
+                        KeyFact::new("◀/▶", "±10"),
+                        KeyFact::new("R", "数値入力"),
+                        KeyFact::new("A", "終了"),
+                        KeyFact::new("X", "保存"),
+                    ]
                 } else {
-                    String::from(
-                        "[▲/▼] 武器  [◀/▶] 会場  [A] 編集  [R] 数値入力  [B] カード  [X] 保存",
-                    )
+                    alloc::vec![
+                        KeyFact::new("▲/▼", "武器"),
+                        KeyFact::new("◀/▶", "会場"),
+                        KeyFact::new("A", "編集"),
+                        KeyFact::new("R", "数値入力"),
+                        KeyFact::new("B", "カード"),
+                        KeyFact::new("X", "保存"),
+                    ]
                 }
             }
             // [B] goes to the slot cards, which is the one thing this line was
             // missing: the card view is the only screen in the section whose
             // way out was named nowhere - not in the footer, not on the deck.
-            Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => format!(
-                "[R] 数値入力  [Y] 回数/武器  [A] {}  [ZR] 進行状況  [X] 保存  [B] キャラ",
-                self.guild_a_label()
-            ),
+            Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => alloc::vec![
+                KeyFact::new("R", "数値入力"),
+                KeyFact::new("Y", "回数/武器"),
+                KeyFact::new("A", self.guild_a_label()),
+                KeyFact::new("ZR", "進行状況"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "キャラ"),
+            ],
+            // The arena editor's four directions mean one thing each: ◀/▶ walk
+            // the parts of the time and ▲/▼ step the part under the cursor.
+            Screen::Guild if self.arena_edit => alloc::vec![
+                KeyFact::new("◀/▶", "項目"),
+                KeyFact::new("▲/▼", "増減"),
+                KeyFact::new("A", "終了"),
+                KeyFact::new("Y", "入力"),
+                KeyFact::new("X", "保存"),
+            ],
+            Screen::Guild => alloc::vec![
+                KeyFact::new("▲/▼", "アリーナ"),
+                KeyFact::new("◀/▶", "順位"),
+                KeyFact::new("A", "編集"),
+                KeyFact::new("Y", "入力"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "カードへ"),
+            ],
             // 進行状況's quest view has a second bit per row, and [R] is the key
             // that writes it (Editor::shoulder_job takes the key back from the
             // sub-tab rule on this view). The line names it; the other two
             // views keep the static one, which names the tab move instead.
-            Screen::Progress if self.progress_view() == PROGRESS_QUESTS => String::from(
-                "[A] ビット  [R] 既読  [Y] タブ  [ZR] 検索  [X] 保存  [B] 戻る",
-            ),
+            Screen::Progress if self.progress_view() == PROGRESS_QUESTS => alloc::vec![
+                KeyFact::new("A", "ビット"),
+                KeyFact::new("R", "既読"),
+                KeyFact::new("Y", "タブ"),
+                KeyFact::new("ZR", "検索"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // クエスト改造's [A] and [◀/▶] answer per row, so its line is built
             // per row: the four tabs have four different answers and two of them
             // change with the cursor.
-            Screen::QuestEdit => self.quest_edit_footer(),
-            _ => String::from(self.static_footer()),
-        };
-        // The way out. [＋] is the quit key everywhere except the three screens
-        // that give it a tool of their own, and there the line says so in six
-        // characters rather than twenty: the footer has 763px and the guide's
-        // own items are worth more than a sentence.
-        //
-        // The sentence is its own item, not a parenthesis hung on the [＋]
-        // item: "「[＋] 新規 …（[＋]は[B]の後）」" put the same key on one line
-        // with two meanings, which is the shape the review found. "終了は [B]
-        // の後" names the exit without reusing the glyph, and it is a step of
-        // its own in the line rather than a footnote to the 新規 key.
-        if self.plus_is_a_tool() {
-            format!("{}  終了は [B] の後", base)
-        } else {
-            format!("{}  [＋] 終了", base)
+            Screen::QuestEdit => self.quest_edit_facts(),
+            _ => self.static_facts(),
         }
     }
 
@@ -7977,7 +8180,7 @@ impl Editor {
         caption_width(&self.footer_hint())
     }
 
-    /// The fixed key guide for every screen but the talisman form.
+    /// The fixed key list for every screen whose line does not follow the row.
     ///
     /// Every line here is measured against the strip the footer really has
     /// (hbedit::FOOTER_HINT_ROOM, 763px) by the host tests, and the rule the
@@ -7986,22 +8189,40 @@ impl Editor {
     /// delete key is named where a record can be deleted, and the guide's low
     /// value items ([▲/▼] 行, [L/R] サブタブ - both drawn on the glass already)
     /// are the ones that went.
-    fn static_footer(&self) -> &'static str {
-        let base = match self.screen {
-            Screen::SaveList => "[A] 開く  [Y] 再読込  [ZL/ZR] セクション",
+    fn static_facts(&self) -> Vec<KeyFact> {
+        match self.screen {
+            Screen::SaveList => alloc::vec![
+                KeyFact::new("A", "開く"),
+                KeyFact::new("Y", "再読込"),
+                KeyFact::note("[ZL/ZR] セクション"),
+            ],
             // [A] opens the character that is highlighted, so the guide names
             // the character and not a bare 決定: the card's button says the same
             // words (ui.rs draw_slots) and a touch and a pad press must not read
             // as two different promises.
-            Screen::Slots => "[◀/▶] 枠  [A] このキャラを編集  [Y] 一括MAX（2回）  [B] 戻る",
+            Screen::Slots => alloc::vec![
+                KeyFact::new("◀/▶", "枠"),
+                KeyFact::new("A", "このキャラを編集"),
+                KeyFact::new("Y", "一括MAX（2回）"),
+                KeyFact::new("B", "戻る"),
+            ],
             // Row 0 is the name: ◀ / ▶ opens the keyboard, and the name may hold
             // a line break, which the guide says because no key hints at it.
-            Screen::Char => "[◀/▶] 増減  [A] 最大（2回）/編集  [Y] 刻み  [X] 保存  [B] 戻る",
+            Screen::Char => alloc::vec![
+                KeyFact::new("◀/▶", "増減"),
+                KeyFact::new("A", "最大（2回）/編集"),
+                KeyFact::new("Y", "刻み"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // The menu is closed by [B] (the pill on the bar says the same
             // word); [-] is the delete key and the menu has nothing to delete.
-            Screen::Items if self.item_menu_open => {
-                "[▲/▼] 選択  [A] 実行（2回）  [B] 閉じる  [X] 保存"
-            }
+            Screen::Items if self.item_menu_open => alloc::vec![
+                KeyFact::new("▲/▼", "選択"),
+                KeyFact::new("A", "実行（2回）"),
+                KeyFact::new("B", "閉じる"),
+                KeyFact::new("X", "保存"),
+            ],
             // L / R walk the BOX pages of the item box rather than a page of
             // rows: the chip used to say ページ, which reads like a scroll and
             // is not what the key does.
@@ -8011,101 +8232,171 @@ impl Editor {
             // that menu now, so the line names the menu and not the search.
             // One word for the number key on every screen: "[R] 数値入力",
             // the same words the deck's button and the inspector pill print.
-            // The [Y] item is not in this line: the strip has 763px and the
-            // deck's own pill already says "[Y] 空きも表示" - the low-value item
-            // that is drawn on the glass is the one that goes.
-            Screen::Items => {
-                "[A] 変更  [◀/▶] 個数  [R] 数値入力  [ZR] 一括  [X] 保存  [B] 戻る"
-            }
+            Screen::Items => alloc::vec![
+                KeyFact::new("A", "変更"),
+                KeyFact::new("◀/▶", "個数"),
+                KeyFact::new("R", "数値入力"),
+                KeyFact::new("ZR", "一括"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // The three pick lists print the same line: the direction keys are
             // one rule everywhere, and the guide says which is which instead
             // of leaving the user to find out per route.
             Screen::ItemPick if self.item_pick_mode == 3 && self.item_pick_stage == 1 => {
-                "[◀/▶] 個数±10  [▲/▼] ±1  [A] この個数を追加  [B] 選び直す"
+                alloc::vec![
+                    KeyFact::new("◀/▶", "個数±10"),
+                    KeyFact::new("▲/▼", "±1"),
+                    KeyFact::new("A", "この個数を追加"),
+                    KeyFact::new("B", "選び直す"),
+                ]
             }
-            Screen::ItemPick | Screen::SkillPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 検索  [X] クリア  [B] 戻る"
-            }
-            // One delete key on every screen: [-] twice. [B] is not "back":
-            // this list is a section of its own, so the way out of it is the
-            // character select, and the guide has to say which screen it goes
-            // to rather than 戻る (which read as "the screen you came from").
-            Screen::Charms => {
-                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] キャラ"
-            }
-            // Built by the form, not here: see footer_hint.
-            Screen::CharmEdit => "",
+            // The shoulder pair moves the same ten rows, but the strip is
+            // 763px and naming both pairs cost 28px more than it has: the
+            // shoulders are one global rule (README) and the arrows are the
+            // pair this screen prints.
+            Screen::ItemPick | Screen::SkillPick => alloc::vec![
+                KeyFact::new("◀/▶", "10件"),
+                KeyFact::new("▲/▼", "1件"),
+                KeyFact::new("A", "決定"),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("X", "クリア"),
+                KeyFact::new("B", "戻る"),
+            ],
+            // [B] is not "back": this list is a section of its own, so the way
+            // out of it is the character select, and the guide has to say which
+            // screen it goes to rather than 戻る.
+            Screen::Charms => alloc::vec![
+                KeyFact::new("A", self.charm_a_label()),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("-", "削除（2回）"),
+                KeyFact::new("＋", "新規"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "キャラ"),
+            ],
+            // Built by the form, not here: see screen_facts.
+            Screen::CharmEdit => alloc::vec![],
             // [B] goes to the slot cards, not to the screen the box was opened
             // from: the guide names the destination rather than saying 戻る and
             // sending the user somewhere else.
-            Screen::Equip => {
-                "[A] 編集  [Y] 検索  [-] 削除（2回）  [＋] 新規  [X] 保存  [B] キャラ"
-            }
+            Screen::Equip => alloc::vec![
+                KeyFact::new("A", self.equip_a_label()),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("-", "削除（2回）"),
+                KeyFact::new("＋", "新規"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "キャラ"),
+            ],
             // [A] is the row's own action (hbedit::EquipFormAction): the two
             // rows that name the record open the picker, the sockets open the
             // decoration list, the numeric rows step, 装備枠 writes and the new
             // form's レベル creates. [Y] is the search shortcut into the same
             // two lists.
-            Screen::EquipEdit => {
-                "[A] 行の操作  [◀/▶] 10件/値  [Y] 検索  [X] 保存  [B] 戻る（下書きは2回）"
-            }
-            Screen::JewelPick => {
-                "[◀/▶][L/R] 10件  [▲/▼] 1件  [A] 決定  [Y] 検索  [X] クリア  [B] 戻る"
-            }
+            Screen::EquipEdit => alloc::vec![
+                KeyFact::new("A", "行の操作"),
+                KeyFact::new("◀/▶", "10件/値"),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る（下書きは2回）"),
+            ],
+            Screen::JewelPick => alloc::vec![
+                KeyFact::new("◀/▶", "10件"),
+                KeyFact::new("▲/▼", "1件"),
+                KeyFact::new("A", "決定"),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("X", "クリア"),
+                KeyFact::new("B", "戻る"),
+            ],
             // One line for the name picker: the id is printed in hex
             // everywhere, so the guide says "名前か 16進ID" rather than
             // leaving the reader to guess which of the two the box takes.
             // [ZR] is the type filter - [-] is the delete key and a picker has
             // nothing to delete.
-            Screen::EquipPick => {
-                "[◀/▶] 10  [▲/▼] 1  [A] 決定  [Y] 検索  [ZR] 種別  [X] クリア  [B] 戻る"
-            }
-            Screen::Sets if self.set_edit.is_some() => {
-                "[A] 決定  [◀/▶] 装備  [-] 解除（2回）  [X] 保存  [B] 一覧（下書きは2回）"
-            }
+            Screen::EquipPick => alloc::vec![
+                KeyFact::new("◀/▶", "10"),
+                KeyFact::new("▲/▼", "1"),
+                KeyFact::new("A", "決定"),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("ZR", "種別"),
+                KeyFact::new("X", "クリア"),
+                KeyFact::new("B", "戻る"),
+            ],
+            Screen::Sets if self.set_edit.is_some() => alloc::vec![
+                KeyFact::new("A", "決定"),
+                KeyFact::new("◀/▶", "装備"),
+                KeyFact::new("-", "解除（2回）"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "一覧（下書きは2回）"),
+            ],
             // [R] is ポーチへ適用: the copy into the pouch had no key at all
             // (the deck's pill was the only door), so the form's one free key
             // took it.
-            Screen::Sets if self.item_set_edit.is_some() => {
-                "[A] 決定  [Y] 取込（2回）  [R] ポーチへ  [ZR] 名前  [B] 一覧（下書きは2回）"
-            }
+            Screen::Sets if self.item_set_edit.is_some() => alloc::vec![
+                KeyFact::new("A", "決定"),
+                KeyFact::new("Y", "取込（2回）"),
+                KeyFact::new("R", "ポーチへ"),
+                KeyFact::new("ZR", "名前"),
+                KeyFact::new("B", "一覧（下書きは2回）"),
+            ],
             // The list's [B] goes to the talisman list (the console opens it),
             // so the guide names that screen instead of saying 戻る.
-            Screen::Sets => "[A] 編集  [◀/▶] タブ  [X] 保存  [B] 護石一覧",
-            Screen::Csv if self.csv_armed.is_some() => {
-                "[A] もう一度で適用  [B] 中止  [Y] 書き出し  [ZR] 再読込"
-            }
-            Screen::Csv => "[A] 適用（2回）  [Y] 書き出し  [ZR] 再読込  [B] 戻る",
-            Screen::Options => {
-                "[◀/▶] 値変更  [Y] スナップショットへ戻す(確認)  [X] 保存  [B] 戻る"
-            }
-            // The rows are the three parts and ▲ / ▼ walks them, which the list
-            // itself shows; the 763px goes on the four keys a player cannot
-            // guess. (The line was 22px too long with "[▲/▼] 部位" in it.)
-            Screen::Roster | Screen::Palico if self.palico_equip_open() => {
-                "[◀/▶] 候補  [A] 装着  [-] 解除（2回）  [B] 一覧  [X] 保存"
-            }
-            Screen::Roster if self.palico_skill_open() => {
-                "[▲/▼] 枠  [◀/▶] 候補  [Y] タブ  [A] 差し替え  [B] 一覧  [X] 保存"
-            }
+            Screen::Sets => alloc::vec![
+                KeyFact::new("A", "編集"),
+                KeyFact::new("◀/▶", "タブ"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "護石一覧"),
+            ],
+            Screen::Csv if self.csv_armed.is_some() => alloc::vec![
+                KeyFact::new("A", "もう一度で適用"),
+                KeyFact::new("B", "中止"),
+                KeyFact::new("Y", "書き出し"),
+                KeyFact::new("ZR", "再読込"),
+            ],
+            Screen::Csv => alloc::vec![
+                KeyFact::new("A", "適用（2回）"),
+                KeyFact::new("Y", "書き出し"),
+                KeyFact::new("ZR", "再読込"),
+                KeyFact::new("B", "戻る"),
+            ],
+            Screen::Options => alloc::vec![
+                KeyFact::new("◀/▶", "値変更"),
+                KeyFact::new("Y", "スナップショットへ戻す(確認)"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // [Y] walks the three numbers the list can edit (Lv / なつき /
             // EXP) and was named nowhere: not in this line, not on the deck.
-            Screen::Roster => {
-                "[Y] 列  [A] 名前  [ZR] 装備  [＋] スキル  [X] 保存  [B] 戻る"
-            }
-            // Built in footer_hint: the word after [A] follows the row.
-            Screen::Palico => "",
-            Screen::Hunts => {
-                "[◀/▶] 増減  [Y] 列  [A] 刻み  [ZR] 表示  [R] 数値入力  [X] 保存  [B] 戻る"
-            }
+            Screen::Roster => alloc::vec![
+                KeyFact::new("Y", "列"),
+                KeyFact::new("A", "名前"),
+                KeyFact::new("ZR", "装備"),
+                KeyFact::new("＋", "スキル"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
+            Screen::Palico => alloc::vec![],
+            Screen::Hunts => alloc::vec![
+                KeyFact::new("◀/▶", "増減"),
+                KeyFact::new("Y", "列"),
+                KeyFact::new("A", "刻み"),
+                KeyFact::new("ZR", "表示"),
+                KeyFact::new("R", "数値入力"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // [Y] is the tab key on all three views. On the quest view it used
             // to write the 既読 bit - a save write on a key that moved the tab
             // on the other two views, which is the review's finding. The write
             // is [R] there, and this line is the two views that have no second
-            // bit: footer_hint writes the quest view's own line.
-            Screen::Progress => {
-                "[A] ビット  [Y] タブ  [◀/▶] ±50  [ZR] 検索  [X] 保存  [B] 戻る"
-            }
+            // bit: screen_facts writes the quest view's own line.
+            Screen::Progress => alloc::vec![
+                KeyFact::new("A", "ビット"),
+                KeyFact::new("Y", "タブ"),
+                KeyFact::new("◀/▶", "±50"),
+                KeyFact::new("ZR", "検索"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // No [R] in this line: the console answers [R] with the sub-tab,
             // so the SD write every quest needs is the deck's button
             // (Editor::request_extract_all_quests) rather than a promise this
@@ -8115,82 +8406,191 @@ impl Editor {
             // [ZR] is the bulk install of the bundled quests. The state machine
             // has answered the key all along (Editor::install_official_dlc), but
             // the console spent ZR on the section bar, so the one action that
-            // writes 189 records was a touch-only button. [-] is not in this
-            // line: the guide names it (the delete is the セーブ内 tab's job) and
-            // the strip has room for one of the two.
-            Screen::SaveQuests => {
-                "[A] 編集/導入（解除2回）  [Y] 検索  [ZR] 一括導入  [X] 保存  [B] SD(.arc)"
-            }
+            // writes 189 records was a touch-only button.
+            Screen::SaveQuests => alloc::vec![
+                KeyFact::new("A", "編集/導入（解除2回）"),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("ZR", "一括導入"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "SD(.arc)"),
+            ],
             // Screen-specific because every key here does something the other
             // screens do not have: Y installs the file into the open save and
             // [ZR] writes the bundled quests out.
             // [B] leaves the quest section for the save list. It used to go to
             // セーブ内, which sent [B] back here: two screens bouncing one key.
-            Screen::ArcList => {
-                "[A] 開く  [Y] 導入（2回）  [ZR] SDへ展開  [B] セーブ一覧"
-            }
+            Screen::ArcList => alloc::vec![
+                KeyFact::new("A", "開く"),
+                KeyFact::new("Y", "導入（2回）"),
+                KeyFact::new("ZR", "SDへ展開"),
+                KeyFact::new("B", "セーブ一覧"),
+            ],
             // The file screens are クエスト改造's detail view, so [B] goes
             // there - and the guide says so instead of 戻る.
-            Screen::ArcEntries => {
-                "[A] 開く  [Y] 検査  [ZR] 抽出  [X] 保存  [B] 改造へ"
-            }
-            // footer_hint writes this screen's line, because [ZR] only works on
-            // a monster row; this is the row that has no sub-field.
-            Screen::Mib => {
-                "[A] 一覧選択  [◀/▶] 増減  [Y] 刻み  [X] 保存  [B] 戻る"
-            }
-            Screen::Gmd => "[A] 文章編集  [X] 保存  [B] 戻る",
-            // footer_hint writes the reward / supply line: its [A] word follows
-            // the cell the cursor is on (EntryAction).
-            Screen::EntryView if self.entry_has_numbers() => {
-                "[◀/▶] 値  [ZR] 項目  [A] アイテム  [R] 数値入力  [Y] 刻み  [X] 保存"
-            }
-            Screen::EntryView => "[◀/▶] 座標・数値  [Y] 刻み  [X] 保存  [B] 戻る",
-            // The arena editor's four directions mean one thing each: ◀/▶ walk
-            // the parts of the time and ▲/▼ step the part under the cursor.
-            Screen::Guild if self.guild_view() == GUILD_TAB_ARENA && self.arena_edit => {
-                "[◀/▶] 項目  [▲/▼] 増減  [A] 終了  [Y] 入力  [X] 保存"
-            }
-            Screen::Guild if self.guild_view() == GUILD_TAB_ARENA => {
-                "[▲/▼] アリーナ  [◀/▶] 順位  [A] 編集  [Y] 入力  [X] 保存  [B] カードへ"
-            }
-            // Built in footer_hint: the word after [A] follows the row.
-            Screen::Guild => "",
+            Screen::ArcEntries => alloc::vec![
+                KeyFact::new("A", "開く"),
+                KeyFact::new("Y", "検査"),
+                KeyFact::new("ZR", "抽出"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "改造へ"),
+            ],
+            // screen_facts writes this screen's line, because [ZR] only works
+            // on a monster row; this is the row that has no sub-field.
+            Screen::Mib => alloc::vec![],
+            Screen::Gmd => alloc::vec![
+                KeyFact::new("A", "文章編集"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
+            // The non-table entries (.sem / .esl / .qdp / .qdl): the arrows
+            // step a coordinate or a number and there is no cell to switch.
+            // screen_facts writes the reward / supply line instead when the
+            // entry is a .rem / .sup table.
+            Screen::EntryView => alloc::vec![
+                KeyFact::new("◀/▶", "座標・数値"),
+                KeyFact::new("Y", "刻み"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
+            // Every view of the card is written in screen_facts (the four
+            // views answer [A] differently), so this arm is unreachable - the
+            // match needs it to be exhaustive.
+            Screen::Guild => alloc::vec![],
             // The checker's [A] is the automatic fix, and it is the only thing
             // the key does.
-            Screen::Check => "[A] 自動修正  [▲/▼] 指摘  [X] .arc 保存  [B] 戻る",
+            Screen::Check => alloc::vec![
+                KeyFact::new("A", "自動修正"),
+                KeyFact::new("▲/▼", "指摘"),
+                KeyFact::new("X", ".arc 保存"),
+                KeyFact::new("B", "戻る"),
+            ],
             // 固定装備 is two levels: the list of slots, and the items inside
             // one. The counts live inside, so the closed list must not name the
             // arrows - they do nothing there at all.
-            Screen::QuestEquip if self.qe_open => {
-                "[◀/▶] 個数  [A] アイテム  [X] 保存  [B] 一覧"
-            }
-            Screen::QuestEquip => "[A] 開く  [X] 保存  [B] 戻る",
-            // Built in footer_hint: the aggregate quest screen's [A] and
+            Screen::QuestEquip if self.qe_open => alloc::vec![
+                KeyFact::new("◀/▶", "個数"),
+                KeyFact::new("A", "アイテム"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "一覧"),
+            ],
+            Screen::QuestEquip => alloc::vec![
+                KeyFact::new("A", "開く"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
+            // Built in screen_facts: the aggregate quest screen's [A] and
             // [◀/▶] answer per row, so its line is the form's
-            // (Editor::quest_edit_footer) rather than one fixed string.
-            Screen::QuestEdit => "",
+            // (Editor::quest_edit_facts) rather than one fixed list.
+            Screen::QuestEdit => alloc::vec![],
             // Conversion is the one screen whose keys are not the usual set:
             // ◀ / ▶ change nothing, and [X] saves the *open* save rather than
             // writing the converted file. [A] asks twice because the write
             // replaces whatever is at the output path.
-            Screen::Convert => "[A] 変換出力（2回）  [Y] 出力名  [B] 戻る",
+            Screen::Convert => alloc::vec![
+                KeyFact::new("A", "変換出力（2回）"),
+                KeyFact::new("Y", "出力名"),
+                KeyFact::new("B", "戻る"),
+            ],
             // 生データ: the list is a viewer until [A] opens the byte editor.
             // Inside it the four directions belong to the byte, so the line
             // says what they do there rather than what they do to the list -
             // one screen, two sets of words, both true.
-            Screen::SaveMap if self.map_edit_open() => {
-                "[▲/▼] 1バイト移動  [◀/▶] 値の変更  [A] 決定  [B] 取消/戻る"
-            }
+            Screen::SaveMap if self.map_edit_open() => alloc::vec![
+                KeyFact::new("▲/▼", "1バイト移動"),
+                KeyFact::new("◀/▶", "値の変更"),
+                KeyFact::new("A", "決定"),
+                KeyFact::new("B", "取消/戻る"),
+            ],
             // The list is a comparison, so the two keys that matter are the one
             // that puts a line back and the one that rebuilds the list; [X] is
             // the save key every screen has.
-            Screen::Review => {
-                "[▲/▼] 行  [◀/▶] 10行  [A] 戻す（2回）  [Y] 再読込  [X] 保存  [B] 戻る"
+            Screen::Review => alloc::vec![
+                KeyFact::new("▲/▼", "行"),
+                KeyFact::new("◀/▶", "10行"),
+                KeyFact::new("A", "戻す（2回）"),
+                KeyFact::new("Y", "再読込"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "戻る"),
+            ],
+            Screen::SaveMap => alloc::vec![
+                KeyFact::new("▲/▼", "行"),
+                KeyFact::new("◀/▶", "10行"),
+                KeyFact::new("A", "編集"),
+                KeyFact::new("Y", "検索"),
+                KeyFact::new("B", "戻る"),
+            ],
+        }
+    }
+
+    /// The クエスト改造 line, per tab and per row.
+    ///
+    /// The four tabs answer [A] and [◀/▶] differently, and two of them change
+    /// with the cursor, so the list is built from the same row the deck's
+    /// button reads (Editor::quest_basic_a_label).
+    fn quest_edit_facts(&self) -> Vec<KeyFact> {
+        match self.quest_edit_tab {
+            QUEST_TAB_BASIC => {
+                if self.quest_basic_text_row() {
+                    alloc::vec![
+                        KeyFact::new("A", "テキスト編集"),
+                        KeyFact::new("X", "保存"),
+                        KeyFact::new("B", "一覧"),
+                    ]
+                } else {
+                    alloc::vec![
+                        KeyFact::new("◀/▶", "制限時間"),
+                        KeyFact::new("X", "保存"),
+                        KeyFact::new("B", "一覧"),
+                    ]
+                }
             }
-            Screen::SaveMap => "[▲/▼] 行  [◀/▶] 10行  [A] 編集  [Y] 検索  [B] 戻る"
-        };
-        base
+            QUEST_TAB_MONSTERS => {
+                // The .sem half of a monster row has no list behind it: those
+                // numbers are stepped, and [A] says so instead of opening one.
+                if self.quest_edit_field >= QUEST_MON_SEM_X {
+                    alloc::vec![
+                        KeyFact::new("◀/▶", "値"),
+                        KeyFact::new("ZR", "項目"),
+                        KeyFact::new("Y", "刻み"),
+                        KeyFact::new("X", "保存"),
+                        KeyFact::new("B", "一覧"),
+                    ]
+                } else {
+                    alloc::vec![
+                        KeyFact::new("A", "選択"),
+                        KeyFact::new("◀/▶", "値"),
+                        KeyFact::new("ZR", "項目"),
+                        KeyFact::new("Y", "刻み"),
+                        KeyFact::new("X", "保存"),
+                        KeyFact::new("B", "一覧"),
+                    ]
+                }
+            }
+            // 報酬: [ZR] walks the row's three cells - アイテム / 個数 / 確率% -
+            // and the line says all three. It said 項目 while the chip beside it
+            // said 個数/確率, so the two places named two different key counts.
+            // The arrow pair is not in this line either: the strip has 763px
+            // and the three stops are the fact this tab has to state.
+            QUEST_TAB_REWARDS => alloc::vec![
+                KeyFact::new("A", "アイテム"),
+                KeyFact::new("ZR", "アイテム→個数→確率"),
+                KeyFact::new("R", "検索"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "一覧"),
+            ],
+            // 支給品 has one value and nothing to switch, so [ZR] there is the
+            // search itself - the same word the pill on the bar prints. The
+            // line used to omit the key while the chip said 項目 and the pill
+            // said 検索: three answers for one press.
+            _ => alloc::vec![
+                KeyFact::new("A", "アイテム"),
+                KeyFact::new("◀/▶", "値"),
+                KeyFact::new("ZR", "検索"),
+                KeyFact::new("R", "検索"),
+                KeyFact::new("X", "保存"),
+                KeyFact::new("B", "一覧"),
+            ],
+        }
     }
 
     // -------------------------------------------------------------------
@@ -9131,31 +9531,14 @@ impl Editor {
     /// button has followed the row since [Editor::quest_basic_a_label]; the
     /// footer does now too.
     pub fn quest_edit_footer(&self) -> String {
-        match self.quest_edit_tab {
-            QUEST_TAB_BASIC => {
-                if self.quest_basic_text_row() {
-                    String::from("[A] テキスト編集  [X] 保存  [B] 一覧")
-                } else {
-                    String::from("[◀/▶] 制限時間  [X] 保存  [B] 一覧")
-                }
+        let mut out = String::new();
+        for fact in self.quest_edit_facts() {
+            if !out.is_empty() {
+                out.push_str("  ");
             }
-            QUEST_TAB_MONSTERS => {
-                // The .sem half of a monster row has no list behind it: those
-                // numbers are stepped, and [A] says so instead of opening one.
-                if self.quest_edit_field >= QUEST_MON_SEM_X {
-                    String::from("[◀/▶] 値  [ZR] 項目  [Y] 刻み  [X] 保存  [B] 一覧")
-                } else {
-                    String::from("[A] 選択  [◀/▶] 値  [ZR] 項目  [Y] 刻み  [X] 保存  [B] 一覧")
-                }
-            }
-            // 報酬: [ZR] walks 個数 / 確率% (two values), and the search is its
-            // own press. 支給品 has one value, so [ZR] there is the search and
-            // the line names the key that does it.
-            QUEST_TAB_REWARDS => String::from(
-                "[A] アイテム  [◀/▶] 値  [ZR] 項目  [R] 検索  [X] 保存  [B] 一覧",
-            ),
-            _ => String::from("[A] アイテム  [◀/▶] 値  [R] 検索  [X] 保存  [B] 一覧"),
+            out.push_str(&fact.render());
         }
+        out
     }
 
     /// Move the cursor inside the current tab.
@@ -9277,11 +9660,16 @@ impl Editor {
 
     /// Is the 報酬 tab stepping the chance column rather than the count?
     ///
-    /// The two stops [ZR] walks are the two values a reward row holds: 個数 and
-    /// 確率%. The search is its own press ([R] / the 検索 pill) and is not one
-    /// of them (see [Editor::quest_cycle_field]).
+    /// The three stops [ZR] walks are the three cells a reward row holds:
+    /// アイテム / 個数 / 確率%. The search is its own press ([R] / the 検索
+    /// pill) and is not one of them (see [Editor::quest_cycle_field]).
     pub fn quest_edit_chance(&self) -> bool {
         self.quest_reward_field == QUEST_REWARD_CHANCE
+    }
+
+    /// Is the 報酬 tab on the item cell (where [A] opens the picker)?
+    pub fn quest_edit_item_cell(&self) -> bool {
+        self.quest_reward_field == QUEST_REWARD_ITEM
     }
 
     /// Which of the eleven monster values [◀/▶] is on.
@@ -9300,17 +9688,17 @@ impl Editor {
                 let label = self.quest_field_label();
                 self.message = format!("[◀/▶] で変更する項目: {}", label);
             }
-            // 個数 ⇄ 確率%, and the keyboard opens on neither: a value switch
-            // that opens a keyboard every other press cannot be used to walk the
-            // values, and it left no way back to 個数 (the review's finding).
-            // The search is not a stop at all - it holds no value, so a third
-            // press of a *value* switch could only say "this stop is for the
-            // search". It is the 検索 pill (touch) and [R] here.
+            // アイテム → 個数 → 確率%, the same three cells the row's own
+            // screen walks (Editor::entry_field_count). The keyboard opens on
+            // none of them: a switch that opens a keyboard every other press
+            // cannot be used to walk the cells. The search is not a stop - it
+            // holds no cell - and is the 検索 pill (touch) and [R] here.
             QUEST_TAB_REWARDS => {
                 self.quest_reward_field = (self.quest_reward_field + 1) % QUEST_REWARD_FIELDS;
                 self.message = match self.quest_reward_field {
                     QUEST_REWARD_CHANCE => String::from("[◀/▶] で変更する項目: 確率%"),
-                    _ => String::from("[◀/▶] で変更する項目: 個数"),
+                    QUEST_REWARD_COUNT => String::from("[◀/▶] で変更する項目: 個数"),
+                    _ => String::from("[ZR] で変更する項目: アイテム（[A] で選ぶ）"),
                 };
             }
             // 支給品 has one value and nothing to switch, so the key is the
@@ -9392,6 +9780,15 @@ impl Editor {
                 let rows = self.quest_rewards();
                 if rows.is_empty() {
                     self.message = self.quest_table_empty_line("報酬テーブル");
+                    return false;
+                }
+                // The item cell is chosen, not stepped: the arrows say so
+                // instead of moving a number the cursor is not on, the same
+                // answer the row's own screen gives (adjust_entry_field).
+                if self.quest_edit_item_cell() {
+                    self.message = String::from(
+                        "アイテムの欄です（[A] で選ぶ / [ZR] で 個数・確率 に切り替え）",
+                    );
                     return false;
                 }
                 let cur = self.quest_edit_cursor.min(rows.len() - 1);
@@ -12275,7 +12672,143 @@ impl Editor {
     pub fn empty_a_label(&self) -> Option<&'static str> {
         match self.screen {
             Screen::Charms => Some(self.charm_a_label()),
+            // The equipment box answers the same three ways (編集 / 作成 /
+            // 解除), so an empty box offers 作成 instead of an edit of nothing.
+            Screen::Equip => Some(self.equip_a_label()),
             _ => None,
+        }
+    }
+
+    /// What the equipment box's `[A]` will do, as the word the footer and the
+    /// inspector button print.
+    ///
+    /// The same three answers the talisman list gives
+    /// ([Editor::charm_a_label]): the selected record's form, the first blank
+    /// record of an empty box, and the search that hid every row. The box said
+    /// 編集 over all three, so an empty box offered an edit of nothing.
+    pub fn equip_a_label(&self) -> &'static str {
+        if !self.equip_rows().is_empty() {
+            "編集"
+        } else if self.equip_filter.trim().is_empty() {
+            "作成"
+        } else {
+            "解除"
+        }
+    }
+
+    /// `[A]` on the equipment box: open the form, create the first record, or
+    /// drop a search that hid every row.
+    ///
+    /// The console used to decide this itself and answered 編集 over an empty
+    /// box; the three answers live here now, the same way the talisman list's
+    /// do, so the pad, the button and the tests cannot disagree.
+    pub fn equip_a_press(&mut self) {
+        if !self.equip_rows().is_empty() {
+            self.open_equip_editor();
+            return;
+        }
+        if !self.equip_filter.trim().is_empty() {
+            let was = self.equip_filter.trim().to_string();
+            self.equip_filter.clear();
+            self.equip_cursor = 0;
+            self.equip_delete_armed = None;
+            self.message = alloc::format!(
+                "検索「{}」に一致する装備がありませんでした。検索を解除しました（{} 件）",
+                was,
+                self.equip_rows().len()
+            );
+            return;
+        }
+        self.open_equip_creator();
+    }
+
+    /// Switch the download palicoes' name language.
+    ///
+    /// The one implementation: the pad's ◀ / ▶, the deck's button and the
+    /// headless build all call this, so the state and the sentence cannot
+    /// drift apart.
+    pub fn toggle_palico_lang(&mut self) {
+        self.palico_lang = 1 - self.palico_lang;
+        self.message = alloc::format!(
+            "配信オトモの言語: {}",
+            if self.palico_lang == 0 {
+                "日本語"
+            } else {
+                "英語 (English)"
+            }
+        );
+    }
+
+    /// The deck button's words for the same key: "言語: 日本語".
+    ///
+    /// The footer's fact and the button print the same label, so the touch
+    /// route and the pad route cannot describe one key two ways.
+    pub fn palico_lang_label(&self) -> String {
+        alloc::format!(
+            "言語: {}",
+            if self.palico_lang == 0 { "日本語" } else { "英語" }
+        )
+    }
+
+    /// The label the inspector's step selector prints.
+    ///
+    /// The table and the key are [Editor::step_table]'s answer. The two forms
+    /// spend every pad key elsewhere, so their label names no key and says the
+    /// pills are the only route - a reader who looks for a key that is not
+    /// there is the bug this word removes.
+    pub fn step_pill_label(&self) -> String {
+        let (_, key) = self.step_table();
+        if key.is_empty() {
+            String::from("刻み（タッチのみ）")
+        } else {
+            alloc::format!("刻み [{}]", key)
+        }
+    }
+
+    /// The search that is narrowing the list on this screen, if any.
+    ///
+    /// One answer for the header chip, the empty list's line and the [Y]
+    /// sentence, so a filtered list cannot say "no data" in one place and
+    /// "12 件" in another.
+    pub fn active_search(&self) -> Option<&str> {
+        let needle = match self.screen {
+            Screen::Charms => self.charm_filter.as_str(),
+            Screen::Equip => self.equip_filter.as_str(),
+            Screen::SaveQuests => self.quest_filter.as_str(),
+            Screen::ItemPick => self.item_pick_filter.as_str(),
+            Screen::SkillPick => self.skill_pick_filter.as_str(),
+            Screen::JewelPick => self.jewel_pick_filter.as_str(),
+            Screen::EquipPick => self.equip_pick_filter.as_str(),
+            _ => "",
+        };
+        let needle = needle.trim();
+        if needle.is_empty() {
+            None
+        } else {
+            Some(needle)
+        }
+    }
+
+    /// The line a list with no rows prints.
+    ///
+    /// An empty box and a search that matched nothing are two different states,
+    /// and one word for both ("データがありません") told the user nothing about
+    /// which one they were looking at. A narrowed list names the search and the
+    /// key that changes it; an empty box names the screen's own way to fill it.
+    pub fn empty_list_line(&self) -> String {
+        if let Some(needle) = self.active_search() {
+            return alloc::format!(
+                "検索「{}」に一致する行がありません（[Y] で検索を変更）",
+                needle
+            );
+        }
+        match self.screen {
+            Screen::Charms => String::from("護石がありません（[＋] で新規）"),
+            Screen::Equip => String::from("装備がありません（[＋] で新規）"),
+            Screen::Items => String::from("この表示にアイテムがありません（[Y] で空き枠も表示）"),
+            Screen::Roster => String::from("オトモがいません"),
+            Screen::Hunts => String::from("狩猟記録がありません（[Y] で全モンスター表示）"),
+            _ => String::from("データがありません"),
         }
     }
 
@@ -12358,6 +12891,12 @@ impl Editor {
             self.screen = Screen::Charms;
             return;
         };
+        // The overwrite offer belongs to the draft the first [A] described, so
+        // any other key takes it back before it does its own work - the same
+        // rule the two-press delete follows on the lists.
+        if key != Key::A && key != Key::X {
+            self.charm_write_armed = None;
+        }
         match key {
             // The row count is the form's own (CHARM_EDIT_ROWS): the two arms
             // used to wrap with a literal 7, which is what left the three
@@ -12481,7 +13020,13 @@ impl Editor {
                 self.message =
                     String::from("スキル・装飾品の行で [A] 一覧から選択 / [Y] 名前で検索");
             }
-            Key::X => self.step = (self.step + 1) % STEPS.len(),
+            // [X] is the save key on every screen, and this form is no
+            // exception: it writes the draft into the box and then the file
+            // (Editor::quick_save). It used to be the step key here, which the
+            // console never sent (its global X answered first) and which no
+            // line on the glass ever named - one key, two meanings, and only
+            // one of them was true of the pad.
+            Key::X => self.quick_save(),
             // [A] is the row's own action (hbedit::CharmAction). The skill rows
             // open the picker, the three field rows step, and the box-slot row
             // writes - so the same key that opens a 306 entry list here cannot
@@ -12566,7 +13111,7 @@ impl Editor {
     /// the draft is in the save.
     pub fn commit_charm_draft(&mut self) -> bool {
         let written = self.charm_edit.map(|e| e.index);
-        if !self.write_charm_draft() {
+        if !self.charm_write_press() {
             return false;
         }
         // [A] wrote the record, so the list is where the next thing happens -
@@ -12590,7 +13135,59 @@ impl Editor {
     /// leaving - the user is still editing the record, and the form is where
     /// they were - so the save key runs this half.
     pub fn commit_charm_draft_here(&mut self) -> bool {
-        self.write_charm_draft()
+        self.charm_write_press()
+    }
+
+    /// Would writing the form replace a talisman the box already holds?
+    ///
+    /// True when the form's slot row was moved off the record it was opened on
+    /// and the new slot already holds a talisman. Writing there is the one
+    /// destructive press this form has: the record under it is gone with no
+    /// undo step of its own (the whole save's undo is one step back, which is
+    /// not the same as "not yet").
+    pub fn charm_write_replaces(&self) -> bool {
+        let Some(e) = self.charm_edit else {
+            return false;
+        };
+        if e.index == e.seed.index {
+            return false;
+        }
+        let Some(b) = self.save.as_ref().and_then(|s| s.equipment_box(self.slot)) else {
+            return false;
+        };
+        let o = e.index * crate::charm::CHARM_RECORD;
+        b.get(o..o + crate::charm::CHARM_RECORD)
+            .map(crate::charm::is_talisman)
+            .unwrap_or(false)
+    }
+
+    /// The write the form's [A] and the save key both run, with the overwrite
+    /// confirmation in front of it.
+    ///
+    /// A delete costs two presses on every list, so replacing a record costs
+    /// two as well: the first press names the slot and the record it would
+    /// lose, the second one writes. The armed value is the whole draft, not
+    /// just the index, so changing any field takes the offer back - the second
+    /// press must write what the first one described.
+    fn charm_write_press(&mut self) -> bool {
+        if !self.charm_write_replaces() {
+            self.charm_write_armed = None;
+            return self.write_charm_draft();
+        }
+        let Some(e) = self.charm_edit else {
+            return false;
+        };
+        let value = e.value();
+        if self.charm_write_armed == Some(value) {
+            self.charm_write_armed = None;
+            return self.write_charm_draft();
+        }
+        self.charm_write_armed = Some(value);
+        self.message = alloc::format!(
+            "枠 {} には既に護石があります。もう一度 [A] で上書き（[B] で取りやめ）",
+            e.index
+        );
+        false
     }
 
     /// Write the form into the box and leave the navigation to the caller.
@@ -12771,14 +13368,11 @@ impl Editor {
                 self.palico_cursor = (self.palico_cursor + 1) % n.max(1);
                 self.cursor = self.palico_cursor;
             }
-            Key::L | Key::R => {
-                self.palico_lang = 1 - self.palico_lang;
-                self.message = if self.palico_lang == 0 {
-                    String::from("オトモ名（日本語）")
-                } else {
-                    String::from("オトモ名（英語）")
-                };
-            }
+            // The language is the arrow pair, and the console sends the same
+            // pair here (its own L / R are the sub-tabs). The deck's button
+            // calls the same method, so the pad, the touch route and the
+            // headless build cannot end up in three different states.
+            Key::Left | Key::Right => self.toggle_palico_lang(),
             // [A] is the row's own action: 導入 on a palico that is not in
             // the save, and 解除 on one that is. A release deletes the record,
             // so it costs two presses (Editor::palico_a_press); the chip the
@@ -13595,7 +14189,12 @@ impl Editor {
                     // The save key writes the draft and stays on the form: it
                     // used to run [A]'s commit, which leaves for the list, so
                     // [X] closed the form the user was editing.
-                    self.commit_charm_draft_here();
+                    if !self.commit_charm_draft_here() {
+                        // The form said why (a slot that refuses the record, or
+                        // an overwrite waiting for its second press). Writing
+                        // the file now would be a save that lacks the screen.
+                        return;
+                    }
                 }
                 if self.charm_draft_dirty() {
                     self.message = String::from(
@@ -13637,7 +14236,7 @@ impl Editor {
             Screen::QuestEdit => {
                 self.flush_quest_edit();
                 if self.arc_path.is_some() {
-                    self.input(Key::X);
+                    self.request_write_arc();
                 } else if self.save.is_some() {
                     self.install_into_save();
                     // The install only moves bytes inside the open save. The
@@ -13658,13 +14257,9 @@ impl Editor {
                 // narrower answer to the same question).
                 self.store_entry();
                 if self.arc_path.is_some() {
-                    // [A] is the .arc save on the .mib screen ([X] is the step
-                    // there) and [X] is it on the other four.
-                    if self.screen == Screen::Mib {
-                        self.input(Key::A);
-                    } else {
-                        self.input(Key::X);
-                    }
+                    // One writer for the five file screens: the working copies
+                    // are stored above, and the archive is written here.
+                    self.request_write_arc();
                 } else if self.save.is_some() {
                     // A quest that came out of the save has no path: the write
                     // is the save's.
@@ -14104,10 +14699,11 @@ impl Editor {
                 self.step = (self.step + 1) % STEPS.len();
                 self.message = alloc::format!("刻みを ±{} に切り替えました", STEPS[self.step]);
             }
-            // [X] stays the step here: the console's global X answers QuickSave
-            // before the state machine sees it, so this arm is the headless
-            // build's only step key and the review's list does not touch it.
-            Key::X => self.step = (self.step + 1) % STEPS.len(),
+            // [X] is the save key, exactly as the footer says. It used to be
+            // the step key here: the console's global X answered QuickSave
+            // before the state machine saw it, so the two layers gave one key
+            // two meanings and only the console's was on the glass.
+            Key::X => self.quick_save(),
             Key::Left | Key::Right => {
                 if self.field == 0 {
                     if let Some(c) = self.character() {
@@ -14179,10 +14775,10 @@ impl Editor {
                     }
                 }
             }
-            // The state machine's own step key. The console never sends it
-            // ([X] is the global save there) and no footer names it any more,
-            // so the deck's 刻み button is the route both builds share.
-            Key::X => self.step = (self.step + 1) % STEPS.len(),
+            // [X] is the save key. The step is the deck's button on this
+            // screen (the footer says "[X] 保存" and names no step key), so the
+            // headless build answers the same press the pad does.
+            Key::X => self.quick_save(),
             // The item box's one list-shape key: 所持品のみ <-> 全枠. It is a
             // method of its own because the console's deck has a button that
             // runs the same thing, and a tap and a press must not be able to
@@ -17186,101 +17782,95 @@ impl Editor {
     /// The one-line description at the top of the screen.
     ///
     /// The console draws this above the content, once per screen, so a player
-    /// who has never seen the screen is told what the first key does without
-    /// opening a manual. It is also the line that says how to reach 詳細, which
-    /// is the whole point of the two-tier navigation: the usual work finishes
-    /// on the first tier and the bytes are one press further away.
-    pub fn screen_guide(&self) -> &'static str {
+    /// who has never seen the screen is told what it is and what the first key
+    /// does without opening a manual.
+    ///
+    /// The sentence is the screen's own description ([Editor::guide_lead], which
+    /// names no key) followed by the first items of [Editor::key_facts],
+    /// printed exactly as the footer prints them. The guide and the footer are
+    /// one table, so a key cannot mean one thing at the top of the screen and
+    /// another at the bottom - the fifth review found seven screens where the
+    /// two said different things.
+    pub fn screen_guide(&self) -> String {
+        let mut out = String::from(self.guide_lead());
+        let facts = self.guide_facts();
+        for fact in &facts {
+            out.push(' ');
+            out.push_str(&fact.render());
+            out.push('、');
+        }
+        while out.ends_with('、') {
+            out.pop();
+        }
+        out
+    }
+
+    /// The facts the guide strip prints: the first [GUIDE_FACT_COUNT] keys of
+    /// the screen, in the footer's own order.
+    ///
+    /// Public so a test can compare the guide with the footer without parsing
+    /// the sentence: the guide is this list rendered, and nothing else.
+    pub fn guide_facts(&self) -> Vec<KeyFact> {
+        self.key_facts()
+            .into_iter()
+            .filter(|f| !f.key.is_empty())
+            .take(GUIDE_FACT_COUNT)
+            .collect()
+    }
+
+    /// What this screen is, in one sentence that names no key.
+    ///
+    /// The key meanings come from [Editor::key_facts]; this is only the
+    /// description, so the two cannot say different things about the same key.
+    fn guide_lead(&self) -> &'static str {
         match self.screen {
-            Screen::SaveList => "セーブを選んで [A] で開きます。[Y] でカードを読み直します。",
-            // The card's [A] button and this line say the same words: the
-            // highlighted slot is the one the edit opens, so the guide names
-            // the character rather than a bare 編集.
-            Screen::Slots => "キャラを選んで [A] でこのキャラを編集。[◀/▶] で枠、[Y] 2回で一括MAX。",
-            Screen::Char => "行を選んで [◀/▶] で変更、[A] 2回で最大。[生データ] でこの画面のバイト。",
-            Screen::Items => "アイテムを選んで [A] で種類、[◀/▶] で個数。[Y] で空き枠も表示。",
-            Screen::ItemPick => "名前で検索して [A] で決定。[B] で元の画面へ。",
+            Screen::SaveList => "セーブを選んで開きます。",
+            Screen::Slots => "キャラクターを選びます。",
+            Screen::Char => "キャラクターの数値を編集します。",
+            Screen::Items => "アイテムボックスの所持品を編集します。",
+            Screen::ItemPick => "アイテムを名前で選びます。",
+            Screen::SkillPick => "スキルを名前で選びます。",
+            Screen::JewelPick => "装飾品を名前で選びます。",
+            Screen::EquipPick => "装備を名前で選びます。",
             // The [A] word follows the list: an empty box creates the first
             // talisman, which is not an edit of anything.
             Screen::Charms if self.charms().is_empty() && self.charm_filter.trim().is_empty() => {
-                "護石がありません。[A] で最初の1個を作成（[＋] でも新規）。"
+                "護石がありません。"
             }
-            Screen::Charms => "護石を選んで [A] で編集、[＋] で新規。[Y] で種類やスキル名を検索できます。",
-            Screen::CharmEdit => "行ごとに [A] で操作（スキルは一覧）、[◀/▶] で値。[B] で一覧へ。",
-            Screen::SkillPick => "スキルを選んで [A] で決定。[Y] で名前を検索できます。",
-            Screen::Equip => "装備を選んで [A] で編集、[Y] で名前を検索、[＋] で新規。[生データ] で装備BOXのバイト。",
-            Screen::EquipEdit => "行ごとに [A] で選択、[◀/▶] で10件/値。[B] で一覧へ。",
-            Screen::JewelPick => "装飾品を選んで [A] で決定。[Y] で名前を検索できます。",
-            Screen::EquipPick => "装備を名前で選んで [A] で決定。[ZR] で種別を切り替え。",
-            Screen::Sets => "マイセットを選んで [A] で編集、[◀/▶] でアイテム/装備の切替。",
-            Screen::Hunts => "狩猟記録の行を選んで [◀/▶] で増減。[Y] で項目切替。",
-            // The card carries four views and [B] unwinds one level at a time:
-            // 回数 / 武器 go back to the card, the card goes back to the slot
-            // cards. One key, two depths - so the line says so instead of
-            // leaving the reader to find out which one a press gets.
-            Screen::Guild => {
-                "カード/回数/武器/闘技大会の4ビューは [L] で送り、[B] は1段ずつ戻ります。"
-            }
-            // The three places that name this screen's keys (this line, the
-            // footer and the text build's key line) say the same thing: [Y]
-            // walks the views, [A] flips the bit, [R] is the quest view's
-            // second bit and [ZR] is the search.
-            Screen::Progress => {
-                "[A] でビット切替、[Y] でビット列切替、[R] はクエストの既読、[ZR] で名前を絞り込み。"
-            }
-            Screen::Roster => "オトモを選んで [A] で名前、[ZR] で装備、[＋] でスキル。",
-            // [◀/▶] is the language on this build and was named nowhere at all:
-            // the two arrows are the only key this screen answers that no line
-            // mentioned.
-            Screen::Palico => {
-                "配信オトモを選んで [A] で導入/解除、[◀/▶] で名前の言語、[Y] 2回で全導入。"
-            }
-            // Only three keys answer here, so the line names those three and
-            // nothing else: [X] saves the open save, not the converted file.
-            Screen::Convert => "3DS と Switch の形式を変換します。[A] で変換出力、[Y] で出力名、[B] で戻る。",
-            Screen::Options => "設定の行を [◀/▶] で変更、[A] で保存、[Y] で直近スナップショットへ戻す。",
-            Screen::Csv => "CSV を選んで [A] で適用（2回）、[Y] で書き出し。",
-            // [-] on the save's own list is the delete, twice, like every
-            // other list; the 書き出し moved to the deck's pill when [R] went
-            // back to the sub-tab. The line named the wrong key for the wrong
-            // job, and the only way to check it was to read
-            // `input_save_quests` beside it.
+            Screen::Charms => "護石の一覧です。",
+            Screen::CharmEdit => "護石の内容を編集します。",
+            Screen::Equip => "装備BOXの一覧です。",
+            Screen::EquipEdit => "装備の内容を編集します。",
+            Screen::QuestEquip => "クエストの固定装備を編集します。",
             // The two bundle tabs count what the build really carries, and a
             // checkout without the generated bundle carries none: the guide
             // says so rather than leaving an empty list unexplained.
             Screen::SaveQuests if !Self::bundled_quests_available() => {
-                "DLC バンドル未生成: 公式・没クエは 0 件です（セーブ内は [A] で改造）。"
+                "DLC バンドル未生成: 公式・没クエは 0 件です。"
             }
             // The two catalogue tabs have nothing to delete: their rows are the
-            // bundle, not the save, and [-] there only ever answered with a
-            // refusal. The guide promised the delete on all three tabs.
-            Screen::SaveQuests if self.quest_tab != 0 => {
-                "クエストを選んで [A] で導入/解除（解除は2回）。[-] 削除はこの一覧では使いません。[L/R] で一覧切替。"
-            }
-            Screen::SaveQuests => {
-                "クエストを選んで [A] で改造、[-] で削除（2回）。書き出しは右のボタン。[L/R] で一覧切替。"
-            }
-            Screen::QuestEquip => "固定装備の枠を [A] で開いて編集します。",
-            Screen::QuestEdit => "4つのタブでクエストを作ります。[ファイル] でファイル単位の画面へ。",
-            Screen::ArcList => ".arc を選んで [A] で開きます。[Y] 2回でセーブへ導入、[ZR] で書き出し。",
-            Screen::ArcEntries => "クエストの構成ファイルです。[A] で中身、[L/R] でタブ切替。",
-            Screen::EntryView => "エントリの中身です。[◀/▶] で値を変更、[Y] で刻み。",
-            Screen::Mib => {
-                "クエスト条件です。[◀/▶] で値、[A] で一覧から選択。[ZR] はモンスター行の項目切替。"
-            }
-            Screen::Gmd => "クエストの文章です。[A] でテキスト編集、[X] で保存。",
-            Screen::Check => "クエストの検査結果です。[A] で直せる項目を修正します。",
-            // 生データ is two modes and the line says which keys belong to the
-            // one on screen. One line served both and described the editor's
-            // [◀/▶] (the value) on the list, where the key is a ten-row jump -
-            // so the guide named a key that does not do that here.
-            Screen::SaveMap if self.map_edit_open() => {
-                "編集中: [◀/▶] で値、[▲/▼] で1バイト移動、[A] で決定、[B] で取消。"
-            }
-            Screen::SaveMap => {
-                "行を選んで [A] で編集、[◀/▶] で10行送り、[Y] で領域を検索。[B] で戻る。"
-            }
-            Screen::Review => "保存した内容との違いです。[A] を2回でその1項目だけ戻せます。",
+            // bundle, not the save.
+            Screen::SaveQuests if self.quest_tab != 0 => "同梱クエストの一覧です。",
+            Screen::SaveQuests => "セーブ内のクエストです。",
+            Screen::ArcList => "SDカードの .arc ファイルです。",
+            Screen::QuestEdit => "クエストを1画面で改造します。",
+            Screen::ArcEntries => "クエストの構成ファイルです。",
+            Screen::EntryView => "エントリの中身です。",
+            Screen::Mib => "クエスト条件 (.mib) です。",
+            Screen::Gmd => "クエストの文章 (.gmd) です。",
+            Screen::Check => "クエストの検査結果です。",
+            Screen::Hunts => "狩猟記録です。",
+            Screen::Guild => "ギルドカードです。",
+            Screen::Progress => "進行状況です。",
+            Screen::Roster => "所持オトモの一覧です。",
+            Screen::Palico => "配信オトモの一覧です。",
+            Screen::Sets => "マイセットの一覧です。",
+            Screen::Csv => "CSV の入出力です。",
+            Screen::Options => "環境設定です。",
+            Screen::SaveMap if self.map_edit_open() => "生データを編集中です。",
+            Screen::SaveMap => "セーブの生データです。",
+            Screen::Review => "保存した内容との違いです。",
+            Screen::Convert => "3DS と Switch の形式を変換します。",
         }
     }
 
@@ -19609,9 +20199,11 @@ impl Editor {
                 }
                 return;
             }
-            // [-] is the delete key; ポーチへ is not a delete, so it is the
-            // deck's pill on this form (UiAction::ItemSetToPouch) and no key
-            // claims it. [ZR] is already the set-name keyboard here.
+            // [-] is the delete key and ポーチへ is not a delete, so the export
+            // took the one key the form had left ([R], above - the same key the
+            // equipment form spends on its id keyboard). [ZR] is already the
+            // set-name keyboard here. The deck's pill runs the same request, so
+            // a finger and the pad cannot do different things.
             Key::B => {
                 self.item_set_edit = Some(e);
                 if self.form_discard_press(self.item_set_draft_dirty(), "アイテムセット編集") {
@@ -19650,8 +20242,11 @@ impl Editor {
             Key::Y => {
                 self.pending_text = Some((TEXT_EQUIP_FILTER, self.equip_filter.clone()));
             }
-            // A opens the form for the highlighted record.
-            Key::A => self.open_equip_editor(),
+            // [A] is the list's own answer (Editor::equip_a_press): the
+            // selected record's form, the first blank record of an empty box,
+            // or the search that hid every row - the same three answers the
+            // talisman list gives, so one word means one press on both lists.
+            Key::A => self.equip_a_press(),
             // Two presses: the first only names what would go, the second one
             // clears the record. The reference check is the same one
             // equipops::clear runs, asked first so the first press cannot
@@ -19798,11 +20393,16 @@ impl Editor {
             transmog_id: 0,
             transmog_level: 1,
             decorations: [0; 3],
-            field: 0,
+            // The ID row, not 種別: the equipment picker writes the kind with
+            // the id (the list prints both), so one [A] on the row a user
+            // actually knows is the whole identity. Opening on 種別 made the
+            // first press a list of twenty-one words before the one list that
+            // matters.
+            field: 1,
             new: true,
         });
         self.screen = Screen::EquipEdit;
-        self.message = String::from("新規装備: 種別・ID・レベルを決めて [A] で作成");
+        self.message = String::from("新規装備: ID を選ぶと種別も入ります（[A] で作成）");
     }
 
     /// Box indices that already hold a record, in box order.
@@ -20027,11 +20627,10 @@ impl Editor {
                 self.message =
                     String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [A]）");
             }
-            // The editor's step is not reachable from the console on this
-            // screen (X is the save key everywhere), so the arrow keys above do
-            // not depend on it; the arm stays because the GUI reads this state
-            // machine and a key that does nothing is worse than one that steps.
-            Key::X => self.step = (self.step + 1) % STEPS.len(),
+            // [X] is the save key on this form too: it commits the draft and
+            // writes the file (Editor::quick_save). It used to be the step key,
+            // which the pad never sent and no line named.
+            Key::X => self.quick_save(),
             // [A] is the row's own action (hbedit::EquipFormAction): the
             // identity rows open the equipment picker, the sockets open the
             // decoration picker, the numeric rows step, the 装備枠 row writes
@@ -21712,7 +22311,10 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
                 self.mib_cursor = (self.mib_cursor + 1) % n;
                 self.cursor = self.mib_cursor;
             }
-            Key::X => self.step = (self.step + 1) % STEPS.len(),
+            // [X] is the save key: the .arc this .mib belongs to is written
+            // after the working copy is stored (Editor::quick_save). It used to
+            // be the step key here, which the pad never sent.
+            Key::X => self.quick_save(),
             Key::Left | Key::Right => {
                 let f = fields[self.mib_cursor];
                 if f.kind == FieldKind::Bytes {
@@ -27041,21 +27643,28 @@ mod tests {
                 guide
             );
         }
-        // The guide of the two screens the task quotes names the two facts a
-        // newcomer needs: the first key, and where the bytes behind the screen
-        // are. The pill is called 生データ because that is what it opens - a
-        // read-only hex view, not a deeper editor - so the guide uses that
-        // word too (Editor::detail_pill_label).
-        ed.screen = Screen::Equip;
-        let guide = ed.screen_guide();
-        assert!(guide.contains("[A]"), "{}", guide);
-        assert!(guide.contains("[生データ]"), "{}", guide);
-        // 生データ is a viewer *and* an editor now, and its guide says so: the
-        // screen no longer calls itself 読み取り専用 after the byte editor landed.
+        // Every guide is its own sentence plus the first items of the key
+        // table, printed exactly as the footer prints them: the guide and the
+        // footer are one table (Editor::key_facts), so the two cannot name
+        // different jobs for one key.
+        for &screen in TWO_TIER_SCREENS.iter() {
+            ed.screen = screen;
+            let guide = ed.screen_guide();
+            for fact in ed.guide_facts() {
+                assert!(
+                    guide.contains(&fact.render()),
+                    "{:?}: the guide does not print its own fact: {}",
+                    screen,
+                    guide
+                );
+            }
+        }
+        // The 生データ pill is drawn at the right end of the same strip by the
+        // console (ui.rs draw_guide), so the guide itself does not repeat it -
+        // but the screen still says what it is, and it is an editor now.
         ed.screen = Screen::SaveMap;
         let guide = ed.screen_guide();
-        assert!(guide.contains("[A]"), "{}", guide);
-        assert!(guide.contains("編集"), "{}", guide);
+        assert!(guide.contains("[▲/▼]"), "{}", guide);
         assert!(!guide.contains("読み取り専用"), "{}", guide);
     }
 
@@ -27422,7 +28031,7 @@ mod tests {
     fn the_slot_card_promises_the_character_a_opens() {
         let mut ed = Editor::new();
         ed.screen = Screen::Slots;
-        assert!(ed.screen_guide().contains("[A] でこのキャラを編集"), "{}", ed.screen_guide());
+        assert!(ed.screen_guide().contains("[A] このキャラを編集"), "{}", ed.screen_guide());
         assert!(ed.footer_hint().contains("[A] このキャラを編集"), "{}", ed.footer_hint());
     }
 

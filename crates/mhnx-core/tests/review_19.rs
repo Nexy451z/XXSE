@@ -342,8 +342,8 @@ fn the_palico_language_is_named_in_the_footer_the_guide_and_on_the_deck() {
         "the deck must draw the language button"
     );
     assert!(
-        tail[..end].contains("言語"),
-        "the button must say what it switches"
+        tail[..end].contains("palico_lang_label()"),
+        "the button prints the state machine's own label, not a second wording"
     );
 }
 
@@ -377,8 +377,13 @@ fn the_mib_footer_names_zr_only_where_it_works() {
         "a row with no sub-field must not promise the key: {plain}"
     );
     assert!(plain.contains("[X] 保存"), "{plain}");
-    // The guide says where the key does work.
-    assert!(ed.screen_guide().contains("モンスター行"), "{}", ed.screen_guide());
+    // The guide prints the same table's first items, so it cannot promise the
+    // key on a row the footer refuses it on.
+    let guide = ed.screen_guide();
+    for fact in ed.guide_facts() {
+        assert!(guide.contains(&fact.render()), "{guide}");
+    }
+    assert!(!guide.contains("[ZR]"), "the guide promises ZR on a plain row: {guide}");
 }
 
 // ---------------------------------------------------------------------------
@@ -512,10 +517,14 @@ fn the_talisman_form_names_one_destination_for_b() {
     let footer = ed.footer_hint();
     let guide = ed.screen_guide();
     assert!(footer.contains("[B] 一覧へ"), "{footer}");
-    assert!(guide.contains("[B] で一覧へ"), "{guide}");
+    // The guide prints the same table's first items, so it cannot name a
+    // second destination for the key.
+    for fact in ed.guide_facts() {
+        assert!(guide.contains(&fact.render()), "{guide}");
+    }
     assert!(
-        !footer.contains("[B] 戻る"),
-        "the two must not name two destinations: {footer}"
+        !footer.contains("[B] 戻る") && !guide.contains("戻る"),
+        "the two must not name two destinations: {footer} / {guide}"
     );
 }
 
@@ -584,29 +593,39 @@ fn the_state_machine_answers_the_keys_the_console_table_names() {
     );
 }
 
-/// The console's own chip table says the same words the state machine answers.
+/// The console's chip row says the same words the state machine answers.
 #[test]
 fn the_console_chip_table_names_the_same_job_for_the_same_key() {
+    // The table is the state machine's now (Editor::key_facts): the text
+    // build's actions() renders it, so the words the ASCII console prints are
+    // these - there is no second copy to drift.
     let src = switch_editor_src();
     let body = fn_body(src, "pub(crate) fn actions(");
+    assert!(
+        body.contains("ed.key_facts()"),
+        "the text build renders the state machine's table: {body}"
+    );
     for (screen, key, word) in [
-        ("SaveList => &[", "(\"Y\", \"再読込\")", "再読込"),
-        ("Slots => &[", "(\"Y\", \"一括MAX(2回)\")", "一括MAX"),
-        ("Char => &[", "(\"Y\", \"刻み\")", "刻み"),
-        ("Items => &[", "(\"A\", \"種類変更\")", "種類変更"),
-        ("Items => &[", "(\"R\", \"数値入力\")", "数値入力"),
-        ("Hunts => &[", "(\"Y\", \"列切替\")", "列切替"),
-        ("Hunts => &[", "(\"A\", \"刻み\")", "刻み"),
-        ("Hunts => &[", "(\"R\", \"数値入力\")", "数値入力"),
+        (Screen::SaveList, "Y", "再読込"),
+        (Screen::Slots, "Y", "一括MAX"),
+        (Screen::Char, "Y", "刻み"),
+        (Screen::Items, "A", "変更"),
+        (Screen::Items, "R", "数値入力"),
+        (Screen::Hunts, "Y", "列"),
+        (Screen::Hunts, "A", "刻み"),
+        (Screen::Hunts, "R", "数値入力"),
     ] {
-        let at = body
-            .find(screen)
-            .unwrap_or_else(|| panic!("{screen} is gone from the chip table"));
-        let tail = &body[at..];
-        let end = tail.find("],").expect("the arm's end");
+        let mut ed = Editor::new();
+        ed.screen = screen;
+        let facts = ed.key_facts();
+        let fact = facts
+            .iter()
+            .find(|f| f.key == key)
+            .unwrap_or_else(|| panic!("{screen:?} names no [{key}]: {facts:?}"));
         assert!(
-            tail[..end].contains(key),
-            "{screen} must name {word} on that key"
+            fact.label.contains(word),
+            "{screen:?}: [{key}] says {:?}, not {word}",
+            fact.label
         );
     }
 }
@@ -662,11 +681,13 @@ fn the_guild_b_is_one_level_and_the_guide_says_so() {
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_ARENA);
     assert!(ed.footer_hint().contains("[B] カードへ"), "{}", ed.footer_hint());
     let guide = ed.screen_guide();
-    assert!(guide.contains("1段ずつ"), "{guide}");
-    // The guide names [L] for the four views and never the shoulder pair: [R]
-    // is 数値入力 on three of them (the fifth review's #10).
-    assert!(guide.contains("[L]"), "{guide}");
+    for fact in ed.guide_facts() {
+        assert!(guide.contains(&fact.render()), "{guide}");
+    }
+    // The guide names the view walk ([Y] 回数/武器) and never the shoulder
+    // pair: [R] is 数値入力 on three of the four views (the fifth review's #10).
     assert!(!guide.contains("[L/R]"), "{guide}");
+    assert!(!guide.contains("[L]"), "{guide}");
 }
 
 // ---------------------------------------------------------------------------
@@ -750,7 +771,7 @@ fn the_reward_a_is_the_cells_own_action() {
     // The footer's [A] word is the same value.
     let footer = ed.footer_hint();
     assert!(footer.contains("[A] 確率+1"), "{footer}");
-    assert!(footer.contains("[ZR] 項目"), "{footer}");
+    assert!(footer.contains("[ZR] アイテム→個数→確率"), "{footer}");
     assert!(
         caption_width(&footer) <= FOOTER_HINT_ROOM,
         "the footer does not fit: {}px {footer}",
@@ -762,8 +783,9 @@ fn the_reward_a_is_the_cells_own_action() {
 // D16. Re-entering the quest section moves the list with the bar
 // ---------------------------------------------------------------------------
 
-/// The section jump lights クエスト改造 and lands on セーブ内: the list's own tab
-/// has to move with the bar.
+/// The section jump lands on the save's list, so the bar lights セーブ内 - one
+/// list, one tab. The クエスト改造 tab is the editor, and it is only lit over
+/// the editor.
 #[test]
 fn the_quest_section_jump_resets_the_list_tab() {
     let src = ui_src();
@@ -778,8 +800,12 @@ fn the_quest_section_jump_resets_the_list_tab() {
         "the jump must move the list to the tab the bar lights"
     );
     assert!(
-        tail[..end].contains("self.quest_bar_tab = 0"),
-        "and the bar to the list"
+        tail[..end].contains("self.quest_bar_tab = 1"),
+        "the bar lights the tab whose list is showing (セーブ内)"
+    );
+    assert!(
+        !tail[..end].contains("self.quest_bar_tab = 0"),
+        "and not the editor's tab over the save's list"
     );
 }
 

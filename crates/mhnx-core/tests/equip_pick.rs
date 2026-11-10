@@ -347,11 +347,10 @@ fn a_wanted_weapon_is_created_from_its_name_alone() {
     presses += 1;
     assert_eq!(ed.screen, Screen::EquipEdit);
     assert_eq!(ed.equip_edit.map(|e| e.new), Some(true));
-    // The ID row's [A] opens the whole box: the form starts on kind 1 (armour),
-    // and a pick carries both halves, so no type walk is needed first. (The
-    // 種別 row above it has the kind list, which is a different question.)
-    ed.input(Key::Down);
-    presses += 1;
+    // The ID row's [A] opens the whole box: the form opens on that row, kind 1
+    // (armour) beside it, and a pick carries both halves - no type walk and no
+    // cursor move first. (The 種別 row above it has the kind list, which is a
+    // different question.)
     ed.input(Key::A);
     presses += 1;
     assert_eq!(ed.screen, Screen::EquipPick);
@@ -379,8 +378,9 @@ fn a_wanted_weapon_is_created_from_its_name_alone() {
     assert_eq!(equip::name(&written), "爆砕の大剣");
     // Five presses and one typed word, against the nineteen the review
     // measured: six on the 種別 row, the walk to the list, fourteen on the
-    // type filter, and the pick.
-    assert_eq!(presses, 6, "the route is six presses now");
+    // type filter, and the pick. The form opening on the ID row took the last
+    // one off the route.
+    assert_eq!(presses, 5, "the route is five presses now");
 }
 
 #[test]

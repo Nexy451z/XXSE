@@ -1298,50 +1298,27 @@ fn every_chip_key_changes_something_on_the_screen_it_names() {
 // The text build's table, read out of its source
 // ---------------------------------------------------------------------------
 
-/// (screen name, [(key, label)]) for every arm of actions().
+/// (screen name, [(key, label)]) for every screen's key table.
+///
+/// The table is the state machine's now (`hbedit::Editor::key_facts`): the text
+/// build's actions() renders it, the canvas footer renders it, and the guide
+/// prints its first items. The audit reads that one table instead of parsing a
+/// second copy out of the console's source.
 fn switch_hint_arms() -> Vec<(String, Vec<(String, String)>)> {
-    let start = switch_editor_src()
-        .find("fn actions(screen: mhnx_core::hbedit::Screen)")
-        .expect("actions() is gone - the audit must be updated");
-    let body = &switch_editor_src()[start..];
-    let body = &body[..body.find("\n}").expect("actions() has no closing brace")];
-    let mut arms = Vec::new();
-    let mut rest = body;
-    loop {
-        let Some(pos) = rest.find("=>") else { break };
-        let name: String = rest[..pos]
-            .trim_end()
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let after = rest[pos + 2..].trim_start();
-        if name.is_empty() || !after.starts_with("&[") {
-            rest = &rest[pos + 2..];
-            continue;
-        }
-        let arr = &after[1..];
-        let close = arr.find(']').expect("an arm must end with ]");
-        let mut entries = Vec::new();
-        let mut tail = &arr[..close];
-        while let Some(k) = tail.find("(\"") {
-            let t1 = &tail[k + 2..];
-            let Some(e1) = t1.find('"') else { break };
-            let key = &t1[..e1];
-            let t2 = &t1[e1 + 1..];
-            let Some(q2) = t2.find('"') else { break };
-            let t3 = &t2[q2 + 1..];
-            let Some(e2) = t3.find('"') else { break };
-            entries.push((key.to_string(), t3[..e2].to_string()));
-            tail = &t3[e2..];
-        }
-        arms.push((name, entries));
-        rest = &after[close + 2..];
-    }
-    arms
+    ALL_SCREENS
+        .iter()
+        .filter_map(|&screen| {
+            let mut ed = fixture(screen)?;
+            ed.screen = screen;
+            let chips = ed
+                .key_facts()
+                .into_iter()
+                .filter(|f| !f.key.is_empty())
+                .map(|f| (f.key.to_string(), f.label))
+                .collect();
+            Some((screen_name(screen).to_string(), chips))
+        })
+        .collect()
 }
 
 /// A chip's key ("L/R", "◀/▶", "ZR", "-", "+") as the Key names the console
@@ -1693,9 +1670,14 @@ fn the_guild_guide_names_one_key_for_the_four_views() {
         !src.contains("[L/R] 4ビュー"),
         "the guide claims [R] walks the views while the footer says it types a number"
     );
+    // The guide prints the same table's first items as the footer, so it names
+    // the view walk the same way (Y 回数/武器) and never the shoulder pair.
     let guide = ed.screen_guide();
-    assert!(guide.contains("[L] で送り"), "{guide}");
+    for fact in ed.guide_facts() {
+        assert!(guide.contains(&fact.render()), "{guide}");
+    }
     assert!(!guide.contains("[L/R]"), "{guide}");
+    assert!(!guide.contains("[L]"), "{guide}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,11 +1870,13 @@ fn the_slot_word_is_the_one_the_screen_prints() {
     let ed = editor_with(blank_save(), Screen::Guild);
     let footer = ed.footer_hint();
     assert!(footer.contains("[B] キャラ"), "{footer}");
-    assert!(
-        ed.screen_guide().contains("[B] は1段ずつ"),
-        "the guide names the depth, the footer names the destination: {}",
-        ed.screen_guide()
-    );
+    // The guide prints the same table's first items, so it cannot name a
+    // different destination for [B] than the footer does.
+    let guide = ed.screen_guide();
+    for fact in ed.guide_facts() {
+        assert!(guide.contains(&fact.render()), "{guide}");
+    }
+    assert!(!guide.contains("[B] 戻る"), "{guide}");
     assert!(!ui_src().contains("枠選択"), "the console still says 枠選択");
     assert!(
         !switch_editor_src().contains("枠選択"),

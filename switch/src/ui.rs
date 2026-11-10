@@ -1037,22 +1037,25 @@ impl GuiState {
                 ed.roster_cursor = 0;
             }
             MainSection::Quest => {
-                // Entering the section lands on its first tab, and the bar says
-                // so: it used to land on the save's list with セーブ内 lit.
-                //
-                // The list has to move with the bar: the tab the jump lights is
-                // クエスト改造, and the list it lands on is セーブ内. Leaving the
-                // state machine's own tab where the last visit put it (公式 /
-                // 没クエ) lit one tab and showed another tab's rows.
-                self.quest_bar_tab = 0;
+                // The bar lights the tab whose list is really on screen. The
+                // クエスト改造 tab is the editor: with no .arc loaded it falls
+                // back to the save's list, and that list is セーブ内's - lighting
+                // クエスト改造 over it gave one list two tabs, which is the fifth
+                // review's finding. The list has to move with the bar too:
+                // leaving the state machine's own tab where the last visit put
+                // it (公式 / 没クエ) lit one tab and showed another tab's rows.
                 ed.set_quest_tab(0);
                 if ed.save.is_some() {
+                    self.quest_bar_tab = 1;
                     ed.refresh_quest_titles();
                     ed.screen = Screen::SaveQuests;
                     let n = ed.filtered_quests().len();
                     ed.save_quest_cursor = ed.save_quest_cursor.min(n.saturating_sub(1));
                     ed.cursor = ed.save_quest_cursor;
                 } else {
+                    // SD(.arc) is the tab that lists files, and that is what
+                    // this lands on.
+                    self.quest_bar_tab = 4;
                     ed.screen = Screen::ArcList;
                     ed.cursor = 0;
                 }
@@ -1588,20 +1591,28 @@ impl GuiState {
                 // .arc loaded the tab goes to the list a quest is opened from
                 // and says so, rather than offering a screen with no quest.
                 0 => {
-                    // The pressed tab stays lit, whatever screen it lands on.
-                    self.quest_bar_tab = 0;
                     if ed.arc.is_some() {
+                        // The editor is showing, so the editor's tab is the
+                        // lit one.
+                        self.quest_bar_tab = 0;
                         // The tab is pressed from the list the quest came from,
                         // so that list is where [B] goes back to.
                         let from = ed.screen;
                         ed.enter_quest_edit_from(from);
                     } else if ed.save.is_some() {
+                        // No .arc loaded: the tab lands on the save's list, and
+                        // that list is セーブ内's. Lighting クエスト改造 over it
+                        // gave one list two tabs; the bar now names the tab the
+                        // rows belong to.
+                        self.quest_bar_tab = 1;
                         ed.set_quest_tab(0);
                         ed.refresh_quest_titles();
                         ed.screen = Screen::SaveQuests;
                         ed.message =
                             String::from("改造するクエストを選んで [A] で開いてください");
                     } else {
+                        // SD(.arc) is the tab that lists files.
+                        self.quest_bar_tab = 4;
                         ed.screen = Screen::ArcList;
                         ed.cursor = 0;
                         ed.message = String::from(".arc を選んで [A] で開くと改造画面になります");
@@ -1817,6 +1828,14 @@ impl GuiState {
         let Some(bar) = self.bar.as_ref() else {
             return false;
         };
+        // A bar with nothing to scroll is not on the glass, so it cannot take a
+        // finger either. The state is written by the last frame that drew a
+        // list, and an empty list returns before it draws one - so without the
+        // row count here a 0-row list kept the previous screen's bar and the
+        // 40px strip beside it answered a tap with no thumb under it.
+        if bar.scroll.total() == 0 {
+            return false;
+        }
         if bar.screen != ed.screen || !bar.scroll.active() {
             return false;
         }
@@ -2533,12 +2552,14 @@ impl GuiState {
                 }
                 other => ed.input(other),
             },
+            // The language is the state machine's now: ◀ / ▶ fall through to
+            // Editor::input_palico, which is the same method the deck's button
+            // calls (UiAction::TogglePalicoLang). The console used to keep its
+            // own arm here, with its own sentence - a third implementation of
+            // one key.
             Screen::Palico => match key {
                 Key::Y => {
                     self.apply_action(ed, UiAction::InstallAllPalicoes);
-                }
-                Key::Left | Key::Right => {
-                    self.apply_action(ed, UiAction::TogglePalicoLang);
                 }
                 other => ed.input(other),
             },
@@ -3338,14 +3359,11 @@ impl GuiState {
             UiAction::InstallAllPalicoes => {
                 ed.install_all_palicoes_press();
             }
-            UiAction::TogglePalicoLang => {
-                ed.palico_lang = 1 - ed.palico_lang;
-                ed.message = if ed.palico_lang == 0 {
-                    String::from("配信オトモ言語: 日本語に切り替えました")
-                } else {
-                    String::from("配信オトモ言語: 英語 (English) に切り替えました")
-                };
-            }
+            // The one implementation is the state machine's: the pad's ◀ / ▶
+            // reach it through Editor::input_palico, and this button calls the
+            // same method, so the two cannot end up in different states or say
+            // different sentences.
+            UiAction::TogglePalicoLang => ed.toggle_palico_lang(),
             UiAction::ExtractOfficialArcs => self.wants_extract_official_arcs = true,
             UiAction::ExtractSelectedQuest => ed.request_extract_selected_quest(),
             UiAction::ExtractAllQuests => ed.request_extract_all_quests(),
@@ -4379,17 +4397,17 @@ impl GuiState {
         let marker_w = c.text_width_sized(marker, FontSize::Medium);
         let tail_room = (room - marker_w).max(0);
         let mut width = |s: &str| c.text_width_sized(s, FontSize::Medium);
-        if width(guide) <= room {
+        if width(&guide) <= room {
             c.text_clipped(
                 MAIN_X + 4,
                 GUIDE_Y + 3,
                 room,
-                guide,
+                &guide,
                 t.text_secondary,
                 FontSize::Medium,
             );
         } else {
-            let tail = mhnx_core::hbedit::guide_tail(guide, tail_room, &mut width);
+            let tail = mhnx_core::hbedit::guide_tail(&guide, tail_room, &mut width);
             if !tail.is_empty() {
                 c.text_clipped(
                     MAIN_X + 4,
@@ -4673,7 +4691,8 @@ impl GuiState {
                     // next to a key whose arrows could only refuse.
                     match ed.quest_reward_field {
                         mhnx_core::hbedit::QUEST_REWARD_CHANCE => String::from("[ZR] 確率%"),
-                        _ => String::from("[ZR] 個数"),
+                        mhnx_core::hbedit::QUEST_REWARD_COUNT => String::from("[ZR] 個数"),
+                        _ => String::from("[ZR] アイテム"),
                     }
                 } else {
                     // 支給品 has one value and nothing to switch, so [ZR] there
@@ -6189,14 +6208,30 @@ impl GuiState {
                 1,
                 t.border_subtle,
             );
-            c.text_centered(
-                MAIN_X,
+            // The line says which empty this is: a search that matched nothing
+            // names the needle and the key that changes it, an empty box names
+            // the screen's own way to fill it (hbedit::Editor::empty_list_line).
+            // One word for both states ("データがありません") told the user
+            // nothing about which one they were looking at.
+            let line = ed.empty_list_line();
+            let lw = c
+                .text_width_sized(&line, FontSize::Medium)
+                .min(V1_LIST_W - 40);
+            let lx = MAIN_X + (V1_LIST_W - lw) / 2;
+            c.text_clipped(lx, body_y + 48, lw, &line, t.text_secondary, FontSize::Medium);
+            // The strip belongs to the screen, not to the rows: a pending delete
+            // or a record that does not fit its type is exactly why a list can
+            // be empty, and this branch used to return before it was drawn.
+            self.draw_list_strip(
+                c,
+                strip_lines,
+                0,
                 body_y,
-                V1_LIST_W,
-                120,
-                "データがありません",
-                t.text_secondary,
-                FontSize::Medium,
+                body_h,
+                row_h,
+                warn_lh,
+                &warnings,
+                &notice,
             );
             self.draw_studio_inspector(
                 c,
@@ -6209,6 +6244,10 @@ impl GuiState {
                 false,
                 primary_a_label,
             );
+            // A bar that is not drawn must not take a finger: the state is
+            // written by the last frame that drew one, and a 0-row list kept
+            // the previous screen's bar in the 40px strip beside the panel.
+            self.bar = None;
             return;
         }
 
@@ -6324,52 +6363,17 @@ impl GuiState {
 
         // The strip, pinned to the bottom of the list panel: warnings first, in
         // the warning colour, then the one line of explanation in grey.
-        if strip_lines > 0 {
-            let mut lines: Vec<(String, bool)> = Vec::new();
-            if warnings.is_empty() {
-                if let Some(n) = notice.first() {
-                    lines.push((n.clone(), false));
-                }
-            } else {
-                lines.push((warnings[0].clone(), true));
-                if warnings.len() > 1 {
-                    let second = if warnings.len() == 2 {
-                        warnings[1].clone()
-                    } else {
-                        format!("ほか {} 件 — 上の行を直してください", warnings.len() - 1)
-                    };
-                    lines.push((second, true));
-                } else if let Some(n) = notice.first() {
-                    lines.push((n.clone(), false));
-                }
-            }
-            let drawn = total.min(vis);
-            let rows_bottom =
-                body_y + mhnx_core::hbedit::LIST_PAD_TOP + drawn as i32 * row_h;
-            let limit = body_y + body_h - 4;
-            let mut strip_h = lines.len() as i32 * warn_lh;
-            let mut top = (limit - strip_h).max(rows_bottom + 12);
-            // If the strip would run past the panel (a tall font metric), drop
-            // the second line instead of drawing over the footer.
-            if top + strip_h > limit && lines.len() > 1 {
-                lines.truncate(1);
-                strip_h = warn_lh;
-                top = (limit - strip_h).max(rows_bottom + 12);
-            }
-            if top - 8 > rows_bottom + 2 {
-                c.hline(MAIN_X + 16, top - 8, V1_LIST_W - 32, t.border_subtle);
-            }
-            for (i, (line, is_warning)) in lines.iter().enumerate() {
-                c.text_clipped(
-                    MAIN_X + 20,
-                    top + i as i32 * warn_lh,
-                    V1_LIST_W - 40,
-                    line,
-                    if *is_warning { t.accent_warn } else { t.text_secondary },
-                    FontSize::Small,
-                );
-            }
-        }
+        self.draw_list_strip(
+            c,
+            strip_lines,
+            total.min(vis),
+            body_y,
+            body_h,
+            row_h,
+            warn_lh,
+            &warnings,
+            &notice,
+        );
 
         // Right Inspector Panel (x = 832, y = 132, w = 428, h = 526)
         //
@@ -6387,6 +6391,75 @@ impl GuiState {
             has_stepper,
             primary_a_label,
         );
+    }
+
+    /// The warning / explanation strip under a list.
+    ///
+    /// Warnings first, in the warning colour, then the one line of explanation
+    /// in grey. It is drawn for every list, including one with no rows: a
+    /// pending delete, a record that does not fit its type and the one line of
+    /// explanation are facts about the screen, not about the rows. The empty
+    /// list used to return before this was drawn, so the two screens whose
+    /// warning is exactly why the list is empty showed nothing at all.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_list_strip(
+        &mut self,
+        c: &mut Canvas,
+        strip_lines: i32,
+        rows_drawn: usize,
+        body_y: i32,
+        body_h: i32,
+        row_h: i32,
+        warn_lh: i32,
+        warnings: &[String],
+        notice: &[String],
+    ) {
+        if strip_lines == 0 {
+            return;
+        }
+        let t = theme();
+        let mut lines: Vec<(String, bool)> = Vec::new();
+        if warnings.is_empty() {
+            if let Some(n) = notice.first() {
+                lines.push((n.clone(), false));
+            }
+        } else {
+            lines.push((warnings[0].clone(), true));
+            if warnings.len() > 1 {
+                let second = if warnings.len() == 2 {
+                    warnings[1].clone()
+                } else {
+                    format!("ほか {} 件 — 上の行を直してください", warnings.len() - 1)
+                };
+                lines.push((second, true));
+            } else if let Some(n) = notice.first() {
+                lines.push((n.clone(), false));
+            }
+        }
+        let rows_bottom = body_y + mhnx_core::hbedit::LIST_PAD_TOP + rows_drawn as i32 * row_h;
+        let limit = body_y + body_h - 4;
+        let mut strip_h = lines.len() as i32 * warn_lh;
+        let mut top = (limit - strip_h).max(rows_bottom + 12);
+        // If the strip would run past the panel (a tall font metric), drop the
+        // second line instead of drawing over the footer.
+        if top + strip_h > limit && lines.len() > 1 {
+            lines.truncate(1);
+            strip_h = warn_lh;
+            top = (limit - strip_h).max(rows_bottom + 12);
+        }
+        if top - 8 > rows_bottom + 2 {
+            c.hline(MAIN_X + 16, top - 8, V1_LIST_W - 32, t.border_subtle);
+        }
+        for (i, (line, is_warning)) in lines.iter().enumerate() {
+            c.text_clipped(
+                MAIN_X + 20,
+                top + i as i32 * warn_lh,
+                V1_LIST_W - 40,
+                line,
+                if *is_warning { t.accent_warn } else { t.text_secondary },
+                FontSize::Small,
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6806,12 +6879,12 @@ impl GuiState {
             // a size) and the key named beside it is the key that cycles it.
             // The table and the key are the state machine's (Editor::step_table):
             // a copy here named [Y] on screens that spend it elsewhere.
-            let (steps, step_key) = ed.step_table();
-            let step_lbl = if step_key.is_empty() {
-                String::from("刻み")
-            } else {
-                format!("刻み [{}]", step_key)
-            };
+            let (steps, _step_key) = ed.step_table();
+            // The label is the state machine's (Editor::step_pill_label): on
+            // the two forms every pad key is spent elsewhere, so the pills are
+            // the only route and the label says so instead of leaving the
+            // reader to look for a key that does not exist.
+            let step_lbl = ed.step_pill_label();
             c.text_sized(ix + 20, cur_y + 4, &step_lbl, t.text_secondary, FontSize::Small);
             // [R] 数値入力: the three screens that hold a number a user would
             // rather type than step (個数 / HR / 時間 / 狩猟数).
@@ -7356,14 +7429,16 @@ impl GuiState {
                 // The language is the arrow pair on this build and had no touch
                 // route at all: the two keys were the only way to reach it and
                 // no line on the screen named them.
-                let lang = if ed.palico_lang == 0 { "日本語" } else { "英語" };
+                // The words are the state machine's (Editor::palico_lang_label),
+                // the same label the footer's fact prints: the button and the
+                // key line cannot describe one key two ways.
                 self.draw_tool_button(
                     c,
                     ix + 20,
                     cur_y,
                     full_w,
                     38,
-                    &format!("[◀/▶] 名前の言語: {}", lang),
+                    &format!("[◀/▶] {}", ed.palico_lang_label()),
                     UiAction::TogglePalicoLang,
                 );
                 cur_y += 44;
@@ -8651,7 +8726,7 @@ impl GuiState {
             &rows,
             ed.equip_cursor.min(rows.len().saturating_sub(1)),
             false,
-            "編集",
+            ed.equip_a_label(),
             &[],
             &warnings,
         );

@@ -15,7 +15,8 @@ use mhnx_core::equip;
 use mhnx_core::hbedit::{
     self, caption_width, CharmAction, Editor, EquipFormAction, Key, Screen, Shoulder, ZrJob,
     FOOTER_HINT_ROOM, FORM_STEPS, PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS,
-    QUEST_REWARD_CHANCE, QUEST_REWARD_COUNT, QUEST_REWARD_FIELDS, QUEST_TAB_BASIC,
+    QUEST_REWARD_CHANCE, QUEST_REWARD_COUNT, QUEST_REWARD_FIELDS, QUEST_REWARD_ITEM,
+    QUEST_TAB_BASIC,
     QUEST_TAB_MONSTERS, QUEST_TAB_REWARDS, QUEST_TAB_SUPPLIES, TEXT_QUEST_ITEM,
 };
 use mhnx_core::quest::{Gmd, GMD_TAG, GMD_VERSION, MIB_SIZE};
@@ -567,7 +568,10 @@ fn the_quest_footer_follows_the_row() {
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     let rewards = ed.footer_hint();
     assert!(rewards.contains("[R] 検索"), "{rewards}");
-    assert!(rewards.contains("[ZR] 項目"), "{rewards}");
+    assert!(
+        rewards.contains("[ZR] アイテム→個数→確率"),
+        "the three cells are named: {rewards}"
+    );
     ed.quest_set_tab(QUEST_TAB_SUPPLIES);
     let supplies = ed.footer_hint();
     assert!(supplies.contains("[R] 検索"), "{supplies}");
@@ -722,12 +726,14 @@ fn the_progress_keys_agree_in_all_three_places() {
     assert!(hint.contains("[Y] タブ"), "{hint}");
     assert!(hint.contains("[ZR] 検索"), "{hint}");
 
-    // 2. The guide.
+    // 2. The guide: the screen's sentence plus the first two facts, printed
+    // exactly as the footer prints them. The guide and the footer are one
+    // table (Editor::key_facts), so the two cannot disagree about a key.
     let guide = ed.screen_guide();
-    assert!(guide.contains("[A]"), "{guide}");
-    assert!(guide.contains("[Y]"), "{guide}");
-    assert!(guide.contains("[R]"), "{guide}");
-    assert!(guide.contains("[ZR]"), "{guide}");
+    for fact in ed.guide_facts() {
+        assert!(guide.contains(&fact.render()), "{guide}");
+    }
+    assert!(!guide.contains("[L/R]"), "the guide names no shoulder pair: {guide}");
 
     // 3. The text build's key line.
     let keys = ed
@@ -803,21 +809,23 @@ fn a_tab_step_keeps_the_row() {
     assert_eq!(ed.roster_cursor, 2, "the roster keeps its row");
 }
 
-/// D17: the 報酬 tab's [ZR] walked a third stop (検索) that holds no value, so
-/// the arrows there could only say "this stop is for the search".
+/// D17: the 報酬 tab's [ZR] walks the row's three cells - アイテム / 個数 /
+/// 確率% - the same count the row's own screen walks.
 #[test]
-fn the_reward_value_switch_has_two_stops() {
+fn the_reward_value_switch_has_three_stops() {
     let mut ed = editor_with_quest();
     ed.open_quest_from_save(QUEST_ID);
     ed.quest_set_tab(QUEST_TAB_REWARDS);
-    assert_eq!(QUEST_REWARD_FIELDS, 2, "個数 and 確率%, and nothing else");
+    assert_eq!(QUEST_REWARD_FIELDS, 3, "アイテム / 個数 / 確率%, and nothing else");
     assert_eq!(ed.quest_reward_field, QUEST_REWARD_COUNT);
     ed.input(Key::Z);
     assert_eq!(ed.quest_reward_field, QUEST_REWARD_CHANCE);
     ed.input(Key::Z);
+    assert_eq!(ed.quest_reward_field, QUEST_REWARD_ITEM);
+    ed.input(Key::Z);
     assert_eq!(
         ed.quest_reward_field, QUEST_REWARD_COUNT,
-        "two stops, and back to the count"
+        "three stops, and back to the count"
     );
     // The search is its own press on both tabs.
     ed.input(Key::R);
@@ -827,7 +835,7 @@ fn the_reward_value_switch_has_two_stops() {
     );
     let hint = ed.footer_hint();
     assert!(hint.contains("[R] 検索"), "{hint}");
-    assert!(hint.contains("[ZR] 項目"), "{hint}");
+    assert!(hint.contains("[ZR] アイテム→個数→確率"), "{hint}");
 }
 
 /// D18: the two record forms' pills offered the shared table's ±100 / ±1000 /

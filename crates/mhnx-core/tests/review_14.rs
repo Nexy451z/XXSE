@@ -365,8 +365,7 @@ fn the_save_key_on_the_equipment_form_writes_the_draft() {
     assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
     let form = ed.equip_edit.expect("the new form");
     assert!(form.new);
-    // 種別 / ID / レベル: the level row is the third.
-    ed.input(Key::Down);
+    // The form opens on the ID row; レベル is the next one down.
     ed.input(Key::Down);
     ed.input(Key::Right);
     let form = ed.equip_edit.expect("the form");
@@ -408,8 +407,10 @@ fn a_draft_that_cannot_be_committed_is_said_out_loud() {
         ed.take_write().is_none(),
         "a save that lacks the draft must not be written"
     );
+    // The form says why (the slot refuses the record); the save key must not
+    // replace that sentence with a claim that the file was written.
     assert!(
-        ed.message.contains("下書きが残っています"),
+        ed.message.contains("書き込めません") || ed.message.contains("下書きが残っています"),
         "and the line has to say so: {}",
         ed.message
     );

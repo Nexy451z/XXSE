@@ -187,7 +187,7 @@ fn the_new_form_creates_a_record_and_selects_its_row() {
     assert_eq!(ed.screen, Screen::EquipEdit, "[+] opens the new form");
     let form = ed.equip_edit.expect("the form is open");
     assert!(form.new, "the form must know it is making a record");
-    assert_eq!(form.field, 0, "the first row is the type");
+    assert_eq!(form.field, 1, "the form starts on the ID row, whose list writes both halves");
     assert_eq!(form.kind, 1);
 
     // 種別 1 -> 2, ID 1 -> 11, レベル 1 -> 2. The id row takes the pick lists'
@@ -202,6 +202,9 @@ fn the_new_form_creates_a_record_and_selects_its_row() {
     let id = 1 + mhnx_core::hbedit::EQUIP_ID_STEP as u16;
     assert_eq!((form.kind, form.id, form.level), (2, id, 2));
 
+    // The cursor is back on 種別 after the wrap; the create row is レベル.
+    ed.input(Key::Down);
+    ed.input(Key::Down);
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Equip, "[A] writes and returns to the list");
     assert_eq!(used_records(ed.save.as_ref().unwrap(), slot), before + 1);

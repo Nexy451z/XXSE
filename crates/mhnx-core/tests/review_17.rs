@@ -999,7 +999,7 @@ fn the_guide_tail_is_measured_once() {
     let body = fn_body(ui_src(), "fn draw_guide");
     assert!(body.contains("tail_room"), "{body}");
     assert!(
-        body.contains("guide_tail(guide, tail_room"),
+        body.contains("guide_tail(&guide, tail_room"),
         "the tail is measured against the room it is drawn in: {body}"
     );
 }

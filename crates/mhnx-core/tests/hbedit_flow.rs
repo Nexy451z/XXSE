@@ -108,8 +108,9 @@ fn save_flow_edits_funds_and_writes_a_valid_container() {
     assert_eq!(ed.char_value(1), funds0 + 1);
     ed.input(Key::Left);
     assert_eq!(ed.char_value(1), funds0);
-    // One X press moves the step to 10 (STEPS = [1, 10, 100, 1000, 10000]).
-    ed.input(Key::X);
+    // The step is the deck's button (STEPS = [1, 10, 100, 1000, 10000]); [X]
+    // is the save key on every screen and the footer says so.
+    ed.step = 1;
     ed.input(Key::Right);
     assert_eq!(ed.char_value(1), funds0 + 10);
     ed.input(Key::Left);
@@ -508,10 +509,10 @@ fn palico_screen_installs_and_removes() {
     assert!(lines[0].text.contains("DOWNLOAD PALICO"));
     assert!(lines[0].text.contains("JP"));
 
-    // Language toggle.
-    ed.input(Key::L);
+    // Language toggle: the state machine answers the arrow pair itself.
+    ed.input(Key::Left);
     assert!(ed.lines()[0].text.contains("EN"));
-    ed.input(Key::L);
+    ed.input(Key::Right);
 
     // Walk to 0x66 (Boonyah / 坊ニャ春道) and install it.
     let ids = mhnx_core::dlcats::all_ids();
@@ -4009,50 +4010,27 @@ fn audit_assert_read_only(what: &str, setup: fn(&mut Editor), keys: &[Key]) {
 /// honest: this is the table the console really compiles.
 const SWITCH_EDITOR_SRC: &str = include_str!("../../../switch/src/editor.rs");
 
-/// (screen name, [(key, label)]) for every arm of actions().
+/// (screen name, [(key, label)]) for every screen's key table.
+///
+/// The table is the state machine's now (`hbedit::Editor::key_facts`): the text
+/// build's actions() renders it, the canvas footer renders it, and the guide
+/// prints its first items. The audit reads that one table instead of parsing a
+/// second copy out of the console's source - the copy is what drifted.
 fn switch_hint_arms() -> Vec<(String, Vec<(String, String)>)> {
-    let start = SWITCH_EDITOR_SRC
-        .find("fn actions(screen: mhnx_core::hbedit::Screen)")
-        .expect("actions() is gone - the audit must be updated");
-    let body = &SWITCH_EDITOR_SRC[start..];
-    let body = &body[..body.find("\n}").expect("actions() has no closing brace")];
-    let mut arms = Vec::new();
-    let mut rest = body;
-    loop {
-        let Some(pos) = rest.find("=>") else { break };
-        let name: String = rest[..pos]
-            .trim_end()
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let after = rest[pos + 2..].trim_start();
-        if name.is_empty() || !after.starts_with("&[") {
-            rest = &rest[pos + 2..];
-            continue;
-        }
-        let arr = &after[1..];
-        let close = arr.find(']').expect("an arm must end with ]");
-        let mut entries = Vec::new();
-        let mut tail = &arr[..close];
-        while let Some(k) = tail.find("(\"") {
-            let t1 = &tail[k + 2..];
-            let Some(e1) = t1.find('"') else { break };
-            let key = &t1[..e1];
-            let t2 = &t1[e1 + 1..];
-            let Some(q2) = t2.find('"') else { break };
-            let t3 = &t2[q2 + 1..];
-            let Some(e2) = t3.find('"') else { break };
-            entries.push((key.to_string(), t3[..e2].to_string()));
-            tail = &t3[e2..];
-        }
-        arms.push((name, entries));
-        rest = &after[close + 2..];
-    }
-    arms
+    AUDIT_SCREENS
+        .iter()
+        .map(|&screen| {
+            let mut ed = Editor::new();
+            ed.screen = screen;
+            let chips = ed
+                .key_facts()
+                .into_iter()
+                .filter(|f| !f.key.is_empty())
+                .map(|f| (f.key.to_string(), f.label))
+                .collect();
+            (audit_screen_name(screen).to_string(), chips)
+        })
+        .collect()
 }
 
 fn hint_keys(arms: &[(String, Vec<(String, String)>)], screen: &str) -> Vec<String> {
@@ -4376,12 +4354,10 @@ fn audit_the_item_type_can_be_changed_through_the_picker() {
     assert!(ed.dirty);
     assert!(!ed.item_undo.is_empty(), "the replacement must be undoable");
 
-    // On the item box X changes the step and the save goes through the method
-    // the console's global [X] calls (the console's [A] is the picker, so it
-    // cannot be the save key there either).
-    assert_eq!(ed.step, 0);
-    ed.input(Key::X);
-    assert_eq!(ed.step, 1, "X is the step key on this screen");
+    // On the item box [X] is the save key, exactly as the footer says; the step
+    // is the deck's button, so the headless build sets it directly.
+    ed.step = 1;
+    assert_eq!(ed.step, 1, "the step is not on a key here");
     ed.item_screen_save();
     match ed.take_write() {
         Some(Write::File { bytes, .. }) => {
@@ -5009,9 +4985,11 @@ fn audit_the_slots_screen_does_not_promise_the_palico_list() {
         "the console spends [R] on the sub-tab, not on the roster: {:?}",
         slots
     );
+    // The footer names the slot pair, not the shoulders: the sub-tab is the
+    // console's and no line on the glass promises it here.
     assert!(
-        slots.iter().any(|(k, _)| k == "L/R"),
-        "the sub-tab pair is what the shoulders do here: {:?}",
+        slots.iter().any(|(k, _)| k == "◀/▶"),
+        "the slot pair is what the arrows do here: {:?}",
         slots
     );
 
@@ -5046,27 +5024,29 @@ fn audit_the_hint_table_has_no_catch_all_arm() {
         .collect();
     assert_eq!(
         arms.len(),
-        32,
+        names.len(),
         "arms: {:?}",
         arms.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
     );
+    // Every entry must name a real screen and carry keys: the table is the
+    // state machine's, and a screen with no keys is a screen nobody can drive.
+    for (name, keys) in &arms {
+        assert!(
+            names.contains(&name.as_str()),
+            "an entry names something that is not a screen: {name}"
+        );
+        assert!(!keys.is_empty(), "{name} has no keys");
+    }
+    // The console renders that table instead of carrying its own copy: the copy
+    // is what had the catch-all arm (a bare `Charm` binding that swallowed the
+    // seventeen arms below it).
     assert!(
-        !arms.iter().any(|(n, _)| n == "Charm"),
-        "Charm is not a variant, so it would match every screen"
+        SWITCH_EDITOR_SRC.contains("ed.key_facts()"),
+        "the text build must render the state machine's table"
     );
-    // Every arm must name a real screen: a binding would swallow the rest.
     assert!(
-        arms.iter().all(|(n, _)| names.contains(&n.as_str())),
-        "an arm names something that is not a screen: {:?}",
-        arms.iter()
-            .map(|(n, _)| n.as_str())
-            .filter(|n| !names.contains(n))
-            .collect::<Vec<_>>()
-    );
-    // And the charm screen itself still has its own arm with its own keys.
-    assert!(
-        !hint_keys(&arms, "Charms").is_empty(),
-        "the charm screen lost its chips"
+        !SWITCH_EDITOR_SRC.contains("fn actions(screen: mhnx_core::hbedit::Screen)"),
+        "the second table is gone"
     );
 }
 
@@ -5083,7 +5063,7 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     // because a plain L is the sub-tab key), and [-] is the two-press delete.
     let charms = hint_keys(&arms, "Charms");
     assert!(
-        charms.iter().any(|k| k == "+"),
+        charms.iter().any(|k| k == "＋"),
         "the charm screen creates with [＋], so it must say so: {:?}",
         charms
     );
@@ -5119,7 +5099,7 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     // the state machine, whose L / R are the sub-tabs), so the chips say so.
     let palico = hint_keys(&arms, "Palico");
     assert!(
-        palico.iter().any(|h| h == "</>"),
+        palico.iter().any(|h| h == "◀/▶"),
         "the language is ◀ / ▶ on the console: {:?}",
         palico
     );
@@ -5144,15 +5124,17 @@ fn audit_the_hint_table_names_the_keys_that_work() {
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::CharmEdit, "L must create a charm");
 
-    // Palico: the state machine's L switches the language; the console's
-    // ◀ / ▶ run the same toggle through UiAction::TogglePalicoLang.
+    // Palico: the state machine answers the arrow pair itself, and the deck's
+    // button calls the same method - one implementation, one sentence.
     let mut ed = Editor::new();
     open_save(&mut ed);
     ed.input(Key::R);
     assert_eq!(ed.screen, Screen::Palico);
     assert_eq!(ed.palico_lang, 0);
-    ed.input(Key::L);
-    assert_eq!(ed.palico_lang, 1, "L must switch the language");
+    ed.input(Key::Left);
+    assert_eq!(ed.palico_lang, 1, "◀ must switch the language");
+    ed.input(Key::Right);
+    assert_eq!(ed.palico_lang, 0, "▶ switches it back");
 
     // SkillPick: X really clears the filter.
     let mut ed = Editor::new();
@@ -5199,14 +5181,14 @@ fn audit_the_hint_table_names_the_keys_that_work() {
         other => panic!("expected one quest, got {:?}", other),
     }
 
-    // Mib: X really cycles the adjustment step.
+    // Mib: [X] is the save key (the footer says so), and the step is the deck's
+    // button - the headless build sets it directly.
     let mut ed = Editor::new();
     ed.open_arc_bytes(&arc.to_string_lossy(), &bytes);
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::Mib);
-    assert_eq!(ed.step, 0);
-    ed.input(Key::X);
-    assert_eq!(ed.step, 1, "X cycles the step on the .mib screen");
+    ed.step = 1;
+    assert_eq!(ed.step, 1, "the step is not on a key here");
 }
 
 #[test]

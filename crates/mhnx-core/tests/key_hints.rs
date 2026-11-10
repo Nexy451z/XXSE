@@ -6,15 +6,13 @@
 //! tests read the strings the console draws and the handlers that answer them,
 //! and fail when the two disagree.
 //!
-//! Two sources are read as text because the crates cannot call each other:
-//! `switch/src/editor.rs` needs the Nintendo SDK and is not part of this
-//! workspace, so its chip table is included as a string the same way
-//! `hbedit_flow` does it.
+//! The key table is the state machine's (`hbedit::Editor::key_facts`), so the
+//! audit reads the one table every surface renders instead of parsing a second
+//! copy out of the console's source.
 
 use mhnx_core::hbedit::{Editor, Screen, ZrJob};
 
 const HBEDIT_SRC: &str = include_str!("../src/hbedit.rs");
-const SWITCH_EDITOR_SRC: &str = include_str!("../../../switch/src/editor.rs");
 
 // ---------------------------------------------------------------------------
 // What the console answers before the state machine sees the key
@@ -28,7 +26,6 @@ const SWITCH_EDITOR_SRC: &str = include_str!("../../../switch/src/editor.rs");
 ///
 /// * Sets - the list's ◀ / ▶ / Y switch tabs (the set form owns them instead,
 ///   and its footer names them as its own keys).
-/// * Palico - ◀ / ▶ run `UiAction::TogglePalicoLang`.
 /// * Mib - [Y] is the step and [ZR] walks a monster slot's eight values.
 /// * Options / EntryView - [Y] is the snapshot restore and the step.
 /// * Slots - ◀ / ▶ pick the previous / next slot (the state machine only
@@ -36,7 +33,6 @@ const SWITCH_EDITOR_SRC: &str = include_str!("../../../switch/src/editor.rs");
 const CONSOLE_ONLY: &[(&str, &[&str])] = &[
     ("Slots", &["Left", "Right"]),
     ("Sets", &["Left", "Right", "Y"]),
-    ("Palico", &["Left", "Right"]),
     ("Mib", &["Y", "Z"]),
     ("Options", &["Y"]),
     ("EntryView", &["Y"]),
@@ -220,7 +216,7 @@ fn audit_no_hint_gives_the_delete_key_any_other_job() {
     }
     assert!(seen >= 10, "the delete lines are still there: {seen}");
 
-    // The console's chip table: a "-" chip is a delete chip.
+    // The key table every surface renders: a "-" chip is a delete chip.
     for (screen, entries) in switch_hint_arms() {
         for (key, label) in entries {
             if key != "-" {
@@ -303,50 +299,26 @@ fn audit_a_footer_that_names_zr_is_a_screen_zr_reaches() {
 // 3. the console's chips name keys the console answers
 // ---------------------------------------------------------------------------
 
-/// The Switch build's chip table, read straight out of its source.
+/// The state machine's key table, per screen.
+///
+/// The table used to be the text build's, read out of its source; it is the
+/// state machine's now (`hbedit::Editor::key_facts`) and every surface renders
+/// it, so the audit reads the one table the screen really prints.
 fn switch_hint_arms() -> Vec<(String, Vec<(String, String)>)> {
-    let start = SWITCH_EDITOR_SRC
-        .find("fn actions(screen: mhnx_core::hbedit::Screen)")
-        .expect("actions() is gone - the audit must be updated");
-    let body = &SWITCH_EDITOR_SRC[start..];
-    let body = &body[..body.find("\n}").expect("actions() has no closing brace")];
-    let mut arms = Vec::new();
-    let mut rest = body;
-    loop {
-        let Some(pos) = rest.find("=>") else { break };
-        let name: String = rest[..pos]
-            .trim_end()
-            .chars()
-            .rev()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        let after = rest[pos + 2..].trim_start();
-        if name.is_empty() || !after.starts_with("&[") {
-            rest = &rest[pos + 2..];
-            continue;
-        }
-        let arr = &after[1..];
-        let close = arr.find(']').expect("an arm must end with ]");
-        let mut entries = Vec::new();
-        let mut tail = &arr[..close];
-        while let Some(k) = tail.find("(\"") {
-            let t1 = &tail[k + 2..];
-            let Some(e1) = t1.find('"') else { break };
-            let key = &t1[..e1];
-            let t2 = &t1[e1 + 1..];
-            let Some(q2) = t2.find('"') else { break };
-            let t3 = &t2[q2 + 1..];
-            let Some(e2) = t3.find('"') else { break };
-            entries.push((key.to_string(), t3[..e2].to_string()));
-            tail = &t3[e2..];
-        }
-        arms.push((name, entries));
-        rest = &after[close + 2..];
-    }
-    arms
+    AUDIT_SCREENS
+        .iter()
+        .map(|&screen| {
+            let mut ed = Editor::new();
+            ed.screen = screen;
+            let chips = ed
+                .key_facts()
+                .into_iter()
+                .filter(|f| !f.key.is_empty())
+                .map(|f| (f.key.to_string(), f.label))
+                .collect();
+            (screen_name(screen).to_string(), chips)
+        })
+        .collect()
 }
 
 /// The chip names a key, so the key has to be a key this build answers.
@@ -361,7 +333,7 @@ fn audit_the_chips_name_keys_the_console_answers() {
                 "X" => vec!["X".into()],
                 "Y" => vec!["Y".into()],
                 "ZR" => vec!["Z".into()],
-                "+" => vec!["Plus".into()],
+                "+" | "＋" => vec!["Plus".into()],
                 "-" => vec!["Minus".into()],
                 "R" => vec!["R".into()],
                 "L" => vec!["L".into()],

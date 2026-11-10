@@ -975,7 +975,7 @@ impl Painter {
                 sys::log_line("=====================================================");
                 // The same one-line guide the canvas draws under the bar, so
                 // the fallback screen tells a first-time player the same thing.
-                sys::log_line(ed.screen_guide());
+                sys::log_line(&ed.screen_guide());
                 for l in &lines {
                     sys::log_line(&format!("{}{}", if l.cursor { ">" } else { " " }, l.text));
                 }
@@ -991,13 +991,13 @@ impl Painter {
                     sys::log_line("[A] この内容で保存   [B] 中止");
                 }
                 let mut bar = alloc::string::String::new();
-                for (k, label) in actions(ed.screen) {
+                for (k, label) in actions(ed) {
                     if !bar.is_empty() {
                         bar.push_str("   ");
                     }
                     bar.push_str(k);
                     bar.push(' ');
-                    bar.push_str(label);
+                    bar.push_str(&label);
                 }
                 sys::log_line(&bar);
                 unsafe { sys::consoleUpdate(core::ptr::null_mut()) };
@@ -1055,334 +1055,19 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
 ///
 /// The footer draws these as chips, so a screen never needs the user to
 /// remember a key that is not on screen.
-pub(crate) fn actions(screen: mhnx_core::hbedit::Screen) -> &'static [(&'static str, &'static str)] {
-    use mhnx_core::hbedit::Screen::*;
-    match screen {
-        // Every line here is what the console's pad dispatch does, not what
-        // the state machine would do with the same key: L / R are the sub-tabs
-        // on this build (the transform screen is a section of its own) and X is
-        // the global save, so neither can be a screen-local tool.
-        SaveList => &[
-            ("A", "開く"),
-            ("Y", "再読込"),
-            ("L/R", "サブタブ"),
-            ("X", "保存"),
-            ("+", "終了"),
-        ],
-        Convert => &[("A", "変換して保存"), ("Y", "名前"), ("B", "戻る")],
-        // [Y] is the bulk MAX on this build (the console answers it before the
-        // state machine sees it), and it asks for a second press now. The five
-        // keys the state machine gives this screen (X items, L charms, R the
-        // download pallet, - the equipment box) are not what the console does
-        // with them: X is the save key everywhere, L / R are the sub-tab pair,
-        // and [-] is the delete key. The sections - the way to the boxes the
-        // state machine's own keys would have opened - are ZL / ZR.
-        Slots => &[
-            ("A", "キャラ"),
-            ("Y", "一括MAX(2回)"),
-            ("L/R", "サブタブ"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // [Y] is the step key on this build (the console answers it before the
-        // state machine, whose Y opens マイセット). [-] is the delete key and a
-        // character has nothing to delete: the hunt record it used to open is
-        // the オトモ・記録 section, one ZL away.
-        Char => &[
-            ("A", "最大(2回)/編集"),
-            ("</>", "値を変更"),
-            ("Y", "刻み"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // [Y] is the list's own state (所持品のみ <-> 空きも表示) and [A] opens
-        // the picker; the step the arrows use is the deck's button, because
-        // every key on this screen is spoken for.
-        // [-] is the delete key and the item box has nothing to delete, so the
-        // bulk menu took [ZR]: the review's finding was that the one screen
-        // whose whole point is bulk edits could not reach them from the pad.
-        // [L] is the sub-tab, not the undo - the undo is the deck's button.
-        Items => &[
-            ("A", "種類変更"),
-            ("</>", "個数"),
-            ("R", "数値入力"),
-            ("Y", "空き表示"),
-            ("ZR", "一括操作"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // The same three chips on every pick list: the direction keys are one
-        // rule on all routes (hbedit::pick_move), so the footer names the same
-        // two steps rather than a route-specific wording.
-        ItemPick => &[
-            ("A", "決定/追加"),
-            ("◀/▶", "10件"),
-            ("▲/▼", "1件"),
-            ("Y", "検索"),
-            ("X", "クリア"),
-            ("B", "戻る"),
-        ],
-        // The console's pad dispatch, not the bare state machine: [A] on the
-        // charm list opens the form, [Y] is the list's search (the same key as
-        // the equipment box and the quest list) and [-] is the two-press
-        // delete. It said [Y] 削除 while [Y] opened the form and [-] deleted:
-        // the one line that named the wrong key on the wrong action.
-        Charms => &[
-            // The A word follows the list (hbedit::Editor::charm_a_label):
-            // 編集 / 作成 / 検索解除. This table is the text build's, and the
-            // console prints the state machine's word, so the two must not
-            // name two different jobs for one key.
-            ("A", "編集/作成/解除"),
-            ("Y", "検索"),
-            ("-", "削除(2回)"),
-            ("+", "新規（空き枠のみ）"),
-            ("X", "保存"),
-            ("B", "キャラ"),
-        ],
-        // The form's [A] is the selected row's own action (hbedit::CharmAction),
-        // so this line cannot name a single one; the drawn build prints the
-        // row's own word in its footer and on its [A] button.
-        CharmEdit => &[
-            ("A", "行の操作"),
-            ("</>", "値"),
-            ("Y", "検索"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        SkillPick => &[
-            ("A", "決定"),
-            ("◀/▶", "10件"),
-            ("▲/▼", "1件"),
-            ("Y", "検索"),
-            ("X", "クリア"),
-            ("B", "戻る"),
-        ],
-        Equip => &[
-            ("A", "編集"),
-            ("Y", "検索"),
-            ("-", "削除(2回)"),
-            ("+", "新規"),
-            ("X", "保存"),
-            ("L/R", "サブタブ"),
-            ("B", "キャラ"),
-        ],
-        // [A] is the row's own action (hbedit::EquipFormAction): the three
-        // sockets open the decoration list, 種別 / ID the equipment list, the
-        // numeric rows step, the 装備枠 row writes and the new form's レベル
-        // row creates. [Y] opens the same two lists with the search box up.
-        EquipEdit => &[
-            ("A", "選ぶ/書き込み"),
-            ("</>", "10件/値"),
-            ("Y", "検索"),
-            ("R", "ID入力"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        JewelPick => &[
-            ("A", "決定"),
-            ("◀/▶", "10件"),
-            ("▲/▼", "1件"),
-            ("Y", "検索"),
-            ("X", "クリア"),
-            ("B", "戻る"),
-        ],
-        // The name picker: the same four movement chips as the other pick
-        // lists, plus [ZR] for the type filter and the hex note, because the id
-        // this list prints is the one it searches. [-] is the delete key and a
-        // picker has nothing to delete.
-        EquipPick => &[
-            ("A", "決定"),
-            ("◀/▶", "10件"),
-            ("▲/▼", "1件"),
-            ("Y", "検索"),
-            ("ZR", "種別"),
-            ("X", "クリア"),
-            ("B", "戻る"),
-        ],
-        QuestEquip => &[("A", "中身を開く/変更"), ("B", "戻る")],
-        // [-] is the two-press delete on every quest list, [Y] the search.
-        // The whole-save SD write is the deck's button, because [R] (its old
-        // key) is the sub-tab on this build.
-        SaveQuests => &[
-            ("A", "編集/導入(解除は2回)"),
-            ("-", "削除(2回)"),
-            ("Y", "検索"),
-            ("ZR", "一括導入"),
-            ("L/R", "サブタブ"),
-            ("X", "保存"),
-            ("B", "SD(.arc)"),
-        ],
-        // [ZR] writes the bundled quests out (the state machine's Key::Z); the
-        // way back is [B], and both layers answer it: the save list. It used to
-        // go to セーブ内, whose own [B] comes right back here.
-        ArcList => &[
-            ("A", "開く"),
-            ("Y", "セーブへ導入(2回)"),
-            ("ZR", "SDへ展開"),
-            ("X", "保存"),
-            ("B", "セーブ一覧"),
-            ("+", "終了"),
-        ],
-        // クエスト改造: one row pair moves, the other steps, [A] opens the
-        // row's chooser, [ZR] picks which value steps and [Y] is the step. The
-        // file-by-file screens are the [ファイル] pill and [R 長押し], because
-        // [ZR] is the value switch here.
-        QuestEdit => &[
-            ("</>", "値"),
-            ("A", "選択"),
-            ("Y", "刻み"),
-            ("ZR", "項目"),
-            ("R", "検索"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // [Y] is the checker on this build (the console answers it before the
-        // state machine, whose Y is the decoded view) and [ZR] writes this one
-        // quest out. [-] is the delete key and a file list has nothing to
-        // delete, so the 抽出 it used to do is [ZR] now.
-        ArcEntries => &[
-            ("A", "開く"),
-            ("Y", "検査"),
-            ("ZR", "抽出"),
-            ("X", "保存"),
-            ("B", "改造へ"),
-        ],
-        // The reward / supply row's two numbers are [ZR]'s job (the state
-        // machine's Key::Z) and [Y] is the step; [A] opens the item list on
-        // those rows and steps the coordinate rows. [X] is the save key, and
-        // on the quest screens the save key writes the .arc
-        // (hbedit::Editor::quick_save).
-        EntryView => &[
-            ("</>", "値"),
-            ("A", "アイテム/値変更"),
-            ("Y", "刻み"),
-            ("ZR", "個数/確率"),
-            ("R", "数値入力"),
-            ("X", ".arc 保存"),
-            ("B", "戻る"),
-        ],
-        Mib => &[
-            ("</>", "増減"),
-            ("A", "一覧選択"),
-            ("Y", "刻み"),
-            ("ZR", "項目"),
-            ("X", ".arc 保存"),
-            ("B", "戻る"),
-        ],
-        Gmd => &[("A", "文章編集"), ("X", ".arc 保存"), ("B", "戻る")],
-        Check => &[("A", "修正"), ("X", ".arc 保存"), ("B", "戻る")],
-        // [ZR] is the list toggle (hbedit::Editor::toggle_hunt_show_all); [-]
-        // is the delete key and a hunt record has nothing to delete.
-        Hunts => &[
-            ("</>", "値"),
-            ("Y", "列切替"),
-            ("A", "刻み"),
-            ("R", "数値入力"),
-            ("ZR", "表示"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // カード / クエスト回数 / 武器使用数 / 闘技大会 are the card's four views
-        // and [Y] walks them (on the quest view it is the 既読 bit instead), so
-        // the arena log is a view, not a shoulder. [ZR] opens the progress
-        // screen (hbedit::Editor::open_progress), [R] types a number on the
-        // three numeric views, and [-] is the delete key - the card has nothing
-        // to delete.
-        Guild => &[
-            ("</>", "値"),
-            ("R", "数値入力"),
-            ("Y", "回数/武器"),
-            ("A", "行の操作"),
-            ("ZR", "進行状況"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // [Y] walks the three views and [R] is the quest view's second bit
-        // (既読): the console takes [R] back from the sub-tab rule on that view
-        // only (hbedit::Editor::shoulder_job), so the chip names it there. [ZR]
-        // is the search on every view.
-        Progress => &[
-            ("A", "ビット切替"),
-            ("R", "既読"),
-            ("Y", "タブ"),
-            ("</>", "±50行"),
-            ("ZR", "検索"),
-            ("L/R", "タブ"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // [ZR] opens the palico equipment panel on both palico screens, and
-        // inside it [-] is the two-press release (the footer there says so).
-        // Plus opens the skill / support move panel on the roster alone; it is
-        // not the quit key there, the slot list one B away still is.
-        Roster => &[
-            ("</>", "値"),
-            ("Y", "項目切替"),
-            ("A", "名前"),
-            ("ZR", "装備"),
-            ("+", "スキル/サポ"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // Two modes on one screen: the list, and the set editor that [A] opens.
-        // The chips name both, because this table is per screen and Y means
-        // different things in the two (tab switch on the list, warnings in the
-        // form). X saves on both.
-        Sets => &[
-            ("A", "編集"),
-            ("</>", "装備を巡回"),
-            // The minus key is the 解除 *inside* the form; the list says so
-            // instead of naming a key that answered nothing there.
-            ("-", "解除(編集で2回)"),
-            ("Y", "警告/タブ切替"),
-            ("X", "保存"),
-            ("B", "護石一覧"),
-        ],
-        // The language is the arrow pair on this build (the console answers
-        // ◀ / ▶ before the state machine, whose L / R are the sub-tabs), the
-        // equipment panel is [ZR], and [-] is the delete key.
-        Palico => &[
-            ("A", "追加/削除"),
-            ("Y", "全導入(2回)"),
-            ("</>", "言語"),
-            ("ZR", "装備"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        Options => &[
-            ("</>", "値変更"),
-            ("Y", "スナップショット"),
-            ("X", "保存"),
-            ("B", "戻る"),
-        ],
-        // Twice for the apply: it replaces a whole box.
-        Csv => &[
-            ("A", "適用(2回)"),
-            ("Y", "書き出し"),
-            ("ZR", "再読込"),
-            ("B", "戻る"),
-        ],
-        // 生データ: the list's four keys, plus [A] opening the byte editor.
-        // Inside the editor the four directions belong to the byte; this table
-        // is per screen and static, so the drawn footer takes the editor's own
-        // words from hbedit::Editor::footer_hint (which knows the mode).
-        SaveMap => &[
-            ("▲/▼", "行"),
-            ("◀/▶", "10行"),
-            ("A", "編集"),
-            ("Y", "検索"),
-            ("B", "戻る"),
-        ],
-        // 変更一覧: the two-press 戻す and the rebuild. [X] is the save key
-        // every screen shares, and [B] leaves to the screen the tab came from.
-        Review => &[
-            ("▲/▼", "行"),
-            ("◀/▶", "10行"),
-            ("A", "戻す（2回）"),
-            ("Y", "作り直す"),
-            ("B", "戻る"),
-        ],
-    }
+///
+/// The list is the state machine's (`hbedit::Editor::key_facts`): the canvas
+/// footer prints that table, the guide strip prints its first items, and this
+/// ASCII console prints it as a row. The table this function used to carry was
+/// a second copy, and the fifth review found seven screens where the two copies
+/// named different jobs for one key - the .mib [ZR] on every row, the reward
+/// [ZR] with two stops instead of three, the talisman form's [B] as 戻る.
+pub(crate) fn actions(ed: &Editor) -> Vec<(&'static str, String)> {
+    ed.key_facts()
+        .into_iter()
+        .filter(|fact| !fact.key.is_empty())
+        .map(|fact| (fact.key, fact.label))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
