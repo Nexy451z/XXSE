@@ -1015,7 +1015,7 @@ pub(crate) fn title(screen: mhnx_core::hbedit::Screen) -> &'static str {
     match screen {
         SaveList => "セーブを開く",
         Convert => "3DS <-> Switch 変換",
-        Slots => "キャラクター選択",
+        Slots => "キャラ選択",
         Char => "キャラクター編集",
         Items => "アイテムボックス",
         ItemPick => "アイテムを選ぶ",

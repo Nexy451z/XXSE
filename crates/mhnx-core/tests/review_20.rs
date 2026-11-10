@@ -1660,7 +1660,10 @@ fn the_guild_guide_names_one_key_for_the_four_views() {
     let mut ed = editor_with(blank_save(), Screen::Guild);
     ed.set_guild_view(mhnx_core::hbedit::GUILD_TAB_CARD);
     let footer = ed.footer_hint();
-    assert!(footer.contains("[R] 数値入力"), "{footer}");
+    // 数値, not 数値入力: the card's line carries seven items plus the arrow
+    // pair the review asked for, and the 763px strip decides the word. The
+    // inspector's pill borrows it (Editor::key_label_or), so the two agree.
+    assert!(footer.contains("[R] 数値"), "{footer}");
     let src = ui_src();
     assert!(
         src.contains("[L] 4ビュー"),
@@ -1899,9 +1902,16 @@ fn the_readme_names_the_three_conditions() {
         r.contains("選択リストでは押した時点"),
         "the [R] note: a pick list answers on the press"
     );
+    // The roster's [+] condition: the skill / support panel and the equipment
+    // panel both quit, and the line says so (the sixth review found the
+    // equipment panel missing from it).
     assert!(
-        r.contains("オトモで終了になるのはそのパネルを開いている間だけ"),
+        r.contains("オトモで終了になるのはパネルを開いている間だけ"),
         "the [＋] condition on the roster"
+    );
+    assert!(
+        r.contains("装備パネル"),
+        "the equipment panel quits on [+] too"
     );
     assert!(
         r.contains("表示の送りは") && r.contains("4 つ"),

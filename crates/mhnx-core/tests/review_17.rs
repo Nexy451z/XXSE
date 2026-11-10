@@ -916,8 +916,10 @@ fn the_plus_key_has_one_meaning_on_the_line() {
             1,
             "{screen:?} gives [＋] two meanings on one line: {hint}"
         );
+        // The note is bracketed off the key column now: it sat where the
+        // chips' words sit and read as one more key.
         assert!(
-            hint.contains("終了は [B] の後"),
+            hint.contains("※終了は [B]"),
             "{screen:?} does not name the way out: {hint}"
         );
         assert!(
@@ -949,12 +951,13 @@ fn the_save_map_guide_follows_the_mode() {
     ed.save = Some(save);
     ed.screen = Screen::SaveMap;
     let list = ed.screen_guide();
-    assert!(list.contains("10行"), "the list's guide: {list}");
     assert!(
-        !list.contains("で値"),
-        "the list's [◀/▶] is not the value: {list}"
+        !list.contains("1バイト") && !list.contains("値の変更"),
+        "the list's guide describes the byte editor: {list}"
     );
-    // The footer's two lines say the same thing in their own words.
+    // The footer's line carries the [◀/▶] word the guide has no room for: the
+    // guide leads with [A] and the row pair now, and the ten-row jump is the
+    // footer's to state.
     let footer = ed.footer_hint();
     assert!(footer.contains("[◀/▶] 10行"), "{footer}");
 
@@ -962,7 +965,6 @@ fn the_save_map_guide_follows_the_mode() {
     ed.input(Key::A);
     assert!(ed.map_edit_open(), "{}", ed.message);
     let edit = ed.screen_guide();
-    assert!(edit.contains("値"), "the editor's guide: {edit}");
     assert!(edit.contains("1バイト"), "the editor's guide: {edit}");
     assert_ne!(list, edit, "the two modes read differently");
     let footer = ed.footer_hint();

@@ -569,7 +569,7 @@ fn the_quest_footer_follows_the_row() {
     let rewards = ed.footer_hint();
     assert!(rewards.contains("[R] 検索"), "{rewards}");
     assert!(
-        rewards.contains("[ZR] アイテム→個数→確率"),
+        rewards.contains("[ZR] 段送り（3段）"),
         "the three cells are named: {rewards}"
     );
     ed.quest_set_tab(QUEST_TAB_SUPPLIES);
@@ -835,7 +835,7 @@ fn the_reward_value_switch_has_three_stops() {
     );
     let hint = ed.footer_hint();
     assert!(hint.contains("[R] 検索"), "{hint}");
-    assert!(hint.contains("[ZR] アイテム→個数→確率"), "{hint}");
+    assert!(hint.contains("[ZR] 段送り（3段）"), "{hint}");
 }
 
 /// D18: the two record forms' pills offered the shared table's ±100 / ±1000 /
@@ -896,12 +896,19 @@ fn the_two_forms_use_one_word_for_the_write() {
 }
 
 /// D20: the footer said "[R] 数値" and the deck's button said "[R] 数値入力".
+///
+/// The word is the key table's now, and the inspector's pill borrows it
+/// (`Editor::key_label`), so one key has one name on one screen - which is the
+/// finding. The literal word moved when the item box's line ran out of strip
+/// (eight items on 763px): the box says 数値 and the other screens say 数値入力,
+/// and neither can disagree with its own pill.
 #[test]
 fn the_number_key_has_one_name() {
     let mut ed = editor_with_equipment(1);
     ed.screen = Screen::Items;
+    let label = ed.key_label("R").expect("the item box names [R]");
     assert!(
-        ed.footer_hint().contains("[R] 数値入力"),
+        ed.footer_hint().contains(&format!("[R] {label}")),
         "{}",
         ed.footer_hint()
     );
@@ -930,16 +937,19 @@ fn the_number_key_has_one_name() {
         "{}",
         ed.footer_hint()
     );
-    // The console's buttons print the same words, and the short name is gone.
+    // The console's pill prints the table's word instead of its own copy, so
+    // the two surfaces cannot drift apart again.
     let ui = ui_src();
-    assert!(ui.contains("\"[R] 数値入力\""), "the deck's button");
-    assert!(
-        !ui.contains("\"[R] 数値\""),
-        "the short name is gone from the console"
+    // Every [R] the console draws borrows the table's word: the inspector pill,
+    // the reward / supply panel's button and the card's button.
+    assert_eq!(
+        ui.matches("ed.key_label_or(\"R\"").count(),
+        3,
+        "every [R] button borrows the table's word"
     );
     assert!(
         !hbedit_src().contains("[R] 数値  "),
-        "and from the footers"
+        "and the footers do not carry two of them"
     );
 }
 

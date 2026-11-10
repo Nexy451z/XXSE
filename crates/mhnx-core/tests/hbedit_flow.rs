@@ -75,6 +75,16 @@ fn open_quest_section(ed: &mut Editor) {
     ed.cursor = 0;
 }
 
+/// Enter the item box the way the console's section bar does.
+///
+/// [X] used to open it from the slot screen; [X] is the save key on every
+/// screen now (the console's global X had already taken it back), so the box is
+/// a section and the tests name it instead of pressing a key that saves.
+fn open_items(ed: &mut Editor) {
+    ed.screen = Screen::Items;
+    ed.cursor = 0;
+}
+
 #[test]
 fn save_flow_edits_funds_and_writes_a_valid_container() {
     if !real_save().exists() {
@@ -139,7 +149,7 @@ fn save_flow_edits_an_item_count() {
     open_save(&mut ed);
 
     // Slots -> X -> item box.
-    ed.input(Key::X);
+    open_items(&mut ed);
     assert_eq!(ed.screen, Screen::Items);
     let vis = ed.visible_items();
     assert!(!vis.is_empty(), "the dump has non-empty item slots");
@@ -151,9 +161,13 @@ fn save_flow_edits_an_item_count() {
     let boxes = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
     let first = vis[0];
     let before = boxes[first].count;
-    // Default step is 1; X cycles it to 10.
+    // The step is the deck's button now ([X] is the save key), so the test
+    // picks it the way the pill does.
     ed.input(Key::Right);
-    ed.input(Key::X);
+    ed.step = mhnx_core::hbedit::STEPS
+        .iter()
+        .position(|&s| s == 10)
+        .expect("a 10 step");
     ed.input(Key::Right);
     let after = ed.save.as_ref().unwrap().read_item_box(0).unwrap()[first].count;
     assert_eq!(
@@ -359,7 +373,7 @@ fn quest_flow_installs_a_download_quest_into_the_save() {
     // X installs the open archive into the open save.
     let had_it = dlc::find_quest(ed.save.as_ref().unwrap(), 1010165).is_some();
     let before_n = dlc::list_quests(ed.save.as_ref().unwrap()).len();
-    ed.input(Key::X);
+    ed.install_into_save();
     assert!(
         ed.message.contains("上書き") || ed.message.contains("追加"),
         "message was {}",
@@ -372,7 +386,7 @@ fn quest_flow_installs_a_download_quest_into_the_save() {
     assert!(list.iter().any(|q| q.quest_id == 1010165));
 
     // Writing the save must keep the quest.
-    ed.input(Key::X); // install again is harmless (idempotent per id? it uses a free slot)
+    ed.install_into_save();
     match ed.take_write() {
         Some(Write::File { bytes, .. }) => {
             let s = Save::from_bytes(&bytes).unwrap();
@@ -469,7 +483,8 @@ fn options_screen_edits_and_saves() {
     // X on the save list opens the options.
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::SaveList);
-    ed.input(Key::X);
+    ed.screen = Screen::Options;
+    ed.cursor = 0;
     assert_eq!(ed.screen, Screen::Options);
 
     let before = ed.save.as_ref().unwrap().options().brightness;
@@ -784,7 +799,7 @@ fn x_on_the_quest_list_opens_the_saves_own_quests() {
     open_save(&mut ed);
     open_quest_section(&mut ed);
     assert_eq!(ed.screen, Screen::ArcList);
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests, "X must switch to the save's quests");
     assert!(!ed.save_quests().is_empty());
     // The lines must name a real quest from the save.
@@ -805,7 +820,7 @@ fn opening_a_quest_from_the_save_fills_the_editor() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     open_quest_section(&mut ed);
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
 
     let want = ed.save_quests()[0].quest_id;
@@ -833,7 +848,7 @@ fn editing_a_quest_from_the_save_writes_back_to_the_same_slot() {
     open_save(&mut ed);
     let before = ed.save.as_ref().unwrap().to_bytes();
     open_quest_section(&mut ed);
-    ed.input(Key::X);
+    ed.open_save_quests();
     let target = ed.save_quests()[0].clone();
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::QuestEdit);
@@ -878,7 +893,7 @@ fn editing_a_quest_from_the_save_writes_back_to_the_same_slot() {
     // path that used to repack the archive as it was on disk and lose the edit.
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::ArcEntries);
-    ed.input(Key::X);
+    ed.install_into_save();
     assert!(
         ed.message.contains("上書き") || ed.message.contains("追加"),
         "message was {}",
@@ -930,7 +945,7 @@ fn minus_is_also_swallowed_on_the_save_quest_list() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     open_quest_section(&mut ed);
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     assert!(
         !ed.minus_rescans(),
@@ -948,7 +963,7 @@ fn a_on_the_item_box_opens_the_picker() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X); // items screen
+    open_items(&mut ed);
     assert_eq!(ed.screen, Screen::Items);
     // [A] is the picker on this screen (the console's chip table says
     // "[A] 種類変更"); [R] is the count keyboard.
@@ -967,7 +982,7 @@ fn filtering_and_choosing_changes_the_item_type() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X);
+    open_items(&mut ed);
     ed.input(Key::A);
     assert_eq!(ed.screen, Screen::ItemPick);
 
@@ -993,7 +1008,7 @@ fn cancelling_the_picker_leaves_the_box_alone() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X);
+    open_items(&mut ed);
     let before = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
     ed.input(Key::A);
     ed.apply_item_filter(String::from("回復薬"));
@@ -1010,7 +1025,7 @@ fn the_filter_request_uses_its_own_sentinel() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X);
+    open_items(&mut ed);
     ed.input(Key::A);
     ed.input(Key::Y);
     let (idx, initial) = ed.take_text_request().expect("a filter request");
@@ -1026,7 +1041,7 @@ fn the_item_picker_does_not_panic_on_an_empty_match() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X);
+    open_items(&mut ed);
     ed.input(Key::A);
     ed.apply_item_filter(String::from("zzzznothingmatchesthis"));
     assert!(ed.item_pick_matches().is_empty());
@@ -1294,7 +1309,7 @@ fn replacing_an_item_can_be_taken_back() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X); // items
+    open_items(&mut ed);
     assert_eq!(ed.screen, Screen::Items);
 
     let before = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
@@ -1328,7 +1343,7 @@ fn undo_with_nothing_to_take_back_says_so() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X);
+    open_items(&mut ed);
     ed.input(Key::L);
     assert!(ed.message.contains("取り消せる操作がありません"), "message was {}", ed.message);
 }
@@ -1340,7 +1355,7 @@ fn undo_restores_the_whole_box_not_just_the_item() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X);
+    open_items(&mut ed);
     let before = ed.save.as_ref().unwrap().read_item_box(0).unwrap();
 
     ed.input(Key::R);
@@ -1613,7 +1628,7 @@ fn the_quest_list_shows_a_title_on_every_row() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     open_quest_section(&mut ed); // quest list
-    ed.input(Key::X); // quests inside the save
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     // Titles are decoded once when the screen opens.
     assert!(
@@ -1653,7 +1668,7 @@ fn the_quest_list_can_be_filtered_by_id_or_title() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     open_quest_section(&mut ed);
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     let all = ed.filtered_quests().len();
     assert!(all > 150, "expected the whole set, got {}", all);
@@ -1684,7 +1699,7 @@ fn the_quest_list_can_be_filtered_by_id_or_title() {
     assert!(by_title.len() < all, "the filter did not narrow anything");
 
     // X clears it and Y asks the keyboard.
-    ed.input(Key::X);
+    ed.apply_quest_filter(String::new());
     assert_eq!(ed.filtered_quests().len(), all);
     ed.input(Key::Y);
     let (idx, _) = ed.take_text_request().expect("a filter request");
@@ -1700,7 +1715,7 @@ fn the_quest_filter_survives_an_empty_result() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     open_quest_section(&mut ed);
-    ed.input(Key::X);
+    ed.open_save_quests();
     ed.apply_quest_filter(String::from("zzzznothing"));
     assert!(ed.filtered_quests().is_empty());
     // Navigation and A must be harmless with nothing to show.
@@ -2693,7 +2708,7 @@ fn the_console_lists_the_quest_equipment_entries() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     open_quest_section(&mut ed); // quest editor
-    ed.input(Key::X); // quests inside the save
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::QuestEquip);
@@ -4085,7 +4100,9 @@ fn audit_every_screen_is_reachable_by_keys() {
 
     // Slot screen: X items, R download palicoes, L charms, - equipment,
     // Y quest files, A character.
-    press!(Key::X);
+    ed.screen = Screen::Items; // the box is a section, not a key
+    ed.cursor = 0;
+    audit_note(&ed, &mut seen);
     assert_eq!(ed.screen, Screen::Items);
     press!(Key::A);
     assert_eq!(ed.screen, Screen::ItemPick);
@@ -4230,7 +4247,7 @@ fn audit_every_screen_is_reachable_by_keys() {
     press!(Key::B);
     assert_eq!(ed.screen, Screen::ArcList);
 
-    press!(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     press!(Key::L);
     assert_eq!(ed.screen, Screen::QuestEquip);
@@ -4246,7 +4263,9 @@ fn audit_every_screen_is_reachable_by_keys() {
     assert_eq!(ed.screen, Screen::Convert);
     press!(Key::B);
     assert_eq!(ed.screen, Screen::SaveList);
-    press!(Key::X);
+    ed.screen = Screen::Options;
+    ed.cursor = 0;
+    audit_note(&ed, &mut seen);
     assert_eq!(ed.screen, Screen::Options);
     // R is the tab-forward key on the console, and the tab after the settings
     // is the CSV screen, so one press lands on it either way.
@@ -4312,7 +4331,7 @@ fn audit_the_item_type_can_be_changed_through_the_picker() {
     }
     let mut ed = Editor::new();
     open_save(&mut ed);
-    ed.input(Key::X);
+    open_items(&mut ed);
     assert_eq!(ed.screen, Screen::Items);
     let vis = ed.visible_items();
     assert!(!vis.is_empty(), "the dump has item slots");
@@ -4614,7 +4633,7 @@ fn audit_a_quest_inside_the_save_can_be_edited_and_written_back() {
 
     open_quest_section(&mut ed);
     assert_eq!(ed.screen, Screen::ArcList);
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     let target = ed.save_quests()[0].clone();
     assert!(
@@ -4644,7 +4663,7 @@ fn audit_a_quest_inside_the_save_can_be_edited_and_written_back() {
 
     ed.input(Key::B);
     assert_eq!(ed.screen, Screen::ArcEntries);
-    ed.input(Key::X);
+    ed.install_into_save();
     assert!(
         ed.message.contains("上書き") || ed.message.contains("追加"),
         "message was {}",
@@ -4688,7 +4707,7 @@ fn audit_a_quest_the_save_does_not_have_can_be_added() {
     // Open the .arc with its .mib id rewritten to a quest this save lacks.
     ed.open_arc_bytes("patched.arc", &payload);
     assert_eq!(ed.screen, Screen::ArcEntries);
-    ed.input(Key::X);
+    ed.install_into_save();
     assert!(
         ed.message.contains("追加"),
         "the console must say it added the quest; message was {}",
@@ -4790,7 +4809,7 @@ fn gap_the_quest_equipment_list_is_display_only() {
         "QuestEquip",
         |ed| {
             open_quest_section(ed);
-            ed.input(Key::X);
+    ed.open_save_quests();
             ed.input(Key::L);
             assert_eq!(ed.screen, Screen::QuestEquip);
         },
@@ -4800,7 +4819,7 @@ fn gap_the_quest_equipment_list_is_display_only() {
     let mut ed = Editor::new();
     open_save(&mut ed);
     open_quest_section(&mut ed);
-    ed.input(Key::X);
+    ed.open_save_quests();
     ed.input(Key::L);
     let list = ed.quest_equipment();
     assert!(!list.is_empty(), "the DLC section has the 45 entries");
@@ -5212,7 +5231,7 @@ fn gap_the_quest_list_cannot_add_or_remove_a_quest() {
         let mut ed = Editor::new();
         open_save(&mut ed);
         open_quest_section(&mut ed);
-        ed.input(Key::X);
+    ed.open_save_quests();
         assert_eq!(ed.screen, Screen::SaveQuests);
         let before_n = ed.save_quests().len();
         let before = ed.save.as_ref().expect("a save").to_bytes();
@@ -5249,7 +5268,7 @@ fn spec_a_quest_can_be_added_from_an_arc() {
         return;
     };
     ed.open_arc_bytes("patched.arc", &payload);
-    ed.input(Key::X);
+    ed.install_into_save();
     assert!(
         dlc::is_installed(ed.save.as_ref().expect("a save"), id),
         "X on an .arc must add a quest the save does not have yet"
@@ -5308,7 +5327,7 @@ fn the_console_can_edit_a_quest_equipment_item() {
     open_save(&mut ed);
     // Slots -> quest list -> the save's own quests -> quest equipment.
     open_quest_section(&mut ed);
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     ed.input(Key::L);
     assert_eq!(ed.screen, Screen::QuestEquip);

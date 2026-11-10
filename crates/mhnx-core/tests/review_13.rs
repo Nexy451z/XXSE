@@ -357,11 +357,12 @@ fn the_way_out_is_on_every_guide_that_has_one() {
             "{screen:?} does not name the way back: {hint}"
         );
     }
-    // A form's draft costs two presses and the guide says so.
+    // A form's draft costs two presses and the guide says so - in words that
+    // say what the second press does, not just that there are two of them.
     ed.screen = Screen::Sets;
     assert!(ed.open_set_editor(0), "{}", ed.message);
     assert!(
-        ed.footer_hint().contains("[B] 一覧（下書きは2回）"),
+        ed.footer_hint().contains("[B] 一覧（2回で破棄）"),
         "{}",
         ed.footer_hint()
     );

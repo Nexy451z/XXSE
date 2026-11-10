@@ -610,7 +610,11 @@ fn the_console_chip_table_names_the_same_job_for_the_same_key() {
         (Screen::Slots, "Y", "一括MAX"),
         (Screen::Char, "Y", "刻み"),
         (Screen::Items, "A", "変更"),
-        (Screen::Items, "R", "数値入力"),
+        // 数値, not 数値入力: the box's line carries eight items on a 763px
+        // strip, so the number key's word is the short one there. The
+        // inspector's pill borrows whichever word the table has
+        // (Editor::key_label_or), so the two still agree.
+        (Screen::Items, "R", "数値"),
         (Screen::Hunts, "Y", "列"),
         (Screen::Hunts, "A", "刻み"),
         (Screen::Hunts, "R", "数値入力"),
@@ -771,7 +775,7 @@ fn the_reward_a_is_the_cells_own_action() {
     // The footer's [A] word is the same value.
     let footer = ed.footer_hint();
     assert!(footer.contains("[A] 確率+1"), "{footer}");
-    assert!(footer.contains("[ZR] アイテム→個数→確率"), "{footer}");
+    assert!(footer.contains("[ZR] 段送り（3段）"), "{footer}");
     assert!(
         caption_width(&footer) <= FOOTER_HINT_ROOM,
         "the footer does not fit: {}px {footer}",

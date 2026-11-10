@@ -4817,9 +4817,12 @@ impl GuiState {
 
                 c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                 c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
-                // The count is the list's own length (and the two language
-                // tables'), never a constant: it said 28 next to 60 rows.
-                let bulk = format!("全{}匹 一括導入(2回)", dlcats::all_ids().len());
+                // The word is the key table's (全導入2回). The pill used to
+                // write its own sentence with the catalogue's count in it,
+                // which was both a second name for the key and 189px of label
+                // in a 158px pill - the count was clipped away anyway, and the
+                // list's own length is on the screen above it.
+                let bulk = format!("[Y] {}", ed.key_label_or("Y", "全導入2回"));
                 btn_text(c, 1108, sy, 158, sh, &bulk, t.text_primary, FontSize::Small);
                 self.add_hit(1108, sy, 158, sh, UiAction::InstallAllPalicoes);
             }
@@ -6888,12 +6891,19 @@ impl GuiState {
             c.text_sized(ix + 20, cur_y + 4, &step_lbl, t.text_secondary, FontSize::Small);
             // [R] 数値入力: the three screens that hold a number a user would
             // rather type than step (個数 / HR / 時間 / 狩猟数).
+            //
+            // The word is the key table's (Editor::key_label_or), not a copy
+            // written here: the pill said 数値入力 over a footer that said 数値
+            // on the same screen, and the item box's line has since had to
+            // shorten the word to fit the 763px strip - so the copy would have
+            // drifted again the moment it did.
             if ed.direct_input_available(row_idx) {
                 let rw = 116i32;
                 let rx = ix + iw - 20 - rw;
+                let r_lbl = format!("[R] {}", ed.key_label_or("R", "数値入力"));
                 c.round_rect(rx, cur_y, rw, 24, 4, t.bg_btn);
                 c.round_rect_border(rx, cur_y, rw, 24, 4, 1, t.border_subtle);
-                btn_text(c, rx, cur_y, rw, 24, "[R] 数値入力", t.text_primary, FontSize::Small);
+                btn_text(c, rx, cur_y, rw, 24, &r_lbl, t.text_primary, FontSize::Small);
                 self.add_hit(rx, cur_y, rw, 24, UiAction::Key(Key::R));
             }
             // Two short lines (label, then pills) so all five pills fit inside
@@ -7374,7 +7384,9 @@ impl GuiState {
                         cur_y,
                         full_w,
                         38,
-                        "[◀/▶] アイテム / 装備を切替",
+                        // The table's word (タブ), not a second one: the
+                        // footer said タブ and this button said 切替.
+                        &format!("[◀/▶] {}", ed.key_label_or("◀/▶", "タブ")),
                         UiAction::Key(Key::Right),
                     );
                 }
@@ -7448,7 +7460,9 @@ impl GuiState {
                     cur_y,
                     full_w,
                     38,
-                    &format!("配信オトモ 全{}匹を一括導入（2回）", dlcats::all_ids().len()),
+                    // The key table's word, not a second sentence: the footer
+                    // says 全導入2回 and this button said 全84匹を一括導入.
+                    &format!("[Y] {}", ed.key_label_or("Y", "全導入2回")),
                     UiAction::InstallAllPalicoes,
                 );
             }
@@ -7660,13 +7674,16 @@ impl GuiState {
                         UiAction::Key(Key::Z),
                     );
                     cur_y += 38;
+                    // The word is the key table's (Editor::key_label_or): this
+                    // panel and the footer name one key.
+                    let r_lbl = format!("[R] {}", ed.key_label_or("R", "数値入力"));
                     self.draw_tool_button(
                         c,
                         ix + 20,
                         cur_y,
                         half_w,
                         34,
-                        "[R] 数値入力",
+                        &r_lbl,
                         UiAction::Key(Key::R),
                     );
                     self.draw_tool_button(
@@ -7894,7 +7911,10 @@ impl GuiState {
                     cur_y,
                     half_w,
                     38,
-                    "[B] スロット",
+                    // The word is the key table's (Editor::key_label_or): the
+                    // footer says キャラ and this button said スロット for the
+                    // same press - two names for one destination.
+                    &format!("[B] {}", ed.key_label_or("B", "キャラ")),
                     UiAction::Key(Key::B),
                 );
                 self.draw_tool_button(
@@ -8338,19 +8358,17 @@ impl GuiState {
             rows.push((f, label, meta.to_string(), val, badge));
         }
 
-        let (hdr, a_lbl) = if is_appearance {
-            (
-                "外見・性別・ボイス",
-                if ed.field == 13 { "性別切替" } else { "変更" },
-            )
+        let hdr = if is_appearance {
+            "外見・性別・ボイス"
         } else {
-            (
-                "基本ステータス・所持金・ポイント",
-                if ed.field == 0 { "名前変更" } else { "最大値" },
-            )
+            "基本ステータス・所持金・ポイント"
         };
+        // The [A] word follows the row, and the key table follows it too
+        // (Editor::char_a_label): the footer said 最大（2回）/編集 while this
+        // button said 名前変更 / 最大値 for the same press.
+        let a_lbl = ed.key_label_or("A", "最大（2回）");
 
-        self.draw_adaptive_rows(c, ed, hdr, "", &rows, ed.field, true, a_lbl);
+        self.draw_adaptive_rows(c, ed, hdr, "", &rows, ed.field, true, &a_lbl);
     }
 
     fn draw_items(&mut self, c: &mut Canvas, ed: &Editor) {
@@ -8404,7 +8422,9 @@ impl GuiState {
             &rows,
             ed.cursor.min(rows.len().saturating_sub(1)),
             true,
-            "アイテム変更",
+            // The [A] word is the key table's (Editor::key_label_or): the footer
+            // said 変更 and this button said アイテム変更.
+            &ed.key_label_or("A", "変更"),
         );
     }
 
@@ -9304,7 +9324,9 @@ impl GuiState {
             &rows,
             ed.roster_cursor.min(rows.len().saturating_sub(1)),
             true,
-            "名前変更",
+            // The [A] word is the key table's: the footer said 名前 and this
+            // button said 名前変更.
+            &ed.key_label_or("A", "名前"),
         );
     }
 
@@ -9801,7 +9823,11 @@ impl GuiState {
         self.add_hit(ix + 20, iy + 268, iw - 40, 44, UiAction::Key(Key::A));
 
         let half = (iw - 48) / 2; // 190
-        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, "[R] 数値入力", UiAction::Key(Key::R));
+        // The card's [R] word is the table's: the card view says 数値 (its line
+        // is full) and the other three views say 数値入力, so a copy written
+        // here would be wrong on one of them.
+        let r_lbl = format!("[R] {}", ed.key_label_or("R", "数値入力"));
+        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, &r_lbl, UiAction::Key(Key::R));
         self.draw_tool_button(
             c,
             ix + 28 + half,

@@ -319,9 +319,10 @@ fn the_arena_view_names_no_r_key() {
     let footer = ed.footer_hint();
     assert!(!footer.contains("[R]"), "the arena view promises R: {footer}");
     assert!(!ed.screen_guide().contains("[R]"), "{}", ed.screen_guide());
-    // The three numeric views do name it.
+    // The three numeric views do name it (the card's word is the short one:
+    // its line carries the arrow pair the sixth review restored).
     ed.set_guild_view(hbedit::GUILD_TAB_CARD);
-    assert!(ed.footer_hint().contains("[R] 数値入力"));
+    assert!(ed.footer_hint().contains("[R] 数値"));
 }
 
 /// マイセット's list: [◀/▶] is the tab pair, not a tour of the equipment.
@@ -363,7 +364,7 @@ fn the_reward_zr_names_the_cells_it_walks() {
     assert!(ed.entry_has_chance(), "a reward row has a chance column");
     let footer = ed.footer_hint();
     assert!(
-        footer.contains("[ZR] アイテム→個数→確率"),
+        footer.contains("[ZR] 段送り（3段）"),
         "the three cells are named: {footer}"
     );
     assert!(
@@ -377,7 +378,7 @@ fn the_reward_zr_names_the_cells_it_walks() {
     assert!(ed.entry_has_numbers());
     assert!(!ed.entry_has_chance());
     let footer = ed.footer_hint();
-    assert!(footer.contains("[ZR] アイテム→個数"), "{footer}");
+    assert!(footer.contains("[ZR] 段送り（2段）"), "{footer}");
     assert!(!footer.contains("確率"), "{footer}");
 }
 
@@ -570,7 +571,7 @@ fn the_quest_reward_tab_names_three_cells() {
     ed.input(Key::Z);
     assert_eq!(ed.quest_reward_field, hbedit::QUEST_REWARD_COUNT);
     let footer = ed.footer_hint();
-    assert!(footer.contains("[ZR] アイテム→個数→確率"), "{footer}");
+    assert!(footer.contains("[ZR] 段送り（3段）"), "{footer}");
     // The item cell is a cell, not a number: the tab knows which one it is on.
     ed.quest_reward_field = hbedit::QUEST_REWARD_ITEM;
     assert!(ed.quest_edit_item_cell());
@@ -836,6 +837,12 @@ fn the_slot_word_is_carried_everywhere() {
     ] {
         assert!(!src.contains("枠選択"), "{name} still says 枠選択");
     }
+    // One name on both builds: the canvas said キャラ選択 and the text build
+    // said キャラクター選択 for the same screen.
     assert!(UI_SRC.contains("\"キャラ選択\""), "the canvas title");
-    assert!(EDITOR_SRC.contains("\"キャラクター選択\""), "the text build's title");
+    assert!(EDITOR_SRC.contains("\"キャラ選択\""), "the text build's title");
+    assert!(
+        !EDITOR_SRC.contains("キャラクター選択"),
+        "the long name is gone from the text build"
+    );
 }

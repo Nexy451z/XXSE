@@ -72,7 +72,7 @@ fn a_press_on_an_empty_quest_list_installs_nothing() {
     // made the way the console's section bar makes it.
     ed.screen = Screen::ArcList;
     ed.cursor = 0;
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
 
     let before = ed.save_quests().len();
@@ -361,7 +361,7 @@ fn the_screens_that_use_plus_say_how_to_quit() {
         // ("[＋] 新規 …（[＋]は[B]の後）"). The line still has to say how to
         // leave, and it says it without reusing the glyph.
         assert!(
-            hint.contains("終了は [B] の後"),
+            hint.contains("※終了は [B]"),
             "{:?} spends [＋], so its footer must name the way out: {}",
             screen,
             hint
@@ -467,7 +467,7 @@ fn the_save_quest_list_deletes_on_the_second_press() {
     // made the way the console's section bar makes it.
     ed.screen = Screen::ArcList;
     ed.cursor = 0;
-    ed.input(Key::X);
+    ed.open_save_quests();
     assert_eq!(ed.screen, Screen::SaveQuests);
     ed.apply_quest_filter(String::new());
     let list = ed.filtered_quests();

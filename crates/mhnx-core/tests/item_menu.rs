@@ -56,7 +56,10 @@ fn open(ed: &mut Editor, copy: &Path) {
 }
 
 fn open_items(ed: &mut Editor) {
-    ed.input(Key::X);
+    // The box is a section, not a key: [X] is the save key on every screen
+    // (the console's global X had already taken it back from this route).
+    ed.screen = Screen::Items;
+    ed.cursor = 0;
     assert_eq!(ed.screen, Screen::Items);
 }
 
