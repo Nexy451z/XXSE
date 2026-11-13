@@ -168,6 +168,18 @@ pub fn box_holds_kind(kind: u8) -> bool {
     BOX_KINDS.contains(&kind)
 }
 
+/// Can the equipment form create, or retype a record to, this kind?
+///
+/// A talisman is in the box and in every list - the box screen shows its slot,
+/// the 種別 list names it - but the equipment form is not what makes one. Its
+/// record's skills and slot count live where the form has no row, so a talisman
+/// written here would be a 護石 with no skills: the 護石編集 form is the one
+/// that makes those. The kind is therefore listable and not creatable, which is
+/// the pair of answers the two questions really have.
+pub fn form_creates_kind(kind: u8) -> bool {
+    box_holds_kind(kind) && kind != TALISMAN_KIND
+}
+
 /// Rewrite the level field, keeping the type and the transmog level.
 ///
 /// The level is stored minus one in five bits, so it runs 1..=32. A level of

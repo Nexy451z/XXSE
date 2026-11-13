@@ -22332,12 +22332,12 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             self.message = String::from("装備の編集中に開いてください");
             return false;
         };
-        if !crate::equip::box_holds_kind(kind) {
-            // A talisman has a screen of its own, and the box's list would not
-            // show a record created here: say where it belongs instead of
-            // writing one that vanishes.
+        if !crate::equip::form_creates_kind(kind) {
+            // The talisman is in the list this runs from, so the message has to
+            // be about where one is made rather than about it being unknown
+            // here: its skills and slots are 護石編集's rows, not this form's.
             self.message = alloc::format!(
-                "{} は装備BOXの一覧に出ません（護石は護石一覧で作ります）",
+                "{} は護石一覧で作ります（この画面の行は護石に使えません）",
                 crate::equip::type_name(kind)
             );
             return false;

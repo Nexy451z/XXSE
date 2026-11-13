@@ -220,15 +220,21 @@ fn the_reward_search_is_titled_and_writes_the_filter() {
 /// list, the arrow keys, the picker and the create path all read it.
 #[test]
 fn the_equipment_box_cannot_create_a_talisman() {
-    // The kind list the picker shows.
+    // The kind list the picker shows: 護石 is in it, because a slot of the box
+    // can hold one and a list that cannot name what a slot holds is the bug the
+    // screen was reported with.
     let choices = Editor::equip_kind_choices();
     assert_eq!(choices.len(), equip::BOX_KINDS.len());
     assert!(
-        !choices
+        choices
             .iter()
             .any(|(k, _)| *k == u32::from(equip::TALISMAN_KIND)),
-        "護石 is not a kind of this box"
+        "護石 has to be nameable: the box holds them"
     );
+    // Listed is not creatable: the form has no row for a talisman's skills.
+    assert!(equip::box_holds_kind(equip::TALISMAN_KIND));
+    assert!(!equip::form_creates_kind(equip::TALISMAN_KIND));
+    assert!(equip::form_creates_kind(7));
     // The create path.
     let mut save = save::empty_switch_save();
     save.set_slot_used(0, true);
@@ -253,7 +259,18 @@ fn the_equipment_box_cannot_create_a_talisman() {
     assert!(ed.equip_edit.is_some(), "{}", ed.message);
     assert!(!ed.apply_equip_kind(equip::TALISMAN_KIND));
     assert!(ed.message.contains("護石一覧"), "{}", ed.message);
-    // The arrow keys walk the box's kinds and never land on one.
+    // The arrow keys walk the box's kinds, and every kind they reach is one the
+    // list can name.
+    // The 種別 row is row 0; the form opens on the ID row, so get there first -
+    // the old version of this test pressed [▶] on the ID row and never touched
+    // a kind at all.
+    let mut guard = 0;
+    while ed.equip_edit.map(|e| e.field) != Some(0) {
+        ed.input(Key::Up);
+        guard += 1;
+        assert!(guard <= 12, "row 0 (種別) must be reachable");
+    }
+    let mut seen_talisman = false;
     for _ in 0..(equip::BOX_KINDS.len() * 2 + 3) {
         ed.input(Key::Right);
         let kind = ed.equip_edit.expect("the form").kind;
@@ -261,7 +278,11 @@ fn the_equipment_box_cannot_create_a_talisman() {
             equip::box_holds_kind(kind),
             "the 種別 row reached kind {kind}"
         );
+        if kind == equip::TALISMAN_KIND {
+            seen_talisman = true;
+        }
     }
+    assert!(seen_talisman, "護石 is reachable from the 種別 row");
 }
 
 /// Every kind the box can create is a kind the box lists.
@@ -269,25 +290,39 @@ fn the_equipment_box_cannot_create_a_talisman() {
 fn every_record_the_box_creates_is_a_row_of_its_list() {
     let mut save = save::empty_switch_save();
     save.set_slot_used(0, true);
-    for (n, kind) in equip::BOX_KINDS.iter().enumerate() {
+    // Only what the form can make: a talisman is listed but is made by 護石編集.
+    let creatable: Vec<u8> = equip::BOX_KINDS
+        .iter()
+        .copied()
+        .filter(|k| equip::form_creates_kind(*k))
+        .collect();
+    for (n, kind) in creatable.iter().enumerate() {
         let index = equipops::create_in_box(&mut save, 0, *kind, 1, 1)
             .unwrap_or_else(|e| panic!("kind {kind}: {}", e.text()));
         assert_eq!(index, n, "one blank record per kind, in order");
     }
     let ed = editor_with(save, Screen::Equip);
     let rows = ed.equip_rows();
-    assert_eq!(rows.len(), equip::BOX_KINDS.len());
-    for kind in equip::BOX_KINDS {
+    assert_eq!(rows.len(), creatable.len());
+    for kind in creatable {
         assert!(
             rows.iter().any(|e| e.kind == kind),
             "kind {kind} was created and is not in the list"
         );
     }
-    // And a talisman record, written by the talisman screen, is not a row here.
+    // A talisman written by 護石編集 is a row of this list too: the box holds it,
+    // and a list that hides what the box holds is the bug this screen was
+    // reported with. What it is not is a record this form edits - the press says
+    // so (see the test above).
     let ed = editor_with_charms(3);
+    assert_eq!(
+        ed.equip_rows().len(),
+        3,
+        "the box lists the talismans it holds"
+    );
     assert!(
-        ed.equip_rows().is_empty(),
-        "talismans are the other list's rows"
+        ed.equip_rows().iter().all(|e| e.kind == equip::TALISMAN_KIND),
+        "and names their type"
     );
 }
 

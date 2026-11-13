@@ -1328,7 +1328,13 @@ const STATES: &[(&str, Setup)] = &[
     }),
     ("EquipPick", |ed| {
         ed.open_equip_box();
-        ed.equip_cursor = 0;
+        // The box lists its talismans too, and their form is 護石編集: the
+        // equipment form only opens on a row that is not one.
+        ed.equip_cursor = ed
+            .equip_rows()
+            .iter()
+            .position(|e| e.kind != mhnx_core::equip::TALISMAN_KIND)
+            .unwrap_or(0);
         ed.input(Key::A);
         ed.equip_edit.as_mut().expect("form").field = 8;
         ed.input(Key::A);
@@ -1359,7 +1365,15 @@ const STATES: &[(&str, Setup)] = &[
     ("Equip", |ed| ed.open_equip_box()),
     ("EquipEdit", |ed| {
         ed.open_equip_box();
+        // The box lists its talismans, and a talisman opens 護石編集 rather than
+        // this form, so the probe has to stand on a record this form edits.
+        ed.equip_cursor = ed
+            .equip_rows()
+            .iter()
+            .position(|e| e.kind != mhnx_core::equip::TALISMAN_KIND)
+            .unwrap_or(0);
         ed.input(Key::A);
+        assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
     }),
     ("QuestEquip", |ed| ed.screen = Screen::QuestEquip),
     ("QuestEquip 枠", |ed| {

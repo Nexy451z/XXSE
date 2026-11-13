@@ -264,7 +264,7 @@ pub fn create_in_box(
     id: u16,
     level: u16,
 ) -> Result<usize, EquipError> {
-    if !equip::box_holds_kind(kind) {
+    if !equip::form_creates_kind(kind) {
         return Err(EquipError::NotBoxKind(kind));
     }
     create(save, slot, kind, id, level)
