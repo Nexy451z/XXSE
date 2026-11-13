@@ -15,7 +15,7 @@
 use mhnx_core::arc::{Arc, ArcEntry, ARC_VERSION};
 use mhnx_core::confirm::{HoldAction, HOLD_CONFIRM_FRAMES};
 use mhnx_core::hbedit::{
-    Editor, Key, Screen, Shoulder, ShoulderTap, ZrJob, ITEM_OP_FIND, ITEM_OP_UNDO,
+    Editor, Key, Screen, Shoulder, ShoulderTap, ZrHold, ZrJob, ITEM_OP_FIND, ITEM_OP_UNDO,
     PROGRESS_QUESTS, PROGRESS_REQUESTS, QUEST_TAB_REWARDS,
 };
 use mhnx_core::quest::{Gmd, GMD_TAG, GMD_VERSION, MIB_SIZE};
@@ -473,7 +473,9 @@ fn the_header_button_does_not_call_itself_zr() {
 // ---------------------------------------------------------------------------
 
 /// The copy into the pouch was the deck's pill alone: a finger could press it
-/// and the pad could not.
+/// and the pad could not. It is the held [ZR] now: [R] is a sub-tab key on
+/// every screen, and the form already owns [ZR] for its name keyboard, so the
+/// copy is that key's second job (hbedit::Editor::zr_hold_job).
 #[test]
 fn the_item_set_form_can_copy_to_the_pouch_from_the_pad() {
     let mut ed = open_blank();
@@ -481,26 +483,32 @@ fn the_item_set_form_can_copy_to_the_pouch_from_the_pad() {
     assert!(ed.open_item_set_editor(0), "{}", ed.message);
     assert!(ed.item_set_editor_open());
 
+    // The form owns the screen, so neither shoulder moves the tab strip under
+    // it - the same answer the equipment form gives.
     assert_eq!(
         ed.shoulder_job(Key::R),
-        Shoulder::Screen,
-        "the form's [R] is its own key"
+        Shoulder::Swallow,
+        "the form owns the shoulders"
     );
-    assert_eq!(ed.shoulder_job(Key::L), Shoulder::SubTab, "[L] keeps the sub-tab");
+    assert_eq!(ed.shoulder_job(Key::L), Shoulder::Swallow);
 
     let hint = ed.footer_hint();
-    assert!(hint.contains("[R] ポーチへ"), "the footer names the key: {hint}");
+    assert!(
+        hint.contains("[ZR長] ポーチへ"),
+        "the footer names the key: {hint}"
+    );
+    assert_eq!(ed.zr_hold_job(), ZrHold::Action);
 
     // Two presses, like every other replace: the first one only offers it.
-    ed.input(Key::R);
+    assert!(ed.zr_hold_press(), "the held [ZR] runs the form's job");
     assert!(
-        ed.message.contains("もう一度 [R]"),
+        ed.message.contains("もう一度 [ZR] 長押し"),
         "the first press asks: {}",
         ed.message
     );
-    ed.input(Key::R);
+    assert!(ed.zr_hold_press());
     assert!(
-        !ed.message.contains("もう一度 [R]"),
+        !ed.message.contains("もう一度 [ZR] 長押し"),
         "the second press runs it instead of asking again: {}",
         ed.message
     );

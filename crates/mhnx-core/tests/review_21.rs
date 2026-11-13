@@ -297,17 +297,18 @@ fn the_mib_zr_is_named_only_on_a_monster_row() {
     }
 }
 
-/// 支給品: [ZR] is the search, and the line says 検索 - the same word as the
-/// pill on the bar.
+/// 支給品: the search is the held [ZR], and the line says 検索 - the same word
+/// as the pill on the bar.
 #[test]
 fn the_supply_tab_names_the_search_on_zr() {
     let mut ed = editor_with(blank_save(), Screen::QuestEdit);
     ed.quest_set_tab(hbedit::QUEST_TAB_SUPPLIES);
-    // One search item, not two: [ZR] and [R] open the same keyboard on this
-    // tab, so the line names the key the two item tabs share (the seventh
-    // review's D14).
+    // One search item, not two: the [ZR] tap and the [ZR] hold open the same
+    // keyboard on this tab, so the line names the hold - the key the two item
+    // tabs share (the seventh review's D14, moved to the hold when the
+    // shoulders became one band).
     let footer = ed.footer_hint();
-    assert!(footer.contains("[R] 検索"), "{footer}");
+    assert!(footer.contains("[ZR長] 検索"), "{footer}");
     assert_eq!(footer.matches("検索").count(), 1, "{footer}");
     assert!(!footer.contains("[ZR] 項目"), "{footer}");
     // The key really opens the search.
@@ -325,18 +326,22 @@ fn the_supply_tab_names_the_search_on_zr() {
     assert!(!UI_SRC.contains("\"[ZR] 検索\""), "and not the key");
 }
 
-/// ギルドカード's 闘技大会 view: [R] is the sub-tab there, so no line names it.
+/// ギルドカード's 闘技大会 view: no number to type, so no line names the hold.
 #[test]
-fn the_arena_view_names_no_r_key() {
+fn the_arena_view_names_no_number_key() {
     let mut ed = editor_with(blank_save(), Screen::Guild);
     ed.set_guild_view(hbedit::GUILD_TAB_ARENA);
     let footer = ed.footer_hint();
-    assert!(!footer.contains("[R]"), "the arena view promises R: {footer}");
+    assert!(
+        !footer.contains("[ZR長]"),
+        "the arena view promises a number key: {footer}"
+    );
+    assert!(!footer.contains("[R]"), "and no [R] either: {footer}");
     assert!(!ed.screen_guide().contains("[R]"), "{}", ed.screen_guide());
     // The three numeric views do name it (the card's word is the short one:
     // its line carries the arrow pair the sixth review restored).
     ed.set_guild_view(hbedit::GUILD_TAB_CARD);
-    assert!(ed.footer_hint().contains("[R] 数値"));
+    assert!(ed.footer_hint().contains("[ZR長] 数値"));
 }
 
 /// マイセット's list: [◀/▶] is the tab pair, not a tour of the equipment.

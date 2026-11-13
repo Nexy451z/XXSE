@@ -16,7 +16,7 @@
 
 use mhnx_core::arc::{Arc, ArcEntry, ARC_VERSION};
 use mhnx_core::charm;
-use mhnx_core::hbedit::{Editor, Key, Screen, QUEST_REWARD_CHANCE, QUEST_TAB_REWARDS};
+use mhnx_core::hbedit::{Editor, Key, Screen, Shoulder, QUEST_REWARD_CHANCE, QUEST_TAB_REWARDS};
 use mhnx_core::quest::{Gmd, GMD_TAG, GMD_VERSION, MIB_SIZE};
 use mhnx_core::save::{self, Save};
 
@@ -1338,6 +1338,10 @@ fn chip_keys(chip: &str) -> Vec<&'static str> {
         "R" => vec!["R"],
         "L/R" => vec!["L", "R"],
         "ZR" => vec!["Z"],
+        // The held [ZR]: the job [R] used to carry. The console runs it through
+        // the state machine (Editor::zr_hold_press), so it is not a bare Key -
+        // the screen's own [R] arm is what the hold runs.
+        "ZR長" => vec!["R"],
         "ZL" => vec!["ZL"],
         "-" => vec!["Minus"],
         "+" | "＋" => vec!["Plus"],
@@ -1682,7 +1686,9 @@ fn the_guild_guide_names_one_key_for_the_four_views() {
     // 数値, not 数値入力: the card's line carries seven items plus the arrow
     // pair the review asked for, and the 763px strip decides the word. The
     // inspector's pill borrows it (Editor::key_label_or), so the two agree.
-    assert!(footer.contains("[R] 数値"), "{footer}");
+    // The key is the held [ZR] now: [R] is the sub-tab on all four views, so
+    // the view walk is the shoulder pair and the number is the hold.
+    assert!(footer.contains("[ZR長] 数値"), "{footer}");
     let src = ui_src();
     // The warning strip names no key any more (the seventh review: the footer
     // is the one surface that names keys), and it never claimed [R] walks the
@@ -1695,19 +1701,25 @@ fn the_guild_guide_names_one_key_for_the_four_views() {
         src.contains("4ビュー: カード → 回数 → 武器 → 闘技大会"),
         "the strip still says where the four views are"
     );
-    // The guide prints the same table's first items as the footer, and the one
-    // key that walks the views is 表示 on all three of them.
+    // The guide prints the same table's first items as the footer.
     let guide = ed.screen_guide();
     for fact in ed.guide_facts() {
         assert!(guide.contains(&fact.render()), "{guide}");
     }
     assert!(!guide.contains("[L/R]"), "{guide}");
     assert!(!guide.contains("[L]"), "{guide}");
+    // The walk is the shoulder pair now: the four views are the bar's tabs
+    // (sub_tabs_for), so [L] / [R] walk them and the line no longer spends an
+    // item on [Y] 表示 - the tab strip is on the glass and the footer would
+    // only repeat what the bar already prints. [Y] still walks them (it is the
+    // pad's habit), it is just not the key the line names.
+    assert_eq!(ed.key_label("Y"), None, "the walk is the shoulders, not [Y]");
     assert_eq!(
-        ed.key_label("Y").as_deref(),
-        Some("表示"),
-        "one word for the view walk"
+        ed.shoulder_job(Key::R),
+        Shoulder::SubTab,
+        "the shoulders walk the four views"
     );
+    assert_eq!(ed.shoulder_job(Key::L), Shoulder::SubTab);
 }
 
 // ---------------------------------------------------------------------------

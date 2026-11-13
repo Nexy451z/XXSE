@@ -44,8 +44,11 @@
 //!     names it (刻み on the byte screens, 列切替 on 狩猟記録, 項目切替 on オトモ,
 //!     タブ on マイセット and on 進行状況). No screen deletes on `Y`: the
 //!     two-press delete is `[-]` everywhere.
-//!   - `R`: the number key where the footer promises `[R] 数値入力`, and the
-//!     second bit of 進行状況's quest view (既読). The footer names it on both.
+//!   - `L` / `R`: the sub-tab pair, on every screen and both ways round - the
+//!     two are one band and neither is special (hbedit::Shoulder). The jobs
+//!     `R` used to carry (the number keyboard, the item search, 既読, the id
+//!     keyboard, ポーチへ) are the *held* `ZR` now (`hbedit::Editor::
+//!     zr_hold_job`), and the footer names them as `[ZR長]`.
 //!
 //! The words are one vocabulary, not one screen's habit: 検索 opens a name
 //! search everywhere, 刻み is the step size, 削除 removes a record and 解除
@@ -461,6 +464,18 @@ pub enum UiAction {
     /// pill in the inspector. One word for it, the same one the talisman and
     /// equipment screens use: 検索.
     FilterItems,
+    /// The job a *held* [ZR] carries (hbedit::Editor::zr_hold_press): the
+    /// number keyboard on the four screens that hold a number, the item search
+    /// on the quest editor's two item tabs, 既読 on the progress screen's quest
+    /// view, the id keyboard on the equipment form and ポーチへ on the item set
+    /// form.
+    ///
+    /// It is an action of its own rather than a bare R key: [R] is a sub-tab
+    /// key now, so a button that sent it would move the tab strip instead of
+    /// opening the keyboard - the pill would promise one thing and the press
+    /// would do another. The state machine owns the job, so the button runs the
+    /// same method the hold does.
+    ZrHold,
     /// 進行状況's 既読 write: the second bit of the quest view.
     ///
     /// [Y] used to run it there and move the tab on the other two views. The
@@ -2291,28 +2306,31 @@ impl GuiState {
     /// | [◀] / [▶]      | 10 rows (hbedit::pick_move)           | value / page by the row's meaning | value ±step; 10 on an id row |
     /// | [▲] / [▼]      | 1 row                                 | 1 row                             | 1 row              |
     /// | held [◀]/[▶]   | repeats at 8 / 4 / 3 frames           | repeats at 8 / 4 / 3 frames       | repeats at 8 / 4 / 3 frames |
-    /// | [L] / [R] tap  | ten rows, same as [◀] / [▶], repeated while held | the mode's own key (swallowed by the set / palico form) | previous / next sub-tab; [R]'s tap runs on the *release* |
+    /// | [L] / [R] tap  | ten rows, same as [◀] / [▶], repeated while held | previous / next sub-tab (swallowed by the set / palico form) | previous / next sub-tab; the tap runs on the *release* |
     /// | held [L]       | (repeats the ten-row step)            | —                                 | first hold offers 元に戻す, second hold runs it |
     /// | held [R]       | (repeats the ten-row step)            | —                                 | opens 詳細 (from the screen the key went down on) |
     /// | [A]            | 決定                                  | the row's own action              | the row's own action (equipment / talisman forms: 選ぶ・書き込み・作成) |
     /// | [Y]            | 検索 (the keyboard)                    | 一覧の表示切替 (item box: 空きも表示) / the mode's own key | 一覧の 検索・表示切替, otherwise the screen's own second action |
     /// | [X]            | クリア／保存 (per screen)              | 保存                              | 保存 (global QuickSave) |
-    /// | [ZR]           | 種別 filter (the name picker; the other three send it to the section bar) | the screen's own second action | the screen's own second action, else the section bar |
+    /// | [ZR] tap       | 種別 filter (the name picker; the other three send it to the section bar) | the screen's own second action | the screen's own second action, else the section bar |
+    /// | held [ZR]      | —                                     | 数値入力 / 検索 / 既読 / ID入力 / ポーチへ, where the screen has one (hbedit::Editor::zr_hold_job) | same |
     /// | [－] / [＋]     | 2-press delete / 終了                  | 2-press delete / quit             | 2-press delete / the screen's own tool |
     ///
-    /// The two rules that make it collision-free: (1) [L] is answered on the
-    /// press and its hold is a *second* answer that never undoes the first, so a
-    /// hold cannot lose its tab move and two taps cannot be swallowed by a
-    /// hold - while [R]'s tap waits for the release, because its hold opens
-    /// 詳細 and a hold that also moved the sub-tab opened it on the wrong screen
-    /// (hbedit::ShoulderTap); (2) a pick list owns L / R as movement before the
+    /// The three rules that make it collision-free: (1) the shoulders answer as
+    /// one band - both taps run on the *release* (hbedit::ShoulderTap), so the
+    /// same gesture is the same gesture whichever shoulder was used, and a hold
+    /// never also taps; (2) a pick list owns L / R as movement before the
     /// sub-tab rule is reached (see `shoulder_moves`), exactly as it owns
-    /// [◀] / [▶].
+    /// [◀] / [▶]; (3) no screen takes a shoulder back (hbedit::Shoulder has no
+    /// answer for that) - the jobs [R] used to carry are the held [ZR], which
+    /// is the key those screens already own for their second action.
     pub fn handle_pad_key(&mut self, ed: &mut Editor, key: Key, _cur_buttons: u64) {
         // What a shoulder press means is the state machine's answer
-        // (hbedit::Editor::shoulder_job): the sub-tab by default, the ten row
-        // jump of a pick list, the screen's own key where a footer promises
-        // "[R] 数値入力", and nothing at all under a form that owns the screen.
+        // (hbedit::Editor::shoulder_job): the sub-tab on every screen, the ten
+        // row jump of a pick list, and nothing at all under a form that owns
+        // the screen. No screen takes the key back: the jobs [R] used to carry
+        // are the held [ZR] (hbedit::Editor::zr_hold_job), which the main loop
+        // answers before this dispatch is reached.
         //
         // The console used to keep its own copy of that rule as a list of
         // exceptions, and the list is what the review found twice: [R] on the
@@ -2336,13 +2354,12 @@ impl GuiState {
                     return;
                 }
                 Shoulder::Swallow => return,
-                // The screen's own key: fall through to the dispatch below, so
-                // the screen's own arm answers it. That distinction matters -
-                // [R] on the item box opens the count keyboard this layer owns
-                // (hbedit's [R] opens the item picker, which is [A]'s job), so
-                // handing the key straight to the state machine here would have
-                // swapped the two keys instead of giving [R] its promise.
-                Shoulder::Screen => {}
+                // A modal panel that owns every key (the palico skill panel):
+                // fall through to the dispatch below, so the panel's own arm
+                // answers it. No *screen* answers this - a screen that took a
+                // shoulder back is the bug the enum exists to prevent, and the
+                // jobs [R] used to carry are the held [ZR] now.
+                Shoulder::Panel => {}
             }
         }
 
@@ -2443,28 +2460,28 @@ impl GuiState {
                 // A runs the highlighted row and every other key is the
                 // menu's (`-` / B close it, Up / Down move it).
                 Key::A if ed.item_menu_open => ed.input(Key::A),
-                // [A] is the picker and [R] the count keyboard - the same two
-                // jobs the state machine's own arms have (hbedit::input_items),
-                // so the pad and the headless build cannot swap them again.
-                // [A] used to be sent as [R] because the state machine had them
-                // the other way round.
+                // [A] is the picker - the same job the state machine's own arm
+                // has (hbedit::input_items), so the pad and the headless build
+                // cannot swap them again. The count keyboard is the held [ZR]
+                // now (hbedit::Editor::zr_hold_job), and it runs the state
+                // machine's [R] arm through zr_hold_press.
                 Key::A => ed.input(Key::A),
                 // [Y] is the list's own state, as the footer promised all
                 // along: 所持品のみ <-> 空きも表示. It used to be the step here,
                 // which left the state machine's toggle unreachable - the one
                 // thing this screen's heading can say that nothing else does.
                 // The step is the deck's button now (every key on this screen
-                // is spoken for: A picks, R types the count, X saves, ZR opens
-                // the bulk menu, +/- are tools and quit, L/R are the BOX tabs,
-                // ZL/ZR the sidebar, and [-] is the delete key with nothing to
-                // delete here).
+                // is spoken for: A picks, X saves, ZR opens the bulk menu and
+                // its hold types the count, +/- are tools and quit, L/R are the
+                // BOX tabs, ZL/ZR the sidebar, and [-] is the delete key with
+                // nothing to delete here).
                 Key::Y if ed.item_menu_open => {}
                 Key::Y => self.apply_action(ed, UiAction::ToggleItemEmpty),
-                // [R] types the count of the selected slot. It used to open the
-                // same picker [A] opens, so nothing was lost by giving it to the
-                // one number on this screen a user would rather type than step.
-                // The state machine answers the same key the same way now, so
-                // this is a fall-through rather than a second copy of the rule.
+                // [R] is the count keyboard at the *state machine's* level, and
+                // the pad never sends it: the shoulders are both tab keys
+                // (hbedit::Editor::shoulder_job) and the count is the held [ZR]
+                // (zr_hold_press runs this same arm). It stays a fall-through so
+                // the headless build and the hold share one implementation.
                 Key::R => ed.input(Key::R),
                 // [-] is the delete key and this screen has nothing to
                 // delete. [ZR] opens the bulk menu (hbedit::Editor::
@@ -2595,12 +2612,11 @@ impl GuiState {
             // Either set form owns every key while it is open: the equipment
             // one for its parts, the item one for its thirty-two entries.
             Screen::Sets if ed.set_editor_open() => match key {
-                // [R] is ポーチへ適用 on the item set form: the footer names it
-                // and hbedit::Editor::shoulder_job hands the key to the screen
-                // (Shoulder::Screen), so this list is the only thing that was
-                // dropping it - the one key the footer promised and the pad
-                // could not press. The equipment form has no [R] arm, so the
-                // key is a no-op there, exactly as every other unclaimed key.
+                // ポーチへ適用 on the item set form is the held [ZR] now
+                // (hbedit::Editor::zr_hold_press), so this list only has to
+                // pass the keys the forms answer. [R] is still forwarded: the
+                // state machine's own [R] arm is what the hold runs, and the
+                // headless build presses it directly.
                 Key::Up | Key::Down | Key::Left | Key::Right | Key::A | Key::Y | Key::Minus
                 | Key::R | Key::Z | Key::B => ed.input(key),
                 _ => {},
@@ -3071,6 +3087,14 @@ impl GuiState {
         }
         match action {
             UiAction::Key(k) => self.handle_pad_key(ed, k, 0),
+            // The held [ZR]'s job, run through the state machine: the same
+            // method the pad's hold runs (hbedit::Editor::zr_hold_press), so a
+            // finger and a held shoulder cannot do different things.
+            UiAction::ZrHold => {
+                if ed.zr_hold_press() {
+                    self.stop_fling();
+                }
+            }
             // A tap outside a modal panel: it is here to stop, and stopping is
             // all it does.
             UiAction::ModalBlank => {}
@@ -4769,11 +4793,11 @@ impl GuiState {
                 self.add_hit(1108, sy, 158, sh, UiAction::Key(Key::Y));
             }
             // 進行状況: the search is [ZR] on every view, and the pill sends the
-            // same key ([A] toggles the bit, [Y] walks the views, [R] is the
-            // quest view's second bit, the four directions move and [L] is the
-            // tab). The quest view's [R] (既読) keeps its pill beside it; on the
-            // other two views that key walks the views, which the tab bar above
-            // already does for a finger.
+            // same key ([A] toggles the bit, [Y] walks the views, the held [ZR]
+            // is the quest view's second bit, the four directions move and
+            // [L] / [R] are the tab). The quest view's 既読 keeps its pill beside
+            // it; on the other two views that hold does nothing, and the tab bar
+            // above already walks them for a finger.
             Screen::Progress => {
                 let label = if ed.progress_filter.trim().is_empty() {
                     String::from("検索")
@@ -4785,10 +4809,10 @@ impl GuiState {
                 btn_text(c, 964, sy, 136, sh, &label, t.text_primary, FontSize::Small);
                 self.add_hit(964, sy, 136, sh, UiAction::FilterProgress);
                 // 既読 is the quest view's second bit. [Y] moves the tab on all
-                // three views, so the write has a key of its own: [R], which
-                // the console takes back from the sub-tab rule on this view
-                // (hbedit::Editor::shoulder_job). The pill names it and sends
-                // the same method, so a finger and the pad write one bit.
+                // three views and the shoulders do too, so the write has a key
+                // of its own: the held [ZR] (hbedit::Editor::zr_hold_job). The
+                // pill runs the same method, so a finger and the pad write one
+                // bit.
                 if ed.progress_view() == PROGRESS_QUESTS {
                     c.round_rect(1108, sy, 158, sh, 5, t.bg_btn_primary);
                     c.round_rect_border(1108, sy, 158, sh, 5, 1, t.accent_primary);
@@ -6802,8 +6826,9 @@ impl GuiState {
             if ed.step_pills_live() {
                 c.text_sized(ix + 20, cur_y + 4, &step_lbl, t.text_secondary, FontSize::Small);
             }
-            // [R] 数値入力: the three screens that hold a number a user would
-            // rather type than step (個数 / HR / 時間 / 狩猟数).
+            // 数値入力: the screens that hold a number a user would rather type
+            // than step (個数 / HR / 時間 / 狩猟数). The key is the held [ZR]
+            // (hbedit::Editor::zr_hold_job), and the pill runs the same method.
             //
             // The word is the key table's (Editor::key_label_or), not a copy
             // written here: the pill said 数値入力 over a footer that said 数値
@@ -6813,11 +6838,11 @@ impl GuiState {
             if ed.direct_input_available(row_idx) {
                 let rw = 116i32;
                 let rx = ix + iw - 20 - rw;
-                let r_lbl = pill_word(ed, "R", "数値入力");
+                let r_lbl = pill_word(ed, "ZR長", "数値入力");
                 c.round_rect(rx, cur_y, rw, 24, 4, t.bg_btn);
                 c.round_rect_border(rx, cur_y, rw, 24, 4, 1, t.border_subtle);
                 btn_text(c, rx, cur_y, rw, 24, &r_lbl, t.text_primary, FontSize::Small);
-                self.add_hit(rx, cur_y, rw, 24, UiAction::Key(Key::R));
+                self.add_hit(rx, cur_y, rw, 24, UiAction::ZrHold);
             }
             // Two short lines (label, then pills) so all five pills fit inside
             // the panel, and 24 + 34 in total: the tool deck below still ends
@@ -6990,8 +7015,8 @@ impl GuiState {
                     );
                     // The add's name search: [ZR] (the one input the item box
                     // had left - [Y] is the 空きも表示 toggle, [A] the picker,
-                    // [R] the count, [X] the save, and [-] is the delete key),
-                    // so this pill sends the same key the pad does.
+                    // the held [ZR] the count, [X] the save, and [-] is the
+                    // delete key), so this pill sends the same key the pad does.
                     let search_lbl = if ed.item_box_filter.trim().is_empty() {
                         "検索"
                     } else {
@@ -7230,8 +7255,8 @@ impl GuiState {
                     let to_lbl = if ed.item_set_armed == Some(ItemSetOp::ToPouch) {
                         "もう一度タップで適用する"
                     } else {
-                        // [R] is the same operation on the pad
-                        // (hbedit::Editor::shoulder_job): the pill and the key
+                        // The held [ZR] is the same operation on the pad
+                        // (hbedit::Editor::zr_hold_job): the pill and the key
                         // run one method, so they cannot disagree.
                         "ポーチへ適用（2回）"
                     };
@@ -7437,8 +7462,8 @@ impl GuiState {
                         UiAction::ExtractSelectedQuest,
                     );
                     cur_y += 44;
-                    // The save's whole quest list, one press: the [R] the
-                    // console spends on the sub-tab.
+                    // The save's whole quest list, one press: the key the
+                    // console spends on the sub-tab, so the pad cannot reach it.
                     self.draw_tool_button(
                         c,
                         ix + 20,
@@ -7595,7 +7620,7 @@ impl GuiState {
                     cur_y += 38;
                     // The word is the key table's (Editor::key_label_or): this
                     // panel and the footer name one key.
-                    let r_lbl = pill_word(ed, "R", "数値入力");
+                    let r_lbl = pill_word(ed, "ZR長", "数値入力");
                     self.draw_tool_button(
                         c,
                         ix + 20,
@@ -7603,7 +7628,7 @@ impl GuiState {
                         half_w,
                         34,
                         &r_lbl,
-                        UiAction::Key(Key::R),
+                        UiAction::ZrHold,
                     );
                     self.draw_tool_button(
                         c,
@@ -9412,10 +9437,8 @@ impl GuiState {
         // (sub_tabs_for), so [L/R] walks them and [B] unwinds one level at a
         // time - the line says both, because one key with two depths is the
         // kind of thing that reads as a bug until it is written down.
-        // [L] alone: [R] is 数値入力 on three of the four views (the footer
-        // says so, and hbedit::Editor::shoulder_job hands the key to the
-        // screen), so a line that promised the shoulder pair walked the views
-        // named the same key two different jobs on one screen.
+        // The strip names no key: the footer does, and the shoulders are one
+        // rule (hbedit::Shoulder) rather than this screen's own pair.
         warnings.push(String::from(
             "4ビュー: カード → 回数 → 武器 → 闘技大会（闘技大会だけ数値入力も）",
         ));
@@ -9747,7 +9770,7 @@ impl GuiState {
             format!(
                 "{}（値の増減）/ {}",
                 pill_word(ed, "A", "編集"),
-                pill_word(ed, "R", "数値入力")
+                pill_word(ed, "ZR長", "数値入力")
             )
         };
         c.text_clipped(
@@ -9778,12 +9801,12 @@ impl GuiState {
         self.add_hit(ix + 20, iy + 268, iw - 40, 44, UiAction::Key(Key::A));
 
         let half = (iw - 48) / 2; // 190
-        // The card's [R] word is the table's: the card view says 数値 (its line
-        // is full) and the other three views say 数値入力, so a copy written
-        // here would be wrong on one of them. The button prints no key: the
-        // footer names it (the sixth review's leftovers).
-        let r_lbl = pill_word(ed, "R", "数値入力");
-        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, &r_lbl, UiAction::Key(Key::R));
+        // The number key's word is the table's: the card view says 数値 (its
+        // line is full) and the other views say the same, so a copy written
+        // here would drift. The button prints no key: the footer names it, and
+        // the key is the held [ZR] (hbedit::Editor::zr_hold_job).
+        let r_lbl = pill_word(ed, "ZR長", "数値入力");
+        self.draw_tool_button(c, ix + 20, iy + 322, half, 40, &r_lbl, UiAction::ZrHold);
         self.draw_tool_button(
             c,
             ix + 28 + half,

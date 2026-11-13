@@ -9,9 +9,11 @@ use std::collections::BTreeMap;
 
 use mhnx_core::json::{self, Json};
 use mhnx_core::update::{
-    activate_staged, app_install_plan, banner_text, install_plan, note_lines, parse_release,
-    percent, staged_is_complete, InstallError, Release, RenameFs, Settings, UpdateError,
-    Version, ASSET_NAME, RELEASES_LATEST_URL,
+    activate_staged, already_installed, app_install_plan, banner_text, c_path, device_path, dir_of,
+    install_plan, missing_staged_message, note_lines, parse_release, percent, post_download_message,
+    staged_is_complete, staged_state, CardDir, DirEntry, InstallError, Release, RenameFs, Settings,
+    StagedState, UpdateError, Version, APP_DIR, ASSET_NAME, RELEASES_LATEST_URL, SD_DEVICE,
+    SETTINGS_FILE,
 };
 
 /// A real answer from the release feed, trimmed to the members that matter.
@@ -417,6 +419,176 @@ fn a_second_update_replaces_the_old_backup() {
     activate_staged(&mut fs, &plan).expect("the swap succeeds");
     assert_eq!(fs.files.get(&plan.target), Some(&2));
     assert_eq!(fs.files.get(&plan.backup), Some(&1), "the newest old file wins");
+}
+
+// ---------------------------------------------------------------------------
+// The names as the C library sees them
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_path_the_updater_opens_names_the_card() {
+    // The three names the swap uses and the settings file all carry the
+    // device: fsdev resolves a path without one against whatever device is the
+    // default, and "the default" is not a promise this code can keep.
+    let plan = app_install_plan();
+    for path in [&plan.target, &plan.staged, &plan.backup] {
+        assert_eq!(device_path(path), format!("sdmc:{}", path));
+    }
+    assert_eq!(device_path(SETTINGS_FILE), "sdmc:/switch/XXSE/update.cfg");
+    assert_eq!(SD_DEVICE, "sdmc:");
+
+    // A path that already names one is not given a second name.
+    assert_eq!(
+        device_path("sdmc:/switch/XXSE/XXSE.nro"),
+        "sdmc:/switch/XXSE/XXSE.nro"
+    );
+    // A colon inside a file name is not a device name.
+    assert_eq!(device_path("/switch/XXSE/a:b.nro"), "sdmc:/switch/XXSE/a:b.nro");
+    // Another device is left alone: the updater never opens one, but the
+    // helper must not turn "save:/x" into "sdmc:save:/x".
+    assert_eq!(device_path("save:/system"), "save:/system");
+}
+
+#[test]
+fn the_c_path_ends_in_a_nul_so_fopen_sees_one_name() {
+    let plan = app_install_plan();
+    let c = c_path(&plan.staged);
+    assert_eq!(c.last(), Some(&0), "a C string ends in a NUL");
+    assert_eq!(&c[..c.len() - 1], b"sdmc:/switch/XXSE/XXSE.nro.new");
+    assert!(!c[..c.len() - 1].contains(&0), "no NUL inside the name");
+
+    // The bug this guards: a Vec<u8> built from a String has no terminator, so
+    // fopen reads the allocator's padding as part of the name - the download
+    // then writes a file the swap cannot find.
+    let bare = plan.staged.clone().into_bytes();
+    assert_ne!(bare.last(), Some(&0), "a String is not a C string");
+    assert_eq!(c.len(), bare.len() + SD_DEVICE.len() + 1);
+}
+
+#[test]
+fn the_folder_of_a_name_is_the_folder_it_sits_in() {
+    let plan = app_install_plan();
+    assert_eq!(dir_of(&plan.staged), APP_DIR);
+    assert_eq!(dir_of("/switch/XXSE/XXSE.nro"), "/switch/XXSE");
+    assert_eq!(dir_of("sdmc:/switch/XXSE/XXSE.nro"), "sdmc:/switch/XXSE");
+    assert_eq!(dir_of("/XXSE.nro"), "/");
+    assert_eq!(dir_of("XXSE.nro"), "");
+}
+
+// ---------------------------------------------------------------------------
+// What the card holds
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_card_listing_says_what_is_there() {
+    let empty = CardDir::new(vec![]);
+    assert_eq!(empty.describe(6), "（ファイルがありません）");
+    assert_eq!(empty.size_of("/switch/XXSE/XXSE.nro"), None);
+
+    let card = CardDir::new(vec![
+        DirEntry { name: String::from("XXSE.nro"), size: 4823040 },
+        DirEntry { name: String::from("XXSE.nro.bak"), size: 4700000 },
+        DirEntry { name: String::from("update.cfg"), size: 62 },
+    ]);
+    let line = card.describe(6);
+    assert!(line.contains("XXSE.nro 4823040 バイト"), "{line}");
+    assert!(line.contains("XXSE.nro.bak 4700000 バイト"), "{line}");
+    assert!(line.contains("update.cfg 62 バイト"), "{line}");
+    assert!(!line.contains('\n'), "one line: a dialog draws one line");
+
+    // The size is found by the last component, with or without the device.
+    assert_eq!(card.size_of("/switch/XXSE/XXSE.nro"), Some(4823040));
+    assert_eq!(card.size_of("sdmc:/switch/XXSE/XXSE.nro"), Some(4823040));
+    assert_eq!(card.size_of("/switch/XXSE/XXSE.nro.new"), None);
+
+    // Capped, and the cap says how many were left out.
+    let many = CardDir::new(
+        (0u64..10)
+            .map(|i| DirEntry { name: format!("f{i}"), size: i })
+            .collect(),
+    );
+    let line = many.describe(3);
+    assert!(line.contains("f0 0 バイト"), "{line}");
+    assert!(!line.contains("f3"), "{line}");
+    assert!(line.contains("ほか 7 件"), "{line}");
+}
+
+#[test]
+fn the_staged_file_is_ready_only_at_the_declared_size() {
+    assert_eq!(staged_state(None, 100), StagedState::Missing);
+    assert_eq!(staged_state(Some(100), 100), StagedState::Ready(100));
+    assert_eq!(staged_state(Some(99), 100), StagedState::WrongSize { found: 99 });
+    assert_eq!(staged_state(Some(101), 100), StagedState::WrongSize { found: 101 });
+    // No declared size: a non-empty file is all that can be asked.
+    assert_eq!(staged_state(Some(1), 0), StagedState::Ready(1));
+    assert_eq!(staged_state(Some(0), 0), StagedState::WrongSize { found: 0 });
+}
+
+#[test]
+fn a_missing_download_is_explained_with_the_folder() {
+    let plan = app_install_plan();
+    let card = CardDir::new(vec![
+        DirEntry { name: String::from("XXSE.nro"), size: 4700000 },
+        DirEntry { name: String::from("XXSE.nro.new"), size: 1024 },
+    ]);
+    let message = missing_staged_message(&plan, 4823040, &card);
+    assert!(message.contains(&plan.staged), "{message}");
+    assert!(message.contains(APP_DIR), "{message}");
+    assert!(message.contains("XXSE.nro.new 1024 バイト"), "{message}");
+    assert!(!message.contains("更新済み"), "{message}");
+    assert!(!message.contains('\n'), "one line: a dialog draws one line");
+
+    // An empty folder is its own answer.
+    let message = missing_staged_message(&plan, 4823040, &CardDir::new(vec![]));
+    assert!(message.contains("（ファイルがありません）"), "{message}");
+
+    // The same sentence is what the swap's own error says now.
+    let err = InstallError::MissingStaged;
+    assert_eq!(err.message_with_card(&plan, 4823040, &card), missing_staged_message(&plan, 4823040, &card));
+    assert_eq!(err.message(&plan), format!("ダウンロードしたファイルがありません（{}）", plan.staged));
+}
+
+#[test]
+fn a_missing_download_that_is_already_installed_asks_for_a_restart() {
+    let plan = app_install_plan();
+    let card = CardDir::new(vec![DirEntry { name: String::from("XXSE.nro"), size: 4823040 }]);
+    assert!(already_installed(&plan, 4823040, &card));
+    let message = missing_staged_message(&plan, 4823040, &card);
+    assert!(message.contains("更新済み"), "{message}");
+    assert!(message.contains("再起動"), "{message}");
+    assert!(message.contains("4823040"), "{message}");
+
+    // A target of another size is not "already installed".
+    let older = CardDir::new(vec![DirEntry { name: String::from("XXSE.nro"), size: 4700000 }]);
+    assert!(!already_installed(&plan, 4823040, &older));
+    assert!(!missing_staged_message(&plan, 4823040, &older).contains("更新済み"));
+    // A release that declares no size cannot be called installed.
+    assert!(!already_installed(&plan, 0, &card));
+}
+
+#[test]
+fn the_post_download_check_names_the_size_the_card_kept() {
+    let plan = app_install_plan();
+    let card = CardDir::new(vec![DirEntry { name: String::from("XXSE.nro.new"), size: 4096 }]);
+
+    // The card agrees: nothing to say, the swap goes ahead.
+    assert_eq!(
+        post_download_message(&plan, 4823040, StagedState::Ready(4823040), &card),
+        None
+    );
+
+    // The file is there but short: the message names both sizes.
+    let message = post_download_message(&plan, 4823040, StagedState::WrongSize { found: 4096 }, &card)
+        .expect("a short file is a failure");
+    assert!(message.contains("4096"), "{message}");
+    assert!(message.contains("4823040"), "{message}");
+    assert!(message.contains(&plan.staged), "{message}");
+
+    // The file is not there at all: the message lists the folder.
+    let message = post_download_message(&plan, 4823040, StagedState::Missing, &card)
+        .expect("a missing file is a failure");
+    assert!(message.contains("XXSE.nro.new 4096 バイト"), "{message}");
+    assert!(message.contains(&plan.staged), "{message}");
 }
 
 #[test]

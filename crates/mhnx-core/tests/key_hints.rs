@@ -115,10 +115,17 @@ fn answers(screen: &str, key: &str) -> bool {
     // [X] is the save key on every screen and [＋] quits on every screen that
     // does not give it a tool of its own; the console answers both before the
     // state machine (handle_pad_key's QuickSave and the main loop's BTN_PLUS).
-    // The shoulders are always something (sub-tab, ten-row move or the screen's
-    // own key), so a line that names them is never a dead key.
+    // The shoulders are always something (the sub-tab, or the ten-row move on a
+    // pick list), so a line that names them is never a dead key - and no screen
+    // can take one back (hbedit::Shoulder has no answer for that).
     if matches!(key, "X" | "Plus" | "L" | "R") {
         return true;
+    }
+    // The held [ZR] runs the state machine's own [R] arm
+    // (hbedit::Editor::zr_hold_press), so the screen has to answer that key -
+    // and Editor::zr_hold_job only names the hold where it does.
+    if key == "ZR長" {
+        return handler_src(screen).contains("Key::R");
     }
     let mut body = handler_src(screen);
     // The set screen has three modes (the list and its two forms), and the
@@ -159,6 +166,9 @@ fn named_keys(text: &str) -> Vec<String> {
         ("[L/R]", &["L", "R"]),
         ("[R]", &["R"]),
         ("[R長押し]", &["R"]),
+        // The held [ZR]: one token, so it is not read as a bare [ZR] (which is
+        // the tap - a different job on the same key).
+        ("[ZR長]", &["ZR長"]),
     ];
     let mut out: Vec<String> = Vec::new();
     for (token, keys) in table {
@@ -333,6 +343,12 @@ fn audit_the_chips_name_keys_the_console_answers() {
                 "X" => vec!["X".into()],
                 "Y" => vec!["Y".into()],
                 "ZR" => vec!["Z".into()],
+                // The held [ZR]: the job [R] used to carry. It is not a key of
+                // its own - the state machine's [R] arm is what the hold runs
+                // (Editor::zr_hold_press) - so `answers` checks the screen's
+                // own [R] arm, and Editor::zr_hold_job is the list that says
+                // which screens may name it.
+                "ZR長" => vec!["ZR長".into()],
                 "+" | "＋" => vec!["Plus".into()],
                 "-" => vec!["Minus".into()],
                 "R" => vec!["R".into()],

@@ -16,6 +16,7 @@ use mhnx_core::hbedit::{
     PalicoEquip, PalicoSkill, Request, Screen, SetEdit, Shoulder, FOOTER_GUIDE_GAP, FOOTER_QUIT_W,
     FOOTER_RIGHT, GUILD_ROW_COMMENT, GUILD_ROW_NAME, GUILD_TAB_ARENA, GUILD_TAB_CARD,
     GUILD_TAB_COUNTS, GUILD_TAB_WEAPONS, PALICO_EQUIP_NONE, PALICO_EQUIP_ROWS, PALICO_MOVE_ROWS,
+    ZrHold,
 };
 use mhnx_core::save::{Save, BODY_SIZE, SLOT_STRIDE};
 
@@ -67,30 +68,34 @@ fn fn_body<'a>(src: &'a str, decl: &str) -> &'a str {
 // ---------------------------------------------------------------------------
 
 /// A1: [R] was answered by the sub-tab rule before the screen's own arm, so the
-/// "[R] 数値入力" both footers print opened nothing: the BOX tab moved instead.
+/// number keyboard both footers print opened nothing: the BOX tab moved instead.
+///
+/// The fix that gave [R] to the screen made the band asymmetric instead - [L]
+/// moved the tab and [R] opened a keyboard - so a user crossing the hunt
+/// record's tabs with the shoulders landed in the number entry and could not
+/// reach the guild card at all. Both keys are the tab now, and the job [R]
+/// carried is the held [ZR] (tests/shoulder_rule.rs pins the whole rule).
 #[test]
-fn the_two_screens_that_promise_a_number_take_r_for_typing() {
+fn the_two_screens_that_promise_a_number_keep_the_tab_on_r() {
     let mut ed = Editor::new();
 
     ed.screen = Screen::Items;
     assert_eq!(
         ed.shoulder_job(Key::R),
-        Shoulder::Screen,
-        "the item box's footer promises [R] 数値入力"
-    );
-    assert_eq!(
-        ed.shoulder_job(Key::L),
         Shoulder::SubTab,
-        "[L] still moves the BOX tab"
+        "the item box's [R] is the BOX tab, like its [L]"
+    );
+    assert_eq!(ed.shoulder_job(Key::L), Shoulder::SubTab);
+    assert_eq!(
+        ed.zr_hold_job(),
+        ZrHold::Action,
+        "the count keyboard is the held [ZR]"
     );
 
     ed.screen = Screen::Hunts;
-    assert_eq!(
-        ed.shoulder_job(Key::R),
-        Shoulder::Screen,
-        "the hunt record's footer promises [R] 数値入力"
-    );
+    assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab);
     assert_eq!(ed.shoulder_job(Key::L), Shoulder::SubTab);
+    assert_eq!(ed.zr_hold_job(), ZrHold::Action);
 
     // Every screen that does not hold a number keeps the tab moves, which is
     // the rule the whole navigation rests on.
@@ -108,17 +113,18 @@ fn the_two_screens_that_promise_a_number_take_r_for_typing() {
         assert_eq!(ed.shoulder_job(Key::L), Shoulder::SubTab, "{screen:?}");
     }
 
-    // The four pick lists are the ten-row step, and the screens that already
-    // had a keyboard keep it.
+    // The four pick lists are the ten-row step, and the three record screens
+    // that used to take [R] keep the tab.
     ed.screen = Screen::ItemPick;
     assert_eq!(ed.shoulder_job(Key::L), Shoulder::Move);
+    assert_eq!(ed.shoulder_job(Key::R), Shoulder::Move);
     ed.screen = Screen::EquipEdit;
-    assert_eq!(ed.shoulder_job(Key::R), Shoulder::Screen);
+    assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab);
     ed.screen = Screen::Guild;
     ed.set_guild_view(GUILD_TAB_CARD);
-    assert_eq!(ed.shoulder_job(Key::R), Shoulder::Screen);
+    assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab);
     ed.set_guild_view(GUILD_TAB_ARENA);
-    assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab, "the arena keeps [Y] for its time");
+    assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab);
 
     // The console asks instead of keeping its own list of exceptions.
     let ui = ui_src();
@@ -564,12 +570,13 @@ fn a_slot_change_puts_every_open_form_away() {
 }
 
 // ---------------------------------------------------------------------------
-// A9: the [R] pill is not drawn on rows that refuse the key
+// A9: the 数値入力 pill is not drawn on rows that refuse the key
 // ---------------------------------------------------------------------------
 
 /// A9: supports_direct_input lit the pill on every row of the guild card, but
 /// request_guild_text only answers the two numbers: the comment and the card
-/// name rows printed a keyboard they refused.
+/// name rows printed a keyboard they refused. The pill runs the held [ZR]'s
+/// job now (UiAction::ZrHold), and the rows it is drawn on are the same ones.
 #[test]
 fn the_guild_pill_is_only_on_the_rows_that_take_a_number() {
     let mut ed = Editor::new();
@@ -612,7 +619,7 @@ fn the_guild_pill_is_only_on_the_rows_that_take_a_number() {
     let ui = ui_src();
     assert!(
         ui.contains("ed.direct_input_available(row_idx)"),
-        "the [R] pill must be the state machine's answer"
+        "the 数値入力 pill must be the state machine's answer"
     );
 }
 

@@ -373,6 +373,65 @@ pub fn app_install_plan() -> InstallPlan {
     install_plan(APP_DIR, NRO_NAME)
 }
 
+// ---------------------------------------------------------------------------
+// The names as the C library sees them
+// ---------------------------------------------------------------------------
+
+/// The device every path the updater touches lives on.
+///
+/// libnx' fsdev resolves a path that carries no device name against whatever
+/// device is the default one (`setDefaultDevice` when the first device is
+/// mounted, the first mounted device after that). That is `sdmc` today because
+/// hbmenu mounts the card before the application starts - but it is a
+/// *default*, not a rule: a second mounted device, a different loader or a
+/// different mount order changes what `/switch/XXSE/XXSE.nro.new` means. The
+/// loader path handed to `envSetNextLoad` has always spelled the device out;
+/// every open, rename and remove spells it out now too, so the file the
+/// download writes and the file the swap looks for cannot be resolved against
+/// two different devices.
+pub const SD_DEVICE: &str = "sdmc:";
+
+/// "sdmc:" plus the fsdev path, unless the path already names a device.
+///
+/// A device name is the part before the first ':' and it only counts when it
+/// comes before the first '/': "sdmc:/switch/x" names a device, while
+/// "/switch/a:b" is a file called "a:b".
+pub fn device_path(path: &str) -> String {
+    let named = match (path.find(':'), path.find('/')) {
+        (Some(colon), Some(slash)) => colon < slash,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if named {
+        path.to_string()
+    } else {
+        format!("{}{}", SD_DEVICE, path)
+    }
+}
+
+/// The path as C wants it: with the device name, and with a NUL at the end.
+///
+/// The NUL is not decoration. `fopen` reads a C string, and a `Vec<u8>` built
+/// from a `String` has no terminator: the byte after it is whatever the
+/// allocator left in the padding. A download that hands such a buffer to
+/// `fopen` writes to a name that only looks like the one the swap will look
+/// for, and the user sees "ダウンロードしたファイルがありません" right after a
+/// download that said it was done.
+pub fn c_path(path: &str) -> Vec<u8> {
+    let mut out = device_path(path).into_bytes();
+    out.push(0);
+    out
+}
+
+/// The folder a path sits in: "/switch/XXSE/XXSE.nro.new" -> "/switch/XXSE".
+pub fn dir_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) => "/",
+        Some(i) => &path[..i],
+        None => "",
+    }
+}
+
 /// The file operations the swap needs, so the swap itself can be tested on the
 /// host with a fake card instead of a real one.
 pub trait RenameFs {
@@ -408,6 +467,21 @@ impl InstallError {
             InstallError::ActivateFailed => {
                 format!("差し替えに失敗しました。元のファイルは {} にあります", plan.backup)
             }
+        }
+    }
+
+    /// The sentence for a failure, with the card's own answer when the staged
+    /// file is the thing that is missing.
+    ///
+    /// The bare 「ダウンロードしたファイルがありません」 is the one thing the
+    /// user already knew. What the folder holds - a 0-byte `.new`, a `.new`
+    /// under a name that is not quite the one we look for, a `.bak` from an
+    /// earlier attempt, or nothing at all - is what makes the next report an
+    /// answer instead of a symptom.
+    pub fn message_with_card(&self, plan: &InstallPlan, expected: u64, card: &CardDir) -> String {
+        match self {
+            InstallError::MissingStaged => missing_staged_message(plan, expected, card),
+            other => other.message(plan),
         }
     }
 }
@@ -447,6 +521,143 @@ pub fn staged_is_complete(staged_size: u64, expected_size: u64) -> bool {
         return staged_size > 0;
     }
     staged_size == expected_size
+}
+
+// ---------------------------------------------------------------------------
+// What the card actually holds
+// ---------------------------------------------------------------------------
+
+/// How many names one failure message lists.
+pub const DIR_LIST_MAX: usize = 6;
+
+/// One name in the application folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub size: u64,
+}
+
+/// The application folder as the card reports it.
+///
+/// The console fills this in from the real card when a swap fails. A failed
+/// swap used to say only that the staged file was not there; the listing is
+/// what turns the next report into an answer, because a `.new` of 0 bytes, a
+/// `.new` under a name that is not quite the one we look for, a `.bak` from
+/// an earlier attempt and an empty folder are four different bugs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CardDir {
+    pub entries: Vec<DirEntry>,
+}
+
+impl CardDir {
+    pub fn new(entries: Vec<DirEntry>) -> CardDir {
+        CardDir { entries }
+    }
+
+    /// The size of one name in this folder. The path may carry a device name
+    /// and any number of folders; only the last component is compared, so the
+    /// caller can pass the same names the swap uses.
+    pub fn size_of(&self, path: &str) -> Option<u64> {
+        let name = match path.rfind('/') {
+            Some(i) => &path[i + 1..],
+            None => path,
+        };
+        self.entries.iter().find(|e| e.name == name).map(|e| e.size)
+    }
+
+    /// The folder as one line a dialog can draw.
+    pub fn describe(&self, max: usize) -> String {
+        if self.entries.is_empty() {
+            return String::from("（ファイルがありません）");
+        }
+        let max = if max == 0 { 1 } else { max };
+        let mut out = String::new();
+        for (i, entry) in self.entries.iter().enumerate() {
+            if i >= max {
+                out.push_str(&format!(" ほか {} 件", self.entries.len() - max));
+                break;
+            }
+            if !out.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("{} {} バイト", entry.name, entry.size));
+        }
+        out
+    }
+}
+
+/// What the card says about the staged download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedState {
+    /// There, and the size the release declared.
+    Ready(u64),
+    /// Not there at all.
+    Missing,
+    /// There, but not the size the release declared.
+    WrongSize { found: u64 },
+}
+
+/// Read the card's answer for the staged file.
+pub fn staged_state(found: Option<u64>, expected: u64) -> StagedState {
+    match found {
+        None => StagedState::Missing,
+        Some(size) if staged_is_complete(size, expected) => StagedState::Ready(size),
+        Some(size) => StagedState::WrongSize { found: size },
+    }
+}
+
+/// Is the file the loader starts already the new one?
+///
+/// A successful swap leaves no `.new` behind: the staged file *became* the
+/// target. So "no `.new`" on its own is not a failure - when the target is
+/// exactly the size the release declared, the bytes are in place and the only
+/// thing missing is a restart.
+pub fn already_installed(plan: &InstallPlan, expected: u64, card: &CardDir) -> bool {
+    if expected == 0 {
+        // The release declared no size: there is nothing to compare, and
+        // claiming "updated" on a guess is worse than asking for another try.
+        return false;
+    }
+    card.size_of(&plan.target) == Some(expected)
+}
+
+/// What to say when the swap cannot find the staged file.
+pub fn missing_staged_message(plan: &InstallPlan, expected: u64, card: &CardDir) -> String {
+    if already_installed(plan, expected, card) {
+        return format!(
+            "更新済みです。再起動してください（{} は新しい版と同じ {} バイトです）",
+            plan.target, expected
+        );
+    }
+    format!(
+        "ダウンロードしたファイルがありません（{}）。{} の中身: {}",
+        plan.staged,
+        dir_of(&plan.staged),
+        card.describe(DIR_LIST_MAX)
+    )
+}
+
+/// What to say when the download said it was done but the card disagrees.
+///
+/// `None` means the card agrees with the download and the swap may go ahead.
+pub fn post_download_message(
+    plan: &InstallPlan,
+    expected: u64,
+    state: StagedState,
+    card: &CardDir,
+) -> Option<String> {
+    match state {
+        StagedState::Ready(_) => None,
+        StagedState::Missing => Some(missing_staged_message(plan, expected, card)),
+        StagedState::WrongSize { found } => Some(format!(
+            "保存したファイルの大きさが違います（{}: {} / {} バイト）。{} の中身: {}",
+            plan.staged,
+            found,
+            expected,
+            dir_of(&plan.staged),
+            card.describe(DIR_LIST_MAX)
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@
 //! Every test here is a reproduction: it fails on the commit before this one.
 
 use mhnx_core::hbedit::{
-    self, caption_width, Editor, ItemSetOp, Key, PalicoEquip, Screen, FOOTER_HINT_ROOM,
+    self, caption_width, Editor, ItemSetOp, Key, PalicoEquip, Screen, Shoulder, FOOTER_HINT_ROOM,
     GUILD_TAB_ARENA, GUILD_TAB_CARD, GUILD_TAB_COUNTS, GUILD_TAB_WEAPONS, QUEST_TAB_REWARDS,
     QUEST_TAB_SUPPLIES,
 };
@@ -612,8 +612,8 @@ fn the_talisman_form_can_show_the_second_press() {
 // D14. One search item on the supply tab
 // ---------------------------------------------------------------------------
 
-/// [ZR] and [R] open the same keyboard on 支給品, so the line printed 検索
-/// twice for one job.
+/// The [ZR] tap and the held [ZR] open the same keyboard on 支給品, so the line
+/// printed 検索 twice for one job.
 #[test]
 fn one_search_item_on_the_supply_tab() {
     let mut ed = editor(Screen::QuestEdit);
@@ -624,7 +624,7 @@ fn one_search_item_on_the_supply_tab() {
         .filter(|f| f.label == hbedit::WORD_SEARCH)
         .map(|f| f.key.to_string())
         .collect();
-    assert_eq!(searches, vec![String::from("R")], "one search item");
+    assert_eq!(searches, vec![String::from("ZR長")], "one search item");
     let hint = ed.footer_hint();
     assert_eq!(hint.matches("検索").count(), 1, "{hint}");
 }
@@ -658,12 +658,21 @@ fn one_save_item_on_the_options_screen() {
 /// [Y] walks the three views that hold the card's numbers, and the table said
 /// 表示 / 回数/武器 / 武器 for the same press while the two warning strips said
 /// "クエスト回数 → 武器使用数" and "武器使用数へ" in their own words.
+///
+/// The walk is the shoulder pair now - the four views are the bar's tabs
+/// (sub_tabs_for) - so the line spends no item on [Y] at all: the tab strip is
+/// on the glass and the footer would only repeat it. [Y] still walks them.
 #[test]
 fn one_y_word_on_the_guild_views() {
     let mut ed = editor(Screen::Guild);
     for view in [GUILD_TAB_CARD, GUILD_TAB_COUNTS, GUILD_TAB_WEAPONS] {
         ed.set_guild_view(view);
-        assert_eq!(label(&ed, "Y"), "表示", "view {view}");
+        assert_eq!(
+            ed.key_label("Y"),
+            None,
+            "view {view}: the walk is the shoulders, not [Y]"
+        );
+        assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab, "view {view}");
     }
     // The arena view's [Y] is the keyboard, and the table says so.
     ed.set_guild_view(GUILD_TAB_ARENA);

@@ -508,8 +508,8 @@ fn the_talisman_form_names_the_search_key() {
     assert!(ed.take_text_request().is_some(), "[Y] must ask for the name");
 }
 
-/// The equipment form's [R] is the ID keyboard on the two identity rows, and
-/// the line did not name it.
+/// The equipment form's held [ZR] is the ID keyboard on the two identity rows,
+/// and the line did not name it.
 #[test]
 fn the_equipment_form_names_the_id_key() {
     let mut ed = editor(Screen::EquipEdit);
@@ -517,11 +517,11 @@ fn the_equipment_form_names_the_id_key() {
         new: true,
         ..hbedit::EquipEdit::default()
     });
-    assert!(names(&ed, "R"), "{:?}", ed.key_facts());
-    assert_eq!(label(&ed, "R"), "ID入力");
+    assert!(names(&ed, "ZR長"), "{:?}", ed.key_facts());
+    assert_eq!(label(&ed, "ZR長"), "ID入力");
     ed.equip_edit.as_mut().expect("a form").field = 1;
-    ed.input(Key::R);
-    assert!(ed.take_text_request().is_some(), "[R] must ask for the id");
+    assert!(ed.zr_hold_press(), "the held [ZR] asks for the id");
+    assert!(ed.take_text_request().is_some(), "the hold must ask for the id");
 }
 
 /// 生データ edits bytes, so [X] is the save key there like everywhere else -
@@ -553,7 +553,9 @@ const PRE_MERGE: &[(&str, &[&str])] = &[
     ("SaveList", &["A", "Y"]),
     ("Slots", &["A", "Y", "B"]),
     ("Char", &["A", "◀/▶", "Y", "B"]),
-    ("Items", &["A", "◀/▶", "R", "Y", "ZR", "B"]),
+    // The number keyboard is the held [ZR] now (the shoulders are both tab
+    // keys), so the key this table named as [R] is [ZR長].
+    ("Items", &["A", "◀/▶", "ZR長", "Y", "ZR", "B"]),
     ("ItemPick", &["A", "◀/▶", "▲/▼", "Y", "B"]),
     ("SkillPick", &["A", "◀/▶", "▲/▼", "Y", "B"]),
     ("JewelPick", &["A", "◀/▶", "▲/▼", "Y", "B"]),
@@ -561,19 +563,19 @@ const PRE_MERGE: &[(&str, &[&str])] = &[
     ("Charms", &["A", "Y", "-", "B"]),
     ("CharmEdit", &["A", "◀/▶", "Y", "B"]),
     ("Equip", &["A", "Y", "-", "B"]),
-    ("EquipEdit", &["A", "◀/▶", "Y", "R", "B"]),
+    ("EquipEdit", &["A", "◀/▶", "Y", "ZR長", "B"]),
     ("QuestEquip", &["A", "B"]),
     ("SaveQuests", &["A", "-", "Y", "ZR", "B"]),
     ("ArcList", &["A", "Y", "ZR", "B"]),
-    ("QuestEdit", &["A", "◀/▶", "Y", "ZR", "R", "B"]),
+    ("QuestEdit", &["A", "◀/▶", "Y", "ZR", "ZR長", "B"]),
     ("ArcEntries", &["A", "Y", "ZR", "B"]),
-    ("EntryView", &["A", "◀/▶", "Y", "ZR", "R", "B"]),
+    ("EntryView", &["A", "◀/▶", "Y", "ZR", "ZR長", "B"]),
     ("Mib", &["A", "◀/▶", "Y", "ZR", "B"]),
     ("Gmd", &["A", "B"]),
     ("Check", &["A", "B"]),
-    ("Hunts", &["A", "◀/▶", "Y", "ZR", "R", "B"]),
-    ("Guild", &["A", "◀/▶", "Y", "ZR", "R", "B"]),
-    ("Progress", &["A", "◀/▶", "Y", "ZR", "R", "B"]),
+    ("Hunts", &["A", "◀/▶", "Y", "ZR", "ZR長", "B"]),
+    ("Guild", &["A", "◀/▶", "Y", "ZR", "ZR長", "B"]),
+    ("Progress", &["A", "◀/▶", "Y", "ZR", "ZR長", "B"]),
     ("Roster", &["A", "◀/▶", "Y", "ZR", "B"]),
     ("Palico", &["A", "◀/▶", "Y", "ZR", "B"]),
     ("Sets", &["A", "◀/▶", "-", "Y", "B"]),
@@ -689,7 +691,7 @@ fn the_deck_borrows_the_tables_words() {
         "pill_word(ed, \"◀/▶\"",
         "pill_word(ed, \"A\"",
         "pill_word(ed, \"Y\"",
-        "pill_word(ed, \"R\"",
+        "pill_word(ed, \"ZR長\"",
     ] {
         assert!(UI_SRC.contains(needle), "the deck must borrow {needle}");
     }

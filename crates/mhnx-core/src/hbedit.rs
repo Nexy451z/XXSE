@@ -192,24 +192,34 @@ enum FormLeaveAsk {
 
 /// What a shoulder press means on the screen that is showing.
 ///
-/// [L] / [R] are the sub-tab keys by default, and that default is the whole
-/// navigation rule: a shoulder tap moves the tab strip and nothing else. A few
-/// screens take the key back, and each one is named here rather than left to a
-/// negative list at the call site - the negative list is how [R] came to
-/// swallow the numeric input the item box and the hunt record print in their
-/// own footers ("[R] 数値入力"), so choosing a BOX tab moved the tab instead of
-/// opening the keyboard.
+/// [L] / [R] are the sub-tab keys, and that is the whole navigation rule: a
+/// shoulder press moves the tab strip and nothing else. The rule is one line
+/// because the two keys are one band - the console answers them on the same
+/// frame, and a screen that took [R] back made one gesture mean two things
+/// depending on which shoulder was used. That is exactly what the pad did: [L]
+/// moved the tab and [R] opened a keyboard on the item box, the hunt record,
+/// the guild card, the reward rows and the equipment form, so a user crossing
+/// the hunt record's tabs with the shoulders landed in the number entry and
+/// could not reach the guild card at all.
+///
+/// The jobs [R] carried are [ZR] held now ([Editor::zr_hold_job]), which is the
+/// key those screens already own for their second action - so nothing lost a
+/// key, and no screen can take a shoulder back again.
+///
+/// Three answers, and every one of them is named here rather than left to a
+/// negative list at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shoulder {
-    /// Previous / next sub-tab: the default on every screen.
+    /// Previous / next sub-tab: the answer on every screen of the editor.
     SubTab,
     /// The ten-row jump of a pick list: the shoulder is turned into [◀] / [▶].
     Move,
-    /// The screen's own key: the console hands the press to that screen's
-    /// handler. Not necessarily the state machine's [L] / [R] - the item box's
-    /// [R] opens the count keyboard, which the console owns - so the press must
-    /// not be forwarded blindly.
-    Screen,
+    /// A modal panel that owns every key while it is open (the palico skill
+    /// panel): the press is forwarded to the panel, and the tab strip under it
+    /// must not move. No *screen* answers this - a screen that did would be
+    /// taking a shoulder back, which is the bug this enum exists to make
+    /// impossible.
+    Panel,
     /// Nobody: a modal form owns the screen and neither reads the shoulder nor
     /// lets the tab strip under it move.
     Swallow,
@@ -239,6 +249,30 @@ pub enum ZrJob {
     /// The screen's own second action. The console hands the press to the state
     /// machine, exactly as it does for every other key.
     Screen,
+}
+
+/// What a *held* [ZR] means on the screen that is showing.
+///
+/// The jobs [R] carried before the shoulders became one band live here now: the
+/// number keyboard of the item box, the hunt record, the guild card and the
+/// reward / supply rows, the item search of the quest editor's two item tabs,
+/// the 既読 bit of the progress screen's quest view, the id keyboard of the
+/// equipment form and ポーチへ適用 on the item set form. [R] is a tab key on
+/// every one of those screens now, so each job needed a key of its own - and
+/// [ZR] is the key those screens already own (its tap is the screen's second
+/// action, [Editor::zr_job]), so the hold is the second job of the same key
+/// rather than a new key nobody has.
+///
+/// The hold is answered on the frame it crosses the threshold, the same way
+/// [R]'s 詳細 is ([ShoulderTap]): a press that lingers is the hold, and a press
+/// that comes up first is still the tap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZrHold {
+    /// No second job behind the key on this screen: the hold does nothing and
+    /// the press is still the tap.
+    None,
+    /// The job [R] used to carry. The console runs [Editor::zr_hold_press].
+    Action,
 }
 
 /// What 詳細 would open, captured when the key went down.
@@ -368,7 +402,7 @@ pub const QUEST_TAB_LABELS: [&str; QUEST_TABS] = ["基本", "モンスター", "
 /// The cycle used to end on a 検索 stop that holds no value, and the fix then
 /// was to drop to two - but the item cell is a real cell with its own action
 /// ([A] opens the picker), so the row's own screen walks three and this tab
-/// does too. The search is its own press ([R] and the 検索 pill).
+/// does too. The search is its own press (the held [ZR] and the 検索 pill).
 pub const QUEST_REWARD_ITEM: usize = 0;
 /// The count column of a reward row.
 pub const QUEST_REWARD_COUNT: usize = 1;
@@ -2410,7 +2444,7 @@ pub fn equip_form_rows(e: &EquipEdit, ename: &str) -> Vec<EquipFormRow> {
             row(
                 1,
                 "アイテムID",
-                String::from("[A] 名前から選ぶ / ◀ ▶ で10件 / [R] ID入力 / [Y] 検索"),
+                String::from("[A] 名前から選ぶ / ◀ ▶ で10件 / [ZR] 長押し ID入力 / [Y] 検索"),
                 named,
             ),
             row(
@@ -2462,7 +2496,7 @@ pub fn equip_form_rows(e: &EquipEdit, ename: &str) -> Vec<EquipFormRow> {
         row(
             8,
             "アイテムID",
-            String::from("[A] 名前から選ぶ / ◀ ▶ で10件 / [R] ID入力 / 変えると差し替え"),
+            String::from("[A] 名前から選ぶ / ◀ ▶ で10件 / [ZR] 長押し ID入力 / 変えると差し替え"),
             named,
         ),
     ]
@@ -7746,10 +7780,10 @@ impl Editor {
                 "闘技大会: ▲▼ アリーナ / ◀▶ 順位 / [A] 編集 / [Y] 直接入力 / [X] 保存",
             ),
             GUILD_TAB_COUNTS => String::from(
-                "クエスト回数: ▼ 項目 / ◀▶ 増減 / [R] 数値入力 / [X] 保存（[ZR] 進行状況）",
+                "クエスト回数: ▼ 項目 / ◀▶ 増減 / [ZR] 長押し 数値入力 / [X] 保存（[ZR] 進行状況）",
             ),
             GUILD_TAB_WEAPONS => String::from(
-                "武器使用数: ▲▼ 武器 / ◀▶ 会場 / [A] 編集 / [R] 数値入力 / [X] 保存",
+                "武器使用数: ▲▼ 武器 / ◀▶ 会場 / [A] 編集 / [ZR] 長押し 数値入力 / [X] 保存",
             ),
             _ => String::from("ギルドカード: ▼ 項目 / ◀▶ 増減 / [A] コメント / [ZR] 進行状況 / [X] 保存"),
         };
@@ -8486,7 +8520,7 @@ impl Editor {
                     alloc::format!("段送り（{}段）", self.entry_field_count()),
                 ),
                 KeyFact::new("A", self.entry_a_label()),
-                KeyFact::new("R", "数値入力"),
+                KeyFact::new("ZR長", "数値"),
                 KeyFact::new("Y", "刻み"),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
@@ -8498,8 +8532,7 @@ impl Editor {
             // it at all.
             Screen::Guild if self.guild_view() == GUILD_TAB_CARD => alloc::vec![
                 KeyFact::new("◀/▶", "増減"),
-                KeyFact::new("R", "数値"),
-                KeyFact::new("Y", "表示"),
+                KeyFact::new("ZR長", "数値"),
                 KeyFact::new("A", "+刻み"),
                 KeyFact::new("ZR", "進行"),
                 KeyFact::new("X", WORD_SAVE),
@@ -8509,9 +8542,8 @@ impl Editor {
             // jobs, and the counts line carries eight items on a 763px strip.
             Screen::Guild if self.guild_view() == GUILD_TAB_COUNTS => alloc::vec![
                 KeyFact::new("◀/▶", "増減"),
-                KeyFact::new("R", "数値"),
+                KeyFact::new("ZR長", "数値"),
                 KeyFact::new("A", "+刻み"),
-                KeyFact::new("Y", "表示"),
                 KeyFact::new("ZR", "進行"),
                 KeyFact::new("B", self.b_word()),
                 KeyFact::new("X", WORD_SAVE),
@@ -8521,7 +8553,7 @@ impl Editor {
                     alloc::vec![
                         KeyFact::new("▲/▼", "±刻み"),
                         KeyFact::new("◀/▶", "±10"),
-                        KeyFact::new("R", "数値入力"),
+                        KeyFact::new("ZR長", "数値"),
                         KeyFact::new("A", "終了"),
                         KeyFact::new("X", WORD_SAVE),
                     ]
@@ -8533,8 +8565,7 @@ impl Editor {
                         KeyFact::new("▲/▼", "行"),
                         KeyFact::new("◀/▶", "会場"),
                         KeyFact::new("A", "編集"),
-                        KeyFact::new("R", "数値"),
-                        KeyFact::new("Y", "表示"),
+                        KeyFact::new("ZR長", "数値"),
                         KeyFact::new("B", self.b_word()),
                         KeyFact::new("X", WORD_SAVE),
                     ]
@@ -8544,7 +8575,7 @@ impl Editor {
             // missing: the card view is the only screen in the section whose
             // way out was named nowhere - not in the footer, not on the deck.
             Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => alloc::vec![
-                KeyFact::new("R", "数値入力"),
+                KeyFact::new("ZR長", "数値"),
                 // The same word the card view prints: [Y] walks the three views
                 // that hold the card's numbers (Editor::guild_next_view), so one
                 // key had three words (表示 / 回数/武器 / 武器) for one press.
@@ -8571,13 +8602,13 @@ impl Editor {
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
-            // 進行状況's quest view has a second bit per row, and [R] is the key
-            // that writes it (Editor::shoulder_job takes the key back from the
-            // sub-tab rule on this view). The line names it; the other two
-            // views keep the static one, which names the tab move instead.
+            // 進行状況's quest view has a second bit per row, and the held [ZR]
+            // is the key that writes it (Editor::zr_hold_job). The line names
+            // it; the other two views keep the static one, which names the tab
+            // move instead.
             Screen::Progress if self.progress_view() == PROGRESS_QUESTS => alloc::vec![
                 KeyFact::new("A", "ビット"),
-                KeyFact::new("R", "既読"),
+                KeyFact::new("ZR長", "既読"),
                 KeyFact::new("Y", "タブ"),
                 KeyFact::new("ZR", "検索"),
                 KeyFact::new("X", WORD_SAVE),
@@ -8662,8 +8693,10 @@ impl Editor {
             // [ZR] opens the bulk operation menu - the key [-] used to carry
             // before it became the delete key. The name search is a row inside
             // that menu now, so the line names the menu and not the search.
-            // One word for the number key on every screen: "[R] 数値入力",
-            // the same words the deck's button and the inspector pill print.
+            // One word for the number key on every screen: "[ZR長] 数値", the
+            // same words the deck's button and the inspector pill print. The
+            // key is the held [ZR] on every screen, so the chip is one token
+            // ("ZR長" = ZR 長押し) rather than a second key name.
             // [Y] is named here: the box is the one list whose [Y] changes what
             // the list *shows* (所持品のみ <-> 空きも表示), the heading prints
             // the state, and the line that says how to change it was missing -
@@ -8679,7 +8712,7 @@ impl Editor {
             Screen::Items => alloc::vec![
                 KeyFact::new("A", "変更"),
                 KeyFact::new("◀/▶", "個数"),
-                KeyFact::new("R", "数値"),
+                KeyFact::new("ZR長", "数値"),
                 KeyFact::new("Y", "空き枠"),
                 KeyFact::new("ZR", "一括"),
                 KeyFact::new("X", WORD_SAVE),
@@ -8731,15 +8764,15 @@ impl Editor {
             // decoration list, the numeric rows step, 装備枠 writes and the new
             // form's レベル creates. [Y] is the search shortcut into the same
             // two lists.
-            // [R] is the ID keyboard on the two identity rows and was named
-            // nowhere: the deck and the inspector pill were the only places
-            // that said so. The [B] word says what the second press does
+            // The held [ZR] is the ID keyboard on the two identity rows and
+            // was named nowhere: the deck and the inspector pill were the only
+            // places that said so. The [B] word says what the second press does
             // instead of counting it.
             Screen::EquipEdit => alloc::vec![
                 KeyFact::new("A", "操作"),
                 KeyFact::new("◀/▶", "10"),
                 KeyFact::new("Y", WORD_SEARCH),
-                KeyFact::new("R", "ID入力"),
+                KeyFact::new("ZR長", "ID入力"),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
@@ -8778,13 +8811,14 @@ impl Editor {
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
-            // [R] is ポーチへ適用: the copy into the pouch had no key at all
-            // (the deck's pill was the only door), so the form's one free key
-            // took it.
+            // The held [ZR] is ポーチへ適用: the copy into the pouch had no key
+            // at all (the deck's pill was the only door), so the form's one
+            // free key took it. [R] is the sub-tab now, like every other
+            // screen.
             Screen::Sets if self.item_set_edit.is_some() => alloc::vec![
                 KeyFact::new("A", "決定"),
                 KeyFact::new("Y", "取込（2回）"),
-                KeyFact::new("R", "ポーチへ"),
+                KeyFact::new("ZR長", "ポーチへ"),
                 KeyFact::new("ZR", "名前"),
                 KeyFact::new("B", self.b_word()),
             ],
@@ -8838,15 +8872,15 @@ impl Editor {
                 KeyFact::new("Y", "列"),
                 KeyFact::new("A", "刻み"),
                 KeyFact::new("ZR", "表示"),
-                KeyFact::new("R", "数値入力"),
+                KeyFact::new("ZR長", "数値"),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
             // [Y] is the tab key on all three views. On the quest view it used
             // to write the 既読 bit - a save write on a key that moved the tab
             // on the other two views, which is the review's finding. The write
-            // is [R] there, and this line is the two views that have no second
-            // bit: screen_facts writes the quest view's own line.
+            // is the held [ZR] there, and this line is the two views that have
+            // no second bit: screen_facts writes the quest view's own line.
             Screen::Progress => alloc::vec![
                 KeyFact::new("A", "ビット"),
                 KeyFact::new("Y", "タブ"),
@@ -8857,10 +8891,9 @@ impl Editor {
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
-            // No [R] in this line: the console answers [R] with the sub-tab,
-            // so the SD write every quest needs is the deck's button
-            // (Editor::request_extract_all_quests) rather than a promise this
-            // key cannot keep.
+            // No number key in this line: the SD write every quest needs is
+            // the deck's button (Editor::request_extract_all_quests) rather
+            // than a promise a key cannot keep.
             // [B] goes to the SD(.arc) list, which is the tab beside this one
             // - the guide names it rather than saying 戻る.
             // [ZR] is the bulk install of the bundled quests. The state machine
@@ -9048,18 +9081,19 @@ impl Editor {
                 KeyFact::new("A", "アイテム"),
                 KeyFact::new("◀/▶", "値"),
                 KeyFact::new("ZR", "段送り（2段）"),
-                KeyFact::new("R", WORD_SEARCH),
+                KeyFact::new("ZR長", WORD_SEARCH),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
-            // 支給品: one search item, not two. [ZR] and [R] both open the same
-            // keyboard on this tab (it has one value and nothing to switch), so
-            // the line printed 検索 twice for one job; [R] is the key the two
-            // item tabs share and the one the line names.
+            // 支給品: one search item, not two. The [ZR] tap and the [ZR] hold
+            // both open the same keyboard on this tab (it has one value and
+            // nothing to switch), so the line printed 検索 twice for one job;
+            // the hold is the key the two item tabs share and the one the line
+            // names.
             _ => alloc::vec![
                 KeyFact::new("A", "アイテム"),
                 KeyFact::new("◀/▶", "値"),
-                KeyFact::new("R", WORD_SEARCH),
+                KeyFact::new("ZR長", WORD_SEARCH),
                 KeyFact::new("X", WORD_SAVE),
                 KeyFact::new("B", self.b_word()),
             ],
@@ -9127,76 +9161,119 @@ impl Editor {
 
     /// What a shoulder press means on the screen that is showing.
     ///
-    /// See [Shoulder]: the sub-tab is the default, the pick lists move ten
-    /// rows, and the screens whose footer promises "[R] 数値入力" get the key
-    /// before the tab strip does.
+    /// See [Shoulder]. One answer for the band: the sub-tab on every screen, the
+    /// ten-row step on the four pick lists, and nothing at all under a form or
+    /// panel that owns the screen. No screen takes a shoulder back - the jobs
+    /// that used to be [R] are [ZR] held ([Editor::zr_hold_job]).
     pub fn shoulder_job(&self, key: Key) -> Shoulder {
+        // The two keys are one band, and the console answers both on the same
+        // frame: the question is asked per press, so a caller passing anything
+        // else is a wiring bug rather than a screen with a third shoulder.
+        debug_assert!(
+            matches!(key, Key::L | Key::R),
+            "shoulder_job is asked about a shoulder"
+        );
         // The forms that own their screen keep the shoulders too: a tab move
         // under them would leave a form open on a screen that no longer shows
-        // it. (The set form's own keys are directions, so a shoulder is nobody's
-        // there; the palico skill panel steps its candidate list with them.)
-        if self.screen == Screen::Sets && self.set_edit.is_some() {
+        // it. Both set forms answer the same way - the item set form's [R] was
+        // ポーチへ適用 and is [ZR] held now, so the form has no shoulder job of
+        // its own left.
+        if self.screen == Screen::Sets && (self.set_edit.is_some() || self.item_set_edit.is_some()) {
             return Shoulder::Swallow;
         }
         if self.palico_equip_open() {
             return Shoulder::Swallow;
         }
+        // The one panel that reads the shoulders itself: it steps its candidate
+        // list ten at a time with them.
         if self.palico_skill_open() {
-            return Shoulder::Screen;
+            return Shoulder::Panel;
         }
-        let right = key == Key::R;
         match self.screen {
             // The four pick lists move ten rows with the shoulders.
             Screen::ItemPick | Screen::SkillPick | Screen::JewelPick | Screen::EquipPick => {
                 Shoulder::Move
             }
-            // [R] types the count of the selected slot, and both footers say so
-            // ("[R] 数値入力"): the tab strip must not answer first.
-            Screen::Items | Screen::Hunts if right => Shoulder::Screen,
-            // A reward / supply row holds numbers too.
-            Screen::EntryView if right && self.entry_has_numbers() => Shoulder::Screen,
-            // クエスト改造's 報酬 / 支給品 tabs print "[R] 検索" in their footer,
-            // and [R] was answered by the sub-tab rule first - so the key the
-            // line named moved to the next tab and the search never opened. The
-            // two tabs take the key back. 基本 / モンスター name no [R], so they
-            // keep the tab move.
-            Screen::QuestEdit
-                if right
-                    && matches!(
-                        self.quest_edit_tab,
-                        QUEST_TAB_REWARDS | QUEST_TAB_SUPPLIES
-                    ) =>
-            {
-                Shoulder::Screen
-            }
-            // 進行状況's quest view has a second bit per row (既読) and [R] is
-            // the key its footer names for it. The award and request views have
-            // one bit per row ([A]) and no such key, so they keep the tab move.
-            Screen::Progress if right && self.progress_view() == PROGRESS_QUESTS => {
-                Shoulder::Screen
-            }
-            // The equipment form's two identity rows take [R] as the ID entry
-            // key (the number a user knows and cannot reach by stepping).
-            Screen::EquipEdit if right => Shoulder::Screen,
-            // The card's numeric rows take [R] as the keyboard; the arena view
-            // is the one that does not - it spends [Y] on the time instead.
-            Screen::Guild if right && self.guild_view() != GUILD_TAB_ARENA => Shoulder::Screen,
-            // The item set form's [R] is ポーチへ適用: the copy into the pouch
-            // was the deck's pill alone, so the pad could not reach it at all.
-            // [L] keeps the sub-tab, [R] is the form's own key - the same shape
-            // the equipment form's [R] (the id keyboard) has.
-            Screen::Sets if right && self.item_set_edit.is_some() => Shoulder::Screen,
+            // Every other screen - including the four that hold a number, the
+            // quest editor's two item tabs, the progress screen's quest view,
+            // the equipment form and the guild card: the same tab move the
+            // other shoulder makes.
             _ => Shoulder::SubTab,
         }
     }
 
-    /// Does the row under the cursor hold a number [R] can type?
+    /// What a held [ZR] means on the screen that is showing.
     ///
-    /// The inspector draws the [R] 数値入力 pill from this answer, so a row
-    /// that refuses the key has to answer false: the pill is a promise, and a
-    /// pill that only ever answers "no number here" is the shape of bug this
-    /// rule exists for. The guild card's comment and its own copy of the name
-    /// are text ([A] opens them), which is why they are not rows 0 and 1.
+    /// See [ZrHold]. This is the question the console asks on the frame the key
+    /// crosses the hold threshold, and it is the same list of jobs
+    /// [Editor::shoulder_job] used to answer "the screen's own key" for -
+    /// moved to the key those screens already own, so that neither shoulder is
+    /// special any more.
+    pub fn zr_hold_job(&self) -> ZrHold {
+        // A panel or form that owns the screen owns both keys: the hold is not
+        // a second job of the screen underneath.
+        if self.palico_equip_open() || self.palico_skill_open() {
+            return ZrHold::None;
+        }
+        if self.screen == Screen::Sets {
+            // The item set form's held [ZR] is ポーチへ適用 - the one hold on
+            // this list that types nothing. The equipment form has no hold job
+            // at all: its [R] was the id keyboard, and the form's own [A] / [Y]
+            // already reach the pickers that key opened.
+            return if self.item_set_edit.is_some() {
+                ZrHold::Action
+            } else {
+                ZrHold::None
+            };
+        }
+        match self.screen {
+            // The four screens that hold a number a user would rather type than
+            // step: the count of the selected slot, the hunt count / size, the
+            // card's HR and play time, the reward / supply row's two cells.
+            Screen::Items if !self.item_menu_open => ZrHold::Action,
+            Screen::Hunts => ZrHold::Action,
+            Screen::Guild if self.guild_view() != GUILD_TAB_ARENA => ZrHold::Action,
+            Screen::EntryView if self.entry_has_numbers() => ZrHold::Action,
+            // クエスト改造's 報酬 / 支給品 tabs: the item name search. 基本 /
+            // モンスター have nothing to search and say so.
+            Screen::QuestEdit
+                if matches!(
+                    self.quest_edit_tab,
+                    QUEST_TAB_REWARDS | QUEST_TAB_SUPPLIES
+                ) =>
+            {
+                ZrHold::Action
+            }
+            // 進行状況's quest view has a second bit per row (既読). The award
+            // and request views have one bit per row ([A]) and no such job.
+            Screen::Progress if self.progress_view() == PROGRESS_QUESTS => ZrHold::Action,
+            // The equipment form's two identity rows: the id keyboard, for the
+            // number a user knows and cannot reach by stepping.
+            Screen::EquipEdit if self.equip_edit.is_some() => ZrHold::Action,
+            _ => ZrHold::None,
+        }
+    }
+
+    /// Run the held [ZR]'s job. False when the screen has none.
+    ///
+    /// The job is the state machine's own [R] arm: the pad no longer sends that
+    /// key, but the headless build and the PC build still do, so there is one
+    /// implementation of each job and not a second copy for the hold.
+    pub fn zr_hold_press(&mut self) -> bool {
+        if self.zr_hold_job() == ZrHold::None {
+            return false;
+        }
+        self.input(Key::R);
+        true
+    }
+
+    /// Does the row under the cursor hold a number the held [ZR] can type?
+    ///
+    /// The inspector draws the 数値入力 pill from this answer, so a row that
+    /// refuses the key has to answer false: the pill is a promise, and a pill
+    /// that only ever answers "no number here" is the shape of bug this rule
+    /// exists for. The guild card's comment and its own copy of the name are
+    /// text ([A] opens them), which is why they are not rows 0 and 1.
     pub fn direct_input_available(&self, row: usize) -> bool {
         match self.screen {
             Screen::Items | Screen::Hunts => true,
@@ -9204,8 +9281,9 @@ impl Editor {
             // from the form's own layout: editing is 7 種別 / 8 ID, creating is
             // 0 種別 / 1 ID. The literal 1 | 8 was the creating form's ID row
             // plus the editing form's ID row, so the editing form drew the pill
-            // on its レベル row - where [R] only answers "種別・ID の行で使いま
-            // す". The pill is a promise, so it follows the rows that keep it.
+            // on its レベル row - where the hold only answers "種別・ID の行で
+            // 使います". The pill is a promise, so it follows the rows that keep
+            // it.
             Screen::EquipEdit => self
                 .equip_edit
                 .map(|e| e.is_identity_row(row))
@@ -10443,7 +10521,8 @@ impl Editor {
             Key::Z => self.quest_cycle_field(),
             // [R] is the item search on the two item tabs: the explicit press
             // [ZR]'s cycle no longer makes on the user's behalf (it used to
-            // open the keyboard every other press). The other two tabs have
+            // open the keyboard every other press). The pad reaches it through
+            // the held [ZR] (Editor::zr_hold_job). The other two tabs have
             // nothing to search and the request says so.
             Key::R => self.request_quest_item_filter(),
 
@@ -15422,10 +15501,10 @@ impl Editor {
             // search moved into the menu as a row (ITEM_OP_FIND) and the menu
             // took the key.
             Key::Z => self.open_item_menu(),
-            // [R] types the count of the selected slot: the footer, the chip
-            // table and the inspector pill all say "[R] 数値入力", and the
-            // console sends the key straight here. It used to open the picker,
-            // which is [A]'s job on this screen.
+            // The held [ZR] types the count of the selected slot: the footer,
+            // the chip table and the inspector pill all say so, and the console
+            // runs the hold through [Editor::zr_hold_press] into this arm. It
+            // used to open the picker, which is [A]'s job on this screen.
             Key::R => {
                 self.request_item_count_text();
             }
@@ -16591,8 +16670,8 @@ impl Editor {
                     }
                 );
             }
-            // [R] types the number: the footer says "[R] 数値入力" and the
-            // console sends the key here.
+            // The held [ZR] types the number: the footer says so and the
+            // console runs the hold into this arm (Editor::zr_hold_press).
             Key::R => {
                 self.request_hunt_text();
             }
@@ -16716,7 +16795,7 @@ impl Editor {
                         String::from("先にセーブを開いてください")
                     } else if self.guild_field > 1 {
                         String::from(
-                            "[◀/▶] は ランク / プレイ時間 の行で効きます（この行は [A] / [R]）",
+                            "[◀/▶] は ランク / プレイ時間 の行で効きます（この行は [A] / [ZR] 長押し）",
                         )
                     } else {
                         String::from("これ以上は変わりません（端まで来ています）")
@@ -16733,9 +16812,10 @@ impl Editor {
                     self.dirty = true;
                 }
             }
-            // [R] answers a numeric row with the keyboard. [Y] stays the step
-            // key (the pills are touch only, so the pad needs it), [A] is the
-            // comment, so R is the one key left for typing.
+            // The held [ZR] answers a numeric row with the keyboard. [Y] stays
+            // the step key (the pills are touch only, so the pad needs it), [A]
+            // is the comment, and the [ZR] tap is the progress screen, so the
+            // hold is the one job left for typing.
             Key::R => {
                 self.request_guild_text();
             }
@@ -16960,7 +17040,7 @@ impl Editor {
         let kind = self.guild_count_selected();
         let sum: u32 = self.guild_counts().iter().sum();
         self.message = alloc::format!(
-            "{}: {}（7 欄の合計 {} / カード表示 {}） [R] 直接入力",
+            "{}: {}（7 欄の合計 {} / カード表示 {}） [ZR] 長押し 直接入力",
             crate::guildcard::quest_count_label(kind),
             self.guild_count_at(kind),
             sum,
@@ -17052,7 +17132,7 @@ impl Editor {
             }
             other => {
                 self.message = alloc::format!(
-                    "この画面では {} は使いません（▲▼ 項目 / ◀▶ 増減 / [R] 数値入力）",
+                    "この画面では {} は使いません（▲▼ 項目 / ◀▶ 増減 / [ZR] 長押し 数値入力）",
                     key_name(other)
                 );
             }
@@ -17138,7 +17218,7 @@ impl Editor {
             if self.guild_wpn_edit {
                 " 編集中 [A] 終了"
             } else {
-                " [R] 直接入力"
+                " [ZR] 長押し 直接入力"
             }
         );
     }
@@ -19108,9 +19188,11 @@ impl Editor {
                 self.progress_tab = (self.progress_view() + PROGRESS_TABS - 1) % PROGRESS_TABS;
             }
             // [R] is the quest view's second bit (既読) and the next tab on the
-            // other two views - the same answer the console's shoulder rule
-            // gives (Editor::shoulder_job takes the key back on the quest view
-            // only). One question, one answer, whichever layer asks it.
+            // other two views. The pad no longer sends this key - the shoulders
+            // are both tab keys (Editor::shoulder_job) and the 既読 write is the
+            // held [ZR] (Editor::zr_hold_job) - but the headless build and the
+            // PC build still press it, so the arm stays the one implementation
+            // of both answers.
             Key::R => {
                 if self.progress_view() == PROGRESS_QUESTS {
                     self.progress_seen_press();
@@ -21191,7 +21273,7 @@ impl Editor {
                 .map(|r| r.used_items().len())
                 .unwrap_or(0);
             self.message = alloc::format!(
-                "ポーチをセット #{:02} の内容で置き換えます（ポーチ {} 枠 → {} 枠）。もう一度 [R]（画面下の「ポーチへ適用」）で実行",
+                "ポーチをセット #{:02} の内容で置き換えます（ポーチ {} 枠 → {} 枠）。もう一度 [ZR] 長押し（画面下の「ポーチへ適用」）で実行",
                 e.set + 1,
                 self.pouch_used(),
                 held
@@ -21240,11 +21322,11 @@ impl Editor {
         let Some(e) = self.item_set_edit else {
             return String::from("アイテムセットを選んで [A]");
         };
-        // ポーチへ is [R]: [-] is the delete key and this is not a delete, so
-        // the export took the one key the form had left (the same one the
-        // equipment form spends on its id keyboard).
+        // ポーチへ is the held [ZR]: [-] is the delete key and this is not a
+        // delete, so the export took the form's second job on the key it
+        // already owns (the [ZR] tap is the set-name keyboard).
         alloc::format!(
-            "枠 {:02} {} — [◀/▶] 巡回 / [A] 決定 / [Y] 取込 / [R] ポーチへ（2回） / [ZR] 名前",
+            "枠 {:02} {} — [◀/▶] 巡回 / [A] 決定 / [Y] 取込 / [ZR] 長押し ポーチへ（2回） / [ZR] 名前",
             e.field + 1,
             self.item_set_row_label(e.field)
         )
@@ -21279,10 +21361,11 @@ impl Editor {
                 self.item_set_from_pouch();
                 return;
             }
-            // [R] is the other half of [Y]: the set into the pouch instead of
-            // the pouch into the set. It was the deck's pill alone, so the pad
-            // could not press it; [ZR] is the set-name keyboard here and [-] is
-            // the delete key, so [R] is the one key the form had left.
+            // The held [ZR] is the other half of [Y]: the set into the pouch
+            // instead of the pouch into the set. It was the deck's pill alone,
+            // so the pad could not press it; the [ZR] tap is the set-name
+            // keyboard here and [-] is the delete key, so the hold is the one
+            // job the form had left.
             Key::R => {
                 self.item_set_edit = Some(e);
                 self.item_set_to_pouch();
@@ -21299,10 +21382,9 @@ impl Editor {
                 return;
             }
             // [-] is the delete key and ポーチへ is not a delete, so the export
-            // took the one key the form had left ([R], above - the same key the
-            // equipment form spends on its id keyboard). [ZR] is already the
-            // set-name keyboard here. The deck's pill runs the same request, so
-            // a finger and the pad cannot do different things.
+            // took the form's second job on the held [ZR] (above). The [ZR] tap
+            // is already the set-name keyboard here. The deck's pill runs the
+            // same request, so a finger and the pad cannot do different things.
             Key::B => {
                 self.item_set_edit = Some(e);
                 if self.form_discard_press(self.item_set_draft_dirty(), "アイテムセット編集") {
@@ -21725,10 +21807,10 @@ impl Editor {
                     );
                 }
             }
-            // [R] types the number of the row instead of stepping it - the same
-            // job it does on the item box, the guild card and the hunt record.
-            // On 種別 / ID it is the fallback for an id the name tables do not
-            // carry (and for a build that has no tables at all).
+            // The held [ZR] types the number of the row instead of stepping it
+            // - the same job it does on the item box, the guild card and the
+            // hunt record. On 種別 / ID it is the fallback for an id the name
+            // tables do not carry (and for a build that has no tables at all).
             Key::R => {
                 if e.is_identity_row(e.field) {
                     self.equip_edit = Some(e);
@@ -21736,7 +21818,7 @@ impl Editor {
                     return;
                 }
                 self.message =
-                    String::from("[R] は 種別・ID の行で使います（名前で選ぶなら [A]）");
+                    String::from("[ZR] 長押し は 種別・ID の行で使います（名前で選ぶなら [A]）");
             }
             // [X] is the save key on this form too: it commits the draft and
             // writes the file (Editor::quick_save). It used to be the step key,
@@ -22132,7 +22214,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
         e.field = e.id_row();
         self.equip_edit = Some(e);
         self.message = alloc::format!(
-            "種別を {} にしました（[A] で ID を選ぶ / [R] で入力）",
+            "種別を {} にしました（[A] で ID を選ぶ / [ZR] 長押し で入力）",
             crate::equip::type_name(kind)
         );
         true
@@ -22166,7 +22248,7 @@ pub fn equip_pick_start(choices: &[EquipChoice], kind: u8, id: u16, new: bool) -
             return false;
         };
         if !self.equip_id_field(e.field) {
-            self.message = String::from("[R] は 種別・ID の行で使います");
+            self.message = String::from("[ZR] 長押し は 種別・ID の行で使います");
             return false;
         }
         let Some(id) = parse_equip_id(text) else {
@@ -26234,6 +26316,10 @@ impl KeyRepeat {
 /// 詳細 - without ever also moving the tab: a hold that also taps is worse than
 /// a tap that is one frame late, and a hold that opened 詳細 *and* moved the
 /// sub-tab opened it on the wrong screen.
+///
+/// [ZR] uses the same shape for its own hold (the job [R] used to carry,
+/// [Editor::zr_hold_job]): a press that lingers is the hold, a press that comes
+/// up first is the tap, and one press is never both.
 ///
 /// This keeps the tap in hand until the key comes up and then decides:
 ///

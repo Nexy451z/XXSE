@@ -286,7 +286,9 @@ impl UpdateState {
 
         let job = Box::new(DownloadJob {
             url: plan.url.clone().into_bytes(),
-            path: self.paths.staged.clone().into_bytes(),
+            // The path stays a Rust string: the C string is built where it is
+            // used, so it carries the device name and a NUL (see c_path).
+            path: self.paths.staged.clone(),
             expected: plan.size,
         });
         let arg = Box::into_raw(job) as *mut c_void;
@@ -408,6 +410,32 @@ impl UpdateState {
                     );
                     return;
                 }
+                // The swap is about to look for this exact name, so the card is
+                // asked first: a download that did not land says so here, with
+                // the folder it did (or did not) land in, instead of turning
+                // into "ダウンロードしたファイルがありません" one frame later.
+                let card = card_dir();
+                let state = core_update::staged_state(file_size(&self.paths.staged), expected);
+                if let Some(message) =
+                    core_update::post_download_message(&self.paths, expected, state, &card)
+                {
+                    // A file of the wrong size is not a build; it is thrown
+                    // away rather than left where the swap could pick it up.
+                    if matches!(state, core_update::StagedState::WrongSize { .. }) {
+                        let _ = remove_file(&self.paths.staged);
+                    }
+                    // No .new but a target of exactly the new size means the
+                    // swap already happened: that is a restart, not a retry.
+                    self.phase = if matches!(state, core_update::StagedState::Missing)
+                        && core_update::already_installed(&self.paths, expected, &card)
+                    {
+                        Phase::UpdatedManual
+                    } else {
+                        Phase::Failed
+                    };
+                    self.message = message;
+                    return;
+                }
                 self.activate();
             }
             Err(message) => {
@@ -438,7 +466,7 @@ impl UpdateState {
                 // environment has no next-load entry (an old hbmenu, or a launch
                 // that did not come from one) the user restarts by hand and the
                 // new build is what starts.
-                let path = loader_path(&self.paths.target);
+                let path = core_update::device_path(&self.paths.target);
                 let next = to_c(path.as_bytes());
                 let argv = to_c(b"");
                 let ok = unsafe { sys::envHasNextLoad() }
@@ -455,8 +483,23 @@ impl UpdateState {
                 }
             }
             Err(e) => {
-                self.phase = Phase::Failed;
-                self.message = e.message(&self.paths);
+                // The message carries what the folder actually holds: a 0-byte
+                // .new, a .new under a name that is not quite ours, a .bak from
+                // an earlier attempt and an empty folder are four different
+                // bugs, and only the listing tells them apart.
+                let card = card_dir();
+                self.message = e.message_with_card(&self.paths, expected, &card);
+                // A .new that is gone because the swap already happened is not
+                // a failure: the bytes are in place and the user only has to
+                // restart. Offering "もう一度" there downloads the same file
+                // again for nothing.
+                self.phase = if e == core_update::InstallError::MissingStaged
+                    && core_update::already_installed(&self.paths, expected, &card)
+                {
+                    Phase::UpdatedManual
+                } else {
+                    Phase::Failed
+                };
             }
         }
     }
@@ -489,7 +532,10 @@ struct DownloadOutcome {
 
 struct DownloadJob {
     url: Vec<u8>,
-    path: Vec<u8>,
+    /// Where the bytes go, as the updater names it. The C string the download
+    /// opens is built from this with core_update::c_path, so the name it
+    /// writes is the same name the swap looks for.
+    path: String,
     expected: u64,
 }
 
@@ -643,10 +689,20 @@ unsafe fn write_download(job: &DownloadJob) -> core::result::Result<u64, String>
     if handle.is_null() {
         return Err(String::from("通信の初期化に失敗しました"));
     }
-    let file = sys::fopen(job.path.as_ptr() as *const c_char, c"wb".as_ptr());
+    // The name as C sees it: device-qualified and NUL-terminated. This used to
+    // hand fopen a Vec<u8> taken straight from a String, which has no
+    // terminator - fopen then read the allocator's padding as part of the
+    // name, and the download could land on a file that only looked like the
+    // one the swap would look for.
+    let path_c = core_update::c_path(&job.path);
+    let file = sys::fopen(path_c.as_ptr() as *const c_char, c"wb".as_ptr());
     if file.is_null() {
         net::curl_easy_cleanup(handle);
-        return Err(String::from("保存先を開けませんでした（/switch/XXSE の空き容量を確認してください）"));
+        return Err(format!(
+            "保存先を開けませんでした（{}、fsdev 0x{:08X}）",
+            job.path,
+            sys::fsdevGetLastResult()
+        ));
     }
 
     FILE_WRITTEN.store(0, Ordering::Relaxed);
@@ -684,8 +740,14 @@ unsafe fn write_download(job: &DownloadJob) -> core::result::Result<u64, String>
     // The count is the file's own: it is what write_file actually stored.
     let written = FILE_WRITTEN.load(Ordering::Relaxed);
 
-    let _ = sys::fflush(file);
-    let _ = sys::fclose(file);
+    // stdio buffers, the card does not. fflush empties newlib's buffer, fsync
+    // is fsdev's fsFileFlush (libnx has no fsFileCommit; the devoptab fsync_r
+    // hook is the explicit "push it out" this file can reach while stdio still
+    // owns the handle), and fclose releases it. All three return codes are
+    // carried into the messages below instead of being dropped.
+    let flushed = sys::fflush(file);
+    let synced = sys::fsync(sys::fileno(file));
+    let closed = sys::fclose(file);
     FILE_WRITTEN.store(0, Ordering::Relaxed);
 
     if DL_CANCEL.load(Ordering::SeqCst) {
@@ -703,7 +765,22 @@ unsafe fn write_download(job: &DownloadJob) -> core::result::Result<u64, String>
             written, job.expected
         ));
     }
-    Ok(written)
+
+    // What the card kept, asked through the same device the swap will use.
+    // "written" is what stdio accepted; this is the file. A disagreement here
+    // is the whole "ダウンロードしたファイルがありません" class of bug, so it
+    // is reported where the reason is still known instead of a frame later.
+    match file_size(&job.path) {
+        Some(size) if size == written => Ok(written),
+        Some(size) => Err(format!(
+            "保存したファイルの大きさが違います（{}: {} / {} バイト、fflush={} fsync={} fclose={}）",
+            job.path, size, written, flushed, synced, closed
+        )),
+        None => Err(format!(
+            "保存したファイルがカードにありません（{}、fflush={} fsync={} fclose={}）",
+            job.path, flushed, synced, closed
+        )),
+    }
 }
 
 /// Bytes the download callback has stored, read by the worker after the
@@ -769,19 +846,32 @@ fn run_download(_job: &DownloadJob) -> core::result::Result<u64, String> {
 // The card
 // ---------------------------------------------------------------------------
 
-/// The real card behind mhnx_core::update::RenameFs. fsdev resolves these
-/// paths against sdmc, which is the device hbmenu and this application both
-/// start from.
+/// The real card behind mhnx_core::update::RenameFs.
+///
+/// Every path is opened through core_update::c_path: it carries the device name
+/// ("sdmc:") and a NUL, so the name the download writes, the name this trait
+/// asks about and the name the loader is told to start are one name. fsdev
+/// would resolve a bare "/switch/..." against whichever device is the default,
+/// which is not something this code can promise.
 struct SdCard;
 
 impl RenameFs for SdCard {
     fn exists(&self, path: &str) -> bool {
-        let name = to_c(path.as_bytes());
-        unsafe { !sys::fopen(name.as_ptr() as *const c_char, c"rb".as_ptr()).is_null() }
+        let name = core_update::c_path(path);
+        unsafe {
+            let file = sys::fopen(name.as_ptr() as *const c_char, c"rb".as_ptr());
+            if file.is_null() {
+                return false;
+            }
+            // A FILE* left open keeps the file open, and the swap renames the
+            // very file this question was asked about.
+            let _ = sys::fclose(file);
+            true
+        }
     }
 
     fn remove(&mut self, path: &str) -> bool {
-        let name = to_c(path.as_bytes());
+        let name = core_update::c_path(path);
         // fsdev has no "definitely absent" answer for remove, so the question is
         // asked after the fact: the contract is "the path is gone now".
         unsafe { sys::remove(name.as_ptr() as *const c_char) };
@@ -789,19 +879,105 @@ impl RenameFs for SdCard {
     }
 
     fn rename(&mut self, from: &str, to: &str) -> bool {
-        let a = to_c(from.as_bytes());
-        let b = to_c(to.as_bytes());
+        let a = core_update::c_path(from);
+        let b = core_update::c_path(to);
         unsafe { sys::rename(a.as_ptr() as *const c_char, b.as_ptr() as *const c_char) == 0 }
     }
 }
 
-/// "sdmc:" plus the fsdev path, unless it is already there.
-fn loader_path(target: &str) -> String {
-    if target.starts_with("sdmc:") {
-        target.to_string()
-    } else {
-        format!("sdmc:{}", target)
+/// The same path without the device name: what the raw fs calls take.
+fn fs_path(path: &str) -> &str {
+    path.strip_prefix(core_update::SD_DEVICE).unwrap_or(path)
+}
+
+/// The size the card reports for a path, or None when it cannot be opened.
+///
+/// This asks the fs service through the device fsdev itself uses, so it is the
+/// card's answer and not a count of what stdio accepted. The download checks
+/// its own result with it, and the swap's failure message is built from it.
+fn file_size(path: &str) -> Option<u64> {
+    let device = to_c(b"sdmc");
+    let name = to_c(fs_path(path).as_bytes());
+    unsafe {
+        let fs = sys::fsdevGetDeviceFileSystem(device.as_ptr() as *const c_char);
+        if fs.is_null() {
+            return None;
+        }
+        let mut file = sys::FsFile::ZERO;
+        let rc = sys::fsFsOpenFile(fs, name.as_ptr() as *const c_char, sys::FS_OPEN_MODE_READ, &mut file);
+        if !sys::r_succeeded(rc) {
+            return None;
+        }
+        let mut size = 0i64;
+        let rc = sys::fsFileGetSize(&mut file, &mut size);
+        sys::fsFileClose(&mut file);
+        if !sys::r_succeeded(rc) || size < 0 {
+            return None;
+        }
+        Some(size as u64)
     }
+}
+
+/// What the application folder holds, as the card reports it.
+///
+/// This is what makes a failed update reportable: a 0-byte .new, a .new under a
+/// name that is not quite the one we look for, a .bak from an earlier attempt
+/// and an empty folder are four different bugs, and only the listing tells them
+/// apart. It never fails - an unreadable folder is an empty one, because a
+/// message is not worth a second failure.
+fn card_dir() -> core_update::CardDir {
+    let mut entries: Vec<core_update::DirEntry> = Vec::new();
+    let device = to_c(b"sdmc");
+    let name = to_c(fs_path(core_update::APP_DIR).as_bytes());
+    unsafe {
+        let fs = sys::fsdevGetDeviceFileSystem(device.as_ptr() as *const c_char);
+        if fs.is_null() {
+            return core_update::CardDir::new(entries);
+        }
+        let mut dir = sys::FsDir::ZERO;
+        let rc = sys::fsFsOpenDirectory(
+            fs,
+            name.as_ptr() as *const c_char,
+            sys::FS_DIR_OPEN_MODE_READ_DIRS | sys::FS_DIR_OPEN_MODE_READ_FILES,
+            &mut dir,
+        );
+        if !sys::r_succeeded(rc) {
+            return core_update::CardDir::new(entries);
+        }
+        let mut batch = [sys::FsDirectoryEntry::ZERO; 8];
+        loop {
+            let mut total = 0i64;
+            let rc = sys::fsDirRead(&mut dir, &mut total, batch.len(), batch.as_mut_ptr());
+            if !sys::r_succeeded(rc) {
+                break;
+            }
+            // Only the entries the call filled in: the rest of the batch still
+            // holds the previous read, and reading past "total" would list the
+            // same name twice.
+            let got = if total <= 0 {
+                0
+            } else {
+                (total as usize).min(batch.len())
+            };
+            for entry in batch[..got].iter() {
+                entries.push(core_update::DirEntry {
+                    name: entry.name_str().to_string(),
+                    size: if entry.is_file() {
+                        entry.file_size.max(0) as u64
+                    } else {
+                        0
+                    },
+                });
+            }
+            // A short batch is the end of the folder; the cap keeps a card full
+            // of junk from turning one message into a megabyte.
+            if got < batch.len() || entries.len() >= 32 {
+                break;
+            }
+        }
+        sys::fsDirClose(&mut dir);
+    }
+    core_update::CardDir::new(entries)
 }
 
 // ---------------------------------------------------------------------------
@@ -816,7 +992,7 @@ fn to_c(bytes: &[u8]) -> Vec<u8> {
 }
 
 fn read_text(path: &str) -> Option<String> {
-    let name = to_c(path.as_bytes());
+    let name = core_update::c_path(path);
     unsafe {
         let file = sys::fopen(name.as_ptr() as *const c_char, c"rb".as_ptr());
         if file.is_null() {
@@ -840,7 +1016,7 @@ fn read_text(path: &str) -> Option<String> {
 }
 
 fn write_text(path: &str, text: &str) -> bool {
-    let name = to_c(path.as_bytes());
+    let name = core_update::c_path(path);
     unsafe {
         let file = sys::fopen(name.as_ptr() as *const c_char, c"wb".as_ptr());
         if file.is_null() {
@@ -855,6 +1031,6 @@ fn write_text(path: &str, text: &str) -> bool {
 }
 
 fn remove_file(path: &str) -> bool {
-    let name = to_c(path.as_bytes());
+    let name = core_update::c_path(path);
     unsafe { sys::remove(name.as_ptr() as *const c_char) == 0 }
 }

@@ -13,7 +13,7 @@ use mhnx_core::arc::{Arc, ArcEntry, ARC_VERSION};
 use mhnx_core::charm;
 use mhnx_core::equip;
 use mhnx_core::hbedit::{
-    self, caption_width, CharmAction, Editor, EquipFormAction, Key, Screen, Shoulder, ZrJob,
+    self, caption_width, CharmAction, Editor, EquipFormAction, Key, Screen, Shoulder, ZrHold, ZrJob,
     FOOTER_HINT_ROOM, FORM_STEPS, PROGRESS_AWARDS, PROGRESS_QUESTS, PROGRESS_REQUESTS,
     QUEST_REWARD_CHANCE, QUEST_REWARD_COUNT, QUEST_REWARD_FIELDS, QUEST_REWARD_ITEM,
     QUEST_TAB_BASIC,
@@ -312,65 +312,85 @@ fn a_fresh_talisman_is_clean_and_the_save_key_writes_no_duplicate() {
 // B. what the screen promises and what it does
 // ---------------------------------------------------------------------------
 
-/// B2: 報酬 / 支給品 print "[R] 検索", and shoulder_job did not list
+/// B2: 報酬 / 支給品 print 検索, and shoulder_job did not list
 /// Screen::QuestEdit, so the press moved to the next tab and the search never
 /// opened.
+///
+/// The search is the held [ZR] now: [R] is the tab key on both item tabs like
+/// it is everywhere else, and the hold is the key the two tabs' footers name.
 #[test]
-fn the_reward_search_key_is_the_screens_own_key() {
+fn the_reward_search_key_is_the_screens_held_zr() {
     let mut ed = editor_with_quest();
     ed.open_quest_from_save(QUEST_ID);
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     assert_eq!(
         ed.shoulder_job(Key::R),
-        Shoulder::Screen,
-        "the footer names [R] 検索, so the key is the screen's"
+        Shoulder::SubTab,
+        "[R] is the tab key on the reward tab too"
+    );
+    assert_eq!(
+        ed.zr_hold_job(),
+        ZrHold::Action,
+        "the footer names the held [ZR] 検索, so the hold is the screen's"
     );
     ed.take_text_request();
-    ed.input(Key::R);
+    assert!(ed.zr_hold_press(), "the hold runs the search");
     assert_eq!(
         ed.take_text_request().map(|(id, _)| id),
         Some(TEXT_QUEST_ITEM),
-        "the press opens the item search: {}",
+        "the hold opens the item search: {}",
         ed.message
     );
-    // [L] keeps the tab move, and the two tabs that name no [R] keep it too.
+    // [L] keeps the tab move, and the two tabs that name no search keep it too.
     assert_eq!(ed.shoulder_job(Key::L), Shoulder::SubTab);
     ed.quest_set_tab(QUEST_TAB_BASIC);
     assert_eq!(
-        ed.shoulder_job(Key::R),
-        Shoulder::SubTab,
-        "基本 names no [R]"
+        ed.zr_hold_job(),
+        ZrHold::None,
+        "基本 names no search"
     );
     ed.quest_set_tab(QUEST_TAB_SUPPLIES);
-    assert_eq!(ed.shoulder_job(Key::R), Shoulder::Screen);
-    assert!(ed.footer_hint().contains("[R] 検索"), "{}", ed.footer_hint());
+    assert_eq!(ed.zr_hold_job(), ZrHold::Action);
+    assert!(
+        ed.footer_hint().contains("[ZR長] 検索"),
+        "{}",
+        ed.footer_hint()
+    );
 }
 
 /// B3: [Y] became the tab key, so the quest view's 既読 bit was left with a
-/// touch pill only. It has [R] now, and the console takes the key back from the
-/// sub-tab rule on that view alone.
+/// touch pill only. It has a pad key now: the held [ZR], which is the key that
+/// view's footer names.
 #[test]
 fn the_seen_bit_has_a_pad_key() {
     let mut ed = editor_with_quest();
     ed.open_progress();
     ed.progress_tab = PROGRESS_QUESTS;
     ed.set_progress_cursor(0);
-    assert_eq!(ed.shoulder_job(Key::R), Shoulder::Screen);
+    assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab);
+    assert_eq!(ed.zr_hold_job(), ZrHold::Action);
     let (_, seen, _) = ed.progress_quest_state(0);
     assert!(!seen);
-    ed.input(Key::R);
+    assert!(ed.zr_hold_press());
     let (_, seen, _) = ed.progress_quest_state(0);
-    assert!(seen, "the press writes the seen bit: {}", ed.message);
+    assert!(seen, "the hold writes the seen bit: {}", ed.message);
     assert!(ed.dirty, "and the save is dirty");
-    // The other two views have one bit per row: [R] walks them.
+    // The other two views have one bit per row: the hold has no job there and
+    // [R] walks them.
     ed.progress_tab = PROGRESS_AWARDS;
+    assert_eq!(ed.zr_hold_job(), ZrHold::None);
+    assert!(!ed.zr_hold_press(), "the hold does nothing on the award view");
     assert_eq!(ed.shoulder_job(Key::R), Shoulder::SubTab);
     let view = ed.progress_view();
     ed.input(Key::R);
     assert_ne!(ed.progress_view(), view, "[R] is the tab key there");
     // And the footer names the key it now answers.
     ed.progress_tab = PROGRESS_QUESTS;
-    assert!(ed.footer_hint().contains("[R] 既読"), "{}", ed.footer_hint());
+    assert!(
+        ed.footer_hint().contains("[ZR長] 既読"),
+        "{}",
+        ed.footer_hint()
+    );
 }
 
 /// B4: the pad drops a [＋] quit offer on every key that is not [＋]
@@ -564,10 +584,11 @@ fn the_quest_footer_follows_the_row() {
     );
     assert!(sem_row.contains("[◀/▶] 値"), "{sem_row}");
 
-    // 報酬: [R] 検索 is named; 支給品 has one value, so [ZR] there is the search.
+    // 報酬: the held [ZR] 検索 is named; 支給品 has one value, so [ZR] there is
+    // the search on both the tap and the hold.
     ed.quest_set_tab(QUEST_TAB_REWARDS);
     let rewards = ed.footer_hint();
-    assert!(rewards.contains("[R] 検索"), "{rewards}");
+    assert!(rewards.contains("[ZR長] 検索"), "{rewards}");
     // Two stops: アイテム is [A]'s cell, so [ZR] walks 個数 ⇄ 確率% (the sixth
     // review's leftovers - the third stop could only refuse the arrows).
     assert!(
@@ -576,7 +597,7 @@ fn the_quest_footer_follows_the_row() {
     );
     ed.quest_set_tab(QUEST_TAB_SUPPLIES);
     let supplies = ed.footer_hint();
-    assert!(supplies.contains("[R] 検索"), "{supplies}");
+    assert!(supplies.contains("[ZR長] 検索"), "{supplies}");
 
     // Every one of them fits the strip the console gives the footer.
     for tab in [
@@ -724,7 +745,7 @@ fn the_progress_keys_agree_in_all_three_places() {
     // 1. The footer.
     let hint = ed.footer_hint();
     assert!(hint.contains("[A] ビット"), "{hint}");
-    assert!(hint.contains("[R] 既読"), "{hint}");
+    assert!(hint.contains("[ZR長] 既読"), "{hint}");
     assert!(hint.contains("[Y] タブ"), "{hint}");
     assert!(hint.contains("[ZR] 検索"), "{hint}");
 
@@ -745,7 +766,7 @@ fn the_progress_keys_agree_in_all_three_places() {
         .map(|f| f.render())
         .collect::<Vec<_>>()
         .join(" ");
-    assert!(keys.contains("[R] 既読"), "{keys}");
+    assert!(keys.contains("[ZR長] 既読"), "{keys}");
     assert!(keys.contains("[Y] タブ"), "{keys}");
     assert!(keys.contains("[ZR] 検索"), "{keys}");
     assert!(!keys.contains("[Y] 既読"), "{keys}");
@@ -754,7 +775,7 @@ fn the_progress_keys_agree_in_all_three_places() {
     ed.progress_tab = PROGRESS_AWARDS;
     let hint = ed.footer_hint();
     assert!(hint.contains("[Y] タブ"), "{hint}");
-    assert!(!hint.contains("[R] 既読"), "{hint}");
+    assert!(!hint.contains("既読"), "{hint}");
 }
 
 /// D15: the talisman list's [＋] called open_charms first, which put the list
@@ -837,7 +858,7 @@ fn the_reward_value_switch_has_two_stops() {
         Some(TEXT_QUEST_ITEM)
     );
     let hint = ed.footer_hint();
-    assert!(hint.contains("[R] 検索"), "{hint}");
+    assert!(hint.contains("[ZR長] 検索"), "{hint}");
     assert!(hint.contains("[ZR] 段送り（2段）"), "{hint}");
 }
 
@@ -902,22 +923,24 @@ fn the_two_forms_use_one_word_for_the_write() {
 ///
 /// The word is the key table's now, and the inspector's pill borrows it
 /// (`Editor::key_label`), so one key has one name on one screen - which is the
-/// finding. The literal word moved when the item box's line ran out of strip
-/// (eight items on 763px): the box says 数値 and the other screens say 数値入力,
-/// and neither can disagree with its own pill.
+/// finding. The key moved too: the number keyboard is the held [ZR] on every
+/// screen now (the shoulders are both tab keys), so the chip is one token -
+/// "ZR長" - with one short word beside it, and the pill borrows that.
 #[test]
 fn the_number_key_has_one_name() {
     let mut ed = editor_with_equipment(1);
     ed.screen = Screen::Items;
-    let label = ed.key_label("R").expect("the item box names [R]");
+    let label = ed
+        .key_label("ZR長")
+        .expect("the item box names the held [ZR]");
     assert!(
-        ed.footer_hint().contains(&format!("[R] {label}")),
+        ed.footer_hint().contains(&format!("[ZR長] {label}")),
         "{}",
         ed.footer_hint()
     );
     ed.screen = Screen::Hunts;
     assert!(
-        ed.footer_hint().contains("[R] 数値入力"),
+        ed.footer_hint().contains("[ZR長] 数値"),
         "{}",
         ed.footer_hint()
     );
@@ -936,23 +959,23 @@ fn the_number_key_has_one_name() {
     ed.screen = Screen::EntryView;
     assert!(ed.entry_has_numbers());
     assert!(
-        ed.footer_hint().contains("[R] 数値入力"),
+        ed.footer_hint().contains("[ZR長] 数値"),
         "{}",
         ed.footer_hint()
     );
     // The console's pill prints the table's word instead of its own copy, so
     // the two surfaces cannot drift apart again.
     let ui = ui_src();
-    // Every [R] the console draws borrows the table's word: the inspector pill,
-    // the reward / supply panel's button and the card's button.
+    // Every 数値入力 button borrows the table's word: the inspector pill, the
+    // reward / supply panel's button and the card's button.
     // The sixth review's leftovers: the buttons name no key at all, so they
     // borrow the word through pill_word (the table's word, no bracket).
     // Four: the card's inspector, the reward / supply panel, the arena
     // inspector and the weapon inspector (the seventh review added the last).
     assert_eq!(
-        ui.matches("pill_word(ed, \"R\"").count(),
+        ui.matches("pill_word(ed, \"ZR長\"").count(),
         4,
-        "every [R] button borrows the table's word"
+        "every 数値入力 button borrows the table's word"
     );
     // Only the code lines: the comments explain the key (they say why each
     // button exists).
@@ -961,7 +984,8 @@ fn the_number_key_has_one_name() {
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(!code.contains("[R] 数値入力\""), "no button prints the key");
+    assert!(!code.contains("[ZR長] 数値"), "no button prints the key");
+    assert!(!code.contains("[R] 数値"), "and no button promises [R]");
     assert!(
         !hbedit_src().contains("[R] 数値  "),
         "and the footers do not carry two of them"
@@ -980,6 +1004,9 @@ fn named_keys(text: &str) -> Vec<String> {
         ("[X]", &["X"]),
         ("[Y]", &["Y"]),
         ("[ZR]", &["Z"]),
+        // The held [ZR]: the job [R] used to carry. It is pressed the way the
+        // console presses it (Editor::zr_hold_press), not as a bare Z.
+        ("[ZR長]", &["ZR長"]),
         ("[＋]", &["Plus"]),
         ("[-]", &["Minus"]),
         ("[◀/▶]", &["Left", "Right"]),
@@ -1244,8 +1271,13 @@ fn key_arrives(ed: &mut Editor, key: &str) -> bool {
                 // A form that owns the screen; a footer must not name it.
                 Shoulder::Swallow => return false,
                 Shoulder::Move => ed.input(if key == "R" { Key::Right } else { Key::Left }),
-                Shoulder::Screen => ed.input(k),
+                // A panel that owns every key (the palico skill panel).
+                Shoulder::Panel => ed.input(k),
             }
+        }
+        // The held [ZR]'s job, run the way the console runs it.
+        "ZR長" => {
+            ed.zr_hold_press();
         }
         other => ed.input(key_of(other)),
     }

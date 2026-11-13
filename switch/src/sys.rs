@@ -330,6 +330,12 @@ extern "C" {
     pub fn fwrite(ptr: *const c_void, size: usize, nmemb: usize, stream: *mut c_void) -> usize;
     pub fn fflush(stream: *mut c_void) -> c_int;
     pub fn fclose(stream: *mut c_void) -> c_int;
+    /// The descriptor behind a FILE*, for fsync.
+    pub fn fileno(stream: *mut c_void) -> c_int;
+    /// fsdev implements this as fsFileFlush: it is the closest thing libnx has
+    /// to committing a file that stdio owns (fsFileCommit does not exist; the
+    /// devoptab fsync_r hook does).
+    pub fn fsync(fd: c_int) -> c_int;
     // The two file operations the .nro swap is made of. fsdev implements both
     // for sdmc:, and neither of them ever truncates the file it moves.
     pub fn remove(path: *const c_char) -> c_int;
@@ -369,6 +375,10 @@ extern "C" {
     pub fn fsdevCommitDevice(name: *const c_char) -> Result;
     pub fn fsdevUnmountDevice(name: *const c_char) -> Result;
     pub fn fsdevGetLastResult() -> Result;
+    /// The FsFileSystem behind a mounted device ("sdmc"), or NULL when that
+    /// device is not mounted. The handle is the one fsdev itself uses, so the
+    /// raw fs calls made through it see exactly what stdio sees.
+    pub fn fsdevGetDeviceFileSystem(name: *const c_char) -> *mut FsFileSystem;
 
     // --- services/fs.h -------------------------------------------------------------
     pub fn fsInitialize() -> Result;

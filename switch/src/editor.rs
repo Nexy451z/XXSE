@@ -1089,6 +1089,21 @@ fn key_from(buttons: u64) -> Option<Key> {
     }
 }
 
+/// The [ZR] tap: the screen's own second action, or the section bar.
+///
+/// One function because the tap is answered from two frames - the press on the
+/// screens that have no hold behind the key, the release on the ones that do -
+/// and the two must run the same thing. The question is the state machine's
+/// (hbedit::Editor::zr_job), the same one the footer's guide is written from.
+fn zr_tap_job(gui: &mut crate::ui::GuiState, ed: &mut Editor, cur: u64) {
+    if ed.zr_job() == mhnx_core::hbedit::ZrJob::Screen {
+        gui.stop_fling();
+        gui.handle_pad_key(ed, Key::Z, cur);
+    } else {
+        gui.cycle_sidebar_tab(ed, true);
+    }
+}
+
 /// Apply a completed text input (from `swkbd` or the built-in OSK) to `Editor`.
 ///
 /// One call, because the answer belongs to the request and the request is a row
@@ -1442,6 +1457,12 @@ pub fn run() -> i32 {
     // (hbedit::DetailTarget).
     let mut r_tap = mhnx_core::hbedit::ShoulderTap::new();
     let mut r_target: Option<mhnx_core::hbedit::DetailTarget> = None;
+    // [ZR]'s tap is the section bar (or the screen's own second action) and its
+    // hold is the job [R] used to carry - the number keyboard, the item search,
+    // 既読, the id keyboard, ポーチへ (hbedit::Editor::zr_hold_job). The same
+    // shape [R]'s tap uses: a press that lingers is the hold, a press that comes
+    // up first is the tap, and one press is never both.
+    let mut zr_tap = mhnx_core::hbedit::ShoulderTap::new();
     // A held shoulder repeats on the four pick lists, where L / R are the ten
     // row step rather than the sub-tab: the same 8 / 4 / 3 cadence the
     // direction keys use, so holding L crosses a 6,435 row list instead of
@@ -1557,6 +1578,9 @@ pub fn run() -> i32 {
                 l_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_target = None;
+                // The same for [ZR]: a press that came up inside the panel
+                // must not reach the screen behind it later.
+                zr_tap = mhnx_core::hbedit::ShoulderTap::new();
                 l_repeat.tick(false);
                 r_repeat.tick(false);
                 // ZL walks the character tabs; ZR inserts a line break (Key::Z
@@ -1574,6 +1598,9 @@ pub fn run() -> i32 {
                 l_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_target = None;
+                // The same for [ZR]: a press that came up inside the panel
+                // must not reach the screen behind it later.
+                zr_tap = mhnx_core::hbedit::ShoulderTap::new();
                 l_repeat.tick(false);
                 r_repeat.tick(false);
                 if down & BTN_RSTICK_UP != 0 {
@@ -1598,6 +1625,9 @@ pub fn run() -> i32 {
                 l_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_tap = mhnx_core::hbedit::ShoulderTap::new();
                 r_target = None;
+                // The same for [ZR]: a press that came up inside the panel
+                // must not reach the screen behind it later.
+                zr_tap = mhnx_core::hbedit::ShoulderTap::new();
                 l_repeat.tick(false);
                 r_repeat.tick(false);
                 // The save review is modal: A writes, B goes back, and nothing
@@ -1684,8 +1714,10 @@ pub fn run() -> i32 {
                     ed.clear_quit_arm();
                 }
 
-                // ZL walks the sidebar back; ZR is the sidebar's forward key
-                // only on the screens that have no second action of their own.
+                // ZL walks the sidebar back; ZR's tap is the sidebar's forward
+                // key only on the screens that have no second action of their
+                // own, and ZR's *hold* is the job [R] used to carry
+                // (hbedit::Editor::zr_hold_job).
                 //
                 // ZR used to be the section key everywhere and the key was then
                 // dropped before the state machine saw it, so every screen that
@@ -1697,13 +1729,39 @@ pub fn run() -> i32 {
                 if down & BTN_ZL != 0 {
                     painter.gui.cycle_sidebar_tab(&mut ed, false);
                     need_draw = true;
-                } else if down & BTN_ZR != 0 {
-                    if ed.zr_job() == mhnx_core::hbedit::ZrJob::Screen {
-                        painter.gui.stop_fling();
-                        painter.gui.handle_pad_key(&mut ed, Key::Z, cur);
-                    } else {
-                        painter.gui.cycle_sidebar_tab(&mut ed, true);
+                }
+                if down & BTN_ZR != 0 && zr_tap.press() {
+                    painter.gui.stop_fling();
+                    // A screen with no hold behind the key answers its tap now,
+                    // the same shape a pick list uses for the shoulders: the
+                    // section bar keeps the instant answer it has always had.
+                    // A screen with a hold waits for the release, because a
+                    // press that lingers is the hold and one press must never
+                    // be both.
+                    if ed.zr_hold_job() == mhnx_core::hbedit::ZrHold::None {
+                        zr_tap_job(&mut painter.gui, &mut ed, cur);
+                        zr_tap.spend();
                     }
+                    need_draw = true;
+                }
+                if cur & BTN_ZR != 0 {
+                    match zr_tap.tick() {
+                        mhnx_core::confirm::HoldAction::Arm
+                        | mhnx_core::confirm::HoldAction::Run => {
+                            // One hold, one job: the offer is taken back at
+                            // once, so holding longer cannot run it twice.
+                            zr_tap.clear_arm();
+                            if ed.zr_hold_press() {
+                                need_draw = true;
+                            }
+                        }
+                        mhnx_core::confirm::HoldAction::None => {}
+                    }
+                }
+                if cur & BTN_ZR == 0 && zr_tap.release() {
+                    // A press that came up before the threshold is the tap: the
+                    // section bar, or the screen's own second action.
+                    zr_tap_job(&mut painter.gui, &mut ed, cur);
                     need_draw = true;
                 }
 
@@ -1899,6 +1957,9 @@ pub fn run() -> i32 {
                         // pressed something else while it was still down.
                         r_tap.cancel();
                         r_target = None;
+                        // And neither is the [ZR] tap: the press that is
+                        // still down belongs to the key that came after it.
+                        zr_tap.cancel();
                         painter.gui.handle_pad_key(&mut ed, k, cur);
                         need_draw = true;
                     }

@@ -620,11 +620,13 @@ fn the_console_chip_table_names_the_same_job_for_the_same_key() {
         // 数値, not 数値入力: the box's line carries eight items on a 763px
         // strip, so the number key's word is the short one there. The
         // inspector's pill borrows whichever word the table has
-        // (Editor::key_label_or), so the two still agree.
-        (Screen::Items, "R", "数値"),
+        // (Editor::key_label_or), so the two still agree. The key is the held
+        // [ZR] on every screen (the shoulders are both tab keys), so the chip
+        // is one token: "ZR長" = ZR 長押し.
+        (Screen::Items, "ZR長", "数値"),
         (Screen::Hunts, "Y", "列"),
         (Screen::Hunts, "A", "刻み"),
-        (Screen::Hunts, "R", "数値入力"),
+        (Screen::Hunts, "ZR長", "数値"),
     ] {
         let mut ed = Editor::new();
         ed.screen = screen;
