@@ -619,6 +619,94 @@ impl Canvas {
         }
     }
 
+
+    /// Draw one cell of the grayscale icon sheet, scaled and tinted.
+    ///
+    /// `atlas` is the whole decoded sheet as RGBA8 (`atlas_w * atlas_h * 4`),
+    /// and the cell is `cell` pixels square at `(sx, sy)` on it. The sheet
+    /// carries brightness in its colour channels and coverage in alpha, so the
+    /// pixel that lands on screen is `tint * brightness * coverage` - which is
+    /// how the game gets a red Dragon talisman and a blue King one out of one
+    /// white glyph.
+    ///
+    /// Scaling is nearest neighbour: the cells are 48 px and the grid wants
+    /// exactly that or a little smaller, so anything smoother would be wasted
+    /// work on the console's CPU.
+    #[allow(clippy::too_many_arguments)]
+    pub fn icon_cell(
+        &mut self,
+        x: i32,
+        y: i32,
+        size: i32,
+        atlas: &[u8],
+        atlas_w: usize,
+        atlas_h: usize,
+        sx: usize,
+        sy: usize,
+        cell: usize,
+        tint: Color,
+    ) {
+        self.begin_frame();
+        if self.back.is_null() || size <= 0 || cell == 0 || atlas_w == 0 || atlas_h == 0 {
+            return;
+        }
+        let tint_alpha = (tint >> 24) & 0xFF;
+        if tint_alpha == 0 || sx >= atlas_w || sy >= atlas_h {
+            return;
+        }
+        let x0 = x.max(0);
+        let y0 = y.max(0);
+        let x1 = x.saturating_add(size).min(self.width);
+        let y1 = y.saturating_add(size).min(self.height);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        let stride = self.stride as usize;
+        let need = atlas_w * atlas_h * 4;
+        if atlas.len() < need {
+            return;
+        }
+        for py in y0..y1 {
+            let row = ((py - y) as i64 * cell as i64 / size as i64) as usize;
+            let syy = sy + row;
+            if syy >= atlas_h {
+                continue;
+            }
+            let dst_row = unsafe { self.back.add(py as usize * stride) } as *mut u32;
+            for px in x0..x1 {
+                let col = ((px - x) as i64 * cell as i64 / size as i64) as usize;
+                let sxx = sx + col;
+                if sxx >= atlas_w {
+                    continue;
+                }
+                let i = (syy * atlas_w + sxx) * 4;
+                // brightness times coverage: a white pixel is the tint whole, an
+                // outline pixel is nearly black, a transparent one is nothing.
+                let cov = atlas[i + 3] as u32 * atlas[i] as u32 / 255;
+                if cov == 0 {
+                    continue;
+                }
+                let a = cov * tint_alpha / 255;
+                if a == 0 {
+                    continue;
+                }
+                unsafe {
+                    let dst = dst_row.add(px as usize);
+                    let old = core::ptr::read_unaligned(dst);
+                    core::ptr::write_unaligned(dst, blend_pixel(old, tint, a));
+                }
+            }
+        }
+    }
+
+    /// Fill a rectangle with a flat colour, then dim everything already on it.
+    ///
+    /// Used for the "empty slot" cell, which shows the sheet's blank glyph
+    /// rather than nothing: the game draws a faint box there.
+    pub fn empty_cell(&mut self, x: i32, y: i32, size: i32, fill: Color) {
+        self.rect(x, y, size, size, fill);
+    }
+
     /// Draw a vertical gradient rectangle from `top_color` to `bot_color`.
     pub fn rect_gradient_v(
         &mut self,

@@ -14,6 +14,8 @@
 extern crate alloc;
 
 pub mod app;
+/// The game's icon sheet, read from the SD card.
+pub mod atlas;
 pub mod editor;
 /// The console's sockets and libcurl, transcribed from the devkitPro headers.
 pub mod net;
