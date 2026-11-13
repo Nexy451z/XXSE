@@ -105,6 +105,8 @@ pub mod strings;
 pub mod tex;
 /// Where an icon sits on the sheet, and the colour the game tints it with.
 pub mod icons;
+/// The equipment box as a ten by ten grid of slots over twenty pages.
+pub mod equipgrid;
 
 #[cfg(feature = "gamedata")]
 pub mod gamedata;
