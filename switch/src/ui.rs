@@ -35,7 +35,7 @@
 //!     8px short of that zone (`hbedit::SCROLL_TEXT_GAP`), so no text and no tap
 //!     can land on the other.
 //!   - 装備フォームの `[A]` は行ごとの操作（装備名/装飾品を選ぶ・値・書き込み）で、
-//!     行そのものに「▸ 選ぶ / ▸ 書き込み」と出る（`hbedit::EquipFormAction`）。
+//!     行そのものに「▶ 選ぶ / ▶ 書き込み」と出る（`hbedit::EquipFormAction`）。
 //!   - `X`: Always Save / Apply changes (`セーブ保存` / `.arc保存` / `護石反映`).
 //!   - `Y`: The list key. On every screen whose list can be narrowed it is
 //!     that screen's 検索 (equipment box, talisman list, talisman form, the
@@ -410,6 +410,12 @@ pub enum UiAction {
     SetStep(usize),
     SelectRow(usize),
     ActivateRow(usize),
+    /// One cell of the equipment box grid: the box slot.
+    ///
+    /// A tap moves the cursor and nothing else, the same rule ArenaCell and
+    /// GuildWeaponCell follow: [A] is still the key that opens a record, so a
+    /// tap cannot start an edit or a delete.
+    EquipCell(usize),
     /// One cell of the arena grid: (arena row, rank column).
     ArenaCell(usize, usize),
     /// One cell of the guild card's weapon-usage grid: (weapon row, venue).
@@ -3198,6 +3204,15 @@ impl GuiState {
                 // A tap on another cell is a cursor move: the step editor
                 // belongs to the cell it was armed on.
                 ed.guild_wpn_edit = false;
+            }
+            UiAction::EquipCell(slot) => {
+                ed.equip_grid.set(slot);
+                ed.equip_grid_moved = true;
+                if let Some(pos) = ed.equip_row_of_slot(slot) {
+                    ed.equip_cursor = pos;
+                }
+                // The pending delete belongs to the record it was armed on.
+                ed.equip_delete_armed = None;
             }
             UiAction::ActivateRow(idx) => {
                 set_active_cursor(ed, self, idx);
@@ -8810,6 +8825,9 @@ impl GuiState {
                 if slot == cursor {
                     c.round_rect_border(x - 2, y - 2, CELL + 4, CELL + 4, 6, 2, t.accent_primary);
                 }
+                // A finger reaches the cell the same way the d-pad does: the tap
+                // moves the cursor, [A] (or the panel's button) does the rest.
+                self.add_hit(x - 1, y - 1, CELL + 2, CELL + 2, UiAction::EquipCell(slot));
             }
         }
 
@@ -8865,7 +8883,7 @@ impl GuiState {
         // The rows and the words for [A] live in the state machine
         // (hbedit::equip_form_rows / EquipFormAction), so the host tests read
         // exactly what this list draws - the same arrangement the talisman form
-        // uses. Each title already carries its own "▸ 選ぶ" / "▸ 書き込み", so a
+        // uses. Each title already carries its own "▶ 選ぶ" / "▶ 書き込み", so a
         // row says what [A] does without the footer being read first.
         let rows: alloc::vec::Vec<(usize, String, String, String, String)> =
             mhnx_core::hbedit::equip_form_rows(&ee, &ename)
@@ -10658,7 +10676,7 @@ impl GuiState {
             QUEST_TAB_MONSTERS => {
                 let monsters = ed.quest_monsters();
                 let mut rows: Vec<(usize, String, String, String, String)> = Vec::new();
-                // The five slots, and nothing else: the ▸詳細 rows that used to
+                // The five slots, and nothing else: the ▶詳細 rows that used to
                 // appear under an opened slot pushed slots 4 and 5 out of the
                 // window. The numbers they held are values of the row now -
                 // [ZR] walks all eleven, the .sem five included - and the
@@ -10680,7 +10698,7 @@ impl GuiState {
                     };
                     // The meta names the value [ZR] is on and the slot's .sem
                     // placement. It does not name [Y]: that key is the step
-                    // size here and has opened nothing since the ▸詳細 rows
+                    // size here and has opened nothing since the ▶詳細 rows
                     // moved onto the row.
                     let meta = format!("スロット{}  {}", slot + 1, ed.quest_mon_meta(slot));
                     let idx = rows.len();

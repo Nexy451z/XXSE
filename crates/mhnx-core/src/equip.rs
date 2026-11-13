@@ -148,18 +148,19 @@ pub fn is_hunter_kind(kind: u8) -> bool {
     HUNTER_KINDS.contains(&kind)
 }
 
-/// The kinds the 装備BOX screen lists, in the order its pickers show them.
+/// The kinds the 装備BOX holds, in the order its pickers show them.
 ///
-/// [HUNTER_KINDS] without the talisman (6). A talisman lives in the same box,
-/// but it has a screen and a form of its own (護石一覧 / 護石編集), and the
-/// equipment form's レベル / 着せ替え / 装飾品 rows mean nothing for one.
+/// This is [HUNTER_KINDS] itself: a talisman (6) is in the same box, the box
+/// screen shows every slot, and the 種別 list was the one place it could not be
+/// reached - so a box that held one had a type nothing could name or select.
 ///
-/// One table, because the four places that used to answer "which kinds does
-/// this box hold" separately disagreed: the list hid the talisman while the
-/// 種別 list, the arrow keys, the whole-box picker and the create path all let
-/// one through - so the box could create a talisman and then not show it.
-pub const BOX_KINDS: [u8; 19] = [
-    1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+/// What a talisman is *not* is an equipment form's subject: its レベル /
+/// 着せ替え / 装飾品 rows mean nothing for one, and it has a form of its own
+/// (護石編集). [`crate::hbedit`] sends a press on one there instead of opening
+/// the equipment form on it, which is the rule the old comment here was trying
+/// to express by hiding the type from every list at once.
+pub const BOX_KINDS: [u8; 20] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20, 21,
 ];
 
 /// Does the 装備BOX screen list this kind? See [BOX_KINDS].

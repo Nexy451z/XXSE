@@ -1725,14 +1725,14 @@ impl CharmAction {
     }
 
     /// The hint the row draws after its name, so the row itself says what
-    /// `[A]` does. `▸` marks the row's own key, the same mark the equipment
+    /// `[A]` does. `▶` marks the row's own key, the same mark the equipment
     /// form uses.
     pub fn row_hint(self) -> &'static str {
         match self {
-            CharmAction::WriteToBox => "▸ 書き込み",
-            CharmAction::PickSkill | CharmAction::PickDecoration => "▸ 選ぶ",
+            CharmAction::WriteToBox => "▶ 書き込み",
+            CharmAction::PickSkill | CharmAction::PickDecoration => "▶ 選ぶ",
             // The three that step a field use the arrow key the footer names.
-            CharmAction::CycleKind | CharmAction::CycleSlots | CharmAction::RaisePoints => "▸ +1",
+            CharmAction::CycleKind | CharmAction::CycleSlots | CharmAction::RaisePoints => "▶ +1",
         }
     }
 }
@@ -1917,8 +1917,8 @@ impl EntryAction {
     /// The hint the row draws after its name.
     pub fn row_hint(self) -> &'static str {
         match self {
-            EntryAction::PickItem => "▸ 選ぶ",
-            EntryAction::RaiseCount | EntryAction::RaiseChance => "▸ 増やす",
+            EntryAction::PickItem => "▶ 選ぶ",
+            EntryAction::RaiseCount | EntryAction::RaiseChance => "▶ 増やす",
         }
     }
 
@@ -1979,7 +1979,7 @@ pub fn charm_form_rows(e: &CharmEdit) -> [CharmFormRow; CHARM_EDIT_ROWS] {
         }
     };
     // Every row says what `[A]` does to it, so the key does not have to be
-    // found in the footer first: "▸ 選ぶ" on the two skill rows is the same
+    // found in the footer first: "▶ 選ぶ" on the two skill rows is the same
     // mark the equipment form uses for its pickers.
     let hint = |field: usize, name: &str| -> String {
         format!("{}  {}", name, CharmAction::of_row(field).row_hint())
@@ -2353,15 +2353,15 @@ impl EquipFormAction {
     }
 
     /// The hint the row draws after its name, so the row says what `[A]` does
-    /// without the footer being read. `▸` marks it as the row's own key.
+    /// without the footer being read. `▶` marks it as the row's own key.
     pub fn row_hint(self) -> &'static str {
         match self {
-            EquipFormAction::WriteForm => "▸ 書き込み",
-            EquipFormAction::CreateRecord => "▸ 作成",
-            EquipFormAction::StepValue => "▸ +1",
-            EquipFormAction::PickDecoration => "▸ 選ぶ",
-            EquipFormAction::PickEquip => "▸ 選ぶ",
-            EquipFormAction::PickKind => "▸ 選ぶ",
+            EquipFormAction::WriteForm => "▶ 書き込み",
+            EquipFormAction::CreateRecord => "▶ 作成",
+            EquipFormAction::StepValue => "▶ +1",
+            EquipFormAction::PickDecoration => "▶ 選ぶ",
+            EquipFormAction::PickEquip => "▶ 選ぶ",
+            EquipFormAction::PickKind => "▶ 選ぶ",
         }
     }
 
@@ -2396,7 +2396,7 @@ pub struct EquipFormRow {
 /// The console builds its list from this instead of assembling the strings
 /// itself, so what the host tests read is what the screen draws - the same
 /// arrangement `charm_form_rows` has. Each title ends with the row's own
-/// `EquipFormAction::row_hint`, which is how "▸ 選ぶ" reaches the list without
+/// `EquipFormAction::row_hint`, which is how "▶ 選ぶ" reaches the list without
 /// the footer being the only place that says it.
 ///
 /// `ename` is the name of the record the box holds at `e.index` ("",
@@ -9355,13 +9355,13 @@ impl Editor {
     /// walks its four views with it. On all of those the pills named a key the
     /// screen had already given away, so an empty key is the honest answer: the
     /// five pills are the only route there and the label names no key at all.
-    /// クエスト改造 was on that list while [Y] opened its ▸詳細 rows; the rows
+    /// クエスト改造 was on that list while [Y] opened its ▶詳細 rows; the rows
     /// moved to the deck and the 詳細 row's [A], so the key is back and the
     /// pills name it again.
     pub fn step_table(&self) -> (&'static [i64], &'static str) {
         match self.screen {
             Screen::Hunts => (&HUNT_STEPS[..], "A"),
-            // クエスト改造 answers [Y] again: the ▸詳細 rows moved to the deck
+            // クエスト改造 answers [Y] again: the ▶詳細 rows moved to the deck
             // and the 詳細 row's [A], which is what gave the key back.
             Screen::QuestEdit => (&STEPS[..], "Y"),
             // オトモ spends [Y] on 項目切替 and クエスト装備 does not answer it
@@ -9910,7 +9910,7 @@ impl Editor {
 
     /// The rows of the モンスター tab: the five slots, and nothing else.
     ///
-    /// It used to grow five ▸詳細 rows under a slot that was opened, which
+    /// It used to grow five ▶詳細 rows under a slot that was opened, which
     /// pushed slots 4 and 5 out of the window: the list is a fixed five rows
     /// now, and the .sem numbers are values of the slot's own row (see
     /// [QUEST_MON_SEM_X] and [Editor::quest_sem_line]).
@@ -9920,7 +9920,7 @@ impl Editor {
 
     /// The .sem placement of one slot as one line: "X 12.3 Y 4.5 Z 6.7 W 90° Wv1".
     ///
-    /// The inspector's second line for the row, so the numbers the ▸詳細 rows
+    /// The inspector's second line for the row, so the numbers the ▶詳細 rows
     /// used to hold are on screen without a row being spent on them. None when
     /// the slot has no .sem placement to read.
     pub fn quest_sem_line(&self, slot: usize) -> Option<String> {
@@ -10532,9 +10532,9 @@ impl Editor {
             }
             // [Y] is the step key, the same key it is on the .mib screen, the
             // reward rows and every other screen that has one. This screen had
-            // given it away to the ▸詳細 rows, so the reward chance could only
+            // given it away to the ▶詳細 rows, so the reward chance could only
             // be walked one point at a time: 10% → 50% was forty presses.
-            // The ▸詳細 rows are the deck's button (touch) and the numbers
+            // The ▶詳細 rows are the deck's button (touch) and the numbers
             // behind them are the 詳細 row's [A] (the file screens), which is
             // where a pad reaches them.
             Key::Y => {
@@ -21797,6 +21797,16 @@ impl Editor {
             self.message = String::from("編集できる装備がありません");
             return;
         };
+        // A talisman is in the box and in the 種別 list, but the equipment form
+        // is not its form: レベル / 着せ替え / 装飾品 mean nothing for one, and
+        // it has 護石編集 of its own.
+        if eq.kind == 6 {
+            self.message = alloc::format!(
+                "枠 #{:04} は護石です（護石一覧で編集します）",
+                eq.index
+            );
+            return;
+        }
         if !self.load_equip_form(eq.index) {
             self.message = String::from("この枠は空なので編集できません");
             return;
@@ -21956,7 +21966,7 @@ impl Editor {
             // identity rows open the equipment picker, the sockets open the
             // decoration picker, the numeric rows step, the 装備枠 row writes
             // and the new form's レベル row creates. The row prints the same
-            // word ("▸ 選ぶ" / "▸ 書き込み" / "▸ 作成"), so the key does not
+            // word ("▶ 選ぶ" / "▶ 書き込み" / "▶ 作成"), so the key does not
             // have to be read out of the footer first.
             Key::A => {
                 match e.a_action() {
@@ -27902,7 +27912,7 @@ mod tests {
         // 護石: the form writes through set_charm_with_kind, from the one row
         // whose [A] is the write. A new form lands on the first skill row, and
         // [A] there opens the skill list now, so the cursor moves to 装備BOX枠 -
-        // the row the form itself marks "▸ 書き込み".
+        // the row the form itself marks "▶ 書き込み".
         ed.open_charms();
         ed.input(Key::L);
         ed.charm_edit.as_mut().expect("the talisman form").field = 0;
@@ -28772,21 +28782,21 @@ mod tests {
         // 装備枠 is the row that writes, and the row itself says so - a reader
         // who never looks at the footer can still find the write.
         assert_eq!(rows[0].action, EquipFormAction::WriteForm);
-        assert!(rows[0].title.contains("▸ 書き込み"), "{}", rows[0].title);
+        assert!(rows[0].title.contains("▶ 書き込み"), "{}", rows[0].title);
         // The two rows that name the record open a list, and say so. 種別 has a
         // list of its own (equip::BOX_KINDS): it used to step one kind per
         // press, so reaching 弓 from 頭 cost fourteen presses.
         assert_eq!(rows[7].action, EquipFormAction::PickKind);
-        assert!(rows[7].title.contains("▸ 選ぶ"), "{}", rows[7].title);
+        assert!(rows[7].title.contains("▶ 選ぶ"), "{}", rows[7].title);
         assert_eq!(rows[8].action, EquipFormAction::PickEquip);
         for i in [7usize, 8] {
-            assert!(rows[i].title.contains("▸ 選ぶ"), "{}", rows[i].title);
+            assert!(rows[i].title.contains("▶ 選ぶ"), "{}", rows[i].title);
             assert!(rows[i].meta.contains("[A]"), "{}", rows[i].meta);
         }
         // The three sockets open the decoration list.
         for i in 4..=6 {
             assert_eq!(rows[i].action, EquipFormAction::PickDecoration);
-            assert!(rows[i].title.contains("▸ 選ぶ"), "{}", rows[i].title);
+            assert!(rows[i].title.contains("▶ 選ぶ"), "{}", rows[i].title);
         }
         // The numeric rows step.
         for i in 1..=3 {
@@ -28801,7 +28811,7 @@ mod tests {
         assert_eq!(rows[0].action, EquipFormAction::PickKind);
         assert_eq!(rows[1].action, EquipFormAction::PickEquip);
         assert_eq!(rows[2].action, EquipFormAction::CreateRecord);
-        assert!(rows[2].title.contains("▸ 作成"), "{}", rows[2].title);
+        assert!(rows[2].title.contains("▶ 作成"), "{}", rows[2].title);
         assert_eq!(rows[2].badge, "#03");
     }
 
@@ -28919,7 +28929,7 @@ mod tests {
             CharmAction::PickSkill.label()
         );
         let rows = charm_form_rows(&ed.charm_edit.expect("form"));
-        assert!(rows[3].title.contains("▸ 選ぶ"), "{}", rows[3].title);
+        assert!(rows[3].title.contains("▶ 選ぶ"), "{}", rows[3].title);
         ed.input(Key::A);
         assert_eq!(ed.screen, Screen::SkillPick, "{}", ed.message);
         assert_eq!(
