@@ -388,7 +388,7 @@ fn a_press_on_an_empty_cell_starts_a_new_record_in_that_cell() {
 }
 
 #[test]
-fn a_press_on_a_talisman_says_where_it_is_edited_instead_of_opening_the_form() {
+fn a_press_on_a_talisman_opens_the_talisman_form_on_that_record() {
     let Some(mut ed) = open_editor() else {
         eprintln!("skipping: no sample save");
         return;
@@ -404,11 +404,12 @@ fn a_press_on_a_talisman_says_where_it_is_edited_instead_of_opening_the_form() {
     ed.equip_grid.set(slot);
     ed.equip_grid_moved = true;
     ed.input(Key::A);
-    assert_eq!(ed.screen, Screen::Equip, "the equipment form must not open");
-    assert!(
-        ed.message.contains("護石"),
-        "the message has to say where it is edited: {}",
-        ed.message
-    );
+    // The box holds the talisman, so the press reaches 護石編集 rather than a
+    // note pointing at another list.
+    assert_eq!(ed.screen, Screen::CharmEdit, "{}", ed.message);
+    let form = ed.charm_edit.expect("the talisman form");
+    assert_eq!(form.index, slot, "the form is on the record that was pressed");
+    // And it is not the equipment form, whose rows mean nothing for a talisman.
+    assert!(ed.equip_edit.is_none());
 }
 

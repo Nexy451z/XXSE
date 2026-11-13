@@ -13047,6 +13047,29 @@ impl Editor {
         self.open_charm_editor(false);
     }
 
+    /// Open 護石編集 on the talisman sitting in a box slot.
+    ///
+    /// The box screen can stand on a talisman - the box holds them and the grid
+    /// draws every slot - so a press there has to reach the form that edits one.
+    /// Saying "it is in another list" made the user find that list by hand.
+    ///
+    /// A talisman filter may be hiding the record; a press in the box is not a
+    /// search result, so the filter is dropped rather than obeyed.
+    pub fn edit_charm_at_slot(&mut self, slot: usize) -> bool {
+        let mut pos = self.charms().iter().position(|c| c.index == slot);
+        if pos.is_none() {
+            self.charm_filter.clear();
+            pos = self.charms().iter().position(|c| c.index == slot);
+        }
+        let Some(pos) = pos else {
+            return false;
+        };
+        self.cursor = pos;
+        self.charm_delete_armed = None;
+        self.open_charm_form_selected();
+        self.screen == Screen::CharmEdit
+    }
+
     /// The 護石編集 tab: light the tab, leave the list on screen.
     ///
     /// The tab press used to call [Editor::open_charm_form_selected], so [R] on
@@ -16665,10 +16688,14 @@ impl Editor {
                 }
             }
             Some(eq) if eq.kind == 6 => {
-                self.message = alloc::format!(
-                    "枠 #{:04} は護石です（護石一覧で編集します）",
-                    slot
-                );
+                // Straight into 護石編集 on this record: the box holds it, so a
+                // press on it is the edit the user asked for.
+                if !self.edit_charm_at_slot(slot) {
+                    self.message = alloc::format!(
+                        "枠 #{:04} は護石です（護石一覧で編集します）",
+                        slot
+                    );
+                }
             }
             Some(eq) => {
                 if let Some(pos) = self.equip_row_of_slot(eq.index) {

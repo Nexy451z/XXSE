@@ -94,3 +94,28 @@ fn a_white_pixel_takes_the_tint_and_a_black_one_stays_black() {
     // half brightness halves the colour
     assert_eq!(icons::tint_pixel([128, 128, 128, 255], tint), [0x77, 0x46, 0x2E, 255]);
 }
+
+#[test]
+fn a_talismans_colour_is_its_kind_and_matches_the_game() {
+    // The reference the pairs were checked against is the game's own box: a
+    // 王の護石 (kind 6) draws blue and a 龍の護石 (kind 7) draws red.
+    let king = icons::rarity_tint(6);
+    let dragon = icons::rarity_tint(7);
+    assert_ne!(king, dragon, "the two kinds must not look the same");
+    // 0xAABBGGRR: the low byte is red. Blue wins for 王, red for 龍.
+    let king_rgba = icons::to_rgba(king);
+    let dragon_rgba = icons::to_rgba(dragon);
+    assert!(king_rgba[2] > king_rgba[0], "王 should read blue");
+    assert!(dragon_rgba[0] > dragon_rgba[2], "龍 should read red");
+    // The kind is the rarity: 兵士 (1) takes the first colour, which is the pale
+    // one the empty cell also uses, and 天 (10) the tenth.
+    for kind in 1u8..=10 {
+        assert_eq!(
+            icons::rarity_tint(kind),
+            icons::RARITY_COLORS[kind as usize - 1],
+            "kind {kind}"
+        );
+    }
+    assert_ne!(icons::rarity_tint(10), icons::RARITY_COLORS[0]);
+}
+

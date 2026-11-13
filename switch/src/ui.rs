@@ -8804,9 +8804,18 @@ impl GuiState {
                         // tint is the game's own colour for that rarity; with no
                         // tables on the card every glyph gets the pale first
                         // entry, which is still the right glyph.
-                        let rarity = crate::tables::get()
-                            .equip_rarity(eq.kind, eq.id)
-                            .unwrap_or(1);
+                        // A talisman is the exception that needs no table: its
+                        // kind (1 兵士 … 10 天) is stored in the id field, and
+                        // the game's rarity for that kind is the same number -
+                        // so 王 draws blue and 龍 red, which is what the game
+                        // does. Everything else asks the tables.
+                        let rarity = if eq.kind == 6 {
+                            eq.id.clamp(1, 10) as u8
+                        } else {
+                            crate::tables::get()
+                                .equip_rarity(eq.kind, eq.id)
+                                .unwrap_or(1)
+                        };
                         let tint = mhnx_core::icons::rarity_tint(rarity);
                         // Centred in the well, at three quarters of its size.
                         let ix = x + (CELL - ICON) / 2;
@@ -8837,11 +8846,7 @@ impl GuiState {
                         if eq.transmog != 0 {
                             c.rect(x + CELL - 7, y + CELL - 7, 5, 5, t.accent_primary);
                         }
-                        // A talisman is in the box but edited on its own screen;
-                        // the corner dot says so before the press does.
-                        if eq.kind == 6 {
-                            c.rect(x + 1, y + 1, 6, 6, t.text_muted);
-                        }
+
                     }
                     None => {
                         c.round_rect(x, y, CELL, CELL, 4, t.bg_row_odd);
