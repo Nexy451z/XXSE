@@ -1541,7 +1541,10 @@ impl GuiState {
                 // The row the box was on is kept: a tab step used to put the
                 // list back at the top, so crossing to 装備BOX and back cost
                 // the row the user had reached (hbedit::Editor::open_equip_box).
-                2 => ed.open_equip_box(),
+                2 => {
+            ed.open_equip_box();
+            ed.use_equip_grid();
+        }
                 _ => {
                     ed.screen = Screen::Sets;
                     // The row lives in the state machine now (Editor::sets_cursor):
@@ -8703,19 +8706,145 @@ impl GuiState {
         // The heading carries the filter: a filtered list that said nothing
         // looked like a box that had lost rows, and the key that cleared it
         // was [X], which is the save key everywhere.
-        self.draw_adaptive_rows_warn(
+        // The box is a grid now, not a list of the records that happen to
+        // exist: ten cells a row, ten rows a page, twenty pages. A cell with a
+        // record draws that record's icon, tinted the way the game tints it; an
+        // empty cell is still a cell, because that is where a new piece goes.
+        let t = theme();
+        let body_y = CONTENT_Y + 30;
+        let body_h = FOOTER_Y - body_y - 10;
+
+        // The panel the grid sits in, drawn the same way every list panel is.
+        c.round_rect(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(
+            MAIN_X,
+            body_y,
+            V1_LIST_W,
+            body_h,
+            t.corner_r,
+            1,
+            t.border_subtle,
+        );
+
+        // Heading, with the page count: the box is 20 pages and a reader who
+        // cannot see which one they are on cannot say where a record lives.
+        let page = ed.equip_grid.page();
+        let heading = format!(
+            "{}　{} / {} ページ",
+            ed.equip_filter_heading(),
+            page + 1,
+            mhnx_core::equipgrid::PAGES
+        );
+        c.text_sized(
+            MAIN_X + 16,
+            body_y + 8,
+            &heading,
+            t.text_muted,
+            FontSize::Small,
+        );
+        c.hline(MAIN_X + 12, body_y + 30, V1_LIST_W - 24, t.border_subtle);
+
+        // 41 px cells on a 44 px pitch: ten of them is 437 px, which leaves the
+        // strip under the grid its two lines on a 720p screen.
+        const CELL: i32 = 41;
+        const PITCH: i32 = 44;
+        let grid_w = mhnx_core::equipgrid::COLUMNS as i32 * PITCH - 3;
+        let gx = MAIN_X + (V1_LIST_W - grid_w) / 2;
+        let gy = body_y + 38;
+
+        let atlas = crate::atlas::get();
+        let first = mhnx_core::equipgrid::first_slot_of(page);
+        let cursor = ed.equip_grid.slot();
+        for row in 0..mhnx_core::equipgrid::ROWS {
+            for col in 0..mhnx_core::equipgrid::COLUMNS {
+                let slot = first + row * mhnx_core::equipgrid::COLUMNS + col;
+                let x = gx + col as i32 * PITCH;
+                let y = gy + row as i32 * PITCH;
+
+                // The cell itself: a record gets its icon, an empty one gets the
+                // faint well the game draws so the grid still reads as a grid.
+                let entry = ed.equip_at_slot(slot);
+                match &entry {
+                    Some(eq) => {
+                        let rect = mhnx_core::icons::cell_for_equipment(eq.kind);
+                        // Rarity lives in the game's tables, not in the save, so
+                        // until the tables are read the tint is the pale first
+                        // entry: the glyph is still the right one.
+                        let tint = mhnx_core::icons::rarity_tint(1);
+                        if let Some(a) = atlas {
+                            c.icon_cell(
+                                x,
+                                y,
+                                CELL,
+                                &a.pixels,
+                                a.width,
+                                a.height,
+                                rect.x,
+                                rect.y,
+                                rect.size,
+                                tint,
+                            );
+                        } else {
+                            // No sheet on the card: the type's first character
+                            // stands in, so the cell is still readable.
+                            let name = mhnx_core::equip::type_name(eq.kind);
+                            let head: String = name.chars().take(1).collect();
+                            c.text_centered(x, y, CELL, CELL, &head, t.text_muted, FontSize::Small);
+                        }
+                        // Transmog is in the save (+0x04), so it can be marked
+                        // even when the rarity tables are missing: a corner tick
+                        // in the accent colour.
+                        if eq.transmog != 0 {
+                            c.rect(x + CELL - 7, y + CELL - 7, 6, 6, t.accent_primary);
+                        }
+                        // A talisman is in the box but edited on its own screen;
+                        // the corner dot says so before the press does.
+                        if eq.kind == 6 {
+                            c.rect(x + 1, y + 1, 6, 6, t.text_muted);
+                        }
+                    }
+                    None => {
+                        c.round_rect(x, y, CELL, CELL, 4, t.bg_row_odd);
+                    }
+                }
+                if slot == cursor {
+                    c.round_rect_border(x - 2, y - 2, CELL + 4, CELL + 4, 6, 2, t.accent_primary);
+                }
+            }
+        }
+
+        // The strip under the grid, and the inspector beside it, exactly as the
+        // list screens draw them: the deck on the right is where the screen's
+        // own operations live and an empty box still has them.
+        let warn_lh = c.line_height_sized(FontSize::Small).max(16);
+        let strip_lines = warnings.len().min(2) as i32;
+        self.draw_list_strip(
+            c,
+            strip_lines,
+            mhnx_core::equipgrid::PER_PAGE,
+            body_y,
+            body_h,
+            LIST_ROW_H,
+            warn_lh,
+            &warnings,
+            &[],
+        );
+        let pos = ed
+            .equip_row_of_slot(cursor)
+            .unwrap_or_else(|| ed.equip_cursor.min(rows.len().saturating_sub(1)));
+        self.draw_studio_inspector(
             c,
             ed,
-            &ed.equip_filter_heading(),
-            "",
-            &rows,
-            ed.equip_cursor.min(rows.len().saturating_sub(1)),
+            body_y,
+            body_h,
+            rows.get(pos),
+            pos,
+            rows.len(),
             false,
             ed.equip_a_label(),
-            &[],
-            &warnings,
         );
     }
+
 
     /// The equipment form. Nine rows when an existing record is edited, three
     /// when a new one is being written: one row per field, the value on the

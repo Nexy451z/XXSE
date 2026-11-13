@@ -100,6 +100,51 @@ fn page_turns_clamp_at_both_ends() {
     assert_eq!(c.page(), 19);
 }
 
+
+#[test]
+fn a_press_past_an_edge_turns_the_page_in_reading_order() {
+    let mut c = Cursor::new();
+    // right from the last column of page 0 -> first column, same row, page 1
+    c.set(9);
+    c.step_paged(1, 0);
+    assert_eq!((c.page(), c.row(), c.column()), (1, 0, 0));
+    // and back again
+    c.step_paged(-1, 0);
+    assert_eq!((c.page(), c.row(), c.column()), (0, 0, 9));
+}
+
+#[test]
+fn a_vertical_press_past_the_last_row_turns_the_page() {
+    let mut c = Cursor::new();
+    c.set(99);
+    c.step_paged(0, 1);
+    assert_eq!((c.page(), c.row(), c.column()), (1, 0, 9));
+    c.step_paged(0, -1);
+    assert_eq!((c.page(), c.row(), c.column()), (0, 9, 9));
+}
+
+#[test]
+fn the_paged_step_stops_at_the_ends_of_the_box_rather_than_running_off() {
+    let mut c = Cursor::new();
+    c.set(0);
+    c.step_paged(-1, 0);
+    assert_eq!(c.slot(), 0);
+    c.go_to_page(19);
+    c.set(1999);
+    c.step_paged(1, 0);
+    assert_eq!(c.slot(), 1999);
+}
+
+#[test]
+fn a_press_inside_a_page_moves_one_cell() {
+    let mut c = Cursor::new();
+    c.set(equipgrid::slot_at(0, 4, 4));
+    c.step_paged(1, 0);
+    assert_eq!(c.slot(), equipgrid::slot_at(0, 4, 5));
+    c.step_paged(0, 1);
+    assert_eq!(c.slot(), equipgrid::slot_at(0, 5, 5));
+}
+
 #[test]
 fn every_page_starts_on_its_own_hundred() {
     for page in 0..equipgrid::PAGES {

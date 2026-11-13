@@ -309,3 +309,106 @@ fn changing_the_type_in_the_form_replaces_the_record() {
     );
     assert!(ed.dirty);
 }
+
+#[test]
+fn the_box_screen_is_a_grid_and_a_direction_press_moves_one_cell() {
+    let Some(mut ed) = open_editor() else {
+        eprintln!("skipping: no sample save");
+        return;
+    };
+    ed.open_equip_box();
+    ed.use_equip_grid();
+    assert_eq!(ed.equip_grid.slot(), 0);
+
+    ed.input(Key::Right);
+    assert_eq!(ed.equip_grid.slot(), 1, "[▶] moves one cell right");
+    ed.input(Key::Down);
+    assert_eq!(
+        ed.equip_grid.slot(),
+        mhnx_core::equipgrid::slot_at(0, 1, 1),
+        "[▼] moves one cell down"
+    );
+    ed.input(Key::Left);
+    ed.input(Key::Up);
+    assert_eq!(ed.equip_grid.slot(), 0, "and back again");
+}
+
+#[test]
+fn a_press_past_the_last_column_turns_the_page_rather_than_the_row() {
+    let Some(mut ed) = open_editor() else {
+        eprintln!("skipping: no sample save");
+        return;
+    };
+    ed.open_equip_box();
+    ed.use_equip_grid();
+    ed.equip_grid.set(mhnx_core::equipgrid::slot_at(0, 3, 9));
+    ed.equip_grid_moved = true;
+    ed.input(Key::Right);
+    assert_eq!(ed.equip_grid.page(), 1);
+    assert_eq!((ed.equip_grid.row(), ed.equip_grid.column()), (3, 0));
+}
+
+#[test]
+fn the_cursor_does_not_fall_off_the_first_cell() {
+    let Some(mut ed) = open_editor() else {
+        eprintln!("skipping: no sample save");
+        return;
+    };
+    ed.open_equip_box();
+    ed.use_equip_grid();
+    ed.input(Key::Left);
+    ed.input(Key::Up);
+    assert_eq!(ed.equip_grid.slot(), 0);
+}
+
+#[test]
+fn a_press_on_an_empty_cell_starts_a_new_record_in_that_cell() {
+    let Some(mut ed) = open_editor() else {
+        eprintln!("skipping: no sample save");
+        return;
+    };
+    ed.open_equip_box();
+    ed.use_equip_grid();
+    // The last slot of the box is empty in every save this tool has seen; find
+    // one that really is rather than assuming it.
+    let empty = (0..equip::EQUIP_COUNT)
+        .rev()
+        .find(|i| ed.equip_at_slot(*i).is_none());
+    let Some(empty) = empty else {
+        eprintln!("skipping: the box has no empty slot");
+        return;
+    };
+    ed.equip_grid.set(empty);
+    ed.equip_grid_moved = true;
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::EquipEdit, "{}", ed.message);
+    let draft = ed.equip_edit.expect("a draft");
+    assert!(draft.new, "the form is the new-record form");
+    assert_eq!(draft.index, empty, "the record goes in the cell that was pressed");
+}
+
+#[test]
+fn a_press_on_a_talisman_says_where_it_is_edited_instead_of_opening_the_form() {
+    let Some(mut ed) = open_editor() else {
+        eprintln!("skipping: no sample save");
+        return;
+    };
+    ed.open_equip_box();
+    ed.use_equip_grid();
+    let talisman = (0..equip::EQUIP_COUNT)
+        .find(|i| ed.equip_at_slot(*i).map(|e| e.kind == 6).unwrap_or(false));
+    let Some(slot) = talisman else {
+        eprintln!("skipping: the box holds no talisman");
+        return;
+    };
+    ed.equip_grid.set(slot);
+    ed.equip_grid_moved = true;
+    ed.input(Key::A);
+    assert_eq!(ed.screen, Screen::Equip, "the equipment form must not open");
+    assert!(
+        ed.message.contains("護石"),
+        "the message has to say where it is edited: {}",
+        ed.message
+    );
+}
+

@@ -6983,6 +6983,28 @@ pub struct Editor {
     pub equip_filter: String,
     /// Cursor over the filtered equipment list.
     pub equip_cursor: usize,
+    /// Where the box cursor is on the grid the screen now draws.
+    ///
+    /// The box is a fixed 10 x 10 x 20 grid of slots, not a list of the records
+    /// that happen to exist, so the cursor has to be able to sit on an empty
+    /// slot - that is where "put a new piece here" starts. The list cursor is
+    /// kept in step with it so every path that already works off
+    /// [`Editor::equip_cursor`] keeps working.
+    pub equip_grid: crate::equipgrid::Cursor,
+    /// Has the user moved the box cursor themselves yet?
+    ///
+    /// Until the first direction press the grid is not authoritative: a path
+    /// that sets [`Editor::equip_cursor`] directly (the console's row taps, the
+    /// tests, the "create and select the new record" flow) has to win, or [A]
+    /// would act on slot 0 instead of the record the list is showing.
+    pub equip_grid_moved: bool,
+    /// Does this build draw the box as a grid?
+    ///
+    /// The console does, and its four directions are cells. The desktop build
+    /// still lists the records, where a direction press has always meant "the
+    /// next record" - and there a grid step would stall on the empty slots
+    /// between records, because the list cursor only follows records.
+    pub equip_grid_navigation: bool,
     /// The equipment record being edited, if the form is open.
     pub equip_edit: Option<EquipEdit>,
     /// The 種別 row's [A] asked for the kind list, which the console owns.
@@ -7395,6 +7417,9 @@ impl Editor {
             charm_filter: String::new(),
             equip_filter: String::new(),
             equip_cursor: 0,
+            equip_grid: crate::equipgrid::Cursor::new(),
+            equip_grid_moved: false,
+            equip_grid_navigation: false,
             equip_edit: None,
             equip_kind_pick_pending: false,
             equip_delete_armed: None,
@@ -12875,7 +12900,26 @@ impl Editor {
         self.equip_cursor = self
             .equip_cursor
             .min(self.equip_rows().len().saturating_sub(1));
+        // The grid cursor is the screen's cursor now, so it has to start where
+        // the list was left rather than back at slot 0.
+        self.sync_grid_to_cursor();
         self.screen = Screen::Equip;
+    }
+
+    /// Draw the equipment box as the grid the console shows.
+    ///
+    /// The console calls this when it navigates to the screen; the desktop
+    /// build never does, so its list keeps the behaviour its own tests pin.
+    pub fn use_equip_grid(&mut self) {
+        self.equip_grid_navigation = true;
+        self.sync_grid_to_cursor();
+    }
+
+    /// Put the box grid's cursor on the record the list cursor is on.
+    pub fn sync_grid_to_cursor(&mut self) {
+        if let Some(eq) = self.equip_rows().get(self.equip_cursor) {
+            self.equip_grid.set(eq.index);
+        }
     }
 
     /// 狩猟記録: the list, on the row it was on (see [Editor::open_equip_box]).
@@ -16564,6 +16608,81 @@ impl Editor {
             .into_iter()
             .filter(|e| crate::equip::box_holds_kind(e.kind))
             .collect()
+    }
+
+    /// The record in one box slot, talismans included, or `None` when empty.
+    ///
+    /// [`Editor::equip_rows`] leaves talismans out on purpose - they have their
+    /// own screen - but the box the screen draws is the box itself, so a slot
+    /// holding one must not look empty. A press on such a slot says where the
+    /// record is edited instead of opening the equipment form on it.
+    pub fn equip_at_slot(&self, slot: usize) -> Option<crate::equip::Equipment> {
+        let save = self.save.as_ref()?;
+        let box_ = save.equipment_box(self.slot)?;
+        let off = slot.checked_mul(crate::equip::EQUIP_RECORD)?;
+        let rec = box_.get(off..off + crate::equip::EQUIP_RECORD)?;
+        crate::equip::decode_record(slot, rec).filter(|e| !e.is_empty())
+    }
+
+    /// The filtered list row a box slot occupies, when it is listed at all.
+    pub fn equip_row_of_slot(&self, slot: usize) -> Option<usize> {
+        self.equip_rows().iter().position(|e| e.index == slot)
+    }
+
+    /// Move the box cursor one press and keep the list cursor on the same
+    /// record, so every existing path ([A], [-], the form) still finds it.
+    fn move_equip_grid(&mut self, dx: isize, dy: isize) {
+        // The first press starts from wherever the list cursor already is, so a
+        // screen opened on a record does not jump to slot 0 under the finger.
+        if !self.equip_grid_moved {
+            self.sync_grid_to_cursor();
+            self.equip_grid_moved = true;
+        }
+        self.equip_grid.step_paged(dx, dy);
+        let slot = self.equip_grid.slot();
+        if let Some(pos) = self.equip_row_of_slot(slot) {
+            self.equip_cursor = pos;
+        }
+    }
+
+    /// [A] on the box grid: the record's form, the new form on an empty slot,
+    /// or a note saying where a talisman is edited.
+    fn equip_grid_a_press(&mut self) {
+        // Before the user has moved the cursor the list is the authority; see
+        // Editor::equip_grid_moved.
+        if !self.equip_grid_moved {
+            self.sync_grid_to_cursor();
+        }
+        self.equip_grid_moved = true;
+        let slot = self.equip_grid.slot();
+        match self.equip_at_slot(slot) {
+            None => {
+                self.open_equip_creator();
+                // The new record goes where the user pointed, not into the
+                // first gap the box happens to have.
+                if let Some(ee) = self.equip_edit.as_mut() {
+                    ee.index = slot;
+                }
+            }
+            Some(eq) if eq.kind == 6 => {
+                self.message = alloc::format!(
+                    "枠 #{:04} は護石です（護石一覧で編集します）",
+                    slot
+                );
+            }
+            Some(eq) => {
+                if let Some(pos) = self.equip_row_of_slot(eq.index) {
+                    self.equip_cursor = pos;
+                }
+                if self.load_equip_form(eq.index) {
+                    self.screen = Screen::EquipEdit;
+                    self.message = alloc::format!(
+                        "{} を編集中（A で書き込み / B で戻る）",
+                        crate::equip::name(&eq)
+                    );
+                }
+            }
+        }
     }
 
     /// Equipment of the current slot, after the filter.
@@ -21402,7 +21521,6 @@ impl Editor {
     }
 
     fn input_equip(&mut self, key: Key) {
-        let n = self.equip_rows().len();
         // Anything other than the confirmation itself means the user is no
         // longer looking at the record that was armed, so the pending delete
         // is dropped before the key does its own work.
@@ -21410,8 +21528,17 @@ impl Editor {
             self.equip_delete_armed = None;
         }
         match key {
+            // On the console the box is a grid (see Editor::equip_grid_navigation):
+            // all four directions move the cell cursor and a press past an edge
+            // turns the page. The desktop build keeps the list's own answer,
+            // where a direction press means the next record.
+            Key::Up if self.equip_grid_navigation => self.move_equip_grid(0, -1),
+            Key::Down if self.equip_grid_navigation => self.move_equip_grid(0, 1),
+            Key::Left if self.equip_grid_navigation => self.move_equip_grid(-1, 0),
+            Key::Right if self.equip_grid_navigation => self.move_equip_grid(1, 0),
             Key::Up => self.equip_cursor = self.equip_cursor.saturating_sub(1),
             Key::Down => {
+                let n = self.equip_rows().len();
                 if n > 0 {
                     self.equip_cursor = (self.equip_cursor + 1).min(n - 1);
                 }
@@ -21427,6 +21554,7 @@ impl Editor {
             // selected record's form, the first blank record of an empty box,
             // or the search that hid every row - the same three answers the
             // talisman list gives, so one word means one press on both lists.
+            Key::A if self.equip_grid_navigation => self.equip_grid_a_press(),
             Key::A => self.equip_a_press(),
             // Two presses: the first only names what would go, the second one
             // clears the record. The reference check is the same one

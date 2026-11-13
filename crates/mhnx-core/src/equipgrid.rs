@@ -118,6 +118,49 @@ impl Cursor {
         self.slot = slot_at(self.page(), row, column);
     }
 
+    /// One press of a direction, turning the page at the edge.
+    ///
+    /// This is what the box screen uses: with 2000 slots and no free key for a
+    /// page turn, reading order is the answer - right from the last column of a
+    /// page lands on the same row of the next page, down from the last row
+    /// lands on the first row of the next page, and the same backwards.
+    ///
+    /// [`Cursor::step`] is the clamping version, used where a page turn must not
+    /// be a side effect of a direction press.
+    pub fn step_paged(&mut self, dx: isize, dy: isize) {
+        let row = self.row() as isize + dy;
+        let column = self.column() as isize + dx;
+        if (0..ROWS as isize).contains(&row) && (0..COLUMNS as isize).contains(&column) {
+            self.slot = slot_at(self.page(), row as usize, column as usize);
+            return;
+        }
+        // Past an edge: work out how many pages that is worth and land on the
+        // matching cell of the page we arrive at.
+        let mut page = self.page() as isize;
+        let mut row = row;
+        let mut column = column;
+        if column >= COLUMNS as isize {
+            page += 1;
+            column = 0;
+        } else if column < 0 {
+            page -= 1;
+            column = COLUMNS as isize - 1;
+        }
+        if row >= ROWS as isize {
+            page += 1;
+            row = 0;
+        } else if row < 0 {
+            page -= 1;
+            row = ROWS as isize - 1;
+        }
+        // Past the first or the last page there is nowhere to go: stay put
+        // rather than snapping to a different cell of the page we are on.
+        if page < 0 || page >= PAGES as isize {
+            return;
+        }
+        self.slot = slot_at(page as usize, row as usize, column as usize);
+    }
+
     /// Turn the page, keeping the cursor in the same cell of the new page.
     pub fn turn_page(&mut self, pages: isize) {
         let page = (self.page() as isize + pages).clamp(0, PAGES as isize - 1) as usize;
