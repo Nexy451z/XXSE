@@ -22,31 +22,57 @@ pub const SLOTS: usize = EQUIP_COUNT;
 /// Pages the box is shown in.
 pub const PAGES: usize = SLOTS / PER_PAGE;
 
+/// Pages a box of this many slots is shown in.
+pub fn pages_for(slots: usize) -> usize {
+    slots.div_ceil(PER_PAGE)
+}
+
 /// The slot a page's row and column name.
 ///
 /// Out of range arguments clamp into the page rather than wrapping into a
 /// neighbouring one: a cursor that ran off the right edge of page 3 has to land
 /// on page 3's left edge, not on page 4's.
 pub fn slot_at(page: usize, row: usize, column: usize) -> usize {
-    let page = page.min(PAGES.saturating_sub(1));
+    slot_at_in(SLOTS, page, row, column)
+}
+
+/// [`slot_at`] for a box of any size: the item box is 2300 slots, not 2000.
+pub fn slot_at_in(slots: usize, page: usize, row: usize, column: usize) -> usize {
+    let slots = slots.max(1);
+    let page = page.min(pages_for(slots).saturating_sub(1));
     let row = row.min(ROWS - 1);
     let column = column.min(COLUMNS - 1);
-    (page * PER_PAGE + row * COLUMNS + column).min(SLOTS - 1)
+    (page * PER_PAGE + row * COLUMNS + column).min(slots - 1)
 }
 
 /// Which page a slot is on.
 pub fn page_of(slot: usize) -> usize {
-    (slot.min(SLOTS - 1)) / PER_PAGE
+    page_of_in(SLOTS, slot)
+}
+
+/// [`page_of`] for a box of any size.
+pub fn page_of_in(slots: usize, slot: usize) -> usize {
+    slot.min(slots.max(1) - 1) / PER_PAGE
 }
 
 /// Which row of its page a slot is in.
 pub fn row_of(slot: usize) -> usize {
-    (slot.min(SLOTS - 1)) % PER_PAGE / COLUMNS
+    row_of_in(SLOTS, slot)
+}
+
+/// [`row_of`] for a box of any size.
+pub fn row_of_in(slots: usize, slot: usize) -> usize {
+    slot.min(slots.max(1) - 1) % PER_PAGE / COLUMNS
 }
 
 /// Which column of its page a slot is in.
 pub fn column_of(slot: usize) -> usize {
-    (slot.min(SLOTS - 1)) % COLUMNS
+    column_of_in(SLOTS, slot)
+}
+
+/// [`column_of`] for a box of any size.
+pub fn column_of_in(slots: usize, slot: usize) -> usize {
+    slot.min(slots.max(1) - 1) % COLUMNS
 }
 
 /// The first slot of a page.
@@ -54,10 +80,18 @@ pub fn first_slot_of(page: usize) -> usize {
     page.min(PAGES.saturating_sub(1)) * PER_PAGE
 }
 
+/// [`first_slot_of`] for a box of any size.
+pub fn first_slot_of_in(slots: usize, page: usize) -> usize {
+    page.min(pages_for(slots).saturating_sub(1)) * PER_PAGE
+}
+
 /// Where the cursor is in the box, and where one press takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cursor {
     slot: usize,
+    /// How many slots the box has. The equipment box is 2000, the item box
+    /// 2300, and the arithmetic is the same for both.
+    slots: usize,
 }
 
 impl Default for Cursor {
@@ -67,16 +101,38 @@ impl Default for Cursor {
 }
 
 impl Cursor {
-    /// On the first slot of the first page.
+    /// On the first slot of the first page of the equipment box.
     pub fn new() -> Self {
-        Cursor { slot: 0 }
+        Self::over(SLOTS)
+    }
+
+    /// On the first slot of the first page of a box of `slots` slots.
+    pub fn over(slots: usize) -> Self {
+        Cursor {
+            slot: 0,
+            slots: slots.max(1),
+        }
     }
 
     /// On a particular slot, clamped into the box.
     pub fn at(slot: usize) -> Self {
-        Cursor {
-            slot: slot.min(SLOTS - 1),
-        }
+        Cursor::over(SLOTS).with_slot(slot)
+    }
+
+    /// A copy sitting on `slot`, clamped into the box.
+    pub fn with_slot(mut self, slot: usize) -> Self {
+        self.slot = slot.min(self.slots - 1);
+        self
+    }
+
+    /// How many slots this box has.
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    /// How many pages this box is shown in.
+    pub fn pages(&self) -> usize {
+        pages_for(self.slots)
     }
 
     /// The slot the cursor is on.
@@ -86,22 +142,22 @@ impl Cursor {
 
     /// The page the cursor is on.
     pub fn page(&self) -> usize {
-        page_of(self.slot)
+        page_of_in(self.slots, self.slot)
     }
 
     /// The row the cursor is on, within its page.
     pub fn row(&self) -> usize {
-        row_of(self.slot)
+        row_of_in(self.slots, self.slot)
     }
 
     /// The column the cursor is on, within its page.
     pub fn column(&self) -> usize {
-        column_of(self.slot)
+        column_of_in(self.slots, self.slot)
     }
 
     /// Move to a slot the caller worked out itself.
     pub fn set(&mut self, slot: usize) {
-        self.slot = slot.min(SLOTS - 1);
+        self.slot = slot.min(self.slots - 1);
     }
 
     /// One press of a direction.
@@ -115,7 +171,7 @@ impl Cursor {
         let column = self.column() as isize + dx;
         let row = row.clamp(0, ROWS as isize - 1) as usize;
         let column = column.clamp(0, COLUMNS as isize - 1) as usize;
-        self.slot = slot_at(self.page(), row, column);
+        self.slot = slot_at_in(self.slots, self.page(), row, column);
     }
 
     /// One press of a direction, turning the page at the edge.
@@ -131,7 +187,7 @@ impl Cursor {
         let row = self.row() as isize + dy;
         let column = self.column() as isize + dx;
         if (0..ROWS as isize).contains(&row) && (0..COLUMNS as isize).contains(&column) {
-            self.slot = slot_at(self.page(), row as usize, column as usize);
+            self.slot = slot_at_in(self.slots, self.page(), row as usize, column as usize);
             return;
         }
         // Past an edge: work out how many pages that is worth and land on the
@@ -155,21 +211,22 @@ impl Cursor {
         }
         // Past the first or the last page there is nowhere to go: stay put
         // rather than snapping to a different cell of the page we are on.
-        if page < 0 || page >= PAGES as isize {
+        if page < 0 || page >= self.pages() as isize {
             return;
         }
-        self.slot = slot_at(page as usize, row as usize, column as usize);
+        self.slot = slot_at_in(self.slots, page as usize, row as usize, column as usize);
     }
 
     /// Turn the page, keeping the cursor in the same cell of the new page.
     pub fn turn_page(&mut self, pages: isize) {
-        let page = (self.page() as isize + pages).clamp(0, PAGES as isize - 1) as usize;
-        self.slot = slot_at(page, self.row(), self.column());
+        let last = self.pages().saturating_sub(1) as isize;
+        let page = (self.page() as isize + pages).clamp(0, last) as usize;
+        self.slot = slot_at_in(self.slots, page, self.row(), self.column());
     }
 
     /// Jump to the first cell of a page.
     pub fn go_to_page(&mut self, page: usize) {
-        self.slot = slot_at(page, 0, 0);
+        self.slot = slot_at_in(self.slots, page, 0, 0);
     }
 
     /// Is the cursor on the first slot of its page?

@@ -416,6 +416,12 @@ pub enum UiAction {
     /// GuildWeaponCell follow: [A] is still the key that opens a record, so a
     /// tap cannot start an edit or a delete.
     EquipCell(usize),
+    /// One cell of the item box grid: the box slot.
+    ItemCell(usize),
+    /// One cell of the item box grid, selected without opening anything.
+    ///
+    /// A tap moves the cursor and nothing else, the rule every grid keeps here.
+    ItemPage(i32),
     /// Turn the equipment box one page: -1 back, +1 on.
     ///
     /// The arrows beside the grid are the finger's page turn. The d-pad can do
@@ -1506,11 +1512,14 @@ impl GuiState {
             },
             MainSection::Items => {
                 ed.screen = Screen::Items;
+                // The console draws the box as the grid; the four directions are
+                // cells and a tap picks one.
+                ed.use_item_grid();
                 match idx {
                     0 => {
                         ed.show_empty = false;
                         ed.cursor = 0;
-                        ed.message = String::from("所持アイテムのみ表示中 ([A]でアイテム変更 / [◀▶]で個数)");
+                        ed.message = String::from("所持アイテムのみ表示中 ([A]でアイテム変更 / タップで選択)");
                     }
                     1 => {
                         ed.show_empty = true;
@@ -3209,6 +3218,21 @@ impl GuiState {
                 // A tap on another cell is a cursor move: the step editor
                 // belongs to the cell it was armed on.
                 ed.guild_wpn_edit = false;
+            }
+            UiAction::ItemCell(slot) => {
+                ed.item_grid.set(slot);
+                ed.item_grid_moved = true;
+                if let Some(pos) = ed.visible_items().iter().position(|s| *s == slot) {
+                    ed.cursor = pos;
+                }
+            }
+            UiAction::ItemPage(dir) => {
+                ed.item_grid.turn_page(dir as isize);
+                ed.item_grid_moved = true;
+                let slot = ed.item_grid.slot();
+                if let Some(pos) = ed.visible_items().iter().position(|s| *s == slot) {
+                    ed.cursor = pos;
+                }
             }
             UiAction::EquipPage(dir) => {
                 ed.equip_grid.turn_page(dir as isize);
@@ -8360,9 +8384,196 @@ impl GuiState {
         self.draw_adaptive_rows(c, ed, hdr, "", &rows, ed.field, true, &a_lbl);
     }
 
+
+    /// The item box as the grid the game draws: ten by ten, a page at a time.
+    ///
+    /// The item box is 2300 slots - twenty three pages - and the icon of each
+    /// one comes from the game's own itemData table: the icon cell, and the
+    /// colour byte the game tints it with.
+    fn draw_items_grid(&mut self, c: &mut Canvas, ed: &Editor) {
+        let t = theme();
+        let body_y = CONTENT_Y + 30;
+        let body_h = FOOTER_Y - body_y - 10;
+
+        c.round_rect(MAIN_X, body_y, V1_LIST_W, body_h, t.corner_r, t.bg_panel);
+        c.round_rect_border(
+            MAIN_X,
+            body_y,
+            V1_LIST_W,
+            body_h,
+            t.corner_r,
+            1,
+            t.border_subtle,
+        );
+
+        let page = ed.item_grid.page();
+        let pages = ed.item_grid.pages();
+        let heading = format!(
+            "{}　{} / {} ページ",
+            ed.item_box_heading(),
+            page + 1,
+            pages
+        );
+        c.text_sized(
+            MAIN_X + 16,
+            body_y + 8,
+            &heading,
+            t.text_muted,
+            FontSize::Small,
+        );
+        c.hline(MAIN_X + 12, body_y + 30, V1_LIST_W - 24, t.border_subtle);
+
+        const CELL: i32 = 41;
+        const ICON: i32 = 31;
+        const PITCH: i32 = 44;
+        let grid_w = mhnx_core::equipgrid::COLUMNS as i32 * PITCH - 3;
+        let gx = MAIN_X + (V1_LIST_W - grid_w) / 2;
+        let gy = body_y + 38;
+
+        let atlas = crate::atlas::get();
+        let tables = crate::tables::get();
+        let first = mhnx_core::equipgrid::first_slot_of_in(
+            mhnx_core::itembox::TOTAL_ITEM_SLOTS,
+            page,
+        );
+        let cursor = ed.item_grid.slot();
+        for row in 0..mhnx_core::equipgrid::ROWS {
+            for col in 0..mhnx_core::equipgrid::COLUMNS {
+                let slot = first + row * mhnx_core::equipgrid::COLUMNS + col;
+                let x = gx + col as i32 * PITCH;
+                let y = gy + row as i32 * PITCH;
+                let entry = ed.item_at_slot(slot);
+                match &entry {
+                    Some(it) if it.id != 0 => {
+                        let look = tables.items.look(it.id);
+                        let ix = x + (CELL - ICON) / 2;
+                        let iy = y + (CELL - ICON) / 2;
+                        match (atlas, look) {
+                            (Some(a), Some(look)) => {
+                                let rect = mhnx_core::icons::cell_for(look.icon);
+                                c.icon_cell(
+                                    ix,
+                                    iy,
+                                    ICON,
+                                    &a.pixels,
+                                    a.width,
+                                    a.height,
+                                    rect.x,
+                                    rect.y,
+                                    rect.size,
+                                    mhnx_core::icons::item_tint(look.color),
+                                );
+                            }
+                            _ => {
+                                // No sheet or no table: the id is still the fact,
+                                // so print it rather than leave the cell blank.
+                                let id = format!("{}", it.id);
+                                c.text_centered(ix, iy, ICON, ICON, &id, t.text_muted, FontSize::Small);
+                            }
+                        }
+                        // The stack, in the corner: an item box without counts
+                        // is a list of names.
+                        let n = format!("{}", it.count);
+                        let w = c.text_width_sized(&n, FontSize::Small);
+                        c.text_sized(
+                            x + CELL - w - 1,
+                            y + CELL - 16,
+                            &n,
+                            t.text_primary,
+                            FontSize::Small,
+                        );
+                    }
+                    _ => {
+                        c.round_rect(x, y, CELL, CELL, 4, t.bg_row_odd);
+                    }
+                }
+                if slot == cursor {
+                    c.round_rect_border(x - 2, y - 2, CELL + 4, CELL + 4, 6, 2, t.accent_primary);
+                }
+                self.add_hit(x - 1, y - 1, CELL + 2, CELL + 2, UiAction::ItemCell(slot));
+            }
+        }
+
+        // The finger's page turn, the same pair the equipment box has.
+        let last_page = pages.saturating_sub(1);
+        let arrow: i32 = 52;
+        let arrow_y = gy + (mhnx_core::equipgrid::ROWS as i32 * PITCH - 3) / 2 - arrow / 2;
+        for (dir, ax, glyph, live) in [
+            (-1i32, MAIN_X + 44, "◀", page > 0),
+            (1i32, MAIN_X + V1_LIST_W - 44 - arrow, "▶", page < last_page),
+        ] {
+            c.round_rect(
+                ax,
+                arrow_y,
+                arrow,
+                arrow,
+                8,
+                if live { t.bg_btn } else { t.bg_row_odd },
+            );
+            let ink = if live { t.accent_primary } else { t.text_muted };
+            c.text_centered(ax, arrow_y, arrow, arrow, glyph, ink, FontSize::Large);
+            if live {
+                c.round_rect_border(ax, arrow_y, arrow, arrow, 8, 1, t.border_subtle);
+                self.add_hit(ax, arrow_y, arrow, arrow, UiAction::ItemPage(dir));
+            }
+        }
+
+        // The strip and the deck, as the list screens draw them.
+        let sub = ed.item_box_search_line(0);
+        let notice: alloc::vec::Vec<String> = if sub.is_empty() {
+            alloc::vec::Vec::new()
+        } else {
+            alloc::vec![sub]
+        };
+        let warn_lh = c.line_height_sized(FontSize::Small).max(16);
+        let strip_lines = notice.len().min(2) as i32;
+        self.draw_list_strip(
+            c,
+            strip_lines,
+            mhnx_core::equipgrid::PER_PAGE,
+            body_y,
+            body_h,
+            LIST_ROW_H,
+            warn_lh,
+            &[],
+            &notice,
+        );
+
+        // The row the deck reads: the cell under the cursor, in the same shape
+        // every other screen hands it.
+        let (name, meta, val) = match ed.item_at_slot(cursor) {
+            Some(it) if it.id != 0 => (
+                item_name_of(it.id),
+                format!("BOX #{:04} / ID:{:04}", cursor + 1, it.id),
+                format!("×{}", it.count),
+            ),
+            _ => (
+                String::from("(空き)"),
+                format!("BOX #{:04}", cursor + 1),
+                String::from("-"),
+            ),
+        };
+        let row = (0usize, name, meta, val, format!("#{:04}", cursor + 1));
+        self.draw_studio_inspector(
+            c,
+            ed,
+            body_y,
+            body_h,
+            Some(&row),
+            0,
+            1,
+            false,
+            &ed.key_label_or("A", "変更"),
+        );
+    }
+
     fn draw_items(&mut self, c: &mut Canvas, ed: &Editor) {
         if ed.item_menu_open {
             self.draw_item_menu(c, ed);
+            return;
+        }
+        if ed.item_grid_navigation {
+            self.draw_items_grid(c, ed);
             return;
         }
         let vis = ed.visible_items();

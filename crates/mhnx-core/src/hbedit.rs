@@ -7005,6 +7005,16 @@ pub struct Editor {
     /// next record" - and there a grid step would stall on the empty slots
     /// between records, because the list cursor only follows records.
     pub equip_grid_navigation: bool,
+    /// Where the item box cursor is on the grid the console draws.
+    ///
+    /// The item box is 2300 slots, so the same cell arithmetic runs over a
+    /// bigger box: twenty three pages of a hundred.
+    pub item_grid: crate::equipgrid::Cursor,
+    /// Has the user moved the item grid themselves yet? See
+    /// [`Editor::equip_grid_moved`] for why it matters.
+    pub item_grid_moved: bool,
+    /// Does this build draw the item box as a grid? The console does.
+    pub item_grid_navigation: bool,
     /// The equipment record being edited, if the form is open.
     pub equip_edit: Option<EquipEdit>,
     /// The 種別 row's [A] asked for the kind list, which the console owns.
@@ -7420,6 +7430,9 @@ impl Editor {
             equip_grid: crate::equipgrid::Cursor::new(),
             equip_grid_moved: false,
             equip_grid_navigation: false,
+            item_grid: crate::equipgrid::Cursor::over(crate::itembox::TOTAL_ITEM_SLOTS),
+            item_grid_moved: false,
+            item_grid_navigation: false,
             equip_edit: None,
             equip_kind_pick_pending: false,
             equip_delete_armed: None,
@@ -12626,6 +12639,80 @@ impl Editor {
             .collect()
     }
 
+
+    /// The item in one box slot, or `None` when the box has no such slot.
+    pub fn item_at_slot(&self, slot: usize) -> Option<crate::itembox::ItemSlot> {
+        self.save
+            .as_ref()
+            .and_then(|s| s.read_item_box(self.slot))
+            .and_then(|b| b.get(slot).copied())
+    }
+
+    /// How many slots this character's item box has.
+    pub fn item_box_len(&self) -> usize {
+        self.save
+            .as_ref()
+            .and_then(|s| s.read_item_box(self.slot))
+            .map(|b| b.len())
+            .unwrap_or(0)
+    }
+
+    /// Draw the item box as the grid the console shows.
+    pub fn use_item_grid(&mut self) {
+        self.item_grid_navigation = true;
+        self.sync_item_grid_to_cursor();
+    }
+
+    /// Put the item grid's cursor on the slot the list cursor is on.
+    pub fn sync_item_grid_to_cursor(&mut self) {
+        if let Some(&slot) = self.visible_items().get(self.cursor) {
+            self.item_grid.set(slot);
+        }
+    }
+
+    /// Move the item box cursor one press and keep the list cursor on the same
+    /// slot, so the paths that read [`Editor::cursor`] still find it.
+    fn move_item_grid(&mut self, dx: isize, dy: isize) {
+        if !self.item_grid_moved {
+            self.sync_item_grid_to_cursor();
+            self.item_grid_moved = true;
+        }
+        self.item_grid.step_paged(dx, dy);
+        let slot = self.item_grid.slot();
+        if let Some(pos) = self.visible_items().iter().position(|s| *s == slot) {
+            self.cursor = pos;
+        }
+    }
+
+    /// [A] on the item box grid: the item picker for the cell that was pressed,
+    /// empty or not.
+    ///
+    /// The list path reads the slot off the filtered list, which cannot name a
+    /// slot the list is hiding. The grid can, so an empty cell opens the picker
+    /// that fills it.
+    fn item_grid_a_press(&mut self) {
+        if !self.item_grid_moved {
+            self.sync_item_grid_to_cursor();
+        }
+        self.item_grid_moved = true;
+        let slot = self.item_grid.slot();
+        if slot >= self.item_box_len() {
+            self.message = String::from("この枠はアイテムBOXの外です");
+            return;
+        }
+        self.item_pick_mode = 0;
+        self.item_pick_return = Screen::Items;
+        self.item_pick_target = slot;
+        self.item_pick_cursor = 0;
+        self.item_pick_filter.clear();
+        self.screen = Screen::ItemPick;
+        self.message = alloc::format!(
+            "枠 #{} のアイテムを選んでください — {}",
+            slot + 1,
+            self.pick_key_hint()
+        );
+    }
+
     /// The line the item box prints above its list while a search is on.
     ///
     /// "検索: 回復薬（3 枠）", the whole box when it is off (""), and the id
@@ -15477,6 +15564,14 @@ impl Editor {
         let vis = self.visible_items();
         let n = vis.len();
         match key {
+            // On the console the box is a grid: the four directions move the
+            // cell cursor and a press past an edge turns the page. The desktop
+            // build keeps the list, where [◀][▶] step the count.
+            Key::Up if self.item_grid_navigation => self.move_item_grid(0, -1),
+            Key::Down if self.item_grid_navigation => self.move_item_grid(0, 1),
+            Key::Left if self.item_grid_navigation => self.move_item_grid(-1, 0),
+            Key::Right if self.item_grid_navigation => self.move_item_grid(1, 0),
+            Key::A if self.item_grid_navigation => self.item_grid_a_press(),
             Key::Up => self.move_cursor(n, -1),
             Key::Down => self.move_cursor(n, 1),
             Key::Left | Key::Right => {
