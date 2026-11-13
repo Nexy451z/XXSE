@@ -22,6 +22,8 @@ pub mod net;
 pub mod savedata;
 pub mod swkbd;
 pub mod sys;
+/// The game's tables, read from the SD card.
+pub mod tables;
 pub mod text;
 /// The update check, the download and the .nro swap.
 pub mod update;

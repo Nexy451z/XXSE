@@ -107,6 +107,8 @@ pub mod tex;
 pub mod icons;
 /// The equipment box as a ten by ten grid of slots over twenty pages.
 pub mod equipgrid;
+/// The game's own tables: item looks and the rarity behind an equipment icon.
+pub mod gametables;
 
 #[cfg(feature = "gamedata")]
 pub mod gamedata;

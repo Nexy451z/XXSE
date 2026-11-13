@@ -8782,10 +8782,15 @@ impl GuiState {
                 match &entry {
                     Some(eq) => {
                         let rect = mhnx_core::icons::cell_for_equipment(eq.kind);
-                        // Rarity lives in the game's tables, not in the save, so
-                        // until the tables are read the tint is the pale first
-                        // entry: the glyph is still the right one.
-                        let tint = mhnx_core::icons::rarity_tint(1);
+                        // Rarity lives in the game's tables, not in the save (a
+                        // talisman is the exception and carries its own). The
+                        // tint is the game's own colour for that rarity; with no
+                        // tables on the card every glyph gets the pale first
+                        // entry, which is still the right glyph.
+                        let rarity = crate::tables::get()
+                            .equip_rarity(eq.kind, eq.id)
+                            .unwrap_or(1);
+                        let tint = mhnx_core::icons::rarity_tint(rarity);
                         if let Some(a) = atlas {
                             c.icon_cell(
                                 x,
