@@ -101,6 +101,8 @@ pub mod snapshot;
 pub mod skills;
 /// The interface's own wording, keyed by language.
 pub mod strings;
+/// MT Framework NX textures: the icon atlases the game ships in its romfs.
+pub mod tex;
 
 #[cfg(feature = "gamedata")]
 pub mod gamedata;

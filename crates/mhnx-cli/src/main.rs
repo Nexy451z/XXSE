@@ -24,6 +24,9 @@ USAGE:
   mhnx to-switch <3ds-system> <dir>    write <dir>/system and <dir>/system_backup
   mhnx to-3ds <switch-system> <out>    strip the 36 byte container header
   mhnx arc-list <file.arc>             list the entries in a quest archive
+  mhnx tex-info <file.tex>             show an MT Framework NX texture's header
+  mhnx tex-dump <file.tex> <out.ppm>   decode an RGBA8 texture to a PPM
+  mhnx tex-icons <file.tex> <dir> <n>  cut a texture into n by n pixel cells
   mhnx arc-mib <file.arc>              dump the .mib fields of a quest
   mhnx arc-gmd <file.arc>              dump the quest text
   mhnx arc-repack <in.arc> <out.arc>   decompress and recompress an archive
@@ -197,6 +200,82 @@ fn cmd_to_3ds(src: &str, out: &str) -> Result<(), String> {
     let s = Save::from_bytes(&b).map_err(|e| e.to_string())?;
     std::fs::write(out, s.to_3ds_bytes()).map_err(|e| e.to_string())?;
     println!("wrote {} ({} bytes)", out, s.body().len());
+    Ok(())
+}
+
+
+/// A PPM (P6) writer: no dependencies, and every viewer reads it.
+fn write_ppm(path: &str, img: &mhnx_core::tex::Image) -> Result<(), String> {
+    let mut out = Vec::with_capacity(img.width * img.height * 3 + 32);
+    out.extend_from_slice(format!("P6\n{} {}\n255\n", img.width, img.height).as_bytes());
+    for i in (0..img.pixels.len()).step_by(4) {
+        // Composite over white so the transparent background does not read as black.
+        let a = img.pixels[i + 3] as u32;
+        for c in 0..3 {
+            let v = img.pixels[i + c] as u32;
+            let mixed = (v * a + 255 * (255 - a)) / 255;
+            out.push(mixed as u8);
+        }
+    }
+    std::fs::write(path, &out).map_err(|e| format!("{}: {}", path, e))
+}
+
+fn cmd_tex_info(path: &str) -> Result<(), String> {
+    let bytes = read(path)?;
+    let h = mhnx_core::tex::read_header(&bytes).map_err(|e| format!("{:?}", e))?;
+    println!("{}: {} bytes", path, bytes.len());
+    println!("  payload    {} bytes", h.payload_len);
+    println!("  format     {:#010X} ({})", h.format_word, if h.is_rgba8() { "RGBA8" } else { "not RGBA8" });
+    if h.is_rgba8() {
+        let px = h.payload_len / 4;
+        println!("  pixels     {}", px);
+        let mut w = 32usize;
+        while w <= 4096 {
+            if px % w == 0 {
+                let hh = px / w;
+                if (32..=4096).contains(&hh) {
+                    println!("  shape      {} x {}", w, hh);
+                }
+            }
+            w *= 2;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_tex_dump(path: &str, out: &str) -> Result<(), String> {
+    let bytes = read(path)?;
+    let img = mhnx_core::tex::decode_rgba8_auto(&bytes).map_err(|e| format!("{:?}", e))?;
+    println!("{}: {} x {}", path, img.width, img.height);
+    write_ppm(out, &img)?;
+    println!("wrote {}", out);
+    Ok(())
+}
+
+/// Cut the texture into square cells and write one PPM each.
+///
+/// The cell index is row major: cell 0 is the top left, cell `cols` is the
+/// first of the second row.
+fn cmd_tex_icons(path: &str, dir: &str, size: &str) -> Result<(), String> {
+    let cell: usize = size.parse().map_err(|_| format!("bad cell size: {}", size))?;
+    if cell == 0 {
+        return Err(String::from("cell size must be positive"));
+    }
+    let bytes = read(path)?;
+    let img = mhnx_core::tex::decode_rgba8_auto(&bytes).map_err(|e| format!("{:?}", e))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir, e))?;
+    let cols = img.width / cell;
+    let rows = img.height / cell;
+    let mut written = 0;
+    for r in 0..rows {
+        for c in 0..cols {
+            let tile = img.crop(c * cell, r * cell, cell, cell);
+            let name = format!("{:03}_r{}c{}.ppm", r * cols + c, r, c);
+            write_ppm(&format!("{}/{}", dir, name), &tile)?;
+            written += 1;
+        }
+    }
+    println!("wrote {} cells of {}x{} to {}", written, cell, cell, dir);
     Ok(())
 }
 
@@ -1964,6 +2043,9 @@ fn main() -> ExitCode {
         "to-switch" if args.len() == 3 => cmd_to_switch(&args[1], &args[2]),
         "to-3ds" if args.len() == 3 => cmd_to_3ds(&args[1], &args[2]),
         "arc-list" if args.len() == 2 => cmd_arc_list(&args[1]),
+        "tex-info" if args.len() == 2 => cmd_tex_info(&args[1]),
+        "tex-dump" if args.len() == 3 => cmd_tex_dump(&args[1], &args[2]),
+        "tex-icons" if args.len() == 4 => cmd_tex_icons(&args[1], &args[2], &args[3]),
         "arc-mib" if args.len() == 2 => cmd_arc_mib(&args[1]),
         "arc-gmd" if args.len() == 2 => cmd_arc_gmd(&args[1]),
         "arc-repack" if args.len() == 3 => cmd_arc_repack(&args[1], &args[2]),
