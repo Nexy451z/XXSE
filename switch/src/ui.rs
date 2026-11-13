@@ -416,6 +416,11 @@ pub enum UiAction {
     /// GuildWeaponCell follow: [A] is still the key that opens a record, so a
     /// tap cannot start an edit or a delete.
     EquipCell(usize),
+    /// Turn the equipment box one page: -1 back, +1 on.
+    ///
+    /// The arrows beside the grid are the finger's page turn. The d-pad can do
+    /// it by running off an edge, but a finger has no edge to run off.
+    EquipPage(i32),
     /// One cell of the arena grid: (arena row, rank column).
     ArenaCell(usize, usize),
     /// One cell of the guild card's weapon-usage grid: (weapon row, venue).
@@ -3204,6 +3209,14 @@ impl GuiState {
                 // A tap on another cell is a cursor move: the step editor
                 // belongs to the cell it was armed on.
                 ed.guild_wpn_edit = false;
+            }
+            UiAction::EquipPage(dir) => {
+                ed.equip_grid.turn_page(dir as isize);
+                ed.equip_grid_moved = true;
+                if let Some(pos) = ed.equip_row_of_slot(ed.equip_grid.slot()) {
+                    ed.equip_cursor = pos;
+                }
+                ed.equip_delete_armed = None;
             }
             UiAction::EquipCell(slot) => {
                 ed.equip_grid.set(slot);
@@ -8761,7 +8774,11 @@ impl GuiState {
 
         // 41 px cells on a 44 px pitch: ten of them is 437 px, which leaves the
         // strip under the grid its two lines on a 720p screen.
+        // The well is 41 px on a 44 px pitch; the glyph inside it is three
+        // quarters of that, which is what stops a row of 48 px sheets from
+        // reading as one solid block.
         const CELL: i32 = 41;
+        const ICON: i32 = 31;
         const PITCH: i32 = 44;
         let grid_w = mhnx_core::equipgrid::COLUMNS as i32 * PITCH - 3;
         let gx = MAIN_X + (V1_LIST_W - grid_w) / 2;
@@ -8791,11 +8808,14 @@ impl GuiState {
                             .equip_rarity(eq.kind, eq.id)
                             .unwrap_or(1);
                         let tint = mhnx_core::icons::rarity_tint(rarity);
+                        // Centred in the well, at three quarters of its size.
+                        let ix = x + (CELL - ICON) / 2;
+                        let iy = y + (CELL - ICON) / 2;
                         if let Some(a) = atlas {
                             c.icon_cell(
-                                x,
-                                y,
-                                CELL,
+                                ix,
+                                iy,
+                                ICON,
                                 &a.pixels,
                                 a.width,
                                 a.height,
@@ -8809,13 +8829,13 @@ impl GuiState {
                             // stands in, so the cell is still readable.
                             let name = mhnx_core::equip::type_name(eq.kind);
                             let head: String = name.chars().take(1).collect();
-                            c.text_centered(x, y, CELL, CELL, &head, t.text_muted, FontSize::Small);
+                            c.text_centered(ix, iy, ICON, ICON, &head, t.text_muted, FontSize::Small);
                         }
                         // Transmog is in the save (+0x04), so it can be marked
                         // even when the rarity tables are missing: a corner tick
                         // in the accent colour.
                         if eq.transmog != 0 {
-                            c.rect(x + CELL - 7, y + CELL - 7, 6, 6, t.accent_primary);
+                            c.rect(x + CELL - 7, y + CELL - 7, 5, 5, t.accent_primary);
                         }
                         // A talisman is in the box but edited on its own screen;
                         // the corner dot says so before the press does.
@@ -8833,6 +8853,41 @@ impl GuiState {
                 // A finger reaches the cell the same way the d-pad does: the tap
                 // moves the cursor, [A] (or the panel's button) does the rest.
                 self.add_hit(x - 1, y - 1, CELL + 2, CELL + 2, UiAction::EquipCell(slot));
+            }
+        }
+
+        // The arrows beside the grid: the finger's page turn. A d-pad can run
+        // off an edge to turn a page; a finger has no edge to run off, so the
+        // two ends of the box get a button each.
+        let page_now = ed.equip_grid.page();
+        let last_page = mhnx_core::equipgrid::PAGES - 1;
+        let arrow: i32 = 52;
+        let arrow_y = gy + (mhnx_core::equipgrid::ROWS as i32 * PITCH - 3) / 2 - arrow / 2;
+        for (dir, ax, glyph, live) in [
+            (-1i32, MAIN_X + 44, "◀", page_now > 0),
+            (
+                1i32,
+                MAIN_X + V1_LIST_W - 44 - arrow,
+                "▶",
+                page_now < last_page,
+            ),
+        ] {
+            c.round_rect(
+                ax,
+                arrow_y,
+                arrow,
+                arrow,
+                8,
+                if live { t.bg_btn } else { t.bg_row_odd },
+            );
+            if live {
+                c.round_rect_border(ax, arrow_y, arrow, arrow, 8, 1, t.border_subtle);
+                c.text_centered(ax, arrow_y, arrow, arrow, glyph, t.accent_primary, FontSize::Large);
+                self.add_hit(ax, arrow_y, arrow, arrow, UiAction::EquipPage(dir));
+            } else {
+                // At the ends there is nowhere to go: a dimmed arrow says so
+                // rather than a live button that does nothing.
+                c.text_centered(ax, arrow_y, arrow, arrow, glyph, t.text_muted, FontSize::Large);
             }
         }
 
