@@ -27,6 +27,7 @@ USAGE:
   mhnx tex-info <file.tex>             show an MT Framework NX texture's header
   mhnx tex-dump <file.tex> <out.ppm>   decode an RGBA8 texture to a PPM
   mhnx tex-icons <file.tex> <dir> <n>  cut a texture into n by n pixel cells
+  mhnx equip-icons <file.tex> <dir>    one tinted icon per equipment box type
   mhnx arc-mib <file.arc>              dump the .mib fields of a quest
   mhnx arc-gmd <file.arc>              dump the quest text
   mhnx arc-repack <in.arc> <out.arc>   decompress and recompress an archive
@@ -276,6 +277,43 @@ fn cmd_tex_icons(path: &str, dir: &str, size: &str) -> Result<(), String> {
         }
     }
     println!("wrote {} cells of {}x{} to {}", written, cell, cell, dir);
+    Ok(())
+}
+
+
+/// Write one tinted icon per equipment box type, and a contact sheet.
+///
+/// This is the check that the geometry in `mhnx_core::icons` lands on the icons
+/// the game shows: the sheet it writes is the same one the Python probe made.
+fn cmd_equip_icons(tex: &str, dir: &str) -> Result<(), String> {
+    use mhnx_core::icons;
+    let bytes = read(tex)?;
+    let img = mhnx_core::tex::decode_rgba8_auto(&bytes).map_err(|e| format!("{:?}", e))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir, e))?;
+    let mut written = 0;
+    for kind in 0u8..=24 {
+        let rect = icons::cell_for_equipment(kind);
+        let cell = img.crop(rect.x, rect.y, rect.size, rect.size);
+        let tint = icons::rarity_tint(9);
+        let mut out = Vec::with_capacity(icons::CELL * icons::CELL * 3 + 32);
+        out.extend_from_slice(b"P6\n48 48\n255\n");
+        for i in (0..cell.pixels.len()).step_by(4) {
+            let gray = [
+                cell.pixels[i],
+                cell.pixels[i + 1],
+                cell.pixels[i + 2],
+                cell.pixels[i + 3],
+            ];
+            let p = icons::tint_pixel(gray, tint);
+            out.push(p[0]);
+            out.push(p[1]);
+            out.push(p[2]);
+        }
+        std::fs::write(format!("{}/type_{:02}.ppm", dir, kind), &out)
+            .map_err(|e| format!("{}: {}", dir, e))?;
+        written += 1;
+    }
+    println!("wrote {} equipment icons to {}", written, dir);
     Ok(())
 }
 
@@ -2046,6 +2084,7 @@ fn main() -> ExitCode {
         "tex-info" if args.len() == 2 => cmd_tex_info(&args[1]),
         "tex-dump" if args.len() == 3 => cmd_tex_dump(&args[1], &args[2]),
         "tex-icons" if args.len() == 4 => cmd_tex_icons(&args[1], &args[2], &args[3]),
+        "equip-icons" if args.len() == 3 => cmd_equip_icons(&args[1], &args[2]),
         "arc-mib" if args.len() == 2 => cmd_arc_mib(&args[1]),
         "arc-gmd" if args.len() == 2 => cmd_arc_gmd(&args[1]),
         "arc-repack" if args.len() == 3 => cmd_arc_repack(&args[1], &args[2]),

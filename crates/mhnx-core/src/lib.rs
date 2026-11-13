@@ -103,6 +103,8 @@ pub mod skills;
 pub mod strings;
 /// MT Framework NX textures: the icon atlases the game ships in its romfs.
 pub mod tex;
+/// Where an icon sits on the sheet, and the colour the game tints it with.
+pub mod icons;
 
 #[cfg(feature = "gamedata")]
 pub mod gamedata;
