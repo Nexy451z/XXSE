@@ -297,9 +297,11 @@ fn the_kind_row_prints_the_measured_ceiling_of_the_kind() {
     for (i, row) in rows.iter().enumerate() {
         assert_eq!(row.field, i, "row {} has the wrong field number", i);
     }
-    // The row's own title now carries the hint for its [A]: "種類  ▸ +1".
+    // The row's own title carries the hint for its [A]: "種類  ▶ +1". The
+    // marker is U+25B6, not U+25B8: the console's shared font has no glyph for
+    // the small triangle and drew a box in its place.
     assert!(rows[1].title.starts_with("種類"), "{}", rows[1].title);
-    assert!(rows[1].title.contains("▸ +1"), "{}", rows[1].title);
+    assert!(rows[1].title.contains("▶ +1"), "{}", rows[1].title);
     assert_eq!(rows[1].value, "天の護石");
     assert!(
         rows[1].meta.contains("R100 / スキル1+10 / スキル2+13 / S3"),
