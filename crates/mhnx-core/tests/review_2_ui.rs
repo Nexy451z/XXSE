@@ -361,12 +361,22 @@ fn opening_a_quest_from_the_save_lands_on_the_editor() {
 fn the_equipment_box_does_not_list_talismans_and_the_talisman_form_keeps_its_sockets() {
     let ed = editor_with_charms();
     assert_eq!(ed.equipment().len(), 4, "the box holds three talismans and a weapon");
+    // The box lists what it holds, talismans included: a slot holding one that
+    // read as an empty slot was the report this screen came back with. What the
+    // list must not do is open the *equipment* form on one - that is the
+    // two-forms problem this test is about, and it is now answered by the press
+    // (see review_16) rather than by hiding the type.
     let rows = ed.equip_rows();
-    assert_eq!(rows.len(), 1, "the list is the weapon and nothing else");
-    assert_eq!(rows[0].kind, 7);
-    assert!(
-        rows.iter().all(|e| e.kind != equip::TALISMAN_KIND),
-        "no talisman is a row of the equipment box"
+    assert_eq!(rows.len(), 4, "the box lists its three talismans and its weapon");
+    assert_eq!(
+        rows.iter().filter(|e| e.kind == 7).count(),
+        1,
+        "the weapon is a row"
+    );
+    assert_eq!(
+        rows.iter().filter(|e| e.kind == equip::TALISMAN_KIND).count(),
+        3,
+        "and so are the talismans"
     );
 
     // The talisman form has the three sockets as rows of its own.
@@ -716,13 +726,13 @@ fn every_quest_tab_numbers_its_rows_the_same_way() {
 #[test]
 fn the_kind_row_opens_the_kind_list() {
     let choices = Editor::equip_kind_choices();
-    // Nineteen: the twenty kinds a hunter's box holds, less the talisman, which
-    // has a screen of its own and is not a row of this box (the third review's
-    // finding 2).
-    assert_eq!(choices.len(), 19, "the kinds a hunter's box lists");
+    // Twenty: everything a hunter's box holds, the talisman included. It is in
+    // the box and in the box screen, so a list that cannot name it is a list
+    // that cannot say what a slot holds.
+    assert_eq!(choices.len(), 20, "the kinds a hunter's box lists");
     assert!(
-        !choices.iter().any(|(v, _)| *v == 6),
-        "護石 is not one of them"
+        choices.iter().any(|(v, label)| *v == 6 && label.contains("護石")),
+        "護石 is one of them"
     );
     assert!(choices.iter().any(|(v, label)| *v == 7 && label.contains("大剣")));
 
@@ -730,7 +740,13 @@ fn the_kind_row_opens_the_kind_list() {
     ed.save = Some(save_with_charms_and_a_weapon());
     ed.slot = 0;
     ed.screen = Screen::Equip;
-    ed.equip_cursor = 0;
+    // The box lists its talismans first in this save, and a talisman opens
+    // 護石編集: stand on the weapon row before pressing [A].
+    ed.equip_cursor = ed
+        .equip_rows()
+        .iter()
+        .position(|e| e.kind == 7)
+        .expect("the weapon is a row");
     ed.input(Key::A); // opens the form on the weapon
     assert_eq!(ed.screen, Screen::EquipEdit);
     {
